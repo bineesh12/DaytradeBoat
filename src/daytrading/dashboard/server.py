@@ -1,0 +1,1524 @@
+"""Flask web server for the trading dashboard.
+
+Serves a single-page app with real-time updates via SSE.
+Runs in a background daemon thread so it doesn't block the trading pipeline.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import threading
+import time
+from typing import Optional
+
+from flask import Flask, Response, jsonify, render_template_string, request
+
+from daytrading.dashboard.hub import DashboardHub
+
+logger = logging.getLogger(__name__)
+
+_hub: Optional[DashboardHub] = None
+
+
+def create_app(hub: DashboardHub) -> Flask:
+    global _hub
+    _hub = hub
+
+    app = Flask(__name__)
+    app.config["PROPAGATE_EXCEPTIONS"] = True
+
+    @app.after_request
+    def add_no_cache(response):
+        if response.content_type and "text/html" in response.content_type:
+            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        return response
+
+    @app.route("/")
+    def index():
+        from flask import make_response
+        resp = make_response(render_template_string(DASHBOARD_HTML))
+        resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
+        return resp
+
+    @app.route("/favicon.ico")
+    def favicon():
+        return Response(status=204)
+
+    @app.route("/api/snapshot")
+    def snapshot():
+        return jsonify(_hub.snapshot())
+
+    @app.route("/api/screenshot", methods=["POST"])
+    def save_screenshot():
+        if not getattr(_hub, "journal", None):
+            return jsonify({"ok": False, "error": "journal not configured"}), 503
+        payload = request.get_json(silent=True) or {}
+        symbol = str(payload.get("symbol", "")).strip().upper()
+        image_b64 = payload.get("image_b64")
+        source_path = payload.get("source_path")
+        context = payload.get("context", {})
+        if not symbol:
+            return jsonify({"ok": False, "error": "symbol is required"}), 400
+        if not image_b64 and not source_path:
+            return jsonify({"ok": False, "error": "image_b64 or source_path is required"}), 400
+        try:
+            meta = _hub.journal.save_screenshot(
+                symbol,
+                image_b64=image_b64,
+                source_path=source_path,
+                context=context if isinstance(context, dict) else {},
+            )
+            return jsonify({"ok": True, "screenshot": meta})
+        except Exception as exc:
+            logger.error("Failed to save screenshot: %s", exc)
+            return jsonify({"ok": False, "error": str(exc)}), 500
+
+    @app.route("/api/replay")
+    def replay():
+        if not getattr(_hub, "journal", None):
+            return jsonify({"ok": False, "error": "journal not configured"}), 503
+        day = request.args.get("day")
+        try:
+            limit = int(request.args.get("limit", "0")) or None
+        except Exception:
+            limit = None
+        events = _hub.journal.replay_frames(day=day, limit=limit)
+        return jsonify({"ok": True, "count": len(events), "events": events})
+
+    @app.route("/api/pause", methods=["POST"])
+    def pause_trading():
+        _hub.trading_paused = True
+        _hub._broadcast("trading_control", {"paused": True})
+        logger.info("Trading PAUSED via dashboard")
+        return jsonify({"ok": True, "paused": True})
+
+    @app.route("/api/resume", methods=["POST"])
+    def resume_trading():
+        _hub.trading_paused = False
+        _hub._broadcast("trading_control", {"paused": False})
+        logger.info("Trading RESUMED via dashboard")
+        return jsonify({"ok": True, "paused": False})
+
+    @app.route("/api/force-close", methods=["POST"])
+    def force_close_all():
+        broker = getattr(_hub, "_broker", None)
+        if not broker:
+            return jsonify({"ok": False, "error": "broker not available"}), 503
+        try:
+            broker.close_all_positions()
+            exit_mgr = getattr(_hub, "_exit_manager", None)
+            if exit_mgr:
+                for sym in list(exit_mgr.tracked.keys()):
+                    exit_mgr.untrack(sym)
+            _hub._broadcast("trading_control", {"force_closed": True})
+            logger.info("FORCE CLOSE ALL via dashboard")
+            return jsonify({"ok": True, "message": "All positions closed"})
+        except Exception as exc:
+            logger.error("Force close failed: %s", exc)
+            return jsonify({"ok": False, "error": str(exc)}), 500
+
+    @app.route("/api/stream")
+    def stream():
+        q = _hub.subscribe()
+
+        def generate():
+            try:
+                heartbeat_counter = 0
+                while True:
+                    while q:
+                        msg = q.popleft()
+                        yield "data: {}\n\n".format(json.dumps(msg))
+                        heartbeat_counter = 0
+                    time.sleep(0.3)
+                    heartbeat_counter += 1
+                    # Send keepalive comment every ~5 seconds to prevent timeout
+                    if heartbeat_counter >= 16:
+                        yield ": keepalive\n\n"
+                        heartbeat_counter = 0
+            except GeneratorExit:
+                _hub.unsubscribe(q)
+
+        return Response(generate(), mimetype="text/event-stream")
+
+    return app
+
+
+def start_dashboard(hub: DashboardHub, host: str = "0.0.0.0", port: int = 8080) -> None:
+    """Start the dashboard in a background daemon thread.
+
+    Force-kills any existing process on the port to avoid connection
+    limit issues from orphaned servers.
+    """
+    app = create_app(hub)
+
+    def _run(p: int) -> None:
+        import warnings
+        warnings.filterwarnings("ignore", message=".*development server.*")
+        app.run(host=host, port=p, debug=False, use_reloader=False, threaded=True)
+
+    import socket
+    import subprocess
+
+    # Force-kill any process holding our port
+    try:
+        result = subprocess.run(
+            ["lsof", "-ti", f":{port}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        pids = result.stdout.strip().split()
+        for pid in pids:
+            if pid:
+                try:
+                    os.kill(int(pid), 9)
+                    logger.info("Killed orphan process %s on port %d", pid, port)
+                except (ProcessLookupError, ValueError):
+                    pass
+        if pids:
+            import time
+            time.sleep(1)
+    except Exception:
+        pass
+
+    # Verify port is free now
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind((host, port))
+        sock.close()
+    except OSError:
+        logger.error("Port %d still in use after cleanup — dashboard NOT started", port)
+        return
+
+    t = threading.Thread(target=_run, args=(port,), daemon=True, name="dashboard")
+    t.start()
+    logger.info("Dashboard started at http://localhost:%d", port)
+
+
+# ---------------------------------------------------------------------------
+# Single-page HTML dashboard (embedded — no external files needed)
+# ---------------------------------------------------------------------------
+
+DASHBOARD_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Day Trading Dashboard</title>
+<style>
+:root {
+  --bg: #0f1117;
+  --surface: #1a1d28;
+  --surface2: #232736;
+  --border: #2d3148;
+  --text: #e1e4ed;
+  --text2: #8b8fa3;
+  --green: #00d68f;
+  --green-bg: rgba(0,214,143,0.1);
+  --red: #ff4757;
+  --red-bg: rgba(255,71,87,0.1);
+  --blue: #3b82f6;
+  --blue-bg: rgba(59,130,246,0.1);
+  --yellow: #fbbf24;
+  --yellow-bg: rgba(251,191,36,0.1);
+  --purple: #a78bfa;
+  --radius: 12px;
+  --shadow: 0 2px 8px rgba(0,0,0,0.3);
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; }
+
+/* Top navbar */
+.navbar { background:var(--surface); border-bottom:1px solid var(--border); padding:12px 24px; display:flex; align-items:center; justify-content:space-between; position:sticky; top:0; z-index:100; }
+.navbar h1 { font-size:18px; font-weight:700; letter-spacing:-0.5px; }
+.navbar h1 span { color:var(--blue); }
+.nav-status { display:flex; gap:16px; align-items:center; font-size:13px; }
+.status-dot { width:8px; height:8px; border-radius:50%; display:inline-block; margin-right:4px; }
+.status-dot.on { background:var(--green); box-shadow:0 0 6px var(--green); }
+.status-dot.off { background:var(--red); }
+
+/* Tabs */
+.tabs { display:flex; gap:0; background:var(--surface); border-bottom:1px solid var(--border); padding:0 24px; }
+.tab { padding:12px 20px; cursor:pointer; font-size:13px; font-weight:500; color:var(--text2); border-bottom:2px solid transparent; transition:all 0.2s; }
+.tab:hover { color:var(--text); }
+.tab.active { color:var(--blue); border-bottom-color:var(--blue); }
+
+/* Layout */
+.container { padding:20px 24px; max-width:1440px; margin:0 auto; }
+.grid { display:grid; gap:16px; }
+.grid-4 { grid-template-columns:repeat(4,1fr); }
+.grid-3 { grid-template-columns:repeat(3,1fr); }
+.grid-2 { grid-template-columns:1fr 1fr; }
+.grid-1 { grid-template-columns:1fr; }
+
+/* Cards */
+.card { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:20px; box-shadow:var(--shadow); }
+.card-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; }
+.card-header h3 { font-size:14px; font-weight:600; color:var(--text2); text-transform:uppercase; letter-spacing:0.5px; }
+.card-header .badge { font-size:11px; padding:3px 8px; border-radius:6px; font-weight:600; }
+
+/* Stat cards */
+.stat-card { text-align:center; }
+.stat-value { font-size:28px; font-weight:700; margin:4px 0; letter-spacing:-1px; }
+.stat-label { font-size:12px; color:var(--text2); text-transform:uppercase; letter-spacing:0.5px; }
+.stat-sub { font-size:12px; margin-top:4px; }
+
+/* Tables */
+table { width:100%; border-collapse:collapse; font-size:13px; }
+th { text-align:left; padding:10px 12px; color:var(--text2); font-weight:500; font-size:11px; text-transform:uppercase; letter-spacing:0.5px; border-bottom:1px solid var(--border); }
+td { padding:10px 12px; border-bottom:1px solid var(--border); }
+tr:last-child td { border-bottom:none; }
+tr:hover { background:var(--surface2); }
+
+/* Pills */
+.pill { display:inline-block; padding:2px 8px; border-radius:4px; font-size:11px; font-weight:600; }
+.pill-green { background:var(--green-bg); color:var(--green); }
+.pill-red { background:var(--red-bg); color:var(--red); }
+.pill-blue { background:var(--blue-bg); color:var(--blue); }
+.pill-yellow { background:var(--yellow-bg); color:var(--yellow); }
+.pill-purple { background:rgba(167,139,250,0.1); color:var(--purple); }
+
+.text-green { color:var(--green); }
+.text-red { color:var(--red); }
+.text-blue { color:var(--blue); }
+.text-yellow { color:var(--yellow); }
+
+/* Page sections */
+.page { display:none; }
+.page.active { display:block; }
+
+/* Log panel */
+.log-panel { max-height:300px; overflow-y:auto; font-family:'SF Mono',Monaco,'Consolas',monospace; font-size:12px; line-height:1.8; padding:8px; }
+.log-panel .log-line { padding:2px 0; }
+.log-line .ts { color:var(--text2); }
+.log-line.warn { color:var(--yellow); }
+.log-line.error { color:var(--red); }
+
+/* Empty state */
+.empty { text-align:center; padding:40px; color:var(--text2); }
+.empty .icon { font-size:36px; margin-bottom:12px; }
+
+/* Trading control buttons */
+.ctrl-btn { padding:6px 14px; border:none; border-radius:6px; font-size:12px; font-weight:600; cursor:pointer; transition:opacity 0.2s; }
+.ctrl-btn:hover { opacity:0.85; }
+.ctrl-btn:disabled { opacity:0.4; cursor:not-allowed; }
+.ctrl-btn-stop { background:var(--red); color:#fff; }
+.ctrl-btn-start { background:var(--green); color:#fff; }
+.ctrl-btn-close { background:#dc2626; color:#fff; }
+
+/* Confidence bar */
+.conf-bar { width:60px; height:6px; background:var(--surface2); border-radius:3px; overflow:hidden; display:inline-block; vertical-align:middle; margin-left:6px; }
+.conf-bar-fill { height:100%; border-radius:3px; transition:width 0.3s; }
+
+/* Scanner activity indicator */
+.scanner-activity { display:flex; gap:4px; align-items:center; }
+.scanner-dot { width:6px; height:6px; border-radius:50%; }
+
+@media(max-width:900px) {
+  .grid-4 { grid-template-columns:repeat(2,1fr); }
+  .grid-3 { grid-template-columns:1fr; }
+  .grid-2 { grid-template-columns:1fr; }
+}
+</style>
+</head>
+<body>
+
+<nav class="navbar">
+  <h1><span>&#9650;</span> Day Trading Bot</h1>
+  <div class="nav-status">
+    <span><span class="status-dot" id="dot-market"></span><span id="market-label">Market Closed</span></span>
+    <span class="pill" id="phase-pill" style="font-size:11px">CLOSED</span>
+    <span><span class="status-dot" id="dot-stream"></span><span id="stream-label">Stream Off</span></span>
+    <span style="color:var(--text2)">Cycle: <span id="cycle-count">0</span></span>
+    <span><span class="status-dot" id="dot-scanner"></span><span id="scanner-label">Scanner Off</span></span>
+    <span id="trade-status-pill" class="pill pill-green" style="font-size:11px">ACTIVE</span>
+  </div>
+  <div style="display:flex;gap:6px;align-items:center">
+    <button class="ctrl-btn ctrl-btn-stop" id="btn-stop" title="Pause trading — no new entries">Stop Trade</button>
+    <button class="ctrl-btn ctrl-btn-start" id="btn-start" title="Resume trading" disabled>Start Trade</button>
+    <button class="ctrl-btn ctrl-btn-close" id="btn-force-close" title="Cancel all orders + close all positions immediately">Force Close All</button>
+  </div>
+</nav>
+
+<div class="tabs">
+  <div class="tab active" data-page="overview">Overview</div>
+  <div class="tab" data-page="scanner">Scanner</div>
+  <div class="tab" data-page="trades">Trades</div>
+  <div class="tab" data-page="analytics">Analytics</div>
+  <div class="tab" data-page="journal">Journal</div>
+  <div class="tab" data-page="logs">Logs</div>
+</div>
+
+<!-- ================= OVERVIEW ================= -->
+<div class="page active" id="page-overview">
+<div class="container">
+  <div class="grid grid-4" style="margin-bottom:16px">
+    <div class="card stat-card">
+      <div class="stat-label">Total P&L</div>
+      <div class="stat-value" id="stat-pnl">$0.00</div>
+      <div class="stat-sub" id="stat-pnl-pct"></div>
+    </div>
+    <div class="card stat-card">
+      <div class="stat-label">Total Trades</div>
+      <div class="stat-value" id="stat-trades">0</div>
+      <div class="stat-sub" id="stat-winrate">0% win rate</div>
+    </div>
+    <div class="card stat-card">
+      <div class="stat-label">Scanner Hits</div>
+      <div class="stat-value text-blue" id="stat-scans">0</div>
+      <div class="stat-sub"><span id="stat-signals">0</span> signals / <span id="stat-rejected">0</span> rejected</div>
+    </div>
+    <div class="card stat-card">
+      <div class="stat-label">Account Equity</div>
+      <div class="stat-value" id="stat-equity">$0</div>
+      <div class="stat-sub">Cash: <span id="stat-cash">$0</span></div>
+    </div>
+  </div>
+
+  <div class="grid grid-2">
+    <div class="card">
+      <div class="card-header"><h3>Open Positions</h3><span class="badge pill-blue" id="pos-count">0</span></div>
+      <div id="positions-table-wrap">
+        <div class="empty"><div class="icon">&#128200;</div>No open positions</div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header"><h3>Recent Activity</h3></div>
+      <div id="activity-wrap">
+        <div class="empty"><div class="icon">&#9889;</div>Waiting for trades...</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="grid grid-2" style="margin-top:16px">
+    <div class="card">
+      <div class="card-header"><h3>Latest Scanner Hits</h3><span class="badge pill-blue" id="ov-scan-count2">0</span></div>
+      <div id="ov-scanner-wrap">
+        <div class="empty"><div class="icon">&#128269;</div>No scanner hits yet</div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header"><h3>News Sentiment</h3><span class="badge pill-yellow" id="news-count">0</span></div>
+      <div id="news-wrap">
+        <div class="empty"><div class="icon">&#128240;</div>No news data yet</div>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- ================= SCANNER (combined: Live Movers + Hits + Classification) ================= -->
+<div class="page" id="page-scanner">
+<div class="container">
+  <div class="grid grid-4" style="margin-bottom:16px">
+    <div class="card stat-card">
+      <div class="stat-label">Live Movers</div>
+      <div class="stat-value text-green" id="mv-count">0</div>
+      <div class="stat-sub" id="mv-last-time">--</div>
+    </div>
+    <div class="card stat-card">
+      <div class="stat-label">Scanner Hits</div>
+      <div class="stat-value text-blue" id="scan-total">0</div>
+    </div>
+    <div class="card stat-card">
+      <div class="stat-label">Verified Signals</div>
+      <div class="stat-value text-green" id="scan-signals">0</div>
+    </div>
+    <div class="card stat-card">
+      <div class="stat-label">Conversion Rate</div>
+      <div class="stat-value text-yellow" id="scan-rate">0%</div>
+    </div>
+  </div>
+
+  <!-- Live Movers -->
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-header">
+      <h3>Live Movers</h3>
+      <span style="font-size:11px;color:var(--text2)">Real-time | $1-$20 | UP only | updates every 5s</span>
+    </div>
+    <div id="movers-table-wrap">
+      <div class="empty"><div class="icon">&#128293;</div>Waiting for market activity...</div>
+    </div>
+  </div>
+
+  <!-- Scanner Hits -->
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-header"><h3>Pattern Matches</h3><span class="badge pill-blue" id="ov-scan-count">0</span></div>
+    <div id="scanner-table-wrap">
+      <div class="empty"><div class="icon">&#128269;</div>No pattern matches yet</div>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- ================= TRADES ================= -->
+<div class="page" id="page-trades">
+<div class="container">
+  <div class="grid grid-4" style="margin-bottom:16px">
+    <div class="card stat-card">
+      <div class="stat-label">Total P&L</div>
+      <div class="stat-value" id="trades-pnl">$0.00</div>
+    </div>
+    <div class="card stat-card">
+      <div class="stat-label">Winners</div>
+      <div class="stat-value text-green" id="trades-wins">0</div>
+    </div>
+    <div class="card stat-card">
+      <div class="stat-label">Losers</div>
+      <div class="stat-value text-red" id="trades-losses">0</div>
+    </div>
+    <div class="card stat-card">
+      <div class="stat-label">Win Rate</div>
+      <div class="stat-value" id="trades-winrate">0%</div>
+    </div>
+  </div>
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-header"><h3>Daily P&L by Stock</h3></div>
+    <div id="stock-summary-wrap">
+      <div class="empty"><div class="icon">&#128202;</div>No trades yet</div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-header"><h3>Trade History</h3></div>
+    <div id="trades-table-wrap">
+      <div class="empty"><div class="icon">&#128202;</div>No trades yet</div>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- ================= ANALYTICS ================= -->
+<div class="page" id="page-analytics">
+<div class="container">
+  <div class="grid grid-4" style="margin-bottom:16px">
+    <div class="card stat-card">
+      <div class="stat-label">Avg Win</div>
+      <div class="stat-value text-green" id="an-avg-win">$0.00</div>
+    </div>
+    <div class="card stat-card">
+      <div class="stat-label">Avg Loss</div>
+      <div class="stat-value text-red" id="an-avg-loss">$0.00</div>
+    </div>
+    <div class="card stat-card">
+      <div class="stat-label">Profit Factor</div>
+      <div class="stat-value" id="an-pf">0.00</div>
+    </div>
+    <div class="card stat-card">
+      <div class="stat-label">Expectancy</div>
+      <div class="stat-value" id="an-expect">$0.00</div>
+    </div>
+  </div>
+  <div class="grid grid-2" style="margin-bottom:16px">
+    <div class="card">
+      <div class="card-header"><h3>Per-Symbol Breakdown</h3></div>
+      <div id="an-symbol-table">
+        <div class="empty"><div class="icon">&#128202;</div>No data yet</div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header"><h3>Exit Type Analysis</h3></div>
+      <div id="an-exit-table">
+        <div class="empty"><div class="icon">&#128202;</div>No data yet</div>
+      </div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-header"><h3>Equity Curve</h3></div>
+    <div id="an-equity-chart" style="height:200px;position:relative;overflow:hidden;">
+      <canvas id="equity-canvas" style="width:100%;height:100%"></canvas>
+    </div>
+  </div>
+  <div class="card" style="margin-top:16px">
+    <div class="card-header">
+      <h3>AI Trade Insights</h3>
+      <span id="ai-score" style="font-size:13px;color:var(--text2)"></span>
+    </div>
+    <div id="ai-insights-wrap">
+      <div class="empty"><div class="icon">&#129302;</div>AI analysis will run after 5+ trades</div>
+    </div>
+  </div>
+  <div class="grid grid-2" style="margin-top:16px">
+    <div class="card">
+      <div class="card-header"><h3>Blocked Symbols</h3></div>
+      <div id="ai-blocked-wrap">
+        <div class="empty" style="padding:12px;font-size:12px;color:var(--text2)">No symbols blocked</div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header"><h3>Auto-Adjustments</h3></div>
+      <div id="ai-adjustments-wrap">
+        <div class="empty" style="padding:12px;font-size:12px;color:var(--text2)">No adjustments yet</div>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- ================= LOGS ================= -->
+<div class="page" id="page-logs">
+<div class="container">
+  <div class="card">
+    <div class="card-header"><h3>Live Logs</h3></div>
+    <div class="log-panel" id="log-panel">
+      <div class="empty"><div class="icon">&#128196;</div>No log messages yet</div>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- ================= JOURNAL ================= -->
+<div class="page" id="page-journal">
+<div class="container">
+  <div class="grid grid-4" style="margin-bottom:16px">
+    <div class="card stat-card">
+      <div class="stat-label">Replay Events</div>
+      <div class="stat-value text-blue" id="jr-total">0</div>
+    </div>
+    <div class="card stat-card">
+      <div class="stat-label">Trade Events</div>
+      <div class="stat-value text-green" id="jr-trades">0</div>
+    </div>
+    <div class="card stat-card">
+      <div class="stat-label">Mistakes</div>
+      <div class="stat-value text-red" id="jr-mistakes">0</div>
+    </div>
+    <div class="card stat-card">
+      <div class="stat-label">Screenshots</div>
+      <div class="stat-value text-yellow" id="jr-shots">0</div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-header">
+      <h3>Journal Replay</h3>
+      <div style="display:flex;gap:8px;align-items:center">
+        <span id="jr-updated" style="font-size:11px;color:var(--text2)">Not loaded</span>
+        <button id="jr-refresh-btn" style="padding:6px 10px;border:1px solid var(--border);background:var(--surface2);color:var(--text1);border-radius:6px;cursor:pointer">Refresh</button>
+      </div>
+    </div>
+    <div id="journal-table-wrap">
+      <div class="empty"><div class="icon">&#128221;</div>No journal events yet</div>
+    </div>
+  </div>
+</div>
+</div>
+
+<script>
+// State
+let state = {
+  stats: {}, account: {}, positions: {}, symbols: {},
+  recent_trades: [], recent_scans: [], pnl_history: [],
+  market_open: false, stream_connected: false,
+  watchlist_scan: [], rt_movers: [], rt_new_total: 0,
+  news: {}, journal: {events: [], loaded: false, error: null, last_update: null}
+};
+
+// Tab switching
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+    tab.classList.add('active');
+    document.getElementById('page-' + tab.dataset.page).classList.add('active');
+    if (tab.dataset.page === 'journal') {
+      loadJournal(true);
+    }
+  });
+});
+
+// Formatting helpers
+function fmt$(v) { return (v>=0?'':'') + '$' + Math.abs(v).toFixed(2); }
+function fmtPnl(v) {
+  let s = v >= 0 ? '+$' + v.toFixed(2) : '-$' + Math.abs(v).toFixed(2);
+  return '<span class="' + (v>=0?'text-green':'text-red') + '">' + s + '</span>';
+}
+function chartLink(sym) {
+  let url = 'https://www.tradingview.com/chart/?symbol=' + encodeURIComponent(sym);
+  return '<a href="' + url + '" target="_blank" rel="noopener" style="text-decoration:none" title="Open chart for ' + sym + '"><strong>' + sym + '</strong> <span style="font-size:11px;opacity:0.6">&#128200;</span></a>';
+}
+function confBar(pct) {
+  let color = pct >= 60 ? 'var(--green)' : pct >= 40 ? 'var(--yellow)' : 'var(--red)';
+  return pct.toFixed(0) + '%<div class="conf-bar"><div class="conf-bar-fill" style="width:'+pct+'%;background:'+color+'"></div></div>';
+}
+function typePill(t) {
+  let cls = {entry:'pill-blue',exit:'pill-green',scale_up:'pill-purple',reentry:'pill-yellow'}[t]||'pill-blue';
+  return '<span class="pill '+cls+'">'+t.replace('_',' ').toUpperCase()+'</span>';
+}
+function sidePill(s) {
+  return '<span class="pill '+(s==='buy'?'pill-green':'pill-red')+'">'+s.toUpperCase()+'</span>';
+}
+function stylePill(s) {
+  let cls = {scalping:'pill-blue',day_trading:'pill-purple',swing:'pill-yellow',not_tradeable:'pill-red'}[s]||'pill-blue';
+  return '<span class="pill '+cls+'">'+s.replace('_',' ').toUpperCase()+'</span>';
+}
+function newsPill(sentiment, score) {
+  if (!sentiment) return '';
+  let cls = sentiment === 'positive' ? 'pill-green' : sentiment === 'negative' ? 'pill-red' : 'pill-yellow';
+  let label = sentiment.toUpperCase() + ' (' + (score >= 0 ? '+' : '') + score.toFixed(1) + ')';
+  return '<span class="pill '+cls+'">'+label+'</span>';
+}
+function shortTime(s) {
+  if (!s) return '';
+  try { let d=new Date(s); return d.toLocaleTimeString(); } catch(e) { return s; }
+}
+function escapeHtml(v) {
+  return String(v || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// Render functions
+function renderOverview() {
+  let s = state.stats;
+  let a = state.account;
+
+  let pnlEl = document.getElementById('stat-pnl');
+  pnlEl.innerHTML = fmtPnl(s.total_pnl||0);
+  if (a.starting_cash > 0) {
+    document.getElementById('stat-pnl-pct').textContent =
+      ((s.total_pnl||0)/a.starting_cash*100).toFixed(2) + '% return';
+  }
+
+  document.getElementById('stat-trades').textContent = s.total_trades||0;
+  document.getElementById('stat-winrate').textContent = (s.win_rate||0) + '% win rate';
+  document.getElementById('stat-scans').textContent = s.total_scan_hits||0;
+  document.getElementById('stat-signals').textContent = s.total_signals||0;
+  document.getElementById('stat-rejected').textContent = s.total_rejected||0;
+  document.getElementById('stat-equity').textContent = '$' + (a.equity||0).toLocaleString();
+  document.getElementById('stat-cash').textContent = '$' + (a.cash||0).toLocaleString();
+
+  renderOverviewScanner();
+  renderPositionsCompact();
+  renderActivity();
+}
+
+function renderOverviewScanner() {
+  let wrap = document.getElementById('ov-scanner-wrap');
+  if (!wrap) return;
+  let scans = state.recent_scans.slice(-10).reverse();
+  let countEl = document.getElementById('ov-scan-count2');
+  if (countEl) countEl.textContent = scans.length;
+
+  if (scans.length === 0) {
+    wrap.innerHTML = '<div class="empty"><div class="icon">&#128269;</div>No scanner hits yet</div>';
+    return;
+  }
+  let html = '<table><tr><th>Time</th><th>Symbol</th><th>Price</th><th>Scanner</th><th>Score</th><th>Status</th></tr>';
+  scans.forEach(h => {
+    let status = '';
+    if (h.verified) {
+      status = '<span class="pill pill-green">SIGNAL</span>';
+    } else if (h.action_taken) {
+      status = '<span style="color:var(--red);font-size:11px">\u2718 '+h.action_taken+'</span>';
+    } else {
+      status = '<span style="color:var(--text2);font-size:11px">pending</span>';
+    }
+    html += '<tr><td style="color:var(--text2)">'+shortTime(h.time)+'</td>';
+    html += '<td><strong>'+h.symbol+'</strong></td>';
+    html += '<td>$'+(h.price||0).toFixed(2)+'</td>';
+    html += '<td><span class="pill pill-blue">'+h.scanner_name+'</span></td>';
+    html += '<td>'+h.score.toFixed(2)+'</td>';
+    html += '<td>'+status+'</td></tr>';
+  });
+  html += '</table>';
+  wrap.innerHTML = html;
+}
+
+function renderPositionsCompact() {
+  let wrap = document.getElementById('positions-table-wrap');
+  let keys = Object.keys(state.positions);
+  document.getElementById('pos-count').textContent = keys.length;
+
+  if (keys.length === 0) {
+    wrap.innerHTML = '<div class="empty"><div class="icon">&#128200;</div>No open positions</div>';
+    return;
+  }
+  let html = '<table><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Avg</th><th>Current</th><th>P&L</th></tr>';
+  keys.forEach(sym => {
+    let p = state.positions[sym];
+    html += '<tr><td><strong>'+sym+'</strong></td><td>'+sidePill(p.side.toLowerCase())+'</td>';
+    html += '<td>'+p.quantity+'</td><td>$'+p.avg_price.toFixed(2)+'</td>';
+    html += '<td>$'+p.current_price.toFixed(2)+'</td><td>'+fmtPnl(p.unrealized_pnl)+'</td></tr>';
+  });
+  html += '</table>';
+  wrap.innerHTML = html;
+}
+
+function renderActivity() {
+  let wrap = document.getElementById('activity-wrap');
+  let exits = state.recent_trades.filter(t => t.trade_type === 'exit').slice(-15).reverse();
+  let entries = state.recent_trades.filter(t => t.trade_type === 'entry').slice(-5).reverse();
+  if (exits.length === 0 && entries.length === 0) {
+    wrap.innerHTML = '<div class="empty"><div class="icon">&#9889;</div>Waiting for trades...</div>';
+    return;
+  }
+  let html = '';
+  if (exits.length > 0) {
+    html += '<table><tr><th>Time</th><th>Symbol</th><th>Qty</th><th>Entry</th><th>Exit</th><th>P&L</th></tr>';
+    exits.forEach(t => {
+      let pnl = t.pnl !== null && t.pnl !== undefined ? fmtPnl(t.pnl) : '-';
+      html += '<tr><td style="color:var(--text2)">'+shortTime(t.exit_time||t.entry_time)+'</td>';
+      html += '<td>'+chartLink(t.symbol)+'</td><td>'+t.quantity+'</td>';
+      html += '<td>$'+(t.entry_price||0).toFixed(2)+'</td>';
+      html += '<td>$'+(t.exit_price||0).toFixed(2)+'</td><td>'+pnl+'</td></tr>';
+    });
+    html += '</table>';
+  }
+  if (entries.length > 0) {
+    html += '<div style="margin-top:8px;font-size:12px;color:var(--text2)">Recent entries: ';
+    html += entries.map(t => chartLink(t.symbol)+' '+t.quantity+' @ $'+t.entry_price.toFixed(2)).join(' &middot; ');
+    html += '</div>';
+  }
+  wrap.innerHTML = html;
+}
+
+function renderScanner() {
+  let s = state.stats;
+  document.getElementById('scan-total').textContent = s.total_scan_hits||0;
+  document.getElementById('scan-signals').textContent = s.total_signals||0;
+  let rate = (s.total_scan_hits > 0) ? ((s.total_signals/s.total_scan_hits)*100).toFixed(1) : 0;
+  document.getElementById('scan-rate').textContent = rate + '%';
+
+  let wrap = document.getElementById('scanner-table-wrap');
+  let scans = state.recent_scans.slice(-50).reverse();
+  if (scans.length === 0) {
+    wrap.innerHTML = '<div class="empty"><div class="icon">&#128269;</div>No scanner hits yet</div>';
+    return;
+  }
+  let html = '<table><tr><th>Time</th><th>Symbol</th><th>Price</th><th>Scanner</th><th>Score</th><th>Status</th></tr>';
+  scans.forEach(h => {
+    let status = '';
+    if (h.verified) {
+      status = '<span class="pill pill-green">SIGNAL</span>';
+    } else if (h.action_taken) {
+      status = '<span style="color:var(--red);font-size:11px">\u2718 '+h.action_taken+'</span>';
+    } else {
+      status = '<span style="color:var(--text2);font-size:11px">pending</span>';
+    }
+    html += '<tr><td style="color:var(--text2)">'+shortTime(h.time)+'</td>';
+    html += '<td><strong>'+h.symbol+'</strong></td>';
+    html += '<td>$'+(h.price||0).toFixed(2)+'</td>';
+    html += '<td><span class="pill pill-blue">'+h.scanner_name+'</span></td>';
+    html += '<td>'+h.score.toFixed(2)+'</td>';
+    html += '<td>'+status+'</td></tr>';
+  });
+  html += '</table>';
+  wrap.innerHTML = html;
+}
+
+function renderTrades() {
+  let s = state.stats;
+  document.getElementById('trades-pnl').innerHTML = fmtPnl(s.total_pnl||0);
+  document.getElementById('trades-wins').textContent = s.winning_trades||0;
+  document.getElementById('trades-losses').textContent = s.losing_trades||0;
+  document.getElementById('trades-winrate').textContent = (s.win_rate||0) + '%';
+
+  let wrap = document.getElementById('trades-table-wrap');
+  let trades = state.recent_trades.filter(t => t.trade_type !== 'entry' || t.pnl != null).slice(-50).reverse();
+  if (state.recent_trades.length === 0) {
+    wrap.innerHTML = '<div class="empty"><div class="icon">&#128202;</div>No trades yet</div>';
+    return;
+  }
+  let html = '<table><tr><th>Time</th><th>Type</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Exit</th><th>P&L</th><th>Reason</th></tr>';
+  state.recent_trades.slice(-50).reverse().forEach(t => {
+    let pnl = t.pnl !== null && t.pnl !== undefined ? fmtPnl(t.pnl) : '-';
+    html += '<tr><td style="color:var(--text2)">'+shortTime(t.exit_time||t.entry_time)+'</td>';
+    html += '<td>'+typePill(t.trade_type)+'</td><td>'+chartLink(t.symbol)+'</td>';
+    html += '<td>'+sidePill(t.side)+'</td><td>'+t.quantity+'</td>';
+    html += '<td>$'+t.entry_price.toFixed(2)+'</td>';
+    html += '<td>'+(t.exit_price?'$'+t.exit_price.toFixed(2):'-')+'</td>';
+    html += '<td>'+pnl+'</td>';
+    html += '<td>'+(t.exit_reason||'-')+'</td></tr>';
+  });
+  html += '</table>';
+  wrap.innerHTML = html;
+  renderStockSummary();
+}
+
+function renderStockSummary() {
+  let wrap = document.getElementById('stock-summary-wrap');
+  let exits = state.recent_trades.filter(t => t.trade_type === 'exit' && t.pnl != null);
+  if (exits.length === 0) {
+    wrap.innerHTML = '<div class="empty"><div class="icon">&#128202;</div>No completed trades yet</div>';
+    return;
+  }
+  let stocks = {};
+  exits.forEach(t => {
+    if (!stocks[t.symbol]) stocks[t.symbol] = {pnl: 0, wins: 0, losses: 0, trades: 0, totalQty: 0};
+    let s = stocks[t.symbol];
+    s.pnl += t.pnl;
+    s.trades++;
+    s.totalQty += t.quantity;
+    if (t.pnl >= 0) s.wins++; else s.losses++;
+  });
+  let rows = Object.entries(stocks).sort((a,b) => b[1].pnl - a[1].pnl);
+  let totalPnl = rows.reduce((s,r) => s + r[1].pnl, 0);
+  let totalTrades = rows.reduce((s,r) => s + r[1].trades, 0);
+  let totalWins = rows.reduce((s,r) => s + r[1].wins, 0);
+  let totalLosses = rows.reduce((s,r) => s + r[1].losses, 0);
+  let html = '<table><tr><th>Symbol</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Win Rate</th><th>Shares</th><th>P&L</th></tr>';
+  rows.forEach(([sym, s]) => {
+    let wr = s.trades > 0 ? ((s.wins / s.trades) * 100).toFixed(0) : '0';
+    let pnlClass = s.pnl >= 0 ? 'text-green' : 'text-red';
+    let wrClass = parseInt(wr) >= 50 ? 'text-green' : 'text-red';
+    html += '<tr><td>' + chartLink(sym) + '</td>';
+    html += '<td>' + s.trades + '</td>';
+    html += '<td class="text-green">' + s.wins + '</td>';
+    html += '<td class="text-red">' + s.losses + '</td>';
+    html += '<td class="' + wrClass + '">' + wr + '%</td>';
+    html += '<td>' + s.totalQty.toLocaleString() + '</td>';
+    html += '<td class="' + pnlClass + '"><strong>' + fmtPnl(s.pnl) + '</strong></td></tr>';
+  });
+  let totalWR = totalTrades > 0 ? ((totalWins / totalTrades) * 100).toFixed(0) : '0';
+  let totalClass = totalPnl >= 0 ? 'text-green' : 'text-red';
+  html += '<tr style="border-top:2px solid var(--border);font-weight:bold"><td>TOTAL</td>';
+  html += '<td>' + totalTrades + '</td>';
+  html += '<td class="text-green">' + totalWins + '</td>';
+  html += '<td class="text-red">' + totalLosses + '</td>';
+  html += '<td>' + totalWR + '%</td>';
+  html += '<td></td>';
+  html += '<td class="' + totalClass + '">' + fmtPnl(totalPnl) + '</td></tr>';
+  html += '</table>';
+  wrap.innerHTML = html;
+}
+
+
+function renderMovers() {
+  let movers = (state.rt_movers || []).filter(m => {
+    let sym = state.symbols[m.symbol];
+    return !sym || sym.style !== 'not_tradeable';
+  });
+  document.getElementById('mv-count').textContent = movers.length;
+
+  let wrap = document.getElementById('movers-table-wrap');
+  if (movers.length === 0) {
+    wrap.innerHTML = '<div class="empty"><div class="icon">&#128293;</div>Waiting for market activity...</div>';
+    return;
+  }
+
+  let html = '<table><tr><th>#</th><th>Symbol</th><th>Price</th><th>Change</th><th>Volume</th><th>Trades</th><th>Score</th><th>Status</th></tr>';
+  movers.forEach((s, i) => {
+    let chgClass = s.change_pct >= 0 ? 'text-green' : 'text-red';
+    let chgSign = s.change_pct >= 0 ? '+' : '';
+    let vol = s.volume >= 1000000 ? (s.volume/1000000).toFixed(1)+'M' : (s.volume/1000).toFixed(0)+'K';
+    let sym = state.symbols[s.symbol];
+    let statusPill;
+    let scanRej = '';
+    let scanHit = state.recent_scans.find(sc => sc.symbol === s.symbol);
+    if (scanHit && !scanHit.verified && scanHit.action_taken) {
+      scanRej = '<br><span style="color:var(--red);font-size:10px">\u2718 '+scanHit.action_taken+'</span>';
+    }
+    if (sym && sym.style === 'not_tradeable') {
+      statusPill = '<span class="pill pill-red">NOT TRADEABLE</span>';
+    } else if (sym && sym.style === 'scalping') {
+      statusPill = '<span class="pill pill-green">SCALPING</span>';
+    } else if (sym && sym.style === 'day_trading') {
+      statusPill = '<span class="pill pill-purple">DAY TRADING</span>';
+    } else if (sym) {
+      statusPill = '<span class="pill pill-blue">'+sym.style.toUpperCase()+'</span>';
+    } else {
+      statusPill = '<span class="pill pill-yellow">DETECTED</span>';
+    }
+    html += '<tr><td style="color:var(--text2)">'+(i+1)+'</td>';
+    html += '<td>'+chartLink(s.symbol)+'</td>';
+    html += '<td>$'+s.price.toFixed(2)+'</td>';
+    html += '<td class="'+chgClass+'">'+chgSign+s.change_pct.toFixed(2)+'%</td>';
+    html += '<td>'+vol+'</td>';
+    html += '<td>'+(s.trades||'-')+'</td>';
+    html += '<td>'+confBar((s.score||0)*100)+'</td>';
+    html += '<td>'+statusPill+scanRej+'</td></tr>';
+  });
+  html += '</table>';
+  wrap.innerHTML = html;
+}
+
+
+function renderLogs() {
+  // Logs are appended in real-time via SSE
+}
+
+function renderNews() {
+  let wrap = document.getElementById('news-wrap');
+  let countEl = document.getElementById('news-count');
+  let newsItems = Object.values(state.news || {});
+  if (countEl) countEl.textContent = newsItems.length;
+
+  if (newsItems.length === 0) {
+    wrap.innerHTML = '<div class="empty"><div class="icon">&#128240;</div>No news data yet</div>';
+    return;
+  }
+
+  newsItems.sort((a, b) => (b.score || 0) - (a.score || 0));
+  let html = '<table><tr><th>Symbol</th><th>Sentiment</th><th>Headlines</th></tr>';
+  newsItems.forEach(n => {
+    html += '<tr><td><strong>' + n.symbol + '</strong></td>';
+    html += '<td>' + newsPill(n.sentiment, n.score) + '</td>';
+    html += '<td style="font-size:11px;color:var(--text2);max-width:400px">';
+    (n.headlines || []).slice(0, 2).forEach(h => {
+      html += '<div style="margin-bottom:2px">' + h + '</div>';
+    });
+    html += '</td></tr>';
+  });
+  html += '</table>';
+  wrap.innerHTML = html;
+}
+
+function renderAnalytics() {
+  let exits = (state.recent_trades||[]).filter(t => t.trade_type === 'exit' && t.pnl != null);
+  if (exits.length === 0) return;
+
+  let wins = exits.filter(t => t.pnl >= 0);
+  let losses = exits.filter(t => t.pnl < 0);
+  let totalWin = wins.reduce((s,t) => s + t.pnl, 0);
+  let totalLoss = Math.abs(losses.reduce((s,t) => s + t.pnl, 0));
+  let avgWin = wins.length > 0 ? totalWin / wins.length : 0;
+  let avgLoss = losses.length > 0 ? totalLoss / losses.length : 0;
+  let pf = totalLoss > 0 ? totalWin / totalLoss : wins.length > 0 ? 999 : 0;
+  let wr = exits.length > 0 ? wins.length / exits.length : 0;
+  let expectancy = (wr * avgWin) - ((1 - wr) * avgLoss);
+
+  document.getElementById('an-avg-win').innerHTML = fmtPnl(avgWin);
+  document.getElementById('an-avg-loss').innerHTML = fmtPnl(-avgLoss);
+  document.getElementById('an-pf').textContent = pf.toFixed(2);
+  document.getElementById('an-pf').style.color = pf >= 1 ? 'var(--green)' : 'var(--red)';
+  document.getElementById('an-expect').innerHTML = fmtPnl(expectancy);
+
+  // Per-symbol breakdown
+  let bySymbol = {};
+  exits.forEach(t => {
+    if (!bySymbol[t.symbol]) bySymbol[t.symbol] = {wins:0, losses:0, pnl:0, trades:0};
+    bySymbol[t.symbol].trades++;
+    bySymbol[t.symbol].pnl += t.pnl;
+    if (t.pnl >= 0) bySymbol[t.symbol].wins++; else bySymbol[t.symbol].losses++;
+  });
+  let symArr = Object.entries(bySymbol).sort((a,b) => b[1].pnl - a[1].pnl);
+  let shtml = '<table><tr><th>Symbol</th><th>Trades</th><th>W/L</th><th>Win Rate</th><th>P&L</th></tr>';
+  symArr.forEach(([sym, d]) => {
+    let wr2 = d.trades > 0 ? (d.wins/d.trades*100).toFixed(0) : 0;
+    shtml += '<tr><td><strong>'+sym+'</strong></td>';
+    shtml += '<td>'+d.trades+'</td>';
+    shtml += '<td><span class="text-green">'+d.wins+'</span>/<span class="text-red">'+d.losses+'</span></td>';
+    shtml += '<td>'+wr2+'%</td>';
+    shtml += '<td>'+fmtPnl(d.pnl)+'</td></tr>';
+  });
+  shtml += '</table>';
+  document.getElementById('an-symbol-table').innerHTML = shtml;
+
+  // Exit type analysis
+  let byExit = {};
+  exits.forEach(t => {
+    let r = t.exit_reason || 'unknown';
+    if (!byExit[r]) byExit[r] = {count:0, pnl:0, wins:0};
+    byExit[r].count++;
+    byExit[r].pnl += t.pnl;
+    if (t.pnl >= 0) byExit[r].wins++;
+  });
+  let exitArr = Object.entries(byExit).sort((a,b) => b[1].count - a[1].count);
+  let ehtml = '<table><tr><th>Exit Type</th><th>Count</th><th>Win Rate</th><th>Avg P&L</th><th>Total P&L</th></tr>';
+  exitArr.forEach(([reason, d]) => {
+    let wr3 = d.count > 0 ? (d.wins/d.count*100).toFixed(0) : 0;
+    let avg = d.count > 0 ? d.pnl / d.count : 0;
+    ehtml += '<tr><td>'+reason+'</td>';
+    ehtml += '<td>'+d.count+'</td>';
+    ehtml += '<td>'+wr3+'%</td>';
+    ehtml += '<td>'+fmtPnl(avg)+'</td>';
+    ehtml += '<td>'+fmtPnl(d.pnl)+'</td></tr>';
+  });
+  ehtml += '</table>';
+  document.getElementById('an-exit-table').innerHTML = ehtml;
+
+  // Equity curve
+  let canvas = document.getElementById('equity-canvas');
+  if (canvas && exits.length > 1) {
+    let ctx = canvas.getContext('2d');
+    let dpr = window.devicePixelRatio || 1;
+    let rect = canvas.parentElement.getBoundingClientRect();
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    ctx.scale(dpr, dpr);
+    let w = rect.width, h = rect.height;
+    ctx.clearRect(0,0,w,h);
+
+    let cumPnl = [0];
+    exits.forEach(t => cumPnl.push(cumPnl[cumPnl.length-1] + t.pnl));
+
+    let minP = Math.min(...cumPnl);
+    let maxP = Math.max(...cumPnl);
+    let range = maxP - minP || 1;
+    let pad = 20;
+
+    ctx.strokeStyle = cumPnl[cumPnl.length-1] >= 0 ? '#4ade80' : '#f87171';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    cumPnl.forEach((p, i) => {
+      let x = pad + (i / (cumPnl.length - 1)) * (w - 2*pad);
+      let y = h - pad - ((p - minP) / range) * (h - 2*pad);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+
+    // zero line
+    let zeroY = h - pad - ((0 - minP) / range) * (h - 2*pad);
+    ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4,4]);
+    ctx.beginPath();
+    ctx.moveTo(pad, zeroY);
+    ctx.lineTo(w-pad, zeroY);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // labels
+    ctx.fillStyle = 'var(--text2)';
+    ctx.font = '11px system-ui';
+    ctx.fillStyle = '#888';
+    ctx.fillText('$'+maxP.toFixed(0), 2, pad);
+    ctx.fillText('$'+minP.toFixed(0), 2, h-5);
+    ctx.fillText('$0', 2, zeroY - 3);
+  }
+
+  // AI Insights
+  renderAI();
+}
+
+function renderAI() {
+  let ai = state.ai_analysis || {};
+  let insights = ai.insights || [];
+  let blocked = ai.blocked_symbols || {};
+  let score = ai.score;
+
+  if (score !== undefined && score !== null) {
+    let scoreColor = score >= 60 ? 'var(--green)' : score >= 40 ? 'var(--yellow)' : 'var(--red)';
+    document.getElementById('ai-score').innerHTML =
+      'Session Score: <strong style="color:'+scoreColor+'">'+score.toFixed(0)+'/100</strong>' +
+      (ai.last_analysis ? ' (updated '+ai.last_analysis+')' : '');
+  }
+
+  let wrap = document.getElementById('ai-insights-wrap');
+  if (insights.length === 0) {
+    wrap.innerHTML = '<div class="empty"><div class="icon">&#129302;</div>AI analysis will run after 5+ trades</div>';
+  } else {
+    let html = '';
+    let icons = {critical:'&#9888;&#65039;', warning:'&#9888;', info:'&#8505;&#65039;', positive:'&#9989;'};
+    let colors = {critical:'var(--red)', warning:'#f59e0b', info:'var(--blue)', positive:'var(--green)'};
+    insights.forEach(ins => {
+      let icon = icons[ins.severity] || '&#8226;';
+      let color = colors[ins.severity] || 'var(--text2)';
+      html += '<div style="padding:8px 12px;border-left:3px solid '+color+';margin-bottom:6px;background:rgba(255,255,255,0.03);border-radius:0 6px 6px 0">';
+      html += '<div style="font-size:13px"><span>'+icon+'</span> <strong style="color:'+color+'">'+ins.category.toUpperCase()+'</strong>: '+ins.message+'</div>';
+      if (ins.action_taken) {
+        html += '<div style="font-size:11px;color:var(--green);margin-top:2px">&#8594; '+ins.action_taken+'</div>';
+      }
+      html += '</div>';
+    });
+    wrap.innerHTML = html;
+  }
+
+  let blockedWrap = document.getElementById('ai-blocked-wrap');
+  let blockedEntries = Object.entries(blocked);
+  if (blockedEntries.length === 0) {
+    blockedWrap.innerHTML = '<div style="padding:12px;font-size:12px;color:var(--text2)">No symbols blocked</div>';
+  } else {
+    let bhtml = '<table><tr><th>Symbol</th><th>Reason</th></tr>';
+    blockedEntries.forEach(([sym, reason]) => {
+      bhtml += '<tr><td><strong class="text-red">'+sym+'</strong></td><td style="font-size:12px">'+reason+'</td></tr>';
+    });
+    bhtml += '</table>';
+    blockedWrap.innerHTML = bhtml;
+  }
+
+  let adjWrap = document.getElementById('ai-adjustments-wrap');
+  let adjs = ai.session_adjustments || {};
+  let adjEntries = Object.entries(adjs);
+  if (adjEntries.length === 0) {
+    adjWrap.innerHTML = '<div style="padding:12px;font-size:12px;color:var(--text2)">No adjustments yet</div>';
+  } else {
+    let ahtml = '<table><tr><th>Parameter</th><th>New Value</th></tr>';
+    adjEntries.forEach(([param, val]) => {
+      ahtml += '<tr><td>'+param+'</td><td><strong>'+val+'</strong></td></tr>';
+    });
+    ahtml += '</table>';
+    adjWrap.innerHTML = ahtml;
+  }
+}
+
+function renderJournal() {
+  let jr = state.journal || {};
+  let events = jr.events || [];
+  let byType = {};
+  events.forEach(e => { byType[e.type] = (byType[e.type] || 0) + 1; });
+  document.getElementById('jr-total').textContent = events.length;
+  document.getElementById('jr-trades').textContent = (byType.trade_fill || 0) + (byType.trade_exit || 0);
+  document.getElementById('jr-mistakes').textContent = byType.mistake || 0;
+  document.getElementById('jr-shots').textContent = byType.screenshot || 0;
+  document.getElementById('jr-updated').textContent =
+    jr.last_update ? ('Updated ' + shortTime(jr.last_update)) : 'Not loaded';
+
+  let wrap = document.getElementById('journal-table-wrap');
+  if (jr.error) {
+    wrap.innerHTML = '<div class="empty"><div class="icon">&#9888;&#65039;</div>' + escapeHtml(jr.error) + '</div>';
+    return;
+  }
+  if (events.length === 0) {
+    wrap.innerHTML = '<div class="empty"><div class="icon">&#128221;</div>No journal events yet</div>';
+    return;
+  }
+
+  let typeColors = {
+    trade_fill:'pill-green', trade_exit:'pill-red', classification:'pill-purple',
+    scan_hit:'pill-blue', signal:'pill-yellow', mistake:'pill-red',
+    cycle:'pill-blue', market_regime:'pill-purple', market_context:'pill-blue',
+    screenshot:'pill-yellow'
+  };
+
+  let rows = events.slice().reverse().slice(0, 200).map(ev => {
+    let p = ev.payload || {};
+    let sym = p.symbol || '';
+    let pillCls = typeColors[ev.type] || 'pill-blue';
+    let label = (ev.type || '').replace(/_/g, ' ').toUpperCase();
+
+    let detail = '';
+    if (ev.type === 'trade_fill' || ev.type === 'trade_exit') {
+      let side = p.side || p.trade_type || '';
+      let price = p.price || p.entry_price || p.exit_price || '';
+      let qty = p.quantity || '';
+      let pnl = p.pnl != null ? fmtPnl(p.pnl) : '';
+      detail = escapeHtml(side.toUpperCase()) + ' ' + escapeHtml(qty) + ' @ $' + escapeHtml(price) + (pnl ? ' ' + pnl : '');
+    } else if (ev.type === 'classification') {
+      detail = escapeHtml(p.style || '') + (p.confidence != null ? ' (' + (p.confidence * 100).toFixed(0) + '%)' : '');
+    } else if (ev.type === 'scan_hit' || ev.type === 'signal') {
+      detail = escapeHtml(p.scanner_name || p.pattern || '');
+      if (p.price) detail += ' @ $' + escapeHtml(p.price);
+    } else if (ev.type === 'mistake') {
+      detail = '<span class="text-red">' + escapeHtml(p.kind || '') + '</span>: ' + escapeHtml(p.reason || '');
+    } else if (ev.type === 'cycle') {
+      detail = '#' + (p.cycle || '') + ' scanned:' + (p.symbols_scanned || 0) + ' hits:' + (p.scan_hits || 0) + ' fills:' + (p.fills || 0);
+    } else if (ev.type === 'market_regime') {
+      detail = escapeHtml(p.phase || '') + (p.regime_label ? ' — ' + escapeHtml(p.regime_label) : '');
+    } else {
+      let raw = JSON.stringify(p);
+      detail = escapeHtml(raw.length > 120 ? raw.slice(0, 120) + '...' : raw);
+    }
+
+    return '<tr>'
+      + '<td style="white-space:nowrap">' + shortTime(ev.ts) + '</td>'
+      + '<td><span class="pill ' + pillCls + '">' + label + '</span></td>'
+      + '<td>' + (sym ? chartLink(sym) : '<span style="color:var(--text2)">—</span>') + '</td>'
+      + '<td style="font-size:12px">' + detail + '</td>'
+      + '</tr>';
+  }).join('');
+
+  wrap.innerHTML = '<div style="max-height:500px;overflow-y:auto"><table>'
+    + '<tr><th>Time</th><th>Type</th><th>Symbol</th><th>Details</th></tr>'
+    + rows
+    + '</table></div>';
+}
+
+function loadJournal(force) {
+  let jr = state.journal || {};
+  let now = Date.now();
+  if (!force && jr.last_fetch_ms && (now - jr.last_fetch_ms) < 10000) return;
+  fetch('/api/replay?limit=300')
+    .then(r => r.json())
+    .then(data => {
+      if (!data.ok) throw new Error(data.error || 'failed to load journal');
+      state.journal = {
+        events: data.events || [],
+        loaded: true,
+        error: null,
+        last_update: new Date().toISOString(),
+        last_fetch_ms: Date.now()
+      };
+      renderJournal();
+    })
+    .catch(err => {
+      state.journal = {
+        events: (state.journal && state.journal.events) || [],
+        loaded: true,
+        error: err && err.message ? err.message : 'Failed to load journal',
+        last_update: (state.journal && state.journal.last_update) || null,
+        last_fetch_ms: Date.now()
+      };
+      renderJournal();
+    });
+}
+
+function renderAll() {
+  renderOverview();
+  renderMovers();
+  renderScanner();
+  renderTrades();
+  renderAnalytics();
+  renderNews();
+  renderJournal();
+  updateStatus();
+}
+
+function updateStatus() {
+  let dm = document.getElementById('dot-market');
+  let ds = document.getElementById('dot-stream');
+  let phase = state.market_phase || (state.market_open ? 'OPEN' : 'CLOSED');
+  let isActive = phase !== 'CLOSED';
+  dm.className = 'status-dot ' + (isActive ? 'on' : 'off');
+  ds.className = 'status-dot ' + (state.stream_connected ? 'on' : 'off');
+  document.getElementById('market-label').textContent = isActive ? 'Market Active' : 'Market Closed';
+  document.getElementById('stream-label').textContent = state.stream_connected ? 'Stream Live' : 'Stream Off';
+  document.getElementById('cycle-count').textContent = state.stats.cycle_count || 0;
+
+  let pill = document.getElementById('phase-pill');
+  let phaseColors = {'OPEN':'pill-green','PRE-MARKET':'pill-yellow','AFTER-HOURS':'pill-purple','CLOSED':'pill-red'};
+  pill.className = 'pill ' + (phaseColors[phase]||'pill-red');
+  pill.textContent = phase;
+}
+
+function flashScanner() {
+  let dot = document.getElementById('dot-scanner');
+  let label = document.getElementById('scanner-label');
+  dot.className = 'status-dot on';
+  label.textContent = 'Scanning... ' + (state.last_scan_time || '');
+  setTimeout(() => {
+    dot.className = 'status-dot on';
+    label.textContent = 'Last scan ' + (state.last_scan_time || '');
+  }, 2000);
+}
+
+function addLogLine(msg) {
+  let panel = document.getElementById('log-panel');
+  if (panel.querySelector('.empty')) panel.innerHTML = '';
+  let cls = '';
+  if (msg.level === 'WARNING') cls = ' warn';
+  if (msg.level === 'ERROR') cls = ' error';
+  let line = document.createElement('div');
+  line.className = 'log-line' + cls;
+  line.innerHTML = '<span class="ts">'+shortTime(msg.ts)+'</span> ' + msg.message;
+  panel.appendChild(line);
+  if (panel.children.length > 200) panel.removeChild(panel.firstChild);
+  panel.scrollTop = panel.scrollHeight;
+}
+
+// Deduplicate scans: keep only latest per symbol+scanner
+function dedupeScans(scans) {
+  let map = {};
+  scans.forEach(s => { map[s.symbol + '|' + s.scanner_name] = s; });
+  return Object.values(map);
+}
+
+// Load initial state
+fetch('/api/snapshot')
+  .then(r => r.json())
+  .then(data => {
+    let savedJournal = state.journal;
+    state = data;
+    state.journal = savedJournal || {events: [], loaded: false, error: null, last_update: null};
+    state.trading_paused = data.trading_paused || false;
+    state.recent_scans = dedupeScans(state.recent_scans || []);
+    state.rt_movers = data.rt_movers || [];
+    state.rt_new_total = 0;
+    state.news = data.news || {};
+    renderAll();
+    updateTradeControls();
+    loadJournal(true);
+  });
+
+let jrRefreshBtn = document.getElementById('jr-refresh-btn');
+if (jrRefreshBtn) {
+  jrRefreshBtn.addEventListener('click', function() { loadJournal(true); });
+}
+
+// SSE stream for real-time updates with auto-reconnect
+function connectSSE() {
+let es = new EventSource('/api/stream');
+es.onmessage = function(e) {
+  let msg = JSON.parse(e.data);
+  switch(msg.type) {
+    case 'trade':
+      state.recent_trades.push(msg.data);
+      state.stats.total_trades = (state.stats.total_trades||0) + (msg.data.trade_type==='entry'?1:0);
+      renderOverview();
+      renderTrades();
+      break;
+    case 'exit':
+      state.recent_trades.push(msg.data);
+      if (msg.data.pnl != null) {
+        state.stats.total_pnl = (state.stats.total_pnl||0) + msg.data.pnl;
+        if (msg.data.pnl >= 0) state.stats.winning_trades = (state.stats.winning_trades||0) + 1;
+        else state.stats.losing_trades = (state.stats.losing_trades||0) + 1;
+        let total = (state.stats.winning_trades||0) + (state.stats.losing_trades||0);
+        state.stats.win_rate = total > 0 ? ((state.stats.winning_trades/total)*100).toFixed(1) : 0;
+      }
+      renderOverview();
+      renderTrades();
+      break;
+    case 'classification':
+      state.symbols[msg.data.symbol] = msg.data;
+      if (msg.data.style === 'not_tradeable') {
+        state.rt_movers = (state.rt_movers||[]).filter(m => m.symbol !== msg.data.symbol);
+      }
+      renderMovers();
+      break;
+    case 'scan_hit':
+      // Replace existing entry for same symbol+scanner, keep only latest
+      let idx = state.recent_scans.findIndex(s => s.symbol === msg.data.symbol && s.scanner_name === msg.data.scanner_name);
+      if (idx >= 0) {
+        state.recent_scans.splice(idx, 1);
+      } else {
+        state.stats.total_scan_hits = (state.stats.total_scan_hits||0) + 1;
+      }
+      state.recent_scans.push(msg.data);
+      renderScanner();
+      renderOverview();
+      break;
+    case 'positions':
+      state.positions = msg.data;
+      renderOverview();
+      break;
+    case 'cycle':
+      state.stats.cycle_count = msg.data.cycle;
+      updateStatus();
+      break;
+    case 'market_status':
+      state.market_open = msg.data.market_open;
+      state.stream_connected = msg.data.stream_connected;
+      if (msg.data.market_phase) state.market_phase = msg.data.market_phase;
+      updateStatus();
+      break;
+    case 'watchlist_scan':
+      state.watchlist_scan = msg.data.stocks;
+      state.last_scan_time = new Date().toLocaleTimeString();
+      flashScanner();
+      break;
+    case 'news':
+      state.news[msg.data.symbol] = msg.data;
+      renderNews();
+      if (msg.data.sentiment === 'positive') {
+        addLogLine({level:'INFO', ts: msg.data.ts, message: 'NEWS BOOST ' + msg.data.symbol + ': +' + msg.data.score.toFixed(1) + ' — ' + (msg.data.headlines[0]||'positive news')});
+      } else if (msg.data.sentiment === 'negative') {
+        addLogLine({level:'WARNING', ts: msg.data.ts, message: 'NEWS BLOCK ' + msg.data.symbol + ': ' + msg.data.score.toFixed(1) + ' — ' + (msg.data.headlines[0]||'negative news')});
+      }
+      break;
+    case 'rt_movers':
+      state.rt_movers = msg.data.movers;
+      state.rt_new_total = (state.rt_new_total||0) + (msg.data.new_symbols||[]).length;
+      document.getElementById('mv-last-time').textContent = new Date().toLocaleTimeString();
+      renderMovers();
+      // Flash new symbols in log
+      if (msg.data.new_symbols && msg.data.new_symbols.length > 0) {
+        addLogLine({level:'INFO', ts: msg.data.scan_time, message: 'NEW MOVERS: ' + msg.data.new_symbols.join(', ')});
+      }
+      break;
+    case 'ai_update':
+      state.ai_analysis = msg.data;
+      renderAI();
+      break;
+    case 'trading_control':
+      if (msg.data.paused !== undefined) {
+        state.trading_paused = msg.data.paused;
+        updateTradeControls();
+      }
+      if (msg.data.force_closed) {
+        state.positions = {};
+        renderOverview();
+        addLogLine({level:'WARNING', ts: new Date().toISOString(), message: 'ALL POSITIONS FORCE CLOSED via dashboard'});
+      }
+      break;
+    case 'log':
+      addLogLine(msg.data);
+      break;
+  }
+};
+es.onerror = function() {
+  console.log('SSE disconnected, reconnecting in 2s...');
+  es.close();
+  setTimeout(function() {
+    fetch('/api/snapshot').then(r=>r.json()).then(snap => {
+      let savedJournal = state.journal;
+      state.positions = snap.positions||{};
+      state.recent_trades = snap.recent_trades||[];
+      state.recent_scans = snap.recent_scans||[];
+      state.stats = snap.stats||state.stats;
+      state.account = snap.account||state.account;
+      state.rt_movers = snap.rt_movers||[];
+      state.news = snap.news||{};
+      state.ai_analysis = snap.ai_analysis||{};
+      state.journal = savedJournal || {events: [], loaded: false, error: null, last_update: null};
+      renderAll();
+    }).catch(()=>{});
+    connectSSE();
+  }, 2000);
+};
+}
+connectSSE();
+
+// Trading control buttons
+function updateTradeControls() {
+  let paused = state.trading_paused;
+  let btnStop = document.getElementById('btn-stop');
+  let btnStart = document.getElementById('btn-start');
+  let pill = document.getElementById('trade-status-pill');
+  btnStop.disabled = paused;
+  btnStart.disabled = !paused;
+  pill.textContent = paused ? 'PAUSED' : 'ACTIVE';
+  pill.className = 'pill ' + (paused ? 'pill-red' : 'pill-green');
+}
+
+document.getElementById('btn-stop').addEventListener('click', function() {
+  if (!confirm('Stop trading? No new entries will be placed.')) return;
+  fetch('/api/pause', {method:'POST'}).then(r=>r.json()).then(data => {
+    if (data.ok) {
+      state.trading_paused = true;
+      updateTradeControls();
+      addLogLine({level:'WARNING', ts: new Date().toISOString(), message: 'Trading PAUSED by user'});
+    }
+  }).catch(()=>{});
+});
+
+document.getElementById('btn-start').addEventListener('click', function() {
+  fetch('/api/resume', {method:'POST'}).then(r=>r.json()).then(data => {
+    if (data.ok) {
+      state.trading_paused = false;
+      updateTradeControls();
+      addLogLine({level:'INFO', ts: new Date().toISOString(), message: 'Trading RESUMED by user'});
+    }
+  }).catch(()=>{});
+});
+
+document.getElementById('btn-force-close').addEventListener('click', function() {
+  if (!confirm('FORCE CLOSE ALL positions? This will cancel all open orders and liquidate everything immediately.')) return;
+  fetch('/api/force-close', {method:'POST'}).then(r=>r.json()).then(data => {
+    if (data.ok) {
+      addLogLine({level:'WARNING', ts: new Date().toISOString(), message: 'ALL POSITIONS FORCE CLOSED'});
+      state.positions = {};
+      renderOverview();
+    } else {
+      alert('Force close failed: ' + (data.error || 'unknown error'));
+    }
+  }).catch(err => { alert('Force close failed: ' + err.message); });
+});
+
+// Also poll positions every 5s as a fallback
+setInterval(function() {
+  fetch('/api/snapshot').then(r=>r.json()).then(snap => {
+    state.positions = snap.positions||{};
+    state.account = snap.account||state.account;
+    renderPositionsCompact();
+    let a = state.account;
+    document.getElementById('stat-equity').textContent = '$' + (a.equity||0).toLocaleString();
+    document.getElementById('stat-cash').textContent = '$' + (a.cash||0).toLocaleString();
+  }).catch(()=>{});
+}, 5000);
+
+setInterval(function() {
+  let page = document.getElementById('page-journal');
+  if (page && page.classList.contains('active')) {
+    loadJournal(false);
+  }
+}, 10000);
+</script>
+</body>
+</html>
+"""
