@@ -1,30 +1,136 @@
-"""Shared entry guard — Warrior Trading momentum filter.
+"""Shared entry guard — scoring-based momentum filter.
 
-Criteria (``check_entry_quality``):
+Uses a hybrid approach:
+  1. Hard rejects: 4 absolute deal-breakers (immediate rejection)
+  2. Scoring: 7 weighted conditions scored 0-100
+  3. Penalty: S8 volume exhaustion subtracts up to -30 for declining-volume green bars
+  4. Threshold: score >= 60 to trade
+  5. ML model: optional XGBoost probability check (if model file exists)
 
-  - Price $2–$20
-  - Bar age ≤ 120s
-  - Relative volume ≥ 2× (day-level vs historical average)
-  - Price above VWAP (buyers in control)
-  - Candle body strength (reject dojis)
-  - Momentum quality score (green bars, higher closes, acceleration)
-
-Float filtering is done at the watchlist level (startup + RT scanner).
-
-Every verifier should call ``check_entry_quality`` before generating a signal.
+This allows strong setups (VWAP break + volume) to pass even if
+some minor conditions are imperfect — matching how real traders decide.
 """
 
 from __future__ import annotations
 
 import logging
 import math
+import os
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional, Sequence
+from typing import Optional, Sequence, List
 
 from daytrading.indicators.core import relative_volume, vwap
-from daytrading.models import Bar
+from daytrading.models import Bar, Quote, Tick
 
 logger = logging.getLogger(__name__)
+
+ENTRY_SCORE_THRESHOLD = 65
+
+# ML Monitor — singleton instance for tracking model performance
+_ml_monitor = None
+try:
+    from daytrading.ml.monitor import MLMonitor
+    _ml_monitor = MLMonitor()
+except Exception:
+    pass
+
+# XGBoost model — loaded once at import time, None if unavailable
+_xgb_model = None
+_XGB_THRESHOLD = 0.30
+try:
+    import xgboost as xgb
+    _model_path = os.path.join(
+        os.path.dirname(__file__), "..", "..", "..", "data", "models", "entry_model.json",
+    )
+    _model_path = os.path.normpath(_model_path)
+    if os.path.exists(_model_path):
+        _xgb_model = xgb.Booster()
+        _xgb_model.load_model(_model_path)
+        logger.info("XGBoost entry model loaded from %s", _model_path)
+except Exception:
+    pass
+
+
+def get_ml_monitor():
+    """Get the global ML monitor instance."""
+    return _ml_monitor
+
+
+def _log_candidate(
+    symbol: str, price: float, score: int, passed: bool,
+    reject_reason: Optional[str], ml_prob: Optional[float],
+    breakdown: str, float_shares: Optional[float],
+    today_bars: Sequence[Bar], rel_vol: float,
+    session_high: float, session_open: float, prior_close: float,
+) -> None:
+    """Fire-and-forget log to ML data collector."""
+    try:
+        from daytrading.ml.data_collector import log_entry_candidate
+        log_entry_candidate(
+            symbol=symbol,
+            price=price,
+            score=score,
+            passed=passed,
+            reject_reason=reject_reason,
+            ml_prob=ml_prob,
+            breakdown=breakdown,
+            float_shares=float_shares,
+            day_volume=float(sum(b.volume for b in today_bars)),
+            rel_vol=rel_vol,
+            bars=list(today_bars),
+            session_high=session_high,
+            session_open=session_open,
+            prior_close=prior_close,
+            minutes_since_open=len(today_bars),
+        )
+    except Exception:
+        pass
+
+
+@dataclass(frozen=True)
+class ScannerProfile:
+    """Parameter set for a Warrior Trading style scanner."""
+    name: str
+    min_price: float
+    max_price: float
+    min_day_change_pct: float
+    min_bar_volume: float
+    min_today_volume: float
+    require_volume_surge: bool
+
+
+LOW_FLOAT_RUNNER = ScannerProfile(
+    name="Low Float Runner",
+    min_price=2.0,
+    max_price=20.0,
+    min_day_change_pct=5.0,
+    min_bar_volume=10_000,
+    min_today_volume=200_000,
+    require_volume_surge=True,
+)
+
+MEDIUM_FLOAT_SQUEEZE = ScannerProfile(
+    name="Medium Float Squeeze",
+    min_price=5.0,
+    max_price=50.0,
+    min_day_change_pct=5.0,
+    min_bar_volume=30_000,
+    min_today_volume=500_000,
+    require_volume_surge=True,
+)
+
+FORMER_MOMO = ScannerProfile(
+    name="Former Momo $20+",
+    min_price=20.0,
+    max_price=500.0,
+    min_day_change_pct=3.0,
+    min_bar_volume=50_000,
+    min_today_volume=1_000_000,
+    require_volume_surge=False,
+)
+
+ALL_PROFILES: List[ScannerProfile] = [LOW_FLOAT_RUNNER, MEDIUM_FLOAT_SQUEEZE, FORMER_MOMO]
 
 
 def check_entry_quality(
@@ -33,20 +139,20 @@ def check_entry_quality(
     symbol: str = "",
     min_price: float = 2.0,
     max_price: float = 20.0,
-    min_rvol: float = 2.0,
-    max_bar_age_seconds: int = 120,
+    min_rvol: float = 1.5,
+    max_bar_age_seconds: int = 300,
     min_momentum_quality: int = 40,
+    min_day_change_pct: float = 5.0,
     avg_daily_volume: Optional[float] = None,
+    bars_5m: Optional[Sequence[Bar]] = None,
+    float_shares: Optional[float] = None,
+    ticks: Optional[Sequence[Tick]] = None,
+    quotes: Optional[Sequence[Quote]] = None,
 ) -> Optional[str]:
     """Return a rejection reason string, or ``None`` if the setup is OK.
 
-    Checks (Warrior Trading momentum criteria):
-    1. Price between $2 and $20
-    2. Staleness — bar not older than 120s
-    3. Relative volume ≥ 3× (day-level: today's vol vs historical avg)
-    4. Price above VWAP (buyers in control)
-    5. Candle body not tiny vs range (reject doji)
-    6. Momentum quality score (green bars, higher closes, acceleration)
+    Uses a scoring system: hard rejects first, then score 7 conditions.
+    Score >= 60/100 passes.
     """
     if not bars or len(bars) < 3:
         return "insufficient bars"
@@ -56,127 +162,416 @@ def check_entry_quality(
     if price <= 0:
         return "invalid price"
 
-    # 1. Price range $2–$20
-    if price < min_price:
-        return "price ${:.2f} below ${:.2f}".format(price, min_price)
-    if price > max_price:
-        return "price ${:.2f} above ${:.2f}".format(price, max_price)
+    # --- Split bars into today vs historical ---
+    today_bars: Sequence[Bar] = bars
+    if latest.ts is not None:
+        try:
+            today_date = latest.ts.date()
+            today_bars = [b for b in bars if b.ts is not None and b.ts.date() == today_date]
+        except Exception:
+            pass
 
-    # 2. Staleness check
+    if len(today_bars) < 3:
+        today_bars = bars
+
+    # =================================================================
+    # HARD REJECTS — absolute deal-breakers, no scoring possible
+    # =================================================================
+
+    # 1. Price must be in a tradeable range
+    if price < min_price or price > max_price:
+        return "price ${:.2f} outside range ${:.2f}-${:.2f}".format(price, min_price, max_price)
+
+    # 2. Staleness — data too old to act on (5 minutes)
+    #    Exception: if stock was running hot before going quiet, it's likely
+    #    halted (LULD circuit breaker) — don't reject, it may resume with continuation
     if latest.ts is not None:
         try:
             bar_time = latest.ts if latest.ts.tzinfo else latest.ts.replace(tzinfo=timezone.utc)
             age = (datetime.now(timezone.utc) - bar_time).total_seconds()
             if age > max_bar_age_seconds:
-                return "stale data ({:.0f}s old, max={}s)".format(age, max_bar_age_seconds)
+                # Check if this looks like a halt (high volume spike before silence)
+                is_likely_halt = False
+                if len(today_bars) >= 3:
+                    recent_bars = today_bars[-5:] if len(today_bars) >= 5 else today_bars[-3:]
+                    avg_vol = sum(b.volume for b in today_bars) / len(today_bars)
+                    last_vol = recent_bars[-1].volume
+                    last_change = abs(recent_bars[-1].close - recent_bars[-1].open) / recent_bars[-1].open * 100 if recent_bars[-1].open > 0 else 0
+                    # Halt signature: last bar had above-average volume + big move
+                    if last_vol > avg_vol * 1.5 and last_change > 2.0:
+                        is_likely_halt = True
+                    # Also halt if recent run was very strong (multiple big green bars)
+                    if len(recent_bars) >= 3:
+                        green_count = sum(1 for b in recent_bars if b.close > b.open)
+                        total_move = (recent_bars[-1].close - recent_bars[0].open) / recent_bars[0].open * 100 if recent_bars[0].open > 0 else 0
+                        if green_count >= 2 and total_move > 5.0:
+                            is_likely_halt = True
+
+                if not is_likely_halt:
+                    return "stale data ({:.0f}s old, max={}s)".format(age, max_bar_age_seconds)
+                # Halted stock: allow through but cap staleness at 15 min
+                if age > 900:
+                    return "stale data ({:.0f}s old, likely halted too long)".format(age)
         except Exception:
             pass
 
-    # Split bars into today vs historical
-    today_bars = bars
-    hist_bars: list = []
-    if latest.ts is not None:
-        try:
-            today_date = latest.ts.date()
-            today_bars = [b for b in bars if b.ts is not None and b.ts.date() == today_date]
-            hist_bars = [b for b in bars if b.ts is not None and b.ts.date() != today_date]
-        except Exception:
-            pass
-
-    # 4. Day-level RVOL: is today's volume unusual compared to history?
-    rvol_passed = False
-    if avg_daily_volume is not None and avg_daily_volume > 0 and len(today_bars) >= 3:
-        today_total_vol = sum(b.volume for b in today_bars)
-        minutes_elapsed = max(len(today_bars), 1)
-        expected_vol_so_far = (avg_daily_volume / 390.0) * minutes_elapsed
-        day_rvol = today_total_vol / expected_vol_so_far if expected_vol_so_far > 0 else 0.0
-        if day_rvol >= min_rvol:
-            rvol_passed = True
-        else:
-            return "day rvol {:.1f}x < {:.1f}x (today {:.0f} vs expected {:.0f})".format(
-                day_rvol, min_rvol, today_total_vol, expected_vol_so_far)
-    elif hist_bars and len(today_bars) >= 3:
-        hist_avg_vol = sum(b.volume for b in hist_bars) / len(hist_bars)
-        today_avg_vol = sum(b.volume for b in today_bars) / len(today_bars)
-        day_rvol = today_avg_vol / hist_avg_vol if hist_avg_vol > 0 else 0.0
-        if day_rvol >= min_rvol:
-            rvol_passed = True
-        else:
-            return "day rvol {:.1f}x < {:.1f}x (today avg {:.0f} vs hist avg {:.0f})".format(
-                day_rvol, min_rvol, today_avg_vol, hist_avg_vol)
-    elif len(today_bars) >= 4:
-        rvol_period = min(20, len(today_bars) - 1)
-        rv = relative_volume(today_bars, period=rvol_period)
-        last_rv = rv[-1] if rv else 0.0
-        if not math.isnan(last_rv) and last_rv < min_rvol:
-            return "rvol {:.1f}x < {:.1f}x".format(last_rv, min_rvol)
-
-    # 5. Price > VWAP (buyers in control) — use today's bars only
+    # 3. Below VWAP — buying into sellers is always wrong for momentum
+    last_vwap = 0.0
     if len(today_bars) >= 3:
         vwap_vals = vwap(today_bars)
         last_vwap = vwap_vals[-1] if vwap_vals else 0.0
-        if not math.isnan(last_vwap) and last_vwap > 0 and price < last_vwap:
-            return "below VWAP ({:.2f} < {:.2f})".format(price, last_vwap)
+        if not math.isnan(last_vwap) and last_vwap > 0:
+            if price < last_vwap * 0.995:
+                return "below VWAP ({:.2f} < {:.2f})".format(price, last_vwap)
 
-    # 6. Body vs range (reject doji / weak conviction)
-    if latest.close > 0 and latest.high > latest.low:
-        body = abs(latest.close - latest.open)
-        full_range = latest.high - latest.low
-        if full_range > 0 and body / full_range < 0.15:
-            return "weak candle body ({:.0f}% of range)".format(body / full_range * 100)
-
-    # 7. Momentum quality: green bars + higher closes + acceleration (today's bars)
-    # Skip if fewer than 3 today-bars — not enough data to judge momentum
-    if len(today_bars) >= 3:
-        mq_score, mq_detail = _momentum_quality(today_bars)
-        if mq_score < min_momentum_quality:
-            return "low momentum quality {}/100 ({}) min={}".format(
-                mq_score, mq_detail, min_momentum_quality)
-
-    # 8. Dead cat bounce filter: reject if price is >15% below today's high
+    # 4. Dead cat bounce — price crashed too far from session HOD
     if len(today_bars) >= 5:
         today_high = max(b.high for b in today_bars)
-        if today_high > 0:
+        session_open_price = today_bars[0].open
+        if today_high > 0 and session_open_price > 0:
             drop_from_high = (today_high - price) / today_high
-            if drop_from_high > 0.15:
+            if drop_from_high > 0.20:
                 return "dead cat bounce: price {:.2f} is {:.0f}% below HOD {:.2f}".format(
                     price, drop_from_high * 100, today_high)
 
-    # 9. Overextension filter: don't buy at the tip of a spike
-    # If the last 3 bars are all green and the total move is >5%,
-    # the stock is overextended — wait for a pullback instead of chasing.
-    if len(today_bars) >= 4:
-        last3 = list(today_bars[-3:])
-        prev_bar = today_bars[-4]
-        all_green = all(b.close > b.open for b in last3)
-        if all_green and prev_bar.close > 0:
-            run_pct = (last3[-1].close - prev_bar.close) / prev_bar.close
-            if run_pct > 0.05:
-                return "overextended: {:.1f}% spike in last 3 bars (wait for pullback)".format(
-                    run_pct * 100)
+    # 5. Minimum upward movement — avoid flat names with no momentum edge
+    if len(today_bars) >= 3:
+        session_open_price = today_bars[0].open
+        if session_open_price > 0:
+            day_change_pct_hard = ((price - session_open_price) / session_open_price) * 100
+            if day_change_pct_hard < min_day_change_pct:
+                return "not enough movement: day change {:.1f}% (need {:.1f}%+)".format(
+                    day_change_pct_hard, min_day_change_pct)
 
-        # Also check: is the latest candle an extension bar (huge body)?
-        # Extension bars = selling opportunity, not buying opportunity
-        last = last3[-1]
-        if last.close > last.open and last.high > last.low:
-            body = last.close - last.open
-            avg_body = sum(abs(b.close - b.open) for b in today_bars[-6:-1]) / min(5, len(today_bars) - 1) if len(today_bars) > 1 else body
-            if avg_body > 0 and body > avg_body * 3:
-                return "extension bar: body ${:.2f} is {:.0f}x avg (sell into spike, don't buy)".format(
-                    body, body / avg_body)
+    # 6. Minimum day volume — low-liquidity stocks produce unreliable breakouts
+    day_volume = sum(b.volume for b in today_bars)
+    if day_volume < 200_000:
+        return "low day volume {:.0f} for ${:.2f} stock (need 200K+)".format(day_volume, price)
+    if price >= 20.0 and day_volume < 1_000_000:
+        return "low day volume {:.0f} for ${:.2f} stock (need 1M+)".format(day_volume, price)
+    elif price >= 10.0 and day_volume < 500_000:
+        return "low day volume {:.0f} for ${:.2f} stock (need 500K+)".format(day_volume, price)
 
-    return None
+    # 7. Spread filter — wide spread means illiquid stock, bad fills
+    if quotes and len(quotes) >= 3:
+        recent_quotes = list(quotes[-5:])
+        avg_spread = sum(q.ask - q.bid for q in recent_quotes if q.ask > q.bid > 0) / len(recent_quotes)
+        if price > 0 and avg_spread / price > 0.005:
+            return "spread too wide ({:.2f}c = {:.2f}% of ${:.2f})".format(
+                avg_spread * 100, (avg_spread / price) * 100, price)
+
+    # 8. Tape confirmation — sellers dominating means breakout is failing
+    if ticks and len(ticks) >= 20:
+        from daytrading.indicators.scalping import order_flow_imbalance
+        imb_values = order_flow_imbalance(list(ticks), window=min(30, len(ticks)))
+        current_imb = imb_values[-1] if imb_values else 0.0
+        if current_imb <= -0.3:
+            return "tape shows selling pressure (imbalance={:.2f}, need >-0.3)".format(current_imb)
+
+    # =================================================================
+    # SCORING SYSTEM — weighted conditions, threshold 60/100
+    # =================================================================
+    score = 0
+    breakdown: List[str] = []
+
+    # --- S1: Day Change (max 20 pts) ---
+    day_change_pct = 0.0
+    if len(today_bars) >= 3:
+        session_open = today_bars[0].open
+        if session_open > 0:
+            day_change_pct = ((price - session_open) / session_open) * 100
+
+    if day_change_pct >= 10.0:
+        score += 20
+        breakdown.append("day+{:.0f}%=20".format(day_change_pct))
+    elif day_change_pct >= 5.0:
+        score += 15
+        breakdown.append("day+{:.0f}%=15".format(day_change_pct))
+    elif day_change_pct >= 3.0:
+        score += 10
+        breakdown.append("day+{:.0f}%=10".format(day_change_pct))
+    elif day_change_pct >= 1.5:
+        score += 5
+        breakdown.append("day+{:.1f}%=5".format(day_change_pct))
+    else:
+        breakdown.append("day+{:.1f}%=0".format(day_change_pct))
+
+    # --- S2: Volume - Total Today (max 15 pts) ---
+    today_total_vol = sum(b.volume for b in today_bars) if today_bars else 0
+    if today_total_vol >= 500_000:
+        score += 15
+        breakdown.append("vol{:.0f}K=15".format(today_total_vol / 1000))
+    elif today_total_vol >= 200_000:
+        score += 10
+        breakdown.append("vol{:.0f}K=10".format(today_total_vol / 1000))
+    elif today_total_vol >= 100_000:
+        score += 5
+        breakdown.append("vol{:.0f}K=5".format(today_total_vol / 1000))
+    else:
+        breakdown.append("vol{:.0f}K=0".format(today_total_vol / 1000))
+
+    # --- S3: Volume Surge — recent bars vs earlier (max 15 pts) ---
+    bar_rvol = 0.0  # computed here, also used by S9 (low rvol penalty)
+    if len(today_bars) >= 5:
+        recent_5 = list(today_bars[-5:])
+        recent_avg = sum(b.volume for b in recent_5) / 5
+        if len(today_bars) >= 10:
+            earlier = list(today_bars[:-5])
+            earlier_avg = sum(b.volume for b in earlier) / len(earlier)
+            bar_rvol = recent_avg / earlier_avg if earlier_avg > 0 else 0
+            if bar_rvol >= 2.0 or recent_avg >= 50_000:
+                score += 15
+                breakdown.append("surge{:.1f}x=15".format(bar_rvol))
+            elif bar_rvol >= 1.5 or recent_avg >= 30_000:
+                score += 10
+                breakdown.append("surge{:.1f}x=10".format(bar_rvol))
+            elif bar_rvol >= 1.0 or recent_avg >= 10_000:
+                score += 5
+                breakdown.append("surge{:.1f}x=5".format(bar_rvol))
+            else:
+                breakdown.append("surge{:.1f}x=0".format(bar_rvol))
+        else:
+            if recent_avg >= 30_000:
+                score += 15
+                breakdown.append("barvol{:.0f}K=15".format(recent_avg / 1000))
+            elif recent_avg >= 10_000:
+                score += 10
+                breakdown.append("barvol{:.0f}K=10".format(recent_avg / 1000))
+            else:
+                score += 5
+                breakdown.append("barvol{:.0f}K=5".format(recent_avg / 1000))
+    elif len(today_bars) >= 3:
+        recent_avg = sum(b.volume for b in today_bars[-3:]) / 3
+        if recent_avg >= 10_000:
+            score += 10
+            breakdown.append("barvol{:.0f}K=10".format(recent_avg / 1000))
+        else:
+            score += 3
+            breakdown.append("barvol{:.0f}K=3".format(recent_avg / 1000))
+
+    # --- S4: Momentum Quality (max 15 pts) ---
+    mq_score = 0
+    if len(today_bars) >= 3:
+        mq_score, _ = _momentum_quality(today_bars)
+    if mq_score >= 70:
+        score += 15
+        breakdown.append("mq{}=15".format(mq_score))
+    elif mq_score >= 50:
+        score += 10
+        breakdown.append("mq{}=10".format(mq_score))
+    elif mq_score >= 30:
+        score += 5
+        breakdown.append("mq{}=5".format(mq_score))
+    else:
+        breakdown.append("mq{}=0".format(mq_score))
+
+    # --- S5: Near HOD — not fading (max 15 pts) ---
+    if len(today_bars) >= 5:
+        lookback = min(10, len(today_bars))
+        recent_high = max(b.high for b in today_bars[-lookback:])
+        if recent_high > 0:
+            pullback_pct = (recent_high - price) / recent_high
+            if pullback_pct <= 0.02:
+                score += 15
+                breakdown.append("nearHOD{:.1f}%=15".format(pullback_pct * 100))
+            elif pullback_pct <= 0.05:
+                score += 10
+                breakdown.append("nearHOD{:.1f}%=10".format(pullback_pct * 100))
+            elif pullback_pct <= 0.08:
+                score += 5
+                breakdown.append("nearHOD{:.1f}%=5".format(pullback_pct * 100))
+            else:
+                breakdown.append("fading{:.1f}%=0".format(pullback_pct * 100))
+        else:
+            score += 5
+            breakdown.append("noHOD=5")
+    else:
+        score += 5
+        breakdown.append("fewBars=5")
+
+    # --- S6: Candle Strength (max 10 pts) ---
+    if latest.high > latest.low:
+        body = abs(latest.close - latest.open)
+        full_range = latest.high - latest.low
+        body_ratio = body / full_range if full_range > 0 else 0
+        is_green = latest.close >= latest.open
+        if body_ratio >= 0.5 and is_green:
+            score += 10
+            breakdown.append("candle{:.0f}%G=10".format(body_ratio * 100))
+        elif body_ratio >= 0.3 and is_green:
+            score += 7
+            breakdown.append("candle{:.0f}%G=7".format(body_ratio * 100))
+        elif body_ratio >= 0.15:
+            score += 4
+            breakdown.append("candle{:.0f}%=4".format(body_ratio * 100))
+        else:
+            breakdown.append("doji{:.0f}%=0".format(body_ratio * 100))
+    else:
+        score += 3
+        breakdown.append("noRange=3")
+
+    # --- S7: 5-min Trend Support (max 10 pts) ---
+    if bars_5m and len(bars_5m) >= 3:
+        recent_5m = list(bars_5m[-3:])
+        closes_5m = [b.close for b in recent_5m]
+        green_5m = sum(1 for b in recent_5m if b.close >= b.open)
+
+        if closes_5m[-1] > closes_5m[0] and green_5m >= 2:
+            score += 10
+            breakdown.append("5mUp=10")
+        elif closes_5m[-1] >= closes_5m[0] or green_5m >= 2:
+            score += 6
+            breakdown.append("5mFlat=6")
+        elif green_5m >= 1:
+            score += 3
+            breakdown.append("5mMixed=3")
+        else:
+            breakdown.append("5mDown=0")
+    elif bars_5m and len(bars_5m) >= 1:
+        last_5m = bars_5m[-1]
+        if last_5m.close >= last_5m.open:
+            score += 6
+            breakdown.append("5mGreen=6")
+        else:
+            score += 2
+            breakdown.append("5mRed=2")
+    else:
+        score += 5
+        breakdown.append("no5m=5")
+
+    # --- S8: Volume Exhaustion Penalty (0 to -30 pts) ---
+    exhaust_penalty = _volume_exhaustion_penalty(today_bars)
+    if exhaust_penalty < 0:
+        score += exhaust_penalty
+        breakdown.append("exhaust={}".format(exhaust_penalty))
+
+    # --- S9: Low Relative Volume Penalty (0 to -25 pts) ---
+    if bar_rvol > 0 and len(today_bars) >= 10:
+        if bar_rvol < 0.5:
+            score -= 25
+            breakdown.append("rvol{:.1f}x=-25".format(bar_rvol))
+        elif bar_rvol < 1.0:
+            score -= 20
+            breakdown.append("rvol{:.1f}x=-20".format(bar_rvol))
+        elif bar_rvol < 2.0:
+            score -= 5
+            breakdown.append("rvol{:.1f}x=-5".format(bar_rvol))
+
+    # =================================================================
+    # FINAL DECISION
+    # =================================================================
+
+    # =================================================================
+    # FINAL DECISION
+    # Score is computed for data collection and ML training, but does NOT
+    # block entries. Only ML (when trained) can reject based on quality.
+    # Safety checks above (stale, VWAP, spread, tape) still block.
+    # =================================================================
+
+    # Compute values needed for data collection
+    _session_high = max(b.high for b in today_bars) if today_bars else price
+    _session_open = today_bars[0].open if today_bars else price
+    _prior_close_est = _session_open / (1 + day_change_pct / 100) if day_change_pct > 0 else _session_open
+
+    ml_prob_val = None
+    # XGBoost ML check (optional — skipped if model not loaded or monitor disabled it)
+    ml_active = _xgb_model is not None and (
+        _ml_monitor is None or _ml_monitor.is_model_enabled
+    )
+    if ml_active:
+        try:
+            from daytrading.ml.features import compute_entry_features
+            import xgboost as xgb
+            import numpy as np
+
+            features = compute_entry_features(
+                price,
+                float_shares=float_shares,
+                day_volume=float(sum(b.volume for b in today_bars)),
+                rel_vol=bar_rvol,
+                session_high=_session_high,
+                session_open=_session_open,
+                prior_close=_prior_close_est,
+                bars=list(today_bars),
+                minutes_since_open=len(today_bars),
+            )
+            dmat = xgb.DMatrix([features])
+            ml_prob_val = float(_xgb_model.predict(dmat)[0])
+            if ml_prob_val < _XGB_THRESHOLD:
+                logger.info("ENTRY GUARD ML REJECT %s: prob=%.0f%% < %.0f%% [score=%d]",
+                            symbol, ml_prob_val * 100, _XGB_THRESHOLD * 100, score)
+                if _ml_monitor:
+                    _ml_monitor.record_ml_rejection(symbol, price, ml_prob_val, score)
+                _log_candidate(symbol, price, score, False,
+                               "ML low confidence ({:.0f}%)".format(ml_prob_val * 100),
+                               ml_prob_val, ", ".join(breakdown),
+                               float_shares, today_bars, bar_rvol,
+                               _session_high, _session_open, _prior_close_est)
+                return "ML model low confidence ({:.0f}%, need {:.0f}%)".format(
+                    ml_prob_val * 100, _XGB_THRESHOLD * 100)
+        except Exception as exc:
+            logger.debug("ML scoring skipped for %s: %s", symbol, exc)
+
+    # PASS — log score for data collection (score no longer blocks)
+    if _ml_monitor:
+        _ml_monitor.record_entry_passed()
+
+    logger.info("ENTRY GUARD SCORE %s: %d/100 PASS [%s]",
+                symbol, score, ", ".join(breakdown))
+    _log_candidate(symbol, price, score, True, None, ml_prob_val,
+                   ", ".join(breakdown), float_shares, today_bars, bar_rvol,
+                   _session_high, _session_open, _prior_close_est)
+    return None  # PASS
+
+
+def _volume_exhaustion_penalty(today_bars: Sequence[Bar]) -> int:
+    """Return negative points (0 to -30) if recent green bars show declining volume."""
+    if len(today_bars) < 3:
+        return 0
+
+    recent = list(today_bars[-5:])
+
+    declining_streak = 0
+    for i in range(len(recent) - 1, 0, -1):
+        bar = recent[i]
+        prev = recent[i - 1]
+        is_green = bar.close > bar.open
+        vol_declining = bar.volume < prev.volume
+        if is_green and vol_declining:
+            declining_streak += 1
+        else:
+            break
+
+    if declining_streak >= 4:
+        return -30
+    elif declining_streak >= 3:
+        return -20
+    elif declining_streak >= 2:
+        return -10
+    return 0
+
+
+def _select_profiles(price: float, float_shares: Optional[float]) -> List[ScannerProfile]:
+    """Return profiles that match the stock's price range and float."""
+    profiles = []
+    for p in ALL_PROFILES:
+        if p.min_price <= price <= p.max_price:
+            if float_shares is not None:
+                if p.name == "Low Float Runner" and float_shares <= 20_000_000:
+                    profiles.append(p)
+                elif p.name == "Medium Float Squeeze" and 5_000_000 <= float_shares <= 100_000_000:
+                    profiles.append(p)
+                elif p.name == "Former Momo $20+" and float_shares >= 10_000_000:
+                    profiles.append(p)
+            else:
+                profiles.append(p)
+    return profiles
 
 
 def _momentum_quality(bars: Sequence[Bar], lookback: int = 5) -> tuple:
     """Compute a momentum quality score from recent bars.
 
     Returns (score 0-100, reason_str).
-    Score components:
-      - Green bar ratio (3/5+ green bars = bullish)   0-30 pts
-      - Higher-close streak (closes stepping up)      0-25 pts
-      - Tick acceleration (recent move > early move)   0-25 pts
-      - Buyer pressure (close near high of bar)        0-20 pts
     """
     n = min(lookback, len(bars))
     if n < 3:
@@ -186,14 +581,12 @@ def _momentum_quality(bars: Sequence[Bar], lookback: int = 5) -> tuple:
     score = 0
     details = []
 
-    # 1. Green bar ratio
     green = sum(1 for b in recent if b.close > b.open)
     ratio = green / n
     pts = int(ratio * 30)
     score += pts
     details.append("{}/{} green".format(green, n))
 
-    # 2. Higher-close streak
     streak = 0
     for i in range(len(recent) - 1, 0, -1):
         if recent[i].close > recent[i - 1].close:
@@ -208,7 +601,6 @@ def _momentum_quality(bars: Sequence[Bar], lookback: int = 5) -> tuple:
         score = min(score, 35)
         details.append("weak-streak")
 
-    # 3. Tick acceleration
     mid = n // 2
     first_half = recent[:mid]
     second_half = recent[mid:]
@@ -224,7 +616,6 @@ def _momentum_quality(bars: Sequence[Bar], lookback: int = 5) -> tuple:
         else:
             details.append("decelerating")
 
-    # 4. Buyer pressure: close in upper 60% of bar range
     latest = recent[-1]
     if latest.high > latest.low:
         position = (latest.close - latest.low) / (latest.high - latest.low)

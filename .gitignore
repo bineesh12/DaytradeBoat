@@ -12,3 +12,10 @@ build/
 .env
 *.csv
 *.parquet
+
+# Runtime trading data; keep this local/on the server, not in Git.
+data/journal/
+data/ml/*.jsonl
+data/reports/
+journal.db
+*.db

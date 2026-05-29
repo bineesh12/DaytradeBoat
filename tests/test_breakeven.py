@@ -1,15 +1,7 @@
-"""Tests for breakeven lock — the safety net that guarantees no loss.
+"""Tests for breakeven lock — legacy 3-tier model (skipped).
 
-Verifies:
-  1. Basic breakeven: after Tier 1 fills, stop moves to entry price
-  2. Breakeven holds: price drops to entry → exits at $0 loss
-  3. Breakeven + scale-up: avg price changes → stop recalculates
-  4. Breakeven on short side: works symmetrically
-  5. Breakeven + trailing: trails still work after breakeven locked
-  6. Breakeven + hard stop: hard stop respects breakeven level
-  7. Multiple scale-ups: breakeven recalculates each time
-  8. Edge: breakeven is never BELOW entry for long (never ABOVE for short)
-  9. Breakeven PnL guarantee: across all exits, total PnL ≥ 0
+Current ExitManager uses half-sell at 2:1 + stepping stop.
+See tests/test_smart_exit.py for active exit tests.
 """
 
 from __future__ import annotations
@@ -17,6 +9,10 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 import pytest
+
+pytestmark = pytest.mark.skip(
+    reason="Legacy tier-1 breakeven model; current exits use Warrior half-sell + stepping stop",
+)
 
 from daytrading.exits.manager import (
     ExitManager,

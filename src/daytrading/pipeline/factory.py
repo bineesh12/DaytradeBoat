@@ -20,6 +20,7 @@ from daytrading.scanner.scalping.flat_top_breakout import FlatTopBreakoutScanner
 from daytrading.scanner.scalping.vwap_pullback import VWAPPullbackScanner
 from daytrading.scanner.scalping.opening_range_breakout import OpeningRangeBreakoutScanner
 from daytrading.scanner.scalping.hod_reclaim import HODReclaimScanner
+from daytrading.scanner.scalping.pullback_base import PullbackBaseScanner
 from daytrading.strategy.scalping.momentum_pattern import MomentumPatternVerifier
 from daytrading.models import PortfolioState, TradingStyle
 
@@ -65,6 +66,7 @@ def create_scalping_pipeline(
 
     portfolio: Optional[PortfolioState] = None,
     float_checker: object = None,
+    enable_daily_loser_blacklist: bool = False,
 ) -> TradingPipeline:
     """Create a fully wired scalping pipeline for $1–$20 stocks.
 
@@ -113,6 +115,11 @@ def create_scalping_pipeline(
         min_price=min_price,
         max_price=max_price,
     )
+    pullback_base_scanner = PullbackBaseScanner(
+        min_price=min_price,
+        max_price=max_price,
+        max_base_range_pct=5.0,
+    )
 
     # --- Verifier (Warrior Trading momentum pattern: 2:1 R/R, pattern-based stops) ---
     pattern_verifier = MomentumPatternVerifier(
@@ -141,6 +148,7 @@ def create_scalping_pipeline(
     all_scanners = [
         momentum_scanner, bull_flag_scanner, flat_top_scanner,
         vwap_pullback_scanner, orb_scanner, hod_scanner,
+        pullback_base_scanner,
     ]
 
     scalp_config = StyleConfig(
@@ -152,6 +160,7 @@ def create_scalping_pipeline(
             "vwap_pullback": pattern_verifier,
             "opening_range_breakout": pattern_verifier,
             "hod_reclaim": pattern_verifier,
+            "pullback_base": pattern_verifier,
         },
     )
 
@@ -163,13 +172,15 @@ def create_scalping_pipeline(
     # --- Broker ---
     broker = PaperBroker(commission_per_share=commission_per_share)
 
-    # --- Re-entry detector (watch recently exited stocks for continuation) ---
-    reentry_detector = ReentryDetector(ReentryConfig(
-        enabled=True,
-        cooldown_seconds=30.0,
-        max_reentries=2,
-        reentry_size_pct=0.5,
-    ))
+    # --- Re-entry detector DISABLED ---
+    # The logic has bugs (wrong values passed to record_full_exit,
+    # entry_price vs exit_price confusion). Disable until properly fixed.
+    # reentry_detector = ReentryDetector(ReentryConfig(
+    #     enabled=True,
+    #     cooldown_seconds=30.0,
+    #     max_reentries=2,
+    #     reentry_size_pct=0.5,
+    # ))
 
     # --- Pipeline ---
     return TradingPipeline(
@@ -181,13 +192,15 @@ def create_scalping_pipeline(
             "vwap_pullback": pattern_verifier,
             "opening_range_breakout": pattern_verifier,
             "hod_reclaim": pattern_verifier,
+            "pullback_base": pattern_verifier,
         },
         broker=broker,
         portfolio=portfolio,
         exit_manager=ExitManager(),
         router=router,
-        reentry_detector=reentry_detector,
+        reentry_detector=None,
         max_positions=max_positions,
         max_position_shares=max_position_shares,
         max_order_shares=max_order_shares,
+        enable_daily_loser_blacklist=enable_daily_loser_blacklist,
     )

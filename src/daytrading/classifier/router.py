@@ -51,6 +51,10 @@ class AdaptiveRouter:
         self._configs = style_configs
         self._last_status: Dict[str, str] = {}
 
+    @property
+    def classifier(self) -> MarketRegimeClassifier:
+        return self._classifier
+
     def route(
         self,
         universe: Dict[str, Sequence[Bar]],

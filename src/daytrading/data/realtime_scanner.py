@@ -1,18 +1,25 @@
 """Real-time market scanner — detects movers instantly from the trade stream.
 
 Instead of polling snapshots every 30 seconds, this listens to every trade
-across the entire market via the wildcard '*' subscription and tracks:
-  - Volume per symbol (rolling window)
-  - Price change from open/prev close
-  - Sudden volume spikes
+across the entire market via the wildcard '*' subscription and detects:
+  - Volume bursts: sudden spikes in trading activity (rolling 60s windows)
+  - Price momentum: sustained upward movement
+  - Trade frequency: high trade count = institutional/algo interest
 
-When a stock in the $1-$20 range starts surging, the callback fires
-immediately — no 30-second delay.
+Discovery criteria (any stock meeting ALL of these gets promoted):
+  - Price $1–$20
+  - Accumulated volume ≥ threshold (absolute floor)
+  - Volume velocity: current 60s window is ≥ 3x the prior window
+  - OR: total accumulated volume is very high (top-tier liquidity)
+  - Price is going UP (positive change)
+
+This replaces the old "rank top N" approach which missed good stocks.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from collections import defaultdict
@@ -22,13 +29,16 @@ from daytrading.models import Tick
 
 logger = logging.getLogger(__name__)
 
+# Rolling window size in seconds for volume velocity detection
+_WINDOW_SECS = 60
+
 
 class RealtimeScanner:
     """Processes a firehose of trades and detects movers in real time.
 
-    Accumulates volume and tracks price changes per symbol. Every
-    `check_interval` seconds, ranks the top movers and calls back
-    with any new symbols not yet on the watchlist.
+    Uses a dual-window volume velocity approach: if a stock's volume in the
+    current 60-second window is ≥ 3x the previous window, it's surging.
+    Also promotes any stock exceeding a high absolute volume threshold.
     """
 
     def __init__(
@@ -36,33 +46,35 @@ class RealtimeScanner:
         *,
         min_price: float = 1.0,
         max_price: float = 20.0,
-        min_volume: int = 1_000_000,
-        min_change_pct: float = 2.0,
-        max_symbols: int = 15,
-        check_interval: float = 5.0,
+        min_volume: int = 500_000,
+        volume_surge_ratio: float = 3.0,
+        high_volume_floor: int = 2_000_000,
+        check_interval: float = 10.0,
     ) -> None:
         self._min_price = min_price
         self._max_price = max_price
         self._min_volume = min_volume
-        self._min_change_pct = min_change_pct
-        self._max_symbols = max_symbols
+        self._volume_surge_ratio = volume_surge_ratio
+        self._high_volume_floor = high_volume_floor
         self._check_interval = check_interval
 
-        # Per-symbol accumulators (reset periodically)
-        self._volume: Dict[str, int] = defaultdict(int)
+        # Per-symbol rolling state
+        self._lock = threading.Lock()
+        self._total_volume: Dict[str, int] = defaultdict(int)
+        self._current_window_vol: Dict[str, int] = defaultdict(int)
+        self._prev_window_vol: Dict[str, int] = defaultdict(int)
         self._last_price: Dict[str, float] = {}
-        self._first_price: Dict[str, float] = {}
+        self._low_price: Dict[str, float] = {}
+        self._high_price: Dict[str, float] = {}
         self._trade_count: Dict[str, int] = defaultdict(int)
 
-        self._lock = threading.Lock()
         self._known_watchlist: Set[str] = set()
         self._on_new_movers: Optional[Callable] = None
 
-        # Background checker
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
-        self._last_check: float = 0.0
         self._total_trades: int = 0
+        self._last_window_rotate: float = time.time()
 
     def on_trade(self, tick: Tick) -> None:
         """Called for every trade from the wildcard stream. Must be fast."""
@@ -70,16 +82,18 @@ class RealtimeScanner:
         sym = tick.symbol
         size = int(tick.size)
 
-        # Quick price filter — skip expensive stocks immediately
         if price > self._max_price * 1.5 or price < self._min_price * 0.5:
             return
 
         with self._lock:
-            self._volume[sym] += size
+            self._total_volume[sym] += size
+            self._current_window_vol[sym] += size
             self._trade_count[sym] += 1
             self._last_price[sym] = price
-            if sym not in self._first_price:
-                self._first_price[sym] = price
+            if sym not in self._low_price or price < self._low_price[sym]:
+                self._low_price[sym] = price
+            if sym not in self._high_price or price > self._high_price[sym]:
+                self._high_price[sym] = price
             self._total_trades += 1
 
     def start(
@@ -87,7 +101,6 @@ class RealtimeScanner:
         on_new_movers: Callable[[List[str], List[Dict]], None],
         initial_watchlist: List[str],
     ) -> None:
-        """Start the background checker thread."""
         self._on_new_movers = on_new_movers
         self._known_watchlist = set(initial_watchlist)
         self._stop_event.clear()
@@ -96,7 +109,7 @@ class RealtimeScanner:
         )
         self._thread.start()
         logger.info(
-            "Real-time scanner started — checking every %.0fs",
+            "Real-time scanner started — volume-velocity detection every %.0fs",
             self._check_interval,
         )
 
@@ -116,86 +129,112 @@ class RealtimeScanner:
             if self._stop_event.is_set():
                 break
             try:
+                self._rotate_windows()
                 self._evaluate()
             except Exception as exc:
                 logger.error("RT scanner check error: %s", exc)
 
-    def _evaluate(self) -> None:
-        """Rank accumulated data and detect new movers."""
+    def _rotate_windows(self) -> None:
+        """Shift current window → previous, reset current."""
+        now = time.time()
+        if now - self._last_window_rotate < _WINDOW_SECS:
+            return
         with self._lock:
-            # Snapshot current state
-            volumes = dict(self._volume)
+            self._prev_window_vol = dict(self._current_window_vol)
+            self._current_window_vol = defaultdict(int)
+            self._last_window_rotate = now
+
+    def _evaluate(self) -> None:
+        """Find ALL stocks that qualify — no top-N cap at discovery."""
+        with self._lock:
+            total_vols = dict(self._total_volume)
+            curr_vols = dict(self._current_window_vol)
+            prev_vols = dict(self._prev_window_vol)
             prices = dict(self._last_price)
-            first_prices = dict(self._first_price)
+            lows = dict(self._low_price)
+            highs = dict(self._high_price)
             trade_counts = dict(self._trade_count)
             total = self._total_trades
+            known = set(self._known_watchlist)
 
-        if not volumes:
+        if not total_vols:
             return
 
-        # Build candidates
-        candidates = []
-        for sym, vol in volumes.items():
+        new_discoveries: List[Dict] = []
+
+        for sym, tot_vol in total_vols.items():
+            if sym in known:
+                continue
+
             price = prices.get(sym, 0)
             if price < self._min_price or price > self._max_price:
                 continue
-            if vol < self._min_volume:
+
+            if tot_vol < self._min_volume:
                 continue
 
-            first = first_prices.get(sym, price)
-            if first <= 0:
+            low = lows.get(sym, price)
+            if low <= 0:
                 continue
-            change_pct = (price - first) / first * 100
+            change_pct = (price - low) / low * 100
 
-            # Only pick stocks going UP — no shorts
-            if change_pct < self._min_change_pct:
+            # Must be going up
+            if change_pct < 1.0:
                 continue
 
-            candidates.append({
+            curr_vol = curr_vols.get(sym, 0)
+            prev_vol = prev_vols.get(sym, 0)
+
+            qualified = False
+            reason = ""
+
+            # Criterion 1: Volume velocity surge
+            if prev_vol > 0 and curr_vol >= prev_vol * self._volume_surge_ratio:
+                qualified = True
+                reason = "volume surge {:.0f}x ({:,} vs {:,})".format(
+                    curr_vol / prev_vol, curr_vol, prev_vol)
+
+            # Criterion 2: High absolute volume (clearly active stock)
+            if tot_vol >= self._high_volume_floor:
+                qualified = True
+                reason = "high volume {:,} shares".format(tot_vol)
+
+            # Criterion 3: High trade frequency (many small trades = retail interest)
+            trades = trade_counts.get(sym, 0)
+            if trades >= 500 and tot_vol >= self._min_volume:
+                qualified = True
+                reason = "active tape {:,} trades, {:,} vol".format(trades, tot_vol)
+
+            if not qualified:
+                continue
+
+            new_discoveries.append({
                 "symbol": sym,
                 "price": round(price, 4),
-                "volume": vol,
+                "volume": tot_vol,
                 "change_pct": round(change_pct, 2),
                 "abs_change_pct": round(change_pct, 2),
-                "prev_close": round(first, 4),
-                "trades": trade_counts.get(sym, 0),
+                "prev_close": round(low, 4),
+                "trades": trades,
+                "reason": reason,
             })
 
-        if not candidates:
-            return
-
-        # Rank
-        max_vol = max(c["volume"] for c in candidates)
-        max_chg = max(c["abs_change_pct"] for c in candidates) or 1.0
-        for c in candidates:
-            c["score"] = (c["volume"] / max_vol) * 0.4 + (c["abs_change_pct"] / max_chg) * 0.6
-        candidates.sort(key=lambda c: -c["score"])
-        top = candidates[:self._max_symbols]
-
-        # Detect new movers
-        with self._lock:
-            new_symbols = [
-                s["symbol"] for s in top
-                if s["symbol"] not in self._known_watchlist
-            ]
-
-        if new_symbols:
+        if new_discoveries:
+            new_symbols = [d["symbol"] for d in new_discoveries]
             logger.info(
-                "RT SCANNER: %d new movers detected (from %d trades): %s",
-                len(new_symbols), total, new_symbols,
+                "RT SCANNER: %d new movers from %d trades: %s",
+                len(new_discoveries), total,
+                ", ".join("{} ({})".format(d["symbol"], d["reason"])
+                          for d in new_discoveries[:10]),
             )
             with self._lock:
                 self._known_watchlist.update(new_symbols)
             if self._on_new_movers:
-                self._on_new_movers(new_symbols, top)
-        elif top:
-            # Still broadcast the rankings update even if no new symbols
-            if self._on_new_movers:
-                self._on_new_movers([], top)
+                self._on_new_movers(new_symbols, new_discoveries)
 
     def get_stats(self) -> Dict:
         with self._lock:
             return {
                 "total_trades": self._total_trades,
-                "symbols_seen": len(self._volume),
+                "symbols_seen": len(self._total_volume),
             }

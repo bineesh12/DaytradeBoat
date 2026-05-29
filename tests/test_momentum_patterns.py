@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone, timedelta
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -223,3 +223,145 @@ class TestMomentumPatternVerifier:
         signal = verifier.verify(hit, port)
         assert signal is None
         assert "already in position" in verifier._last_reject
+
+    def test_rejects_late_pullback_far_from_hod(self) -> None:
+        now = datetime.now(timezone.utc)
+        bars = []
+        for i in range(10):
+            bars.append(_bar(i, close=5.0 + i * 0.12, open_=5.0 + i * 0.12 - 0.04,
+                             high=5.1 + i * 0.12, low=4.95 + i * 0.12,
+                             volume=80_000, base_ts=now, n=16))
+        bars.extend([
+            _bar(10, close=6.30, open_=6.15, high=6.50, low=6.10, volume=100_000, base_ts=now, n=16),
+            _bar(11, close=5.95, open_=6.20, high=6.25, low=5.90, volume=90_000, base_ts=now, n=16),
+            _bar(12, close=5.70, open_=5.95, high=6.00, low=5.65, volume=85_000, base_ts=now, n=16),
+            _bar(13, close=5.72, open_=5.66, high=5.75, low=5.62, volume=90_000, base_ts=now, n=16),
+            _bar(14, close=5.76, open_=5.70, high=5.78, low=5.68, volume=95_000, base_ts=now, n=16),
+        ])
+        hit = ScanResult(
+            symbol="TST",
+            scanner_name="pullback_base",
+            ts=now,
+            score=1.0,
+            criteria={"pattern": "pullback_base", "direction": "up", "base_low": 5.62},
+            bars=bars,
+        )
+        verifier = MomentumPatternVerifier()
+        signal = verifier.verify(hit, PortfolioState(cash=100_000))
+        assert signal is None
+        assert "too far from HOD" in verifier._last_reject
+
+    def test_rejects_pullback_base_without_big_move(self) -> None:
+        now = datetime.now(timezone.utc)
+        bars = [
+            _bar(i, close=5.0 + i * 0.02, open_=5.0 + i * 0.02 - 0.01,
+                 high=5.02 + i * 0.02, low=4.98 + i * 0.02,
+                 volume=80_000, base_ts=now, n=15)
+            for i in range(12)
+        ]
+        bars.extend([
+            _bar(12, close=5.23, open_=5.18, high=5.26, low=5.17, volume=90_000, base_ts=now, n=15),
+            _bar(13, close=5.27, open_=5.22, high=5.30, low=5.21, volume=95_000, base_ts=now, n=15),
+            _bar(14, close=5.31, open_=5.25, high=5.34, low=5.24, volume=100_000, base_ts=now, n=15),
+        ])
+        hit = ScanResult(
+            symbol="TST",
+            scanner_name="pullback_base",
+            ts=now,
+            score=1.0,
+            criteria={"pattern": "pullback_base", "direction": "up", "base_low": 5.17},
+            bars=bars,
+        )
+        verifier = MomentumPatternVerifier()
+        signal = verifier.verify(hit, PortfolioState(cash=100_000))
+        assert signal is None
+        assert "move too small" in verifier._last_reject
+
+    def test_rejects_vwap_pullback_barely_above_vwap(self) -> None:
+        now = datetime.now(timezone.utc)
+        bars = [
+            _bar(i, close=5.25, open_=5.24, high=5.28, low=5.22,
+                 volume=80_000, base_ts=now, n=15)
+            for i in range(10)
+        ]
+        bars.extend([
+            _bar(10, close=5.50, open_=5.35, high=5.60, low=5.32, volume=100_000, base_ts=now, n=15),
+            _bar(11, close=5.36, open_=5.45, high=5.48, low=5.32, volume=90_000, base_ts=now, n=15),
+            _bar(12, close=5.34, open_=5.29, high=5.36, low=5.28, volume=95_000, base_ts=now, n=15),
+        ])
+        hit = ScanResult(
+            symbol="TST",
+            scanner_name="vwap_pullback",
+            ts=now,
+            score=1.0,
+            criteria={"pattern": "vwap_pullback", "direction": "up", "pullback_low": 5.28},
+            bars=bars,
+        )
+        verifier = MomentumPatternVerifier()
+        signal = verifier.verify(hit, PortfolioState(cash=100_000))
+        assert signal is None
+        assert "above VWAP" in verifier._last_reject
+
+    @patch("daytrading.strategy.scalping.momentum_pattern.check_entry_quality", return_value=None)
+    def test_allows_strong_pullback_base(self, _mock_guard: object) -> None:
+        now = datetime.now(timezone.utc)
+        bars = []
+        for i in range(8):
+            bars.append(_bar(i, close=5.0 + i * 0.03, open_=5.0 + i * 0.03 - 0.01,
+                             high=5.03 + i * 0.03, low=4.98 + i * 0.03,
+                             volume=60_000, base_ts=now, n=15))
+        bars.extend([
+            _bar(8, close=6.20, open_=5.60, high=6.45, low=5.55, volume=180_000, base_ts=now, n=15),
+            _bar(9, close=6.05, open_=6.20, high=6.25, low=5.95, volume=120_000, base_ts=now, n=15),
+            _bar(10, close=6.02, open_=6.00, high=6.08, low=5.96, volume=110_000, base_ts=now, n=15),
+            _bar(11, close=6.06, open_=6.01, high=6.10, low=5.98, volume=115_000, base_ts=now, n=15),
+            _bar(12, close=6.12, open_=6.05, high=6.16, low=6.02, volume=120_000, base_ts=now, n=15),
+        ])
+        hit = ScanResult(
+            symbol="TST",
+            scanner_name="pullback_base",
+            ts=now,
+            score=1.0,
+            criteria={"pattern": "pullback_base", "direction": "up", "base_low": 5.95},
+            bars=bars,
+        )
+        verifier = MomentumPatternVerifier()
+        signal = verifier.verify(hit, PortfolioState(cash=100_000))
+        assert signal is not None
+        assert signal.action == SignalAction.ENTER_LONG
+
+    @patch("daytrading.strategy.scalping.momentum_pattern.check_entry_quality", return_value=None)
+    def test_hot_hod_reclaim_uses_tactical_stop_when_pullback_stop_is_too_wide(self, _mock_guard: object) -> None:
+        now = datetime.now(timezone.utc)
+        bars = [
+            _bar(0, close=3.40, open_=3.40, high=3.45, low=3.36, volume=100_000, base_ts=now, n=8),
+            _bar(1, close=3.55, open_=3.40, high=3.58, low=3.38, volume=120_000, base_ts=now, n=8),
+            _bar(2, close=3.88, open_=3.55, high=3.95, low=3.52, volume=150_000, base_ts=now, n=8),
+            _bar(3, close=4.18, open_=3.88, high=4.20, low=3.86, volume=180_000, base_ts=now, n=8),
+            _bar(4, close=3.86, open_=4.15, high=4.19, low=3.74, volume=90_000, base_ts=now, n=8),
+            _bar(5, close=4.05, open_=3.86, high=4.08, low=3.82, volume=110_000, base_ts=now, n=8),
+            _bar(6, close=4.51, open_=4.08, high=4.53, low=4.24, volume=785_000, base_ts=now, n=8),
+        ]
+        hit = ScanResult(
+            symbol="IOTR",
+            scanner_name="hod_reclaim",
+            ts=now,
+            score=100.0,
+            criteria={
+                "pattern": "hod_reclaim",
+                "direction": "up",
+                "hod": 4.53,
+                "pullback_low": 3.74,
+                "stop_price": 3.72,
+                "rally_pct": 33.2,
+                "close": 4.51,
+                "volume": 785_000,
+            },
+            bars=bars,
+        )
+        verifier = MomentumPatternVerifier()
+        signal = verifier.verify(hit, PortfolioState(cash=100_000))
+        assert signal is not None
+        assert signal.action == SignalAction.ENTER_LONG
+        assert signal.stop_loss is not None
+        assert (signal.entry_price - signal.stop_loss) / signal.entry_price <= 0.08

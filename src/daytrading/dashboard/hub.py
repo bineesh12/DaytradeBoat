@@ -94,6 +94,11 @@ class DashboardHub:
         self.watchlist_scan: List[dict] = []
         # Real-time movers that met criteria
         self.rt_movers: List[dict] = []
+        # HOD Momentum alert feed (one row per alert type)
+        self.hod_momentum_alerts: List[dict] = []
+        # Active trading watchlist (HOD TTL + pinned + open positions)
+        self.trading_watchlist: List[str] = []
+        self.watchlist_pinned: List[str] = []
 
         # History (ring buffers)
         self.trades: Deque[TradeRecord] = deque(maxlen=max_history)
@@ -153,21 +158,31 @@ class DashboardHub:
             "scan_time": _now_str(),
         })
 
-    def on_rt_movers(self, new_symbols: list, all_ranked: list) -> None:
-        """Called by real-time scanner when new movers are detected."""
+    def on_hod_momentum_alerts(self, alerts: List[dict]) -> None:
+        """Replace HOD Momentum scanner feed."""
         with self._lock:
-            # Update mover list — replace existing, add new
-            existing = {m["symbol"]: m for m in self.rt_movers}
-            for stock in all_ranked:
-                existing[stock["symbol"]] = stock
-            self.rt_movers = sorted(
-                existing.values(), key=lambda x: -x.get("score", 0),
-            )[:30]
-        self._broadcast("rt_movers", {
-            "movers": self.rt_movers,
-            "new_symbols": new_symbols,
-            "scan_time": _now_str(),
+            self.hod_momentum_alerts = alerts[:200]
+        self._broadcast("hod_momentum_alerts", {"alerts": self.hod_momentum_alerts})
+
+    def on_trading_watchlist(
+        self,
+        symbols: List[str],
+        *,
+        pinned: Optional[List[str]] = None,
+    ) -> None:
+        """Symbols the bot is actively scanning for trades."""
+        with self._lock:
+            self.trading_watchlist = list(symbols)
+            if pinned is not None:
+                self.watchlist_pinned = list(pinned)
+        self._broadcast("trading_watchlist", {
+            "symbols": self.trading_watchlist,
+            "pinned": self.watchlist_pinned,
         })
+
+    def on_rt_movers(self, new_symbols: list, all_ranked: list) -> None:
+        """Deprecated — RT mover scanner removed (HOD-only mode). No-op."""
+        return
 
     def on_startup(self, cash: float, equity: float, buying_power: float) -> None:
         with self._lock:
@@ -176,6 +191,21 @@ class DashboardHub:
             self.account_buying_power = buying_power
             self.starting_cash = cash
             self.bot_start_time = _now_str()
+        self.on_account_update(cash, equity, buying_power)
+
+    def on_account_update(
+        self, cash: float, equity: float, buying_power: float,
+    ) -> None:
+        """Push account balances to dashboard (no HTTP poll)."""
+        with self._lock:
+            self.account_cash = cash
+            self.account_equity = equity
+            self.account_buying_power = buying_power
+        self._broadcast("account", {
+            "cash": round(cash, 2),
+            "equity": round(equity, 2),
+            "buying_power": round(buying_power, 2),
+        })
 
     def on_market_status(self, is_open: bool, stream_connected: bool, phase: str = "") -> None:
         with self._lock:
@@ -260,7 +290,7 @@ class DashboardHub:
 
     def on_exit_fill(self, fill: Any, entry_price: float = 0.0, reason: str = "",
                      skip_pnl_accum: bool = False) -> None:
-        pnl = 0.0
+        pnl: Optional[float] = None
         if entry_price > 0:
             pnl = (fill.price - entry_price) * fill.quantity
             if fill.side.value == "buy":
@@ -280,12 +310,13 @@ class DashboardHub:
         )
         with self._lock:
             self.trades.append(rec)
-            if not skip_pnl_accum:
+            if pnl is not None and not skip_pnl_accum:
                 self.total_pnl += pnl
-            if pnl >= 0:
-                self.winning_trades += 1
-            else:
-                self.losing_trades += 1
+            if pnl is not None:
+                if pnl >= 0:
+                    self.winning_trades += 1
+                else:
+                    self.losing_trades += 1
             self.pnl_history.append({"ts": _now_str(), "pnl": self.total_pnl})
         self._broadcast("exit", _trade_dict(rec))
 
@@ -389,6 +420,9 @@ class DashboardHub:
                 "bot_start_time": self.bot_start_time,
                 "watchlist_scan": self.watchlist_scan,
                 "rt_movers": self.rt_movers,
+                "hod_momentum_alerts": list(self.hod_momentum_alerts),
+                "trading_watchlist": list(self.trading_watchlist),
+                "watchlist_pinned": list(self.watchlist_pinned),
                 "news": dict(self.news_data),
                 "ai_analysis": dict(self.ai_analysis),
                 "trading_paused": self.trading_paused,

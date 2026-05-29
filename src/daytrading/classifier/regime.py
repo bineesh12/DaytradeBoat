@@ -99,6 +99,7 @@ class MarketRegimeClassifier:
         self._min_avg_volume = min_avg_volume
         self._high_liq_volume = high_liquidity_volume
         self._min_confidence = min_confidence
+        self.is_premarket: bool = False
 
     def classify(
         self,
@@ -123,14 +124,11 @@ class MarketRegimeClassifier:
 
         metrics = self._compute_metrics(bars, quotes)
 
-        if metrics.liquidity_score < 0.1:
-            # For momentum/low-float stocks, historical volume is irrelevant —
-            # but they MUST have elevated RVOL today to confirm real buying.
-            # Strong trend alone isn't enough (could be thin order book grind).
-            if metrics.rvol < 2.0:
-                return self._not_tradeable(symbol, bars, [
-                    f"Too illiquid: avg_volume below threshold, liquidity={metrics.liquidity_score:.2f}, rvol={metrics.rvol:.1f}x",
-                ])
+        liq_threshold = 0.01 if self.is_premarket else 0.1
+        if metrics.liquidity_score < liq_threshold:
+            return self._not_tradeable(symbol, bars, [
+                f"Too illiquid: liquidity={metrics.liquidity_score:.2f}, rvol={metrics.rvol:.1f}x — order book too thin",
+            ])
 
         scores: Dict[TradingStyle, tuple] = {}
         if self._enable_scalping:
@@ -226,15 +224,23 @@ class MarketRegimeClassifier:
         m.trend_strength = self._compute_trend_strength(bars)
 
         # --- Liquidity score ---
-        avg_vol = sum(b.volume for b in bars[-20:]) / min(20, len(bars))
-        if avg_vol < self._min_avg_volume:
+        recent_bars = list(bars[-20:])
+        avg_vol = sum(b.volume for b in recent_bars) / len(recent_bars) if recent_bars else 0
+        total_session_vol = sum(b.volume for b in bars)
+        min_vol = 500 if self.is_premarket else self._min_avg_volume
+        if avg_vol < min_vol:
             m.liquidity_score = 0.0
         elif avg_vol >= self._high_liq_volume:
             m.liquidity_score = 1.0
         else:
-            m.liquidity_score = (avg_vol - self._min_avg_volume) / (
-                self._high_liq_volume - self._min_avg_volume
+            m.liquidity_score = (avg_vol - min_vol) / (
+                self._high_liq_volume - min_vol
             )
+        # Override: if total session volume proves the stock is active today,
+        # guarantee a passing liquidity score. The entry guard handles
+        # detailed per-bar volume checks separately.
+        if total_session_vol >= 100_000 and m.liquidity_score < 0.15:
+            m.liquidity_score = 0.15
 
         return m
 

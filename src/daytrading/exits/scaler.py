@@ -201,8 +201,8 @@ class _ExitRecord:
 class ReentryConfig:
     """Rules for re-entering after a full exit."""
     enabled: bool = True
-    cooldown_seconds: float = 30.0     # min time after exit before re-entry
-    max_reentries: int = 2             # max re-entries per symbol per session
+    cooldown_seconds: float = 300.0    # 5 min cooldown after stop-out
+    max_reentries: int = 1             # max 1 re-entry per symbol per session
     reentry_size_pct: float = 0.5      # re-enter with 50% of original size
     min_continuation_cents: float = 3.0  # price must move ≥ 3¢ past exit price
     pullback_max_cents: float = 5.0    # pullback must be ≤ 5¢ (not a reversal)

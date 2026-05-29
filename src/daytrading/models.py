@@ -38,6 +38,7 @@ class Timeframe(str, Enum):
     TICK = "tick"
     SEC_1 = "1s"
     SEC_5 = "5s"
+    SEC_10 = "10s"
     SEC_15 = "15s"
     MIN_1 = "1m"
     MIN_5 = "5m"

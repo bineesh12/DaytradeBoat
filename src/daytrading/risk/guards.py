@@ -52,6 +52,23 @@ class FalseBreakoutDetector:
 
         # Volume declining on the breakout candle = weak conviction
         if vol_ratio < 0.8:
+            bar_range = latest.high - latest.low
+            close_position = (latest.close - latest.low) / bar_range if bar_range > 0 else 0.0
+            prior_high = max(b.high for b in bars[:-1])
+            day_volume = sum(b.volume for b in bars)
+            pv = sum(((b.high + b.low + b.close) / 3.0) * b.volume for b in bars)
+            vwap = pv / day_volume if day_volume > 0 else 0.0
+            recent_follow_through = len(bars) >= 3 and latest.close > bars[-3].close
+            vwap_reclaim = vwap > 0 and latest.close >= vwap * 1.01
+            near_high = prior_high > 0 and latest.close >= prior_high * 0.97
+            strong_close = latest.close > latest.open and close_position >= 0.55
+            if (
+                day_volume >= 500_000
+                and vwap_reclaim
+                and near_high
+                and (strong_close or recent_follow_through)
+            ):
+                return None
             return "false breakout: volume declining ({:.1f}x avg on breakout bar)".format(vol_ratio)
 
         bar_range = latest.high - latest.low
@@ -185,7 +202,7 @@ class HaltTracker:
                 if silence >= 30 and abs(price - prev_price) / max(prev_price, 0.01) < 0.001:
                     if symbol not in self._halted:
                         self._halted[symbol] = prev_ts
-                        logger.warning("HALT DETECTED (price freeze) %s — no movement for %.0fs", symbol, silence)
+                        logger.info("LOW ACTIVITY %s — no trades for %.0fs (blocking entry until volume returns)", symbol, silence)
 
                 # Post-halt gap: price jumped >5% after silence
                 elif silence >= 30 and prev_price > 0:
@@ -339,11 +356,11 @@ class SlippageGuard:
                 return round(q.bid - 0.01, 2)
 
     def check_spread(self, symbol: str) -> Optional[str]:
-        """Reject if current spread is too wide."""
+        """Reject if current spread is too wide. Skip check if no quote available."""
         with self._lock:
             q = self._latest_quotes.get(symbol)
             if q is None:
-                return None
+                return None  # no quote data — allow trade, classifier already assessed spread
 
             if q.spread_pct > self._max_spread_pct:
                 return "spread too wide: {:.2f}% (max {:.2f}%) — bid {:.2f} / ask {:.2f}".format(
@@ -413,10 +430,17 @@ class TradeGuard:
             return False, reason
 
         if bars and len(bars) >= 6:
-            # 4. False breakout
-            reason = self.false_breakout.check(bars, symbol=signal.symbol)
-            if reason:
-                return False, reason
+            # 4. False breakout — skip for pullback patterns (volume is expected to be low)
+            pattern = ""
+            if signal.scan_result:
+                pattern = signal.scan_result.criteria.get("pattern", "")
+                if not pattern and signal.scan_result.scanner_name == "momentum_burst":
+                    pattern = "momentum_burst"
+            pullback_patterns = ("vwap_pullback", "pullback_base", "hod_reclaim")
+            if pattern not in pullback_patterns:
+                reason = self.false_breakout.check(bars, symbol=signal.symbol)
+                if reason:
+                    return False, reason
 
             # 5. Liquidity trap
             reason = self.liquidity_trap.check(bars, quotes=quotes, symbol=signal.symbol)

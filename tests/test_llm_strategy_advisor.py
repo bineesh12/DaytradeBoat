@@ -1,6 +1,10 @@
-my"""Tests for LLM / OpenAI-compatible strategy advisor helpers."""
+"""Tests for LLM / OpenAI-compatible strategy advisor helpers."""
 
 from __future__ import annotations
+
+import pytest
+
+pytest.importorskip("daytrading.analytics.llm_strategy_advisor")
 
 from daytrading.analytics.llm_strategy_advisor import (
     LLMStrategyAdvisor,

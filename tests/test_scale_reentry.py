@@ -71,22 +71,19 @@ class TestExitManagerScaleUp:
         assert pos.quantity == 750
         assert pos.stop_loss == 5.03
 
-    def test_scale_up_adds_trailing_tier(self) -> None:
+    def test_scale_up_updates_average_price(self) -> None:
         em = ExitManager()
-        tiers = build_exit_tiers(500, 5.00, Side.BUY)
-        original_tier_count = len(tiers)
         em.track(TrackedPosition(
             symbol="AAPL", side=Side.BUY, quantity=500,
-            entry_price=5.00, stop_loss=4.97, tiers=tiers,
+            entry_price=5.00, entry_ts=_ts(0), stop_loss=4.97,
+            remaining_qty=500, original_qty=500,
         ))
 
         em.scale_up("AAPL", add_qty=250, add_price=5.10)
         pos = em.tracked["AAPL"]
-        assert len(pos.tiers) == original_tier_count + 1
-        new_tier = pos.tiers[-1]
-        assert new_tier.shares == 250
-        assert new_tier.trail_cents is not None
-        assert new_tier.target_price is None
+        assert pos.remaining_qty == 750
+        expected_avg = (5.00 * 500 + 5.10 * 250) / 750
+        assert pos.entry_price == pytest.approx(expected_avg)
 
     def test_scale_up_nonexistent_symbol_is_noop(self) -> None:
         em = ExitManager()

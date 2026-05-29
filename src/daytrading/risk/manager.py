@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import logging
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 try:
     from typing import Protocol, runtime_checkable
@@ -27,6 +30,7 @@ def allow_order(
     """Lightweight pre-trade checks strategies or a custom RiskManager can call."""
 
     if max_order_shares is not None and order.quantity > max_order_shares:
+        logger.info("RISK REJECT %s: order qty %.0f > max %s", order.symbol, order.quantity, max_order_shares)
         return False
 
     pos = portfolio.positions.get(order.symbol)
@@ -34,10 +38,12 @@ def allow_order(
 
     if order.side is Side.BUY and max_position_shares is not None:
         if cur + order.quantity > max_position_shares:
+            logger.info("RISK REJECT %s: position would be %.0f > max %s", order.symbol, cur + order.quantity, max_position_shares)
             return False
     if order.side is Side.SELL and max_position_shares is not None:
         if cur - order.quantity < -max_position_shares:
+            logger.info("RISK REJECT %s: short position would be %.0f > max %s", order.symbol, cur - order.quantity, max_position_shares)
             return False
 
-    _ = bar  # reserved for notional / volatility caps later
+    _ = bar
     return True

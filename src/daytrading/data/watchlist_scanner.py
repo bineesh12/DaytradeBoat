@@ -43,6 +43,12 @@ class WatchlistScanner:
         "VIXY", "VXX", "ETHA", "IBIT", "BITO",
     })
 
+    @staticmethod
+    def _is_probable_warrant_symbol(symbol: str) -> bool:
+        # Common warrant symbols are usually longer root tickers ending in W.
+        # Short real tickers like WNW should stay in the scan universe.
+        return len(symbol) >= 4 and symbol.endswith("W")
+
     def __init__(
         self,
         api_key: str,
@@ -55,6 +61,7 @@ class WatchlistScanner:
         max_symbols: int = 25,
         feed: str = "iex",
         scan_interval: float = 30.0,
+        premarket_min_volume: int = 10_000,
     ) -> None:
         if not _HAS_ALPACA:
             raise ImportError("alpaca-py is required")
@@ -64,10 +71,12 @@ class WatchlistScanner:
         self._min_price = min_price
         self._max_price = max_price
         self._min_volume = min_volume
+        self._premarket_min_volume = premarket_min_volume
         self._min_change = min_change_pct
         self._max_symbols = max_symbols
         self._feed = DataFeed(feed.lower())
         self._scan_interval = scan_interval
+        self._is_premarket = False
 
         # Cached asset list (loaded once, refreshed hourly)
         self._all_symbols: List[str] = []
@@ -89,27 +98,53 @@ class WatchlistScanner:
     # ------------------------------------------------------------------
 
     def scan(self) -> List[Dict]:
-        """Full scan: check all US equities and return ranked stocks."""
+        """Full scan: check all US equities and return ranked stocks.
+
+        Returns ALL candidates that pass the minimum filters (price, volume,
+        change). The downstream float filter will narrow this to tradeable
+        low-float stocks. This prevents good low-float momentum plays from
+        being hidden behind high-float stocks in the ranking.
+        """
         t0 = time.time()
 
         symbols = self._load_all_symbols()
         candidates = self._get_snapshots(symbols)
 
-        # Cache the candidate symbols for fast rescans
         self._candidate_symbols = [c["symbol"] for c in candidates]
 
         ranked = self._rank(candidates)
-        top = ranked[:self._max_symbols]
 
         elapsed = time.time() - t0
+        top_preview = ranked[:25]
         logger.info(
-            "Full scan in %.1fs — %d candidates → top %d: %s",
-            elapsed, len(candidates), len(top),
+            "Full scan in %.1fs — %d candidates (returning all), top movers: %s",
+            elapsed, len(candidates),
             ", ".join("{} ${:.2f} chg={:+.1f}%".format(
                 s["symbol"], s["price"], s["change_pct"]
-            ) for s in top),
+            ) for s in top_preview),
         )
-        return top
+        return ranked
+
+    def scan_candidates(self, *, full_universe: bool = False, readonly: bool = False) -> List[Dict]:
+        """Light rescan of cached movers (or full universe on first run)."""
+        t0 = time.time()
+        if full_universe or not self._candidate_symbols:
+            symbols = self._load_all_symbols()
+        else:
+            symbols = list(self._candidate_symbols)
+
+        candidates = self._get_snapshots(symbols)
+        if candidates and not readonly:
+            self._candidate_symbols = [c["symbol"] for c in candidates]
+
+        ranked = self._rank(candidates)
+        elapsed = time.time() - t0
+        logger.info(
+            "Candidate scan in %.1fs — %d pass filters",
+            elapsed,
+            len(candidates),
+        )
+        return ranked
 
     # ------------------------------------------------------------------
     # Background live scanner (runs every scan_interval seconds)
@@ -225,7 +260,7 @@ class WatchlistScanner:
             if a.exchange in ("NYSE", "NASDAQ", "ARCA", "AMEX")
             and a.tradable
             and len(a.symbol) <= 5
-            and not a.symbol.endswith("W")
+            and not self._is_probable_warrant_symbol(a.symbol)
             and a.symbol not in self._ETF_BLACKLIST
         ]
         self._symbols_loaded_at = now
@@ -256,7 +291,13 @@ class WatchlistScanner:
         if bar is None or prev is None:
             return None
 
-        price = float(bar.close)
+        # During pre-market, daily_bar is stale — use latest_trade for real price
+        if self._is_premarket:
+            latest = getattr(snap, "latest_trade", None)
+            price = float(latest.price) if latest else float(bar.close)
+        else:
+            price = float(bar.close)
+
         if price < self._min_price or price > self._max_price:
             return None
 
@@ -265,13 +306,27 @@ class WatchlistScanner:
             return None
 
         volume = float(bar.volume)
-        if volume < self._min_volume:
-            return None
+        # During pre-market, daily_bar.volume is stale (yesterday's).
+        # Use minute_bar.volume which reflects actual real-time activity.
+        if self._is_premarket:
+            mbar = getattr(snap, "minute_bar", None)
+            if mbar is not None and mbar.volume > volume:
+                volume = float(mbar.volume)
+        effective_min_vol = (
+            self._premarket_min_volume if self._is_premarket else self._min_volume
+        )
+        if volume < effective_min_vol:
+            change_pct_check = (price - prev_close) / prev_close * 100 if prev_close > 0 else 0
+            if abs(change_pct_check) >= 15.0 and volume >= 100_000:
+                pass  # strong mover — accept with lower volume
+            else:
+                return None
 
         change_pct = (price - prev_close) / prev_close * 100
 
-        # Only pick stocks going UP — no shorts
-        if change_pct < self._min_change:
+        # During pre-market, snapshot data is stale — accept any direction
+        # The downstream HOD bar scanner will filter on actual session change
+        if not self._is_premarket and change_pct < self._min_change:
             return None
 
         return {
@@ -287,13 +342,15 @@ class WatchlistScanner:
         if not candidates:
             return []
 
+        import math
+
         max_vol = max(c["volume"] for c in candidates)
         max_chg = max(c["abs_change_pct"] for c in candidates) or 1.0
 
         for c in candidates:
-            vol_score = c["volume"] / max_vol
+            log_vol_score = math.log1p(c["volume"]) / math.log1p(max_vol)
             move_score = c["abs_change_pct"] / max_chg
-            c["score"] = vol_score * 0.4 + move_score * 0.6
+            c["score"] = log_vol_score * 0.5 + move_score * 0.5
 
         candidates.sort(key=lambda c: -c["score"])
         return candidates

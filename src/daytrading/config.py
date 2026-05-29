@@ -55,7 +55,10 @@ class Settings:
 
         # Price filter
         self.min_price: float = _env_float("MIN_PRICE", 1.0)
-        self.max_price: float = _env_float("MAX_PRICE", 20.0)
+        self.max_price: float = _env_float("MAX_PRICE", 500.0)
+
+        # Float cache (SQLite, days before Yahoo refresh)
+        self.float_cache_ttl_days: int = _env_int("FLOAT_CACHE_TTL_DAYS", 7)
 
         # Trading modes
         self.enable_scalping: bool = _env_bool("ENABLE_SCALPING", True)
@@ -91,3 +94,97 @@ class Settings:
         # Classifier
         self.min_avg_volume: float = _env_float("MIN_AVG_VOLUME", 50_000)
         self.scalp_max_spread_pct: float = _env_float("SCALP_MAX_SPREAD_PCT", 0.15)
+
+        # Risk — block re-entry on symbols that lost money today
+        self.enable_daily_loser_blacklist: bool = _env_bool(
+            "ENABLE_DAILY_LOSER_BLACKLIST", True,
+        )
+
+        # Extended hours — allow scanning/entries 4:00 PM–8:00 PM ET (paper testing)
+        self.after_hours_enabled: bool = _env_bool("AFTER_HOURS_ENABLED", False)
+
+        # HOD Momentum alert scanner
+        self.hod_momentum_max_float: float = _env_float(
+            "HOD_MOMENTUM_MAX_FLOAT", 20_000_000,
+        )
+        self.hod_momentum_min_price: float = _env_float(
+            "HOD_MOMENTUM_MIN_PRICE", 2.0,
+        )
+        self.hod_momentum_max_price: float = _env_float(
+            "HOD_MOMENTUM_MAX_PRICE", 20.0,
+        )
+        # Requires SIP feed (alpaca_feed=sip). Not the RT mover scanner — HOD tick only.
+        self.hod_momentum_tick_enabled: bool = _env_bool(
+            "HOD_MOMENTUM_TICK_ENABLED", True,
+        )
+        self.hod_momentum_volume_surge_ratio: float = _env_float(
+            "HOD_MOMENTUM_VOLUME_SURGE_RATIO", 3.0,
+        )
+        self.hod_momentum_tick_cooldown_seconds: float = _env_float(
+            "HOD_MOMENTUM_TICK_COOLDOWN_SECONDS", 30.0,
+        )
+        self.hod_momentum_alert_ttl_minutes: float = _env_float(
+            "HOD_MOMENTUM_ALERT_TTL_MINUTES", 15.0,
+        )
+        self.hod_momentum_watchlist_ttl_minutes: float = _env_float(
+            "HOD_MOMENTUM_WATCHLIST_TTL_MINUTES", 20.0,
+        )
+        self.hod_momentum_bar_pool_max: int = _env_int(
+            "HOD_MOMENTUM_BAR_POOL_MAX", 1000,
+        )
+        self.hod_pool_refresh_minutes: int = _env_int(
+            "HOD_POOL_REFRESH_MINUTES", 10,
+        )
+
+        # Gentle network — batched Alpaca bar fetches
+        self.bar_fetch_batch_size: int = _env_int("BAR_FETCH_BATCH_SIZE", 10)
+        self.bar_fetch_batch_delay_sec: float = _env_float(
+            "BAR_FETCH_BATCH_DELAY_SEC", 0.5,
+        )
+        self.hod_hydrate_batch_max: int = _env_int("HOD_HYDRATE_BATCH_MAX", 25)
+        self.hod_seed_batch_size: int = _env_int("HOD_SEED_BATCH_SIZE", 10)
+        self.hod_seed_max_per_minute: int = _env_int("HOD_SEED_MAX_PER_MINUTE", 100)
+        self.hod_momentum_require_alert_for_entry: bool = _env_bool(
+            "HOD_MOMENTUM_REQUIRE_ALERT_FOR_ENTRY", True,
+        )
+        self.hod_momentum_max_alert_rows: int = _env_int(
+            "HOD_MOMENTUM_MAX_ALERT_ROWS", 200,
+        )
+        self.hod_momentum_min_session_change_pct: float = _env_float(
+            "HOD_MOMENTUM_MIN_SESSION_CHANGE_PCT", 5.0,
+        )
+        self.hod_momentum_min_day_volume: float = _env_float(
+            "HOD_MOMENTUM_MIN_DAY_VOLUME", 200_000,
+        )
+        self.hod_momentum_require_break_prior_day_high: bool = _env_bool(
+            "HOD_MOMENTUM_REQUIRE_BREAK_PRIOR_DAY_HIGH", True,
+        )
+        self.hod_momentum_rth_only: bool = _env_bool(
+            "HOD_MOMENTUM_RTH_ONLY", False,
+        )
+        self.hod_momentum_former_momo_enabled: bool = _env_bool(
+            "HOD_MOMENTUM_FORMER_MOMO_ENABLED", True,
+        )
+        self.hod_momentum_former_momo_min_price: float = _env_float(
+            "HOD_MOMENTUM_FORMER_MOMO_MIN_PRICE", 20.0,
+        )
+        self.hod_momentum_former_momo_min_change_pct: float = _env_float(
+            "HOD_MOMENTUM_FORMER_MOMO_MIN_CHANGE_PCT", 3.0,
+        )
+
+        # Tape-hot detection — volume spike on SIP tape triggers bar load + scan
+        self.hod_tape_hot_volume_threshold: int = _env_int(
+            "HOD_TAPE_HOT_VOLUME_THRESHOLD", 50_000,
+        )
+        self.hod_tape_hot_ttl_minutes: float = _env_float(
+            "HOD_TAPE_HOT_TTL_MINUTES", 5.0,
+        )
+        self.hod_bar_load_workers: int = _env_int(
+            "HOD_BAR_LOAD_WORKERS", 4,
+        )
+        self.hod_hydrate_top_n: int = _env_int(
+            "HOD_HYDRATE_TOP_N", 100,
+        )
+        self.hod_scanner_debug: bool = _env_bool(
+            "DAYTRADING_HOD_SCANNER_DEBUG", False,
+        )

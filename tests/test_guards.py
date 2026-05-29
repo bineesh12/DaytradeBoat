@@ -57,6 +57,16 @@ def _signal(symbol: str = "TST", price: float = 5.0) -> TradeSignal:
     )
 
 
+def _quote(symbol: str = "TST", bid: float = 5.00, ask: float = 5.02) -> Quote:
+    return Quote(symbol=symbol, ts=_ts(0), bid=bid, ask=ask, bid_size=1000, ask_size=1000)
+
+
+def _guard_with_quote(**kwargs) -> TradeGuard:
+    guard = TradeGuard()
+    guard.slippage.update_quote(_quote(**kwargs))
+    return guard
+
+
 # ---------------------------------------------------------------------------
 # 1. False Breakout Detector
 # ---------------------------------------------------------------------------
@@ -88,6 +98,20 @@ class TestFalseBreakoutDetector:
         result = detector.check(bars)
         assert result is not None
         assert "volume declining" in result
+
+    def test_allow_high_volume_vwap_reclaim_with_light_breakout_bar(self) -> None:
+        """Runner reclaiming VWAP near HOD can continue even if one bar volume is lighter."""
+        bars = [
+            _bar(0, close=2.90, open_=2.80, high=2.95, low=2.75, volume=2_000_000),
+            _bar(1, close=5.80, open_=4.50, high=6.20, low=4.40, volume=2_500_000),
+            _bar(2, close=6.20, open_=5.90, high=6.60, low=5.80, volume=1_600_000),
+            _bar(3, close=5.95, open_=6.20, high=6.30, low=5.70, volume=1_300_000),
+            _bar(4, close=5.85, open_=5.95, high=6.00, low=5.60, volume=1_000_000),
+            _bar(5, close=6.72, open_=6.10, high=6.88, low=6.05, volume=500_000),
+        ]
+        detector = FalseBreakoutDetector()
+
+        assert detector.check(bars) is None
 
     def test_reject_rejection_wick(self) -> None:
         """False breakout: big upper wick = sellers rejecting the move."""
@@ -360,7 +384,7 @@ class TestTradeGuard:
 
     def test_all_clear(self) -> None:
         """No guards triggered = entry allowed."""
-        guard = TradeGuard()
+        guard = _guard_with_quote()
         bars = [
             _bar(i, close=5.0 + i * 0.01, open_=5.0 + i * 0.01 - 0.005,
                  high=5.0 + i * 0.01 + 0.01, low=5.0 + i * 0.01 - 0.01,
@@ -368,7 +392,7 @@ class TestTradeGuard:
             for i in range(7)
         ]
         bars[-1] = _bar(6, close=5.08, open_=5.06, high=5.09, low=5.05, volume=20_000)
-        ok, reason = guard.check_entry(_signal(), bars=bars)
+        ok, reason = guard.check_entry(_signal(), bars=bars, quotes=[_quote()])
         assert ok is True
         assert reason is None
 
@@ -397,19 +421,19 @@ class TestTradeGuard:
         assert "spread too wide" in reason
 
     def test_false_breakout_blocks_entry(self) -> None:
-        guard = TradeGuard()
+        guard = _guard_with_quote()
         bars = [
             _bar(i, close=5.0, open_=4.99, high=5.01, low=4.98, volume=20_000)
             for i in range(5)
         ]
         # Declining volume on "breakout"
         bars.append(_bar(5, close=5.05, open_=5.01, high=5.06, low=5.00, volume=10_000))
-        ok, reason = guard.check_entry(_signal(), bars=bars)
+        ok, reason = guard.check_entry(_signal(), bars=bars, quotes=[_quote()])
         assert ok is False
         assert "false breakout" in reason
 
     def test_liquidity_trap_blocks_entry(self) -> None:
-        guard = TradeGuard()
+        guard = _guard_with_quote()
         bars = [
             _bar(i, close=5.0, open_=4.99, high=5.01, low=4.98, volume=10_000)
             for i in range(5)
@@ -417,7 +441,7 @@ class TestTradeGuard:
         # Gap-up reversal: opens above prior high but closes red
         # close > low ensures close position is above 30% so false breakout doesn't fire
         bars.append(_bar(5, close=5.00, open_=5.05, high=5.06, low=4.97, volume=12_000))
-        ok, reason = guard.check_entry(_signal(), bars=bars)
+        ok, reason = guard.check_entry(_signal(), bars=bars, quotes=[_quote()])
         assert ok is False
         assert "liquidity trap" in reason
 
@@ -433,6 +457,6 @@ class TestTradeGuard:
 
     def test_no_bars_skips_candle_checks(self) -> None:
         """With no bars, only halt/panic/spread guards run."""
-        guard = TradeGuard()
-        ok, reason = guard.check_entry(_signal(), bars=None)
+        guard = _guard_with_quote()
+        ok, reason = guard.check_entry(_signal(), bars=None, quotes=[_quote()])
         assert ok is True

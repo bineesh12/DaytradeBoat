@@ -52,6 +52,21 @@ def create_app(hub: DashboardHub) -> Flask:
     def snapshot():
         return jsonify(_hub.snapshot())
 
+    @app.route("/api/ml-stats")
+    def ml_stats():
+        """Return ML model monitoring stats."""
+        try:
+            from daytrading.strategy.entry_guard import get_ml_monitor
+            monitor = get_ml_monitor()
+            if monitor is None:
+                return jsonify({"enabled": False, "reason": "no monitor"})
+            stats = monitor.stats.to_dict()
+            stats["model_loaded"] = True
+            stats["model_active"] = monitor.is_model_enabled
+            return jsonify(stats)
+        except Exception as exc:
+            return jsonify({"enabled": False, "reason": str(exc)})
+
     @app.route("/api/screenshot", methods=["POST"])
     def save_screenshot():
         if not getattr(_hub, "journal", None):
@@ -127,6 +142,10 @@ def create_app(hub: DashboardHub) -> Flask:
 
         def generate():
             try:
+                # Push full state once on connect (replaces removed /api/snapshot polling).
+                yield "data: {}\n\n".format(
+                    json.dumps({"type": "snapshot", "data": _hub.snapshot()}),
+                )
                 heartbeat_counter = 0
                 while True:
                     while q:
@@ -158,7 +177,15 @@ def start_dashboard(hub: DashboardHub, host: str = "0.0.0.0", port: int = 8080) 
     def _run(p: int) -> None:
         import warnings
         warnings.filterwarnings("ignore", message=".*development server.*")
-        app.run(host=host, port=p, debug=False, use_reloader=False, threaded=True)
+        for attempt in range(3):
+            try:
+                app.run(host=host, port=p, debug=False, use_reloader=False, threaded=True)
+                break
+            except Exception as exc:
+                logger.error("Dashboard thread crashed (attempt %d/3): %s", attempt + 1, exc)
+                if attempt < 2:
+                    import time as _t
+                    _t.sleep(2)
 
     import socket
     import subprocess
@@ -183,12 +210,20 @@ def start_dashboard(hub: DashboardHub, host: str = "0.0.0.0", port: int = 8080) 
     except Exception:
         pass
 
-    # Verify port is free now
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.bind((host, port))
-        sock.close()
-    except OSError:
+    # Verify port is free (retry up to 5s for TIME_WAIT release)
+    import time as _time
+    port_free = False
+    for _retry in range(5):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((host, port))
+            sock.close()
+            port_free = True
+            break
+        except OSError:
+            _time.sleep(1)
+    if not port_free:
         logger.error("Port %d still in use after cleanup — dashboard NOT started", port)
         return
 
@@ -316,6 +351,29 @@ tr:hover { background:var(--surface2); }
 .scanner-activity { display:flex; gap:4px; align-items:center; }
 .scanner-dot { width:6px; height:6px; border-radius:50%; }
 
+/* HOD Momentum scanner feed */
+.hod-momentum-scanner { overflow-x:auto; }
+.hod-momentum-scanner table { font-size:12px; }
+.hod-momentum-scanner th { white-space:nowrap; font-size:10px; }
+.hod-momentum-scanner td { white-space:nowrap; vertical-align:middle; }
+.hod-momentum-scanner tr.hod-low-float { background:rgba(0,214,143,0.22); }
+.hod-momentum-scanner tr.hod-low-float:hover { background:rgba(0,214,143,0.32); }
+.hod-momentum-scanner tr.hod-breakout { background:rgba(255,107,53,0.18); }
+.hod-momentum-scanner tr.hod-breakout:hover { background:rgba(255,107,53,0.28); }
+.hod-momentum-scanner tr.hod-reclaim { background:rgba(167,139,250,0.14); }
+.hod-momentum-scanner tr.hod-today-breakout { background:rgba(251,191,36,0.12); }
+.hod-momentum-scanner tr.hod-former-momo { background:rgba(59,130,246,0.14); }
+.hod-momentum-scanner tr.hod-squeeze { background:rgba(251,191,36,0.14); }
+.hod-momentum-scanner tr.hod-default { background:rgba(251,191,36,0.06); }
+.hod-momentum-scanner tr.hod-default:hover { background:rgba(251,191,36,0.12); }
+.hod-alert-name { font-weight:600; font-size:11px; color:var(--text); }
+.hod-hot { color:#ff6b35; margin-right:4px; }
+.hod-source-tick { font-size:10px; color:#ff6b35; font-weight:600; }
+.hod-source-bar { font-size:10px; color:var(--text2); }
+.hod-filters { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:12px; }
+.hod-filter-btn { padding:4px 10px; border-radius:6px; border:1px solid var(--border); background:var(--surface2); color:var(--text2); font-size:11px; cursor:pointer; }
+.hod-filter-btn.active { background:var(--blue-bg); color:var(--blue); border-color:var(--blue); }
+
 @media(max-width:900px) {
   .grid-4 { grid-template-columns:repeat(2,1fr); }
   .grid-3 { grid-template-columns:1fr; }
@@ -400,54 +458,66 @@ tr:hover { background:var(--surface2); }
       </div>
     </div>
     <div class="card">
-      <div class="card-header"><h3>News Sentiment</h3><span class="badge pill-yellow" id="news-count">0</span></div>
-      <div id="news-wrap">
-        <div class="empty"><div class="icon">&#128240;</div>No news data yet</div>
+      <div class="card-header"><h3>ML Model Stats</h3><span class="badge pill-purple" id="ml-status-badge">--</span></div>
+      <div id="ml-stats-wrap">
+        <div class="empty"><div class="icon">&#129302;</div>ML stats loading...</div>
       </div>
     </div>
   </div>
 </div>
 </div>
 
-<!-- ================= SCANNER (combined: Live Movers + Hits + Classification) ================= -->
+<!-- ================= SCANNER (HOD Momentum feed) ================= -->
 <div class="page" id="page-scanner">
 <div class="container">
   <div class="grid grid-4" style="margin-bottom:16px">
     <div class="card stat-card">
-      <div class="stat-label">Live Movers</div>
-      <div class="stat-value text-green" id="mv-count">0</div>
-      <div class="stat-sub" id="mv-last-time">--</div>
-    </div>
-    <div class="card stat-card">
-      <div class="stat-label">Scanner Hits</div>
-      <div class="stat-value text-blue" id="scan-total">0</div>
+      <div class="stat-label">HOD Alerts</div>
+      <div class="stat-value text-green" id="hod-momentum-count">0</div>
+      <div class="stat-sub">Watchlist follows this board</div>
     </div>
     <div class="card stat-card">
       <div class="stat-label">Verified Signals</div>
       <div class="stat-value text-green" id="scan-signals">0</div>
     </div>
     <div class="card stat-card">
-      <div class="stat-label">Conversion Rate</div>
-      <div class="stat-value text-yellow" id="scan-rate">0%</div>
+      <div class="stat-label">Pattern Hits</div>
+      <div class="stat-value text-yellow" id="scan-total">0</div>
+    </div>
+    <div class="card stat-card">
+      <div class="stat-label">Trading Watchlist</div>
+      <div class="stat-value text-blue" id="trading-watchlist-count">0</div>
+      <div class="stat-sub">Active trade symbols</div>
     </div>
   </div>
 
-  <!-- Live Movers -->
   <div class="card" style="margin-bottom:16px">
     <div class="card-header">
-      <h3>Live Movers</h3>
-      <span style="font-size:11px;color:var(--text2)">Real-time | $1-$20 | UP only | updates every 5s</span>
+      <h3>Trading Watchlist</h3>
+      <span style="font-size:11px;color:var(--text2)">HOD trade names only — SPY is pinned for market panic, not HOD alerts</span>
     </div>
-    <div id="movers-table-wrap">
-      <div class="empty"><div class="icon">&#128293;</div>Waiting for market activity...</div>
+    <div id="trading-watchlist-wrap">
+      <div class="empty"><div class="icon">&#128203;</div>No symbols on watchlist yet</div>
     </div>
   </div>
 
-  <!-- Scanner Hits -->
   <div class="card" style="margin-bottom:16px">
-    <div class="card-header"><h3>Pattern Matches</h3><span class="badge pill-blue" id="ov-scan-count">0</span></div>
-    <div id="scanner-table-wrap">
-      <div class="empty"><div class="icon">&#128269;</div>No pattern matches yet</div>
+    <div class="card-header">
+      <h3>HOD Momentum Scanner</h3>
+      <span style="font-size:11px;color:var(--text2)">Chg % = from today open (or vs prior close if bars truncated) · vs Close % = like TradingView day change</span>
+    </div>
+    <div class="hod-filters" id="hod-filters">
+      <button class="hod-filter-btn active" data-filter="all">All</button>
+      <button class="hod-filter-btn" data-filter="New HOD Breakout">New HOD</button>
+      <button class="hod-filter-btn" data-filter="Today HOD Breakout">Today HOD</button>
+      <button class="hod-filter-btn" data-filter="HOD Reclaim">HOD Reclaim</button>
+      <button class="hod-filter-btn" data-filter="Former Momo Stock">Former Momo</button>
+      <button class="hod-filter-btn" data-filter="Low Float - High Rel Vol">Low Float</button>
+      <button class="hod-filter-btn" data-filter="Squeeze - Up 5% in 5min">Squeeze 5%</button>
+      <button class="hod-filter-btn" data-filter="Squeeze - Up 10% in 10min">Squeeze 10%</button>
+    </div>
+    <div class="hod-momentum-scanner" id="hod-momentum-scanner-wrap">
+      <div class="empty"><div class="icon">&#128293;</div>Waiting for HOD momentum alerts...</div>
     </div>
   </div>
 </div>
@@ -611,7 +681,9 @@ let state = {
   stats: {}, account: {}, positions: {}, symbols: {},
   recent_trades: [], recent_scans: [], pnl_history: [],
   market_open: false, stream_connected: false,
-  watchlist_scan: [], rt_movers: [], rt_new_total: 0,
+  watchlist_scan: [], rt_movers: [], hod_momentum_alerts: [], trading_watchlist: [],
+  watchlist_pinned: ['SPY'],
+  hod_momentum_filter: 'all', rt_new_total: 0,
   news: {}, journal: {events: [], loaded: false, error: null, last_update: null}
 };
 
@@ -779,32 +851,110 @@ function renderActivity() {
 
 function renderScanner() {
   let s = state.stats;
-  document.getElementById('scan-total').textContent = s.total_scan_hits||0;
-  document.getElementById('scan-signals').textContent = s.total_signals||0;
-  let rate = (s.total_scan_hits > 0) ? ((s.total_signals/s.total_scan_hits)*100).toFixed(1) : 0;
-  document.getElementById('scan-rate').textContent = rate + '%';
+  let scanTotal = document.getElementById('scan-total');
+  let scanSignals = document.getElementById('scan-signals');
+  if (scanTotal) scanTotal.textContent = s.total_scan_hits||0;
+  if (scanSignals) scanSignals.textContent = s.total_signals||0;
+  renderTradingWatchlist();
+  renderHodMomentumScanner();
+}
 
-  let wrap = document.getElementById('scanner-table-wrap');
-  let scans = state.recent_scans.slice(-50).reverse();
-  if (scans.length === 0) {
-    wrap.innerHTML = '<div class="empty"><div class="icon">&#128269;</div>No scanner hits yet</div>';
+function renderTradingWatchlist() {
+  let wrap = document.getElementById('trading-watchlist-wrap');
+  if (!wrap) return;
+  let syms = (state.trading_watchlist || []).slice();
+  let countEl = document.getElementById('trading-watchlist-count');
+
+  if (syms.length === 0) {
+    wrap.innerHTML = '<div class="empty"><div class="icon">&#128203;</div>No symbols on watchlist yet</div>';
     return;
   }
-  let html = '<table><tr><th>Time</th><th>Symbol</th><th>Price</th><th>Scanner</th><th>Score</th><th>Status</th></tr>';
-  scans.forEach(h => {
+
+  let pinned = new Set(state.watchlist_pinned || ['SPY']);
+  let alertBySym = {};
+  (state.hod_momentum_alerts || []).forEach(a => {
+    if (!alertBySym[a.symbol]) alertBySym[a.symbol] = a;
+  });
+
+  let tradeSyms = syms.filter(s => !pinned.has(s));
+  if (countEl) countEl.textContent = tradeSyms.length;
+
+  if (tradeSyms.length === 0) {
+    wrap.innerHTML = '<div class="empty"><div class="icon">&#128203;</div>Waiting for HOD alerts to add trade symbols...</div>';
+    return;
+  }
+
+  let html = '<table><tr><th>Symbol</th><th>HOD Alert</th><th>Latest</th></tr>';
+  tradeSyms.forEach(sym => {
+    let a = alertBySym[sym];
+    let onBoard = a
+      ? '<span class="pill pill-green">YES</span>'
+      : '<span class="pill pill-yellow">waiting</span>';
+    let alertCell = a
+      ? '<span class="hod-alert-name">' + escapeHtml(a.alert_name) + '</span> @ $' + (a.price||0).toFixed(2)
+      : '<span style="color:var(--text2);font-size:11px">TTL active — no new alert yet</span>';
+    html += '<tr><td>' + chartLink(sym) + '</td><td>' + onBoard + '</td><td>' + alertCell + '</td></tr>';
+  });
+  html += '</table>';
+  wrap.innerHTML = html;
+}
+
+function renderHodMomentumScanner() {
+  let wrap = document.getElementById('hod-momentum-scanner-wrap');
+  if (!wrap) return;
+
+  let alerts = (state.hod_momentum_alerts || []).slice();
+  alerts.sort((a, b) => new Date(b.time || 0) - new Date(a.time || 0));
+  let filter = state.hod_momentum_filter || 'all';
+  if (filter !== 'all') {
+    alerts = alerts.filter(a => a.alert_name === filter);
+  }
+
+  let countEl = document.getElementById('hod-momentum-count');
+  if (countEl) countEl.textContent = (state.hod_momentum_alerts || []).length;
+
+  if (alerts.length === 0) {
+    wrap.innerHTML = '<div class="empty"><div class="icon">&#128293;</div>No alerts match this filter</div>';
+    return;
+  }
+
+  let html = '<table><tr>'
+    + '<th>Time</th><th>Symbol</th><th></th><th>Price</th><th>Volume</th><th>Float</th>'
+    + '<th>Rel Vol</th><th>Bar RV</th><th>Chg %</th><th>Gap %</th><th>vs Close %</th><th>From Low %</th><th>Source</th><th>Alert</th><th>Status</th>'
+    + '</tr>';
+
+  alerts.forEach(a => {
+    let hot = a.hot ? '<span class="hod-hot" title="Hot mover">&#128293;</span>' : '';
+    let chgClass = (a.change_session_pct || 0) >= 0 ? 'text-green' : 'text-red';
     let status = '';
-    if (h.verified) {
+    if (a.verified) {
       status = '<span class="pill pill-green">SIGNAL</span>';
-    } else if (h.action_taken) {
-      status = '<span style="color:var(--red);font-size:11px">\u2718 '+h.action_taken+'</span>';
+    } else if (a.reject_reason) {
+      status = '<span style="color:var(--red);font-size:10px" title="'+escapeHtml(a.reject_reason)+'">REJECT</span>';
     } else {
-      status = '<span style="color:var(--text2);font-size:11px">pending</span>';
+      status = '<span class="pill pill-yellow">ALERT</span>';
     }
-    html += '<tr><td style="color:var(--text2)">'+shortTime(h.time)+'</td>';
-    html += '<td><strong>'+h.symbol+'</strong></td>';
-    html += '<td>$'+(h.price||0).toFixed(2)+'</td>';
-    html += '<td><span class="pill pill-blue">'+h.scanner_name+'</span></td>';
-    html += '<td>'+h.score.toFixed(2)+'</td>';
+    html += '<tr class="'+(a.row_class||'hod-default')+'">';
+    html += '<td style="color:var(--text2)">'+shortTime(a.time)+'</td>';
+    html += '<td>'+chartLink(a.symbol)+'</td>';
+    html += '<td>'+hot+'</td>';
+    html += '<td><strong>$'+(a.price||0).toFixed(2)+'</strong></td>';
+    html += '<td>'+(a.day_volume_fmt||'—')+'</td>';
+    html += '<td>'+(a.float_fmt||'—')+'</td>';
+    html += '<td class="'+chgClass+'">'+(a.rel_vol||0).toFixed(2)+'x</td>';
+    html += '<td>'+(a.bar_rvol||0).toFixed(2)+'x</td>';
+    html += '<td class="'+chgClass+'">'+((a.change_session_pct||0) >= 0 ? '+' : '')+(a.change_session_pct||0).toFixed(2)+'%</td>';
+    let gap = a.gap_pct != null ? (a.gap_pct >= 0 ? '+' : '') + a.gap_pct.toFixed(2) + '%' : '—';
+    let vsYday = a.change_from_close_pct != null ? (a.change_from_close_pct >= 0 ? '+' : '') + a.change_from_close_pct.toFixed(2) + '%' : '—';
+    html += '<td class="'+chgClass+'">'+gap+'</td>';
+    html += '<td class="'+chgClass+'">'+vsYday+'</td>';
+    html += '<td class="'+chgClass+'">+'+(a.change_from_low_pct||0).toFixed(2)+'%</td>';
+    let src = a.source === 'tick'
+      ? '<span class="hod-source-tick">TICK</span>'
+      : '<span class="hod-source-bar">BAR</span>';
+    let alertLabel = escapeHtml(a.alert_name) + (a.burst_text ? ' '+escapeHtml(a.burst_text) : '');
+    html += '<td>'+src+'</td>';
+    html += '<td><span class="hod-alert-name">'+alertLabel+'</span></td>';
     html += '<td>'+status+'</td></tr>';
   });
   html += '</table>';
@@ -888,54 +1038,7 @@ function renderStockSummary() {
 }
 
 
-function renderMovers() {
-  let movers = (state.rt_movers || []).filter(m => {
-    let sym = state.symbols[m.symbol];
-    return !sym || sym.style !== 'not_tradeable';
-  });
-  document.getElementById('mv-count').textContent = movers.length;
-
-  let wrap = document.getElementById('movers-table-wrap');
-  if (movers.length === 0) {
-    wrap.innerHTML = '<div class="empty"><div class="icon">&#128293;</div>Waiting for market activity...</div>';
-    return;
-  }
-
-  let html = '<table><tr><th>#</th><th>Symbol</th><th>Price</th><th>Change</th><th>Volume</th><th>Trades</th><th>Score</th><th>Status</th></tr>';
-  movers.forEach((s, i) => {
-    let chgClass = s.change_pct >= 0 ? 'text-green' : 'text-red';
-    let chgSign = s.change_pct >= 0 ? '+' : '';
-    let vol = s.volume >= 1000000 ? (s.volume/1000000).toFixed(1)+'M' : (s.volume/1000).toFixed(0)+'K';
-    let sym = state.symbols[s.symbol];
-    let statusPill;
-    let scanRej = '';
-    let scanHit = state.recent_scans.find(sc => sc.symbol === s.symbol);
-    if (scanHit && !scanHit.verified && scanHit.action_taken) {
-      scanRej = '<br><span style="color:var(--red);font-size:10px">\u2718 '+scanHit.action_taken+'</span>';
-    }
-    if (sym && sym.style === 'not_tradeable') {
-      statusPill = '<span class="pill pill-red">NOT TRADEABLE</span>';
-    } else if (sym && sym.style === 'scalping') {
-      statusPill = '<span class="pill pill-green">SCALPING</span>';
-    } else if (sym && sym.style === 'day_trading') {
-      statusPill = '<span class="pill pill-purple">DAY TRADING</span>';
-    } else if (sym) {
-      statusPill = '<span class="pill pill-blue">'+sym.style.toUpperCase()+'</span>';
-    } else {
-      statusPill = '<span class="pill pill-yellow">DETECTED</span>';
-    }
-    html += '<tr><td style="color:var(--text2)">'+(i+1)+'</td>';
-    html += '<td>'+chartLink(s.symbol)+'</td>';
-    html += '<td>$'+s.price.toFixed(2)+'</td>';
-    html += '<td class="'+chgClass+'">'+chgSign+s.change_pct.toFixed(2)+'%</td>';
-    html += '<td>'+vol+'</td>';
-    html += '<td>'+(s.trades||'-')+'</td>';
-    html += '<td>'+confBar((s.score||0)*100)+'</td>';
-    html += '<td>'+statusPill+scanRej+'</td></tr>';
-  });
-  html += '</table>';
-  wrap.innerHTML = html;
-}
+function renderMovers() { /* RT mover scanner removed — HOD-only */ }
 
 
 function renderLogs() {
@@ -1248,6 +1351,16 @@ function loadJournal(force) {
     });
 }
 
+
+document.querySelectorAll('.hod-filter-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.hod-filter-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    state.hod_momentum_filter = btn.dataset.filter || 'all';
+    renderHodMomentumScanner();
+  });
+});
+
 function renderAll() {
   renderOverview();
   renderMovers();
@@ -1308,22 +1421,23 @@ function dedupeScans(scans) {
   return Object.values(map);
 }
 
-// Load initial state
-fetch('/api/snapshot')
-  .then(r => r.json())
-  .then(data => {
-    let savedJournal = state.journal;
+// Apply full state from server push (SSE snapshot event — no HTTP poll)
+function applySnapshot(data) {
+  let savedJournal = state.journal;
     state = data;
-    state.journal = savedJournal || {events: [], loaded: false, error: null, last_update: null};
-    state.trading_paused = data.trading_paused || false;
+  state.journal = savedJournal || {events: [], loaded: false, error: null, last_update: null};
+  state.trading_paused = data.trading_paused || false;
     state.recent_scans = dedupeScans(state.recent_scans || []);
     state.rt_movers = data.rt_movers || [];
+  state.hod_momentum_alerts = data.hod_momentum_alerts || [];
+  state.trading_watchlist = data.trading_watchlist || [];
+  state.watchlist_pinned = data.watchlist_pinned || ['SPY'];
     state.rt_new_total = 0;
     state.news = data.news || {};
     renderAll();
-    updateTradeControls();
-    loadJournal(true);
-  });
+  updateTradeControls();
+  loadJournal(true);
+}
 
 let jrRefreshBtn = document.getElementById('jr-refresh-btn');
 if (jrRefreshBtn) {
@@ -1336,6 +1450,14 @@ let es = new EventSource('/api/stream');
 es.onmessage = function(e) {
   let msg = JSON.parse(e.data);
   switch(msg.type) {
+    case 'snapshot':
+      applySnapshot(msg.data);
+      break;
+    case 'account':
+      state.account = msg.data;
+      renderOverview();
+      renderPositionsCompact();
+      break;
     case 'trade':
       state.recent_trades.push(msg.data);
       state.stats.total_trades = (state.stats.total_trades||0) + (msg.data.trade_type==='entry'?1:0);
@@ -1361,6 +1483,17 @@ es.onmessage = function(e) {
       }
       renderMovers();
       break;
+    case 'hod_momentum_alerts':
+      state.hod_momentum_alerts = msg.data.alerts || [];
+      renderHodMomentumScanner();
+      renderTradingWatchlist();
+      if ((msg.data.alerts || []).length > 0) flashScanner();
+      break;
+    case 'trading_watchlist':
+      state.trading_watchlist = msg.data.symbols || [];
+      state.watchlist_pinned = msg.data.pinned || state.watchlist_pinned || ['SPY'];
+      renderTradingWatchlist();
+      break;
     case 'scan_hit':
       // Replace existing entry for same symbol+scanner, keep only latest
       let idx = state.recent_scans.findIndex(s => s.symbol === msg.data.symbol && s.scanner_name === msg.data.scanner_name);
@@ -1376,6 +1509,7 @@ es.onmessage = function(e) {
     case 'positions':
       state.positions = msg.data;
       renderOverview();
+      renderPositionsCompact();
       break;
     case 'cycle':
       state.stats.cycle_count = msg.data.cycle;
@@ -1390,7 +1524,6 @@ es.onmessage = function(e) {
     case 'watchlist_scan':
       state.watchlist_scan = msg.data.stocks;
       state.last_scan_time = new Date().toLocaleTimeString();
-      flashScanner();
       break;
     case 'news':
       state.news[msg.data.symbol] = msg.data;
@@ -1434,25 +1567,46 @@ es.onmessage = function(e) {
 es.onerror = function() {
   console.log('SSE disconnected, reconnecting in 2s...');
   es.close();
-  setTimeout(function() {
-    fetch('/api/snapshot').then(r=>r.json()).then(snap => {
-      let savedJournal = state.journal;
-      state.positions = snap.positions||{};
-      state.recent_trades = snap.recent_trades||[];
-      state.recent_scans = snap.recent_scans||[];
-      state.stats = snap.stats||state.stats;
-      state.account = snap.account||state.account;
-      state.rt_movers = snap.rt_movers||[];
-      state.news = snap.news||{};
-      state.ai_analysis = snap.ai_analysis||{};
-      state.journal = savedJournal || {events: [], loaded: false, error: null, last_update: null};
-      renderAll();
-    }).catch(()=>{});
-    connectSSE();
-  }, 2000);
+  setTimeout(connectSSE, 2000);
 };
 }
 connectSSE();
+
+// Hydrate immediately from REST (fallback if SSE is slow or blocked)
+fetch('/api/snapshot').then(r=>r.json()).then(data => {
+  if (data && data.market_phase) applySnapshot(data);
+  }).catch(()=>{});
+
+// ML Stats polling (every 30s)
+function fetchMLStats() {
+  fetch('/api/ml-stats').then(r=>r.json()).then(data => {
+    let wrap = document.getElementById('ml-stats-wrap');
+    let badge = document.getElementById('ml-status-badge');
+    if (!data || data.enabled === false) {
+      wrap.innerHTML = '<div style="padding:12px;color:var(--text2);font-size:13px;">ML model not loaded</div>';
+      badge.textContent = 'OFF';
+      badge.className = 'badge pill-red';
+      return;
+    }
+    badge.textContent = data.model_active ? 'ACTIVE' : 'DISABLED';
+    badge.className = 'badge ' + (data.model_active ? 'pill-green' : 'pill-red');
+    let html = '<div style="padding:12px;font-size:13px;">';
+    html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px;">';
+    html += '<div><span style="color:var(--text2)">Passed:</span> <b style="color:var(--green)">' + data.entries_passed + '</b></div>';
+    html += '<div><span style="color:var(--text2)">ML Rejected:</span> <b style="color:var(--red)">' + data.entries_rejected_by_ml + '</b></div>';
+    html += '<div><span style="color:var(--text2)">Reject Rate:</span> <b>' + data.rejection_rate_pct + '%</b></div>';
+    html += '<div><span style="color:var(--text2)">Shadow Acc:</span> <b style="color:' + (data.shadow_accuracy_pct >= 50 ? 'var(--green)' : 'var(--red)') + '">' + data.shadow_accuracy_pct + '%</b></div>';
+    html += '</div>';
+    html += '<div style="color:var(--text2);font-size:11px;">Shadow: ' + data.shadow_correct + ' correct / ' + data.shadow_wrong + ' wrong</div>';
+    if (data.model_disabled) {
+      html += '<div style="margin-top:6px;padding:4px 8px;background:var(--red-bg);border-radius:6px;font-size:11px;color:var(--red);">Auto-disabled: ' + data.disable_reason + '</div>';
+    }
+    html += '</div>';
+    wrap.innerHTML = html;
+  }).catch(()=>{});
+}
+fetchMLStats();
+setInterval(fetchMLStats, 30000);
 
 // Trading control buttons
 function updateTradeControls() {
@@ -1500,18 +1654,7 @@ document.getElementById('btn-force-close').addEventListener('click', function() 
   }).catch(err => { alert('Force close failed: ' + err.message); });
 });
 
-// Also poll positions every 5s as a fallback
-setInterval(function() {
-  fetch('/api/snapshot').then(r=>r.json()).then(snap => {
-    state.positions = snap.positions||{};
-    state.account = snap.account||state.account;
-    renderPositionsCompact();
-    let a = state.account;
-    document.getElementById('stat-equity').textContent = '$' + (a.equity||0).toLocaleString();
-    document.getElementById('stat-cash').textContent = '$' + (a.cash||0).toLocaleString();
-  }).catch(()=>{});
-}, 5000);
-
+// Journal tab only — loaded on demand when that page is visible
 setInterval(function() {
   let page = document.getElementById('page-journal');
   if (page && page.classList.contains('active')) {

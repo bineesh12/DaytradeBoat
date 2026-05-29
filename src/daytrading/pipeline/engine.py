@@ -60,7 +60,11 @@ class PipelineResult:
     scale_up_fills: List[Fill] = field(default_factory=list)
     reentry_fills: List[Fill] = field(default_factory=list)
     rejected_orders: int = 0
+    rejection_details: List[Dict[str, str]] = field(default_factory=list)
     symbols_by_style: Dict[str, List[str]] = field(default_factory=dict)
+    entry_strategies: Dict[str, str] = field(default_factory=dict)
+    exit_reasons: Dict[str, str] = field(default_factory=dict)
+    deferred_signals: List[TradeSignal] = field(default_factory=list)
 
 
 class TradingPipeline:
@@ -80,6 +84,7 @@ class TradingPipeline:
         max_positions: int = 5,
         max_position_shares: float = 500,
         max_order_shares: float = 200,
+        enable_daily_loser_blacklist: bool = False,
     ) -> None:
         self._scanners = list(scanners)
         self._verifiers = verifiers
@@ -97,9 +102,30 @@ class TradingPipeline:
         self._scan_only = False
         self._news_checker: Optional[NewsChecker] = None
         self._exit_cooldowns: Dict[str, datetime] = {}
-        self._cooldown_seconds: int = 180  # 3 min cooldown after exiting a stock
+        self._cooldown_seconds: int = 300  # 5 min cooldown after exiting a stock
         self._scan_rejections: Dict[str, str] = {}  # symbol -> last rejection reason
         self._trade_guard = TradeGuard()
+        self._enable_daily_loser_blacklist = enable_daily_loser_blacklist
+        self._daily_losers: set = set()  # symbols that lost money today — no re-entry
+        self._symbol_entry_counts: Dict[str, int] = {}  # per-symbol entries this session
+        self._max_entries_per_symbol: int = 3
+        self._daily_pnl: float = 0.0  # running realized P&L for the day
+        self._max_daily_loss: float = -200.0  # Warrior Trading: stop after -$200
+        self._circuit_breaker_tripped: bool = False
+        self._execution_timer = None  # set by runner if 10s timing is enabled
+        self._bar_aggregator = None   # set by runner for 5m context
+        self._require_hod_alert_for_entry: bool = False
+        self._hod_active_checker = None  # Callable[[str], bool] set by runner
+
+    def set_hod_entry_gate(
+        self,
+        checker,
+        *,
+        require: bool = True,
+    ) -> None:
+        """Only allow new entries when checker(symbol) is True."""
+        self._hod_active_checker = checker
+        self._require_hod_alert_for_entry = require
 
     @property
     def portfolio(self) -> PortfolioState:
@@ -134,6 +160,48 @@ class TradingPipeline:
     def set_cooldown(self, symbol: str) -> None:
         """Record an exit time for cooldown enforcement."""
         self._exit_cooldowns[symbol] = datetime.now(timezone.utc)
+
+    def record_realized_exit(
+        self,
+        symbol: str,
+        entry_price: float,
+        exit_price: float,
+        quantity: float,
+    ) -> float:
+        """Update daily P&L, loser blacklist, and circuit breaker (any exit path)."""
+        if entry_price <= 0 or quantity <= 0:
+            return 0.0
+        trade_pnl = (exit_price - entry_price) * quantity
+        self._daily_pnl += trade_pnl
+        if trade_pnl < 0 and self._enable_daily_loser_blacklist:
+            self._daily_losers.add(symbol)
+            logger.info(
+                "DAILY BLACKLIST %s: lost $%.2f — no re-entry today",
+                symbol, abs(trade_pnl),
+            )
+        # Shorter cooldown for profitable exits to allow pullback re-entry
+        if trade_pnl > 0:
+            self._exit_cooldowns[symbol] = datetime.now(timezone.utc) - timedelta(
+                seconds=self._cooldown_seconds - 120
+            )
+        if self._daily_pnl <= self._max_daily_loss and not self._circuit_breaker_tripped:
+            self._circuit_breaker_tripped = True
+            logger.warning(
+                "CIRCUIT BREAKER: daily P&L $%.2f hit max loss $%.2f — "
+                "NO MORE TRADES TODAY",
+                self._daily_pnl, self._max_daily_loss,
+            )
+        # Log trade outcome for ML data collection
+        try:
+            from daytrading.ml.data_collector import log_trade_outcome
+            log_trade_outcome(
+                symbol=symbol,
+                entry_price=entry_price,
+                exit_price=exit_price,
+            )
+        except Exception:
+            pass
+        return trade_pnl
 
     def run_cycle(
         self,
@@ -175,11 +243,20 @@ class TradingPipeline:
                 if status is OrderStatus.FILLED and fill is not None:
                     apply_fill(self._portfolio, fill)
                     result.exit_fills.append(fill)
+                    result.exit_reasons[exit_sig.symbol] = exit_sig.reason or "unknown"
                     self._exit_cooldowns[exit_sig.symbol] = datetime.now(timezone.utc)
+
+                    tracked_pos = self._exit_manager._positions.get(exit_sig.symbol)
+                    entry_px = tracked_pos.entry_price if tracked_pos else 0
+                    if entry_px > 0:
+                        self.record_realized_exit(
+                            exit_sig.symbol, entry_px, fill.price, fill.quantity,
+                        )
+
                     logger.info(
-                        "EXIT FILLED %s %.0f @ %.4f | %s (cooldown %ds)",
+                        "EXIT FILLED %s %.0f @ %.4f | %s (cooldown %ds, day P&L $%.2f)",
                         exit_sig.symbol, fill.quantity, fill.price, exit_sig.reason,
-                        self._cooldown_seconds,
+                        self._cooldown_seconds, self._daily_pnl,
                     )
                 else:
                     tracked_pos = self._exit_manager._positions.get(exit_sig.symbol)
@@ -394,6 +471,39 @@ class TradingPipeline:
 
             # Cooldown: don't re-enter a stock too soon after exiting
             if signal.action in (SignalAction.ENTER_LONG, SignalAction.ENTER_SHORT):
+                if (
+                    self._require_hod_alert_for_entry
+                    and self._hod_active_checker is not None
+                    and not self._hod_active_checker(signal.symbol)
+                ):
+                    logger.info(
+                        "HOD GATE %s: not on HOD momentum board — skip entry",
+                        signal.symbol,
+                    )
+                    result.skipped.append(signal)
+                    self._scan_rejections[signal.symbol] = (
+                        "not on HOD momentum alert board"
+                    )
+                    continue
+
+                # Circuit breaker: stop all new entries after max daily loss
+                if self._circuit_breaker_tripped:
+                    logger.warning(
+                        "CIRCUIT BREAKER BLOCK %s: daily P&L $%.2f — no new trades",
+                        signal.symbol, self._daily_pnl,
+                    )
+                    result.skipped.append(signal)
+                    continue
+
+                # Daily loser blacklist: don't re-enter a stock that lost today
+                if self._enable_daily_loser_blacklist and signal.symbol in self._daily_losers:
+                    logger.info(
+                        "BLACKLISTED %s: already lost money today — no re-entry",
+                        signal.symbol,
+                    )
+                    result.skipped.append(signal)
+                    continue
+
                 last_exit_ts = self._exit_cooldowns.get(signal.symbol)
                 if last_exit_ts is not None:
                     elapsed = (datetime.now(timezone.utc) - last_exit_ts).total_seconds()
@@ -405,6 +515,15 @@ class TradingPipeline:
                         )
                         result.skipped.append(signal)
                         continue
+
+                # Per-symbol max entries: prevent over-trading one stock
+                if self._symbol_entry_counts.get(signal.symbol, 0) >= self._max_entries_per_symbol:
+                    logger.info(
+                        "MAX ENTRIES %s: already entered %d times today — skip",
+                        signal.symbol, self._max_entries_per_symbol,
+                    )
+                    result.skipped.append(signal)
+                    continue
 
             if self._at_position_limit():
                 logger.warning("Position limit %d reached, skipping %s", self._max_positions, signal.symbol)
@@ -451,6 +570,7 @@ class TradingPipeline:
                             signal.symbol, risk, reward, reward / risk, min_rr,
                         )
                         result.rejected_orders += 1
+                        result.rejection_details.append({"symbol": signal.symbol, "reason": "R:R {:.1f} < {:.1f}".format(reward / risk, min_rr)})
                         continue
 
                     # Cap max dollar risk per trade to $100
@@ -465,6 +585,7 @@ class TradingPipeline:
                                     signal.symbol, dollar_risk,
                                 )
                                 result.rejected_orders += 1
+                                result.rejection_details.append({"symbol": signal.symbol, "reason": "risk_cap ${:.2f}".format(dollar_risk)})
                                 continue
                             logger.info(
                                 "RISK CAP %s: %.0f → %d shares ($%.2f → $%.2f risk)",
@@ -484,6 +605,25 @@ class TradingPipeline:
                                 scan_result=signal.scan_result,
                             )
 
+                    # Also cap to max_order_shares
+                    if signal.quantity > self._max_order_shares:
+                        logger.info(
+                            "SIZE CAP %s: %.0f → %d shares (max %d)",
+                            signal.symbol, signal.quantity, int(self._max_order_shares), int(self._max_order_shares),
+                        )
+                        signal = TradeSignal(
+                            symbol=signal.symbol,
+                            action=signal.action,
+                            quantity=float(int(self._max_order_shares)),
+                            entry_price=signal.entry_price,
+                            stop_loss=signal.stop_loss,
+                            take_profit=signal.take_profit,
+                            trailing_stop_offset=signal.trailing_stop_offset,
+                            max_hold_seconds=signal.max_hold_seconds,
+                            reason=signal.reason,
+                            scan_result=signal.scan_result,
+                        )
+
             order = self._signal_to_order(signal)
             if order is None:
                 continue
@@ -492,6 +632,7 @@ class TradingPipeline:
             if bar is None:
                 logger.warning("No bar data for %s, cannot execute", signal.symbol)
                 result.rejected_orders += 1
+                result.rejection_details.append({"symbol": signal.symbol, "reason": "no_bar_data"})
                 continue
 
             ok = allow_order(
@@ -502,6 +643,7 @@ class TradingPipeline:
             if not ok:
                 logger.info("Risk check rejected %s for %s", signal.action.value, signal.symbol)
                 result.rejected_orders += 1
+                result.rejection_details.append({"symbol": signal.symbol, "reason": "position_risk_limit"})
                 continue
 
             # Advanced guards: false breakout, liquidity trap, halt, market panic, spread
@@ -514,12 +656,32 @@ class TradingPipeline:
                 if not guard_ok:
                     logger.info("GUARD REJECT %s: %s", signal.symbol, guard_reason)
                     result.rejected_orders += 1
+                    result.rejection_details.append({"symbol": signal.symbol, "reason": "guard: {}".format(guard_reason)})
                     continue
+
+            # Defer to execution timer if enabled, otherwise submit immediately
+            if (self._execution_timer is not None
+                    and signal.action in (SignalAction.ENTER_LONG, SignalAction.ENTER_SHORT)):
+                result.deferred_signals.append(signal)
+                result.entry_strategies[signal.symbol] = (
+                    signal.scan_result.scanner_name if signal.scan_result else signal.reason or "unknown"
+                )
+                entered_this_cycle.add(signal.symbol)
+                logger.info(
+                    "DEFERRED %s %s %.0f @ %.4f → waiting for 10s micro-entry | %s",
+                    signal.action.value, signal.symbol,
+                    signal.quantity, signal.entry_price, signal.reason,
+                )
+                continue
 
             fill, status = self._broker.submit(order, bar, self._portfolio)
             if status is OrderStatus.FILLED and fill is not None:
                 apply_fill(self._portfolio, fill)
                 result.fills.append(fill)
+                self._symbol_entry_counts[signal.symbol] = self._symbol_entry_counts.get(signal.symbol, 0) + 1
+                result.entry_strategies[signal.symbol] = (
+                    signal.scan_result.scanner_name if signal.scan_result else signal.reason or "unknown"
+                )
                 entered_this_cycle.add(signal.symbol)
                 logger.info(
                     "FILLED %s %s %.0f @ %.4f | %s",
@@ -532,6 +694,7 @@ class TradingPipeline:
             else:
                 logger.info("Order %s for %s: %s", signal.action.value, signal.symbol, status.value)
                 result.rejected_orders += 1
+                result.rejection_details.append({"symbol": signal.symbol, "reason": "order_{}".format(status.value)})
 
         return result
 
