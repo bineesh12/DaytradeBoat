@@ -76,8 +76,35 @@ def _uptrend_bars_passing_default_guard() -> list[Bar]:
     return bars
 
 
+class _MonitorStub:
+    def __init__(self) -> None:
+        self.rule_rejections = 0
+
+    @property
+    def is_model_enabled(self) -> bool:
+        return True
+
+    def record_rule_rejection(self) -> None:
+        self.rule_rejections += 1
+
+    def record_entry_passed(self) -> None:
+        pass
+
+    def record_ml_rejection(self, *args, **kwargs) -> None:
+        pass
+
+
 class TestHardRejects:
     """Hard rejects should always fail regardless of score."""
+
+    def test_rule_rejects_are_counted_for_ml_dashboard(self, monkeypatch) -> None:
+        monitor = _MonitorStub()
+        monkeypatch.setattr(eg, "_ml_monitor", monitor)
+
+        reason = eg.check_entry_quality([], symbol="TST")
+
+        assert reason == "insufficient bars"
+        assert monitor.rule_rejections == 1
 
     def test_insufficient_bars(self) -> None:
         assert eg.check_entry_quality([]) == "insufficient bars"
@@ -147,6 +174,60 @@ class TestHardRejects:
         ]
         r = eg.check_entry_quality(bars, symbol="TST", quotes=quotes)
         assert r is not None and "spread" in r.lower()
+
+    def test_sub_five_thin_liquidity_rejects_before_ml(self) -> None:
+        """ANNA-like sub-$5 setups need enough day volume before ML/order."""
+        now = datetime.now(timezone.utc)
+        n = 20
+        bars = []
+        for i in range(n):
+            close = 3.05 + (3.48 - 3.05) * (i / (n - 1))
+            bars.append(_bar(
+                i,
+                close=close,
+                open_=close - 0.02,
+                high=close + 0.03,
+                low=close - 0.03,
+                volume=24_000,
+                base_ts=now,
+                n=n,
+            ))
+        r = eg.check_entry_quality(bars, symbol="ANNA")
+        assert r is not None
+        assert "thin sub-$5 liquidity" in r
+
+    def test_sub_five_high_relative_volume_can_pass_under_500k(self) -> None:
+        """A sub-$5 stock under 500K volume can pass when RVOL confirms momentum."""
+        from daytrading.models import Quote
+
+        now = datetime.now(timezone.utc)
+        n = 20
+        bars = []
+        for i in range(n):
+            frac = i / (n - 1)
+            close = 3.00 + 0.75 * frac
+            vol = 15_000 if i < 15 else 35_000
+            bars.append(_bar(
+                i,
+                close=close,
+                open_=close - 0.02,
+                high=close + 0.03,
+                low=close - 0.03,
+                volume=vol,
+                base_ts=now,
+                n=n,
+            ))
+        quotes = [
+            Quote(symbol="TST", ts=now, bid=3.745, ask=3.75, bid_size=800, ask_size=800)
+            for _ in range(5)
+        ]
+
+        r = eg.check_entry_quality(
+            bars, symbol="TST", quotes=quotes, avg_daily_volume=100_000,
+        )
+
+        if r is not None:
+            assert "liquidity" not in r
 
     def test_tight_spread_passes(self) -> None:
         """Spread < 0.5% of price should not reject."""
@@ -224,7 +305,69 @@ class TestScoringSystem:
             bars.append(_bar(i, close=c, open_=o, high=c + 0.05, low=o - 0.02,
                             volume=20_000, base_ts=now, n=n))
         r = eg.check_entry_quality(bars, symbol="TST")
-        assert r is None or "score" in r
+        assert r is None or "score" in r or "liquidity" in r
+
+    def test_full_liquidity_score_rejects_thin_sub_five_chop(self) -> None:
+        """Sub-$5 names need more than just 500K day volume if tape is thin."""
+        from daytrading.models import Quote
+
+        now = datetime.now(timezone.utc)
+        n = 20
+        bars = []
+        for i in range(n):
+            frac = i / (n - 1)
+            close = 3.00 + 0.40 * frac
+            vol = 35_000 if i < 15 else 15_000
+            bars.append(_bar(
+                i,
+                close=close,
+                open_=close - 0.02,
+                high=close + 0.03,
+                low=close - 0.03,
+                volume=vol,
+                base_ts=now,
+                n=n,
+            ))
+        quotes = [
+            Quote(symbol="TST", ts=now, bid=3.39, ask=3.40, bid_size=50, ask_size=50)
+            for _ in range(5)
+        ]
+
+        r = eg.check_entry_quality(bars, symbol="TST", quotes=quotes)
+
+        assert r is not None
+        assert "thin liquidity score" in r
+
+    def test_full_liquidity_score_allows_hot_sub_five_tape(self) -> None:
+        """A real high-volume sub-$5 runner should not be blocked by liquidity scoring."""
+        from daytrading.models import Quote
+
+        now = datetime.now(timezone.utc)
+        n = 20
+        bars = []
+        for i in range(n):
+            frac = i / (n - 1)
+            close = 3.00 + 0.85 * frac
+            vol = 45_000 if i < 15 else 130_000
+            bars.append(_bar(
+                i,
+                close=close,
+                open_=close - 0.02,
+                high=close + 0.03,
+                low=close - 0.03,
+                volume=vol,
+                base_ts=now,
+                n=n,
+            ))
+        quotes = [
+            Quote(symbol="TST", ts=now, bid=3.845, ask=3.85, bid_size=1200, ask_size=1200)
+            for _ in range(5)
+        ]
+
+        r = eg.check_entry_quality(bars, symbol="TST", quotes=quotes)
+
+        if r is not None:
+            assert "liquidity" not in r
 
     def test_low_day_change_low_score(self) -> None:
         """Flat stock with no day change gets hard-rejected for movement."""
@@ -431,7 +574,7 @@ class TestLowRvolPenalty:
         bars = self._bars_with_rvol(0.3)
         r = eg.check_entry_quality(bars, symbol="TST")
         if r is not None:
-            assert "rvol" in r and "-25" in r
+            assert ("rvol" in r and "-25" in r) or "liquidity" in r
 
     def test_fewer_than_10_bars_no_penalty(self) -> None:
         """With < 10 today bars, rvol can't be computed so no penalty."""

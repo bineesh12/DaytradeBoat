@@ -162,8 +162,9 @@ class ExitManager:
     The stop ratchets up every time price gains another 10 ticks.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, max_unrealized_loss: float = 50.0) -> None:
         self._positions: Dict[str, TrackedPosition] = {}
+        self._max_unrealized_loss = max_unrealized_loss
 
     @property
     def tracked(self) -> Dict[str, TrackedPosition]:
@@ -337,6 +338,24 @@ class ExitManager:
                     "MOMENTUM HIGH %s → step size %.1f%% (moved %.1f%%, trend=%.2f)",
                     pos.symbol, pos.step_pct * 100, move_pct * 100, pos.trend_strength,
                 )
+
+        # --- software dollar stop: do not wait for a wide broker stop if
+        # the position has already exceeded the intended dollar risk.
+        if self._max_unrealized_loss > 0 and pos.remaining_qty > 0:
+            if is_long:
+                unrealized_loss = max(0.0, pos.entry_price - price) * pos.remaining_qty
+            else:
+                unrealized_loss = max(0.0, price - pos.entry_price) * pos.remaining_qty
+            if unrealized_loss >= self._max_unrealized_loss:
+                logger.info(
+                    "DOLLAR STOP %s @ %.4f | unrealized loss $%.2f >= $%.2f "
+                    "(entry=%.4f, qty=%d, broker_stop=%.4f)",
+                    pos.symbol, price, unrealized_loss, self._max_unrealized_loss,
+                    pos.entry_price, int(pos.remaining_qty), pos.stop_loss or 0.0,
+                )
+                sig = self._make_exit(pos, pos.remaining_qty, price, ExitReason.STOP_LOSS)
+                pos.remaining_qty = 0
+                return [sig]
 
         # --- hard stop loss: exit all shares ---
         if pos.stop_loss is not None:

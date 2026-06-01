@@ -115,6 +115,11 @@ class TestAlpacaBroker:
                 broker._cancel_grace_seconds = 0.1
                 broker._slippage_guard = None
                 broker._limit_buffer_pct = 0.005
+                broker._marketable_limit_slippage_pct = 0.0075
+                broker._buy_limit_slippage_pct = 0.0075
+                broker._low_liquidity_buy_slippage_pct = 0.005
+                broker._momentum_buy_slippage_pct = 0.01
+                broker._sell_limit_slippage_pct = 0.0075
                 return broker, client
 
     def test_submit_buy_order_filled(self) -> None:
@@ -275,6 +280,86 @@ class TestAlpacaBroker:
         assert fill is not None
         assert limit_requests
         assert limit_requests[0].limit_price == 9.93
+
+    def test_low_liquidity_buy_limit_does_not_chase_thin_move(self, monkeypatch) -> None:
+        from daytrading.execution import alpaca_broker as broker_mod
+
+        limit_requests = []
+
+        def fake_limit_order_request(**kwargs):
+            req = SimpleNamespace(kind="limit", **kwargs)
+            limit_requests.append(req)
+            return req
+
+        monkeypatch.setattr(broker_mod, "LimitOrderRequest", fake_limit_order_request)
+        monkeypatch.setattr(broker_mod, "OrderSide", SimpleNamespace(BUY="buy", SELL="sell"))
+        monkeypatch.setattr(broker_mod, "TimeInForce", SimpleNamespace(DAY="day"))
+
+        client = _MockTradingClient()
+        client._next_order = _MockAlpacaOrder(
+            status="filled",
+            filled_avg_price=2.03,
+            filled_qty=500,
+        )
+        broker, _ = self._make_broker(client)
+
+        order = Order(symbol="KITT", side=Side.BUY, quantity=500, limit_price=2.0154)
+        bar = Bar(
+            symbol="KITT",
+            ts=datetime.now(timezone.utc),
+            open=1.98,
+            high=2.05,
+            low=1.98,
+            close=2.02,
+            volume=20_000,
+        )
+
+        fill, status = broker.submit(order, bar, PortfolioState(cash=25000))
+
+        assert status is OrderStatus.FILLED
+        assert fill is not None
+        assert limit_requests
+        assert limit_requests[0].limit_price == 2.03
+
+    def test_high_volume_momentum_buy_can_use_small_extra_window(self, monkeypatch) -> None:
+        from daytrading.execution import alpaca_broker as broker_mod
+
+        limit_requests = []
+
+        def fake_limit_order_request(**kwargs):
+            req = SimpleNamespace(kind="limit", **kwargs)
+            limit_requests.append(req)
+            return req
+
+        monkeypatch.setattr(broker_mod, "LimitOrderRequest", fake_limit_order_request)
+        monkeypatch.setattr(broker_mod, "OrderSide", SimpleNamespace(BUY="buy", SELL="sell"))
+        monkeypatch.setattr(broker_mod, "TimeInForce", SimpleNamespace(DAY="day"))
+
+        client = _MockTradingClient()
+        client._next_order = _MockAlpacaOrder(
+            status="filled",
+            filled_avg_price=2.04,
+            filled_qty=500,
+        )
+        broker, _ = self._make_broker(client)
+
+        order = Order(symbol="MOMO", side=Side.BUY, quantity=500, limit_price=2.0154)
+        bar = Bar(
+            symbol="MOMO",
+            ts=datetime.now(timezone.utc),
+            open=1.97,
+            high=2.06,
+            low=1.97,
+            close=2.02,
+            volume=150_000,
+        )
+
+        fill, status = broker.submit(order, bar, PortfolioState(cash=25000))
+
+        assert status is OrderStatus.FILLED
+        assert fill is not None
+        assert limit_requests
+        assert limit_requests[0].limit_price == 2.04
 
     def test_zero_quantity_rejected(self) -> None:
         broker, _ = self._make_broker()

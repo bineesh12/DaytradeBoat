@@ -124,6 +124,7 @@ class AlpacaRunner:
         self._news_checker: Optional[NewsChecker] = None
         self._float_checker: Optional[FloatChecker] = None
         self._last_synced_order_ids: set = set()
+        self._recorded_exit_fill_keys: set = set()
         self._trade_analyzer = None
         self._analysis_interval = 10  # run analysis every N cycles
         self._reconciler = PositionReconciler()
@@ -149,6 +150,12 @@ class AlpacaRunner:
         self._hod_seed_max = 80
         self._hod_min_price = 2.0
         self._hod_max_price = 20.0
+        self._hod_sub2_enabled = True
+        self._hod_sub2_min_price = 1.0
+        self._hod_sub2_max_price = 2.0
+        self._hod_sub2_min_change_pct = 10.0
+        self._hod_sub2_min_day_volume = 1_000_000
+        self._hod_sub2_max_float = 10_000_000
         self._hod_pool_max = 50
         self._hod_max_float = 20_000_000
         self._hod_pool_refresh_sec = 10 * 60
@@ -257,6 +264,7 @@ class AlpacaRunner:
             max_positions=cfg.max_positions,
             max_position_shares=cfg.max_position_shares,
             max_order_shares=cfg.max_order_shares,
+            pattern_max_dollar_risk=cfg.max_dollar_risk_per_trade,
             min_avg_volume=vol_threshold,
             high_liquidity_volume=high_liq,
             portfolio=portfolio,
@@ -273,10 +281,15 @@ class AlpacaRunner:
         # Wire slippage guard into broker for smart limit pricing
         broker._slippage_guard = pipeline.trade_guard.slippage
 
+        scanner_min_price = (
+            cfg.hod_sub2_momentum_min_price
+            if cfg.hod_sub2_momentum_enabled
+            else cfg.hod_momentum_min_price
+        )
         scanner = WatchlistScanner(
             api_key=cfg.alpaca_api_key,
             secret_key=cfg.alpaca_secret_key,
-            min_price=cfg.hod_momentum_min_price,
+            min_price=scanner_min_price,
             max_price=cfg.hod_momentum_max_price,
             min_volume=10_000,
             min_change_pct=2.0,
@@ -333,6 +346,12 @@ class AlpacaRunner:
         runner._float_checker = float_checker
         runner._hod_min_price = cfg.hod_momentum_min_price
         runner._hod_max_price = cfg.hod_momentum_max_price
+        runner._hod_sub2_enabled = cfg.hod_sub2_momentum_enabled
+        runner._hod_sub2_min_price = cfg.hod_sub2_momentum_min_price
+        runner._hod_sub2_max_price = cfg.hod_sub2_momentum_max_price
+        runner._hod_sub2_min_change_pct = cfg.hod_sub2_momentum_min_change_pct
+        runner._hod_sub2_min_day_volume = cfg.hod_sub2_momentum_min_day_volume
+        runner._hod_sub2_max_float = cfg.hod_sub2_momentum_max_float
         runner._hod_pool_max = cfg.hod_momentum_bar_pool_max
         runner._hod_max_float = cfg.hod_momentum_max_float
         runner._hod_pool_refresh_sec = max(60, cfg.hod_pool_refresh_minutes * 60)
@@ -374,6 +393,12 @@ class AlpacaRunner:
         pool_max: int = 50,
         float_workers: int = 6,
         max_network_checks: int = 150,
+        sub2_enabled: bool = True,
+        sub2_min_price: float = 1.0,
+        sub2_max_price: float = 2.0,
+        sub2_min_change_pct: float = 10.0,
+        sub2_min_day_volume: float = 1_000_000,
+        sub2_max_float: float = 10_000_000,
     ) -> List[str]:
         """Keep ranked snapshot passers in price band with float <= max_float.
 
@@ -388,7 +413,18 @@ class AlpacaRunner:
             if not sym:
                 continue
             price = row.get("price")
-            if price is None or price < min_price or price > max_price:
+            if price is None:
+                continue
+            standard_price_band = min_price <= price <= max_price
+            abs_change = abs(float(row.get("abs_change_pct", row.get("change_pct", 0.0)) or 0.0))
+            volume = float(row.get("volume", 0.0) or 0.0)
+            sub2_price_band = (
+                sub2_enabled
+                and sub2_min_price <= price < sub2_max_price
+                and abs_change >= sub2_min_change_pct
+                and volume >= sub2_min_day_volume
+            )
+            if not (standard_price_band or sub2_price_band):
                 continue
             eligible.append(row)
 
@@ -435,6 +471,15 @@ class AlpacaRunner:
                 break
             sym = row["symbol"]
             price = row.get("price", 0)
+            row_abs_change = abs(float(row.get("abs_change_pct", row.get("change_pct", 0.0)) or 0.0))
+            row_volume = float(row.get("volume", 0.0) or 0.0)
+            row_is_sub2 = (
+                sub2_enabled
+                and sub2_min_price <= price < sub2_max_price
+                and row_abs_change >= sub2_min_change_pct
+                and row_volume >= sub2_min_day_volume
+            )
+            row_max_float = sub2_max_float if row_is_sub2 else max_float
             shares = float_checker.get_float_cached(sym)
             if shares is not None:
                 if price > 0 and shares * price > SPLIT_SANITY_CAP:
@@ -443,7 +488,7 @@ class AlpacaRunner:
                         sym, shares, price, shares * price / 1e9,
                     )
                     need_network.append(row)
-                elif shares <= max_float:
+                elif shares <= row_max_float:
                     passed.append(sym)
             else:
                 need_network.append(row)
@@ -471,7 +516,17 @@ class AlpacaRunner:
                     len(passed),
                     time.time() - t0,
                 )
-            if shares is None or shares > max_float:
+            price = row.get("price", 0)
+            row_abs_change = abs(float(row.get("abs_change_pct", row.get("change_pct", 0.0)) or 0.0))
+            row_volume = float(row.get("volume", 0.0) or 0.0)
+            row_is_sub2 = (
+                sub2_enabled
+                and sub2_min_price <= price < sub2_max_price
+                and row_abs_change >= sub2_min_change_pct
+                and row_volume >= sub2_min_day_volume
+            )
+            row_max_float = sub2_max_float if row_is_sub2 else max_float
+            if shares is None or shares > row_max_float:
                 continue
             passed.append(sym)
 
@@ -497,16 +552,20 @@ class AlpacaRunner:
         price = self._latest_price(symbol)
         if price is None:
             return True
-        return self._hod_min_price <= price <= self._hod_max_price
+        return (
+            self._hod_min_price <= price <= self._hod_max_price
+            or (
+                self._hod_sub2_enabled
+                and self._hod_sub2_min_price <= price < self._hod_sub2_max_price
+            )
+        )
 
     def _prune_hod_bar_pool_by_price(self) -> List[str]:
         removed: List[str] = []
         kept: List[str] = []
         for sym in self._hod_bar_pool:
             price = self._latest_price(sym)
-            if price is not None and not (
-                self._hod_min_price <= price <= self._hod_max_price
-            ):
+            if price is not None and not self._symbol_in_hod_price_band(sym):
                 removed.append(sym)
             else:
                 kept.append(sym)
@@ -554,6 +613,7 @@ class AlpacaRunner:
             return
         batch = need[: self._hod_hydrate_batch_max]
         logger.info("HOD bar pool: hydrating %d new symbols", len(batch))
+        self._hub.add_log("INFO", "HOD bar pool hydrating {} symbols".format(len(batch)))
         try:
             bars_by_symbol = self._fetch_session_bars(batch)
             prior_stats = self._fetch_prior_day_stats(batch)
@@ -602,6 +662,12 @@ class AlpacaRunner:
             max_price=self._hod_max_price,
             max_float=self._hod_max_float,
             pool_max=self._hod_pool_max,
+            sub2_enabled=self._hod_sub2_enabled,
+            sub2_min_price=self._hod_sub2_min_price,
+            sub2_max_price=self._hod_sub2_max_price,
+            sub2_min_change_pct=self._hod_sub2_min_change_pct,
+            sub2_min_day_volume=self._hod_sub2_min_day_volume,
+            sub2_max_float=self._hod_sub2_max_float,
         )
         added, removed = self._merge_hod_bar_pool(ranked)
         self._prune_hod_bar_pool_by_price()
@@ -617,6 +683,7 @@ class AlpacaRunner:
             if need:
                 batch = need[: self._hod_hydrate_batch_max]
                 logger.info("HOD bar pool: hydrating %d new symbols", len(batch))
+                self._hub.add_log("INFO", "HOD bar pool hydrating {} symbols".format(len(batch)))
                 bars_by_symbol = self._fetch_session_bars(batch)
                 prior_stats = self._fetch_prior_day_stats(batch)
 
@@ -633,6 +700,12 @@ class AlpacaRunner:
             len(self._hod_bar_pool),
             len(added),
             len(removed),
+        )
+        self._hub.add_log(
+            "INFO",
+            "HOD pool refresh [{}]: {} symbols ({} added, {} removed)".format(
+                self._market_phase(), len(self._hod_bar_pool), len(added), len(removed),
+            ),
         )
 
     def _request_pool_refresh_now(self) -> None:
@@ -716,10 +789,25 @@ class AlpacaRunner:
         new_movers = []
         for c in candidates:
             sym = c["symbol"]
-            if sym in current_pool:
-                continue
             # Force-add strong movers even if seen before
             is_strong = c.get("abs_change_pct", 0) >= 10.0 and c.get("volume", 0) >= 200_000
+            if sym in current_pool:
+                bars = self._bar_buffer.get(sym)
+                bars_stale = True
+                if bars:
+                    last_bar = bars[-1]
+                    if last_bar.ts is not None:
+                        try:
+                            bars_stale = (
+                                datetime.now(timezone.utc) - last_bar.ts
+                            ).total_seconds() > 120
+                        except Exception:
+                            bars_stale = False
+                    else:
+                        bars_stale = False
+                if is_strong and (not bars or bars_stale):
+                    new_movers.append(c)
+                continue
             if sym in self._fast_scan_known and not is_strong:
                 continue
             new_movers.append(c)
@@ -741,6 +829,12 @@ class AlpacaRunner:
             len(new_movers),
             time.time() - t0,
             ", ".join(c["symbol"] for c in new_movers[:10]),
+        )
+        self._hub.add_log(
+            "INFO",
+            "Fast scan: {} new movers — {}".format(
+                len(new_movers), ", ".join(c["symbol"] for c in new_movers[:10]),
+            ),
         )
 
     def _setup_hod_momentum(self, cfg: Settings, pipeline: TradingPipeline) -> None:
@@ -773,6 +867,12 @@ class AlpacaRunner:
             min_day_volume=cfg.hod_momentum_min_day_volume,
             require_break_prior_day_high=cfg.hod_momentum_require_break_prior_day_high,
             rth_only=cfg.hod_momentum_rth_only,
+            sub2_enabled=cfg.hod_sub2_momentum_enabled,
+            sub2_min_price=cfg.hod_sub2_momentum_min_price,
+            sub2_max_price=cfg.hod_sub2_momentum_max_price,
+            sub2_min_session_change_pct=cfg.hod_sub2_momentum_min_change_pct,
+            sub2_min_day_volume=cfg.hod_sub2_momentum_min_day_volume,
+            sub2_max_float=cfg.hod_sub2_momentum_max_float,
             debug=cfg.hod_scanner_debug,
         )
 
@@ -788,7 +888,11 @@ class AlpacaRunner:
             self._hod_tick_tracker = HODTickTracker(
                 store,
                 float_checker=self._float_checker,
-                min_price=cfg.hod_momentum_min_price,
+                min_price=(
+                    cfg.hod_sub2_momentum_min_price
+                    if cfg.hod_sub2_momentum_enabled
+                    else cfg.hod_momentum_min_price
+                ),
                 max_price=cfg.hod_momentum_max_price,
                 max_float=cfg.hod_momentum_max_float,
                 min_day_volume=cfg.hod_momentum_min_day_volume,
@@ -1449,7 +1553,7 @@ class AlpacaRunner:
 
         # Initialize AI Trade Analyzer
         from daytrading.analytics.trade_analyzer import TradeAnalyzer
-        self._trade_analyzer = TradeAnalyzer(min_trades=5, max_block_trades=5)
+        self._trade_analyzer = TradeAnalyzer(min_trades=3, max_block_trades=3)
 
         if self._watchlist_data:
             self._hub.on_watchlist_scan(self._watchlist_data)
@@ -1687,6 +1791,10 @@ class AlpacaRunner:
                         # Outside trading window: still check exits but no new entries
                         if self._pipeline.exit_manager.tracked:
                             self._check_exits_only()
+                        self._hub.on_cycle_heartbeat(
+                            cycle_count,
+                            "entry window closed",
+                        )
         except KeyboardInterrupt:
             logger.info("Keyboard interrupt received")
         finally:
@@ -1924,11 +2032,38 @@ class AlpacaRunner:
         cycle_num: Optional[int] = None,
     ) -> float:
         """Single path for P&L, journal, dashboard, and broker stop cleanup."""
+        fill_ts = fill.ts.isoformat() if hasattr(fill.ts, "isoformat") else str(fill.ts)
+        fill_key = (
+            fill.symbol,
+            fill.side.value,
+            round(float(fill.quantity), 4),
+            round(float(fill.price), 4),
+            fill_ts,
+        )
+        recorded_exit_fill_keys = getattr(self, "_recorded_exit_fill_keys", None)
+        if recorded_exit_fill_keys is None:
+            recorded_exit_fill_keys = set()
+            self._recorded_exit_fill_keys = recorded_exit_fill_keys
+        if fill_key in recorded_exit_fill_keys:
+            logger.info(
+                "Duplicate exit fill ignored %s %.0f @ %.4f",
+                fill.symbol, fill.quantity, fill.price,
+            )
+            return 0.0
+        recorded_exit_fill_keys.add(fill_key)
+        if len(recorded_exit_fill_keys) > 1000:
+            self._recorded_exit_fill_keys = set(list(recorded_exit_fill_keys)[-500:])
+
         pnl = 0.0
         if entry_price > 0:
             pnl = self._pipeline.record_realized_exit(
                 fill.symbol, entry_price, fill.price, fill.quantity,
             )
+        try:
+            from daytrading.ml.shadow_collector import label_exit_snapshots
+            label_exit_snapshots(fill.symbol, fill.price)
+        except Exception:
+            pass
         self._hub.on_exit_fill(fill, entry_price=entry_price)
         self._hub.add_log(
             "INFO",
@@ -2433,6 +2568,12 @@ class AlpacaRunner:
             len(hydrate_symbols),
             ", ".join(hydrate_symbols[:10]),
         )
+        self._hub.add_log(
+            "INFO",
+            "Fast scan hydrating {} HOD movers — {}".format(
+                len(hydrate_symbols), ", ".join(hydrate_symbols[:10]),
+            ),
+        )
 
         batch = hydrate_symbols[:self._hod_hydrate_batch_max]
         try:
@@ -2501,6 +2642,14 @@ class AlpacaRunner:
                     volume=0, ts=now,
                 )
                 fill, status = self._broker.submit(order, bar, self._pipeline.portfolio)
+                try:
+                    from daytrading.ml.shadow_collector import log_execution_quality
+                    log_execution_quality(
+                        order=order, bar=bar, status=status, fill=fill,
+                        source="fast_exit_limit",
+                    )
+                except Exception:
+                    pass
                 if fill:
                     from daytrading.execution.broker import apply_fill as _apply_fill
                     _apply_fill(self._pipeline.portfolio, fill)
@@ -2534,6 +2683,14 @@ class AlpacaRunner:
                         limit_price=None,  # broker converts to guarded marketable limit
                     )
                     fill2, status2 = self._broker.submit(market_order, bar, self._pipeline.portfolio)
+                    try:
+                        from daytrading.ml.shadow_collector import log_execution_quality
+                        log_execution_quality(
+                            order=market_order, bar=bar, status=status2, fill=fill2,
+                            source="fast_exit_guarded_marketable",
+                        )
+                    except Exception:
+                        pass
                     if fill2:
                         from daytrading.execution.broker import apply_fill as _apply_fill2
                         _apply_fill2(self._pipeline.portfolio, fill2)
@@ -2808,6 +2965,13 @@ class AlpacaRunner:
                 )
 
             fill, status = self._broker.submit(order, bar, self._pipeline.portfolio)
+            try:
+                from daytrading.ml.shadow_collector import log_execution_quality
+                log_execution_quality(
+                    order=order, bar=bar, status=status, fill=fill, source="timed_entry",
+                )
+            except Exception:
+                pass
             if (
                 fill is None
                 and self._is_hot_hod_timed_signal(signal)
@@ -2918,7 +3082,16 @@ class AlpacaRunner:
                 "TIMED ENTRY hot retry %s %.0f @ %.4f (signal %.4f, cap %.1f%%)",
                 signal.symbol, signal.quantity, live, original, max_chase_pct * 100,
             )
-            return self._broker.submit(retry_order, retry_bar, self._pipeline.portfolio)
+            fill, status = self._broker.submit(retry_order, retry_bar, self._pipeline.portfolio)
+            try:
+                from daytrading.ml.shadow_collector import log_execution_quality
+                log_execution_quality(
+                    order=retry_order, bar=retry_bar, status=status, fill=fill,
+                    source="timed_entry_hot_retry",
+                )
+            except Exception:
+                pass
+            return fill, status
         except Exception as exc:
             logger.warning("TIMED ENTRY hot retry failed %s: %s", signal.symbol, exc)
             return None, first_status
@@ -3025,6 +3198,14 @@ class AlpacaRunner:
             )
             bar = bars[-1]
             fill, status = self._broker.submit(order, bar, self._pipeline.portfolio)
+            try:
+                from daytrading.ml.shadow_collector import log_execution_quality
+                log_execution_quality(
+                    order=order, bar=bar, status=status, fill=fill,
+                    source="breakout_scalp",
+                )
+            except Exception:
+                pass
             if fill:
                 apply_fill(self._pipeline.portfolio, fill)
                 self._on_position_opened(
@@ -3343,6 +3524,30 @@ class AlpacaRunner:
             monitor.check_shadow_outcomes()
         except Exception:
             pass
+        try:
+            from daytrading.ml.shadow_collector import (
+                log_exit_snapshot,
+                update_deferred_outcomes,
+            )
+            update_deferred_outcomes(bar_universe)
+            tracked = self._pipeline.exit_manager.tracked
+            for sym, pos in tracked.items():
+                bars = bar_universe.get(sym) or list(self._bar_buffer.get(sym, []))
+                if not bars:
+                    continue
+                price = bars[-1].close
+                log_exit_snapshot(
+                    symbol=sym,
+                    price=price,
+                    entry_price=pos.entry_price,
+                    remaining_qty=pos.remaining_qty,
+                    sold_half=pos.sold_half,
+                    breakeven_locked=pos.breakeven_locked,
+                    reason=pos.reason,
+                    bars=bars,
+                )
+        except Exception:
+            pass
 
     def _inject_recent_trade_bars(self, bar_universe: dict) -> None:
         """Append a live synthetic 1m bar when REST bars are stale but tape is fresh.
@@ -3458,6 +3663,7 @@ class AlpacaRunner:
                 pass
 
         if not trade_universe and not bar_universe:
+            self._hub.on_cycle_heartbeat(cycle_num, "no bars yet")
             return
 
         now = datetime.now(timezone.utc)
@@ -3472,6 +3678,7 @@ class AlpacaRunner:
         try:
             if self._hub.trading_paused:
                 logger.debug("Trading paused — skipping cycle %d", cycle_num)
+                self._hub.on_cycle_heartbeat(cycle_num, "trading paused")
                 return
             if trade_universe:
                 if self._pipeline._router is not None:
@@ -3980,14 +4187,33 @@ class AlpacaRunner:
             labeled = count_labeled()
             if labeled < 5:
                 logger.info("ML RETRAIN: skipped — only %d labeled samples (need 5+)", labeled)
-                return
-            logger.info("ML RETRAIN: starting with %d labeled samples...", labeled)
-            from daytrading.ml.train import train
-            train()
-            logger.info("ML RETRAIN: complete — model updated for tomorrow")
-            self._hub.add_log("INFO", f"ML model retrained ({labeled} samples)")
+            else:
+                logger.info("ML RETRAIN: starting with %d labeled samples...", labeled)
+                from daytrading.ml.train import train
+                trained = train()
+                if trained:
+                    logger.info("ML RETRAIN: complete — model updated for tomorrow")
+                    self._hub.add_log("INFO", f"ML model retrained ({labeled} samples)")
+                else:
+                    logger.info("ML RETRAIN: skipped — trainer did not write a model")
+                    self._hub.add_log("INFO", "ML retrain skipped — not enough usable data")
         except Exception as exc:
             logger.warning("ML RETRAIN failed: %s", exc)
+
+        try:
+            from daytrading.ml.shadow_collector import dataset_counts
+            from daytrading.ml.shadow_train import train_all_shadow_models
+            counts = dataset_counts()
+            logger.info("ML SHADOW DATASETS: %s", counts)
+            results = train_all_shadow_models(min_samples=20)
+            trained = [name for name, ok in results.items() if ok]
+            if trained:
+                logger.info("ML SHADOW RETRAIN: trained %s", ", ".join(trained))
+                self._hub.add_log("INFO", "ML shadow trained: {}".format(", ".join(trained)))
+            else:
+                logger.info("ML SHADOW RETRAIN: no advisory models trained")
+        except Exception as exc:
+            logger.warning("ML SHADOW RETRAIN failed: %s", exc)
 
     def _shutdown_gracefully(self) -> None:
         """Clean shutdown: stop scanner, stream, optionally close positions."""

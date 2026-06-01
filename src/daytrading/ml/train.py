@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 MODEL_DIR = Path(__file__).resolve().parent.parent.parent.parent / "data" / "models"
 MODEL_PATH = MODEL_DIR / "entry_model.json"
+MIN_LIVE_TRAIN_SAMPLES = int(os.getenv("DAYTRADING_ML_MIN_LIVE_SAMPLES", "25"))
 
 MIN_FLOAT = 500_000
 MAX_FLOAT = 20_000_000
@@ -191,24 +192,27 @@ def _load_live_data() -> Tuple[List[List[float]], List[int]]:
     return X, y
 
 
-def train() -> None:
+def train() -> bool:
     """Main training pipeline."""
     try:
         import xgboost as xgb
     except ImportError:
         logger.error("xgboost not installed. Run: pip install xgboost scikit-learn")
-        sys.exit(1)
+        return False
 
     # Phase 1: Try to use live collected data
     X_live, y_live = _load_live_data()
-    if len(X_live) >= 50:
+    live_has_both_classes = len(set(y_live)) >= 2
+    if len(X_live) >= MIN_LIVE_TRAIN_SAMPLES and live_has_both_classes:
         logger.info("Using LIVE collected data: %d labeled samples (%.0f%% positive)",
                     len(X_live), sum(y_live) / len(y_live) * 100)
         X_all = X_live
         y_all = y_live
     else:
-        logger.info("Live data insufficient (%d samples) — falling back to Alpaca historical",
-                    len(X_live))
+        logger.info(
+            "Live data insufficient (%d samples, both_classes=%s) — falling back to Alpaca historical",
+            len(X_live), live_has_both_classes,
+        )
         X_all, y_all = _fetch_historical_data()
         # Merge any live data we do have
         if X_live:
@@ -216,9 +220,15 @@ def train() -> None:
             y_all.extend(y_live)
             logger.info("Merged %d live samples with %d historical", len(X_live), len(X_all) - len(X_live))
 
-    if len(X_all) < 50:
-        logger.error("Not enough training data: %d samples (need at least 50)", len(X_all))
-        sys.exit(1)
+    if len(X_all) < MIN_LIVE_TRAIN_SAMPLES:
+        logger.error(
+            "Not enough training data: %d samples (need at least %d)",
+            len(X_all), MIN_LIVE_TRAIN_SAMPLES,
+        )
+        return False
+    if len(set(y_all)) < 2:
+        logger.error("Not enough training diversity: need both winners and losers")
+        return False
 
     logger.info("Total samples: %d (%.0f%% positive)", len(X_all), sum(y_all) / len(y_all) * 100)
 
@@ -252,7 +262,16 @@ def train() -> None:
     y_pred = model.predict(X_test)
     acc = accuracy_score(y_test, y_pred)
     logger.info("Test accuracy: %.1f%%", acc * 100)
-    logger.info("\n%s", classification_report(y_test, y_pred, target_names=["loss", "profit"]))
+    logger.info(
+        "\n%s",
+        classification_report(
+            y_test,
+            y_pred,
+            labels=[0, 1],
+            target_names=["loss", "profit"],
+            zero_division=0,
+        ),
+    )
 
     # Feature importance
     from daytrading.ml.features import FEATURE_NAMES
@@ -266,6 +285,7 @@ def train() -> None:
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     model.save_model(str(MODEL_PATH))
     logger.info("Model saved to %s", MODEL_PATH)
+    return True
 
 
 def _fetch_historical_data() -> Tuple[List[List[float]], List[int]]:

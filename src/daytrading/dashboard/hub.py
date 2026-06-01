@@ -353,6 +353,26 @@ class DashboardHub:
         }
         self._broadcast("cycle", summary)
 
+    def on_cycle_heartbeat(self, cycle_num: int, reason: str = "") -> None:
+        """Mark loop progress when a full pipeline result is not available."""
+        with self._lock:
+            self.cycle_count = cycle_num
+            if reason:
+                self.log_messages.append({
+                    "level": "INFO",
+                    "message": "Cycle {} heartbeat: {}".format(cycle_num, reason),
+                    "ts": _now_str(),
+                })
+        self._broadcast("cycle", {
+            "cycle": cycle_num,
+            "scan_hits": 0,
+            "signals": 0,
+            "fills": 0,
+            "exits": 0,
+            "rejected": 0,
+            "reason": reason,
+        })
+
     def on_news(self, symbol: str, score: float, headlines: list) -> None:
         """Store and broadcast news sentiment for a symbol."""
         data = {
@@ -413,6 +433,7 @@ class DashboardHub:
                 },
                 "recent_trades": [_trade_dict(t) for t in list(self.trades)[-50:]],
                 "recent_scans": [_scanner_dict(s) for s in list(self.scanner_hits)[-50:]],
+                "logs": list(self.log_messages),
                 "pnl_history": list(self.pnl_history),
                 "market_open": self.market_open,
                 "market_phase": self.market_phase,

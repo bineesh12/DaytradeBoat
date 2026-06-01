@@ -34,11 +34,20 @@ def _safe_div(a: float, b: float) -> float:
 class NightlyAnalyst:
     """Collects trade data from the journal DB and produces a nightly report."""
 
-    def __init__(self, db_path: str, report_dir: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        db_path: str,
+        report_dir: Optional[str] = None,
+        ml_dir: Optional[str] = None,
+        model_dir: Optional[str] = None,
+    ) -> None:
         self._db_path = db_path
         self._report_dir = report_dir or os.path.join(
             os.path.dirname(db_path), "..", "reports"
         )
+        data_root = os.path.abspath(os.path.join(os.path.dirname(db_path), ".."))
+        self._ml_dir = ml_dir or os.path.join(data_root, "ml")
+        self._model_dir = model_dir or os.path.join(data_root, "models")
         os.makedirs(self._report_dir, exist_ok=True)
 
     def run(self, day: Optional[str] = None) -> Dict[str, Any]:
@@ -76,6 +85,8 @@ class NightlyAnalyst:
             "risk_analysis": self._analyze_risk(trades),
             "scanner_analysis": self._analyze_scanners(scan_hits, trades),
             "rejection_analysis": self._analyze_rejections(mistakes),
+            "ml_learning": self._analyze_ml_learning(day),
+            "ml_progress": self._analyze_ml_progress(day),
             "problems": self._identify_problems(trades, mistakes),
             "cycle_stats": {
                 "total_cycles": len(cycles),
@@ -338,6 +349,326 @@ class NightlyAnalyst:
             "total_rejections": len(mistakes),
             "by_kind": dict(by_kind),
             "top_reasons": [{"reason": r, "count": c} for r, c in top_reasons],
+        }
+
+    def _load_ml_rows(self, filename: str, day: Optional[str] = None) -> List[Dict]:
+        path = os.path.join(self._ml_dir, filename)
+        if not os.path.exists(path):
+            return []
+        rows = []
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if day is None or str(row.get("ts") or "").startswith(day):
+                    rows.append(row)
+        return rows
+
+    def _symbol_outcome(self, rows: List[Dict], field: str) -> Optional[Dict]:
+        best = None
+        for row in rows:
+            value = row.get(field)
+            if value is None:
+                continue
+            try:
+                value_f = float(value)
+            except (TypeError, ValueError):
+                continue
+            if best is None or value_f > best["value"]:
+                best = {
+                    "symbol": row.get("symbol") or "?",
+                    "value": round(value_f, 4),
+                }
+        return best
+
+    def _analyze_binary_outcomes(
+        self,
+        rows: List[Dict],
+        *,
+        positive_name: str,
+        outcome_field: str = "future_return_pct",
+    ) -> Dict:
+        labeled = [r for r in rows if r.get("label") is not None]
+        positives = [r for r in labeled if int(r.get("label") or 0) == 1]
+        return {
+            "total": len(rows),
+            "labeled": len(labeled),
+            positive_name: len(positives),
+            "positive_rate": round(_safe_div(len(positives), len(labeled)) * 100.0, 1),
+            "best": self._symbol_outcome(labeled, outcome_field),
+        }
+
+    def _analyze_execution_learning(self, rows: List[Dict]) -> Dict:
+        labeled = [r for r in rows if r.get("label") is not None]
+        good = [r for r in labeled if int(r.get("label") or 0) == 1]
+        slips = []
+        worst = None
+        status_counts: Dict[str, int] = defaultdict(int)
+        for row in rows:
+            status_counts[str(row.get("status") or "unknown")] += 1
+            slip = row.get("slippage_pct")
+            if slip is None:
+                continue
+            try:
+                slip_f = float(slip)
+            except (TypeError, ValueError):
+                continue
+            slips.append(slip_f)
+            if worst is None or slip_f > worst["value"]:
+                worst = {
+                    "symbol": row.get("symbol") or "?",
+                    "value": round(slip_f, 4),
+                }
+        return {
+            "total": len(rows),
+            "labeled": len(labeled),
+            "good_fills": len(good),
+            "bad_fills": len(labeled) - len(good),
+            "good_rate": round(_safe_div(len(good), len(labeled)) * 100.0, 1),
+            "avg_slippage_pct": round(_safe_div(sum(slips), len(slips)), 4) if slips else 0.0,
+            "worst": worst,
+            "status_counts": dict(status_counts),
+        }
+
+    def _top_reasons(self, rows: List[Dict]) -> List[Dict]:
+        counts: Dict[str, int] = defaultdict(int)
+        for row in rows:
+            reason = str(row.get("reason") or "unknown")[:60]
+            counts[reason] += 1
+        return [
+            {"reason": reason, "count": count}
+            for reason, count in sorted(counts.items(), key=lambda x: -x[1])[:5]
+        ]
+
+    def _analyze_entry_model_candidates(self, day: str) -> Dict:
+        rows = self._load_ml_rows("entry_candidates.jsonl", day)
+        labeled = [r for r in rows if r.get("outcome_pnl") is not None]
+        profitable = []
+        pnl_values = []
+        best = None
+        worst = None
+        for row in labeled:
+            try:
+                pnl = float(row.get("outcome_pnl") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            pnl_values.append(pnl)
+            if pnl > 0:
+                profitable.append(row)
+            candidate = {
+                "symbol": row.get("symbol") or "?",
+                "value": round(pnl, 4),
+            }
+            if best is None or pnl > best["value"]:
+                best = candidate
+            if worst is None or pnl < worst["value"]:
+                worst = candidate
+        passed = [r for r in rows if r.get("passed") is True]
+        rejected = [r for r in rows if r.get("passed") is False]
+        return {
+            "total": len(rows),
+            "labeled": len(labeled),
+            "passed": len(passed),
+            "rejected": len(rejected),
+            "profitable": len(profitable),
+            "positive_rate": round(_safe_div(len(profitable), len(labeled)) * 100.0, 1),
+            "avg_outcome_pct": round(_safe_div(sum(pnl_values), len(pnl_values)), 4) if pnl_values else 0.0,
+            "best": best,
+            "worst": worst,
+        }
+
+    def _analyze_entry_shadow_results(self, day: str) -> Dict:
+        rows = self._load_ml_rows("shadow_results.jsonl", day)
+        correct = [r for r in rows if r.get("ml_correct") is True]
+        wrong = [r for r in rows if r.get("ml_correct") is False]
+        best_missed = None
+        for row in wrong:
+            try:
+                change = float(row.get("change_pct") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            candidate = {
+                "symbol": row.get("symbol") or "?",
+                "value": round(change, 4),
+            }
+            if best_missed is None or change > best_missed["value"]:
+                best_missed = candidate
+        return {
+            "total": len(rows),
+            "labeled": len(rows),
+            "correct": len(correct),
+            "wrong": len(wrong),
+            "positive_rate": round(_safe_div(len(correct), len(rows)) * 100.0, 1),
+            "best_missed": best_missed,
+        }
+
+    def _analyze_ml_learning(self, day: str) -> Dict:
+        """Summarize advisory shadow ML data collected during the trading day."""
+        missed = self._load_ml_rows("missed_opportunities.jsonl", day)
+        pullbacks = self._load_ml_rows("pullback_candidates.jsonl", day)
+        exits = self._load_ml_rows("exit_snapshots.jsonl", day)
+        execution = self._load_ml_rows("execution_quality.jsonl", day)
+        entry_model = self._analyze_entry_model_candidates(day)
+        entry_shadow = self._analyze_entry_shadow_results(day)
+
+        return {
+            "entry_model": entry_model,
+            "entry_shadow": entry_shadow,
+            "missed_opportunities": {
+                **self._analyze_binary_outcomes(missed, positive_name="went_up"),
+                "top_reasons": self._top_reasons(missed),
+            },
+            "pullback_candidates": self._analyze_binary_outcomes(
+                pullbacks,
+                positive_name="worked",
+            ),
+            "exit_helper": self._analyze_binary_outcomes(
+                exits,
+                positive_name="hold_helped",
+            ),
+            "execution_quality": self._analyze_execution_learning(execution),
+            "total_rows": (
+                len(missed) + len(pullbacks) + len(exits) + len(execution)
+                + entry_model.get("total", 0) + entry_shadow.get("total", 0)
+            ),
+        }
+
+    def _previous_report(self, day: str) -> Optional[Dict]:
+        if not os.path.isdir(self._report_dir):
+            return None
+        candidates = []
+        for name in os.listdir(self._report_dir):
+            if not name.endswith(".json"):
+                continue
+            report_day = name[:-5]
+            if report_day >= day:
+                continue
+            candidates.append((report_day, os.path.join(self._report_dir, name)))
+        for _, path in sorted(candidates, reverse=True):
+            try:
+                with open(path) as f:
+                    report = json.load(f)
+            except Exception:
+                continue
+            if isinstance(report, dict):
+                return report
+        return None
+
+    def _ml_dataset_progress(self, current: Dict, previous: Dict) -> List[Dict]:
+        labels = {
+            "entry_model": ("Entry ML candidates", "profitable"),
+            "entry_shadow": ("Entry ML reject shadow", "correct"),
+            "missed_opportunities": ("Missed setups", "went_up"),
+            "pullback_candidates": ("Pullback entries", "worked"),
+            "exit_helper": ("Exit helper", "hold_helped"),
+            "execution_quality": ("Execution quality", "good_fills"),
+        }
+        rows = []
+        for key, (label, positive_key) in labels.items():
+            cur = current.get(key, {})
+            prev = previous.get(key, {}) if previous else {}
+            cur_rate = cur.get("good_rate", cur.get("positive_rate", 0.0))
+            prev_rate = prev.get("good_rate", prev.get("positive_rate", 0.0))
+            rows.append({
+                "dataset": key,
+                "label": label,
+                "tracked_today": cur.get("total", 0),
+                "labeled_today": cur.get("labeled", 0),
+                "positive_today": cur.get(positive_key, 0),
+                "rate_today": cur_rate,
+                "previous_rate": prev_rate,
+                "rate_change": round(float(cur_rate or 0.0) - float(prev_rate or 0.0), 1),
+            })
+        return rows
+
+    def _all_time_ml_counts(self) -> Dict:
+        files = {
+            "entry_model": "entry_candidates.jsonl",
+            "entry_shadow": "shadow_results.jsonl",
+            "missed_opportunities": "missed_opportunities.jsonl",
+            "pullback_candidates": "pullback_candidates.jsonl",
+            "exit_helper": "exit_snapshots.jsonl",
+            "execution_quality": "execution_quality.jsonl",
+        }
+        counts = {}
+        for key, filename in files.items():
+            rows = self._load_ml_rows(filename)
+            if key == "entry_model":
+                labeled = [r for r in rows if r.get("outcome_pnl") is not None]
+            elif key == "entry_shadow":
+                labeled = rows
+            else:
+                labeled = [r for r in rows if r.get("label") is not None]
+            counts[key] = {
+                "total": len(rows),
+                "labeled": len(labeled),
+            }
+        return counts
+
+    def _model_meta(self) -> List[Dict]:
+        model_files = {
+            "missed_opportunity": "missed_opportunity_model.meta.json",
+            "pullback_entry": "pullback_entry_model.meta.json",
+            "exit_helper": "exit_helper_model.meta.json",
+            "execution_risk": "execution_risk_model.meta.json",
+        }
+        metas = []
+        for name, filename in model_files.items():
+            path = os.path.join(self._model_dir, filename)
+            if not os.path.exists(path):
+                metas.append({
+                    "model": name,
+                    "status": "collecting_data",
+                    "samples": 0,
+                    "positive_rate": None,
+                    "test_accuracy": None,
+                    "trained_at": None,
+                })
+                continue
+            try:
+                with open(path) as f:
+                    meta = json.load(f)
+            except Exception:
+                meta = {}
+            metas.append({
+                "model": name,
+                "status": "trained",
+                "samples": int(meta.get("samples") or 0),
+                "positive_rate": meta.get("positive_rate"),
+                "test_accuracy": meta.get("test_accuracy"),
+                "trained_at": datetime.fromtimestamp(
+                    os.path.getmtime(path),
+                    timezone.utc,
+                ).isoformat(),
+            })
+        return metas
+
+    def _analyze_ml_progress(self, day: str) -> Dict:
+        """Compare today's ML learning against previous reports and model metadata."""
+        current = self._analyze_ml_learning(day)
+        previous_report = self._previous_report(day) or {}
+        previous_learning = previous_report.get("ml_learning", {})
+        previous_day = previous_report.get("day")
+        if previous_day and not previous_learning:
+            previous_learning = self._analyze_ml_learning(previous_day)
+        all_time = self._all_time_ml_counts()
+        total_all_time = sum(d["total"] for d in all_time.values())
+        labeled_all_time = sum(d["labeled"] for d in all_time.values())
+
+        return {
+            "previous_day": previous_day,
+            "rows_today": current.get("total_rows", 0),
+            "rows_previous": previous_learning.get("total_rows", 0),
+            "rows_change": current.get("total_rows", 0) - previous_learning.get("total_rows", 0),
+            "all_time_rows": total_all_time,
+            "all_time_labeled": labeled_all_time,
+            "datasets": self._ml_dataset_progress(current, previous_learning),
+            "models": self._model_meta(),
         }
 
     def _identify_problems(self, trades: List[Dict], mistakes: List[Dict]) -> List[Dict]:
@@ -796,6 +1127,172 @@ class NightlyAnalyst:
             for r in top_reasons[:10]:
                 lines.append(f"- **{r['count']}x** — {r['reason']}")
             lines.append("")
+
+        # ============================================================
+        # ML LEARNING — Shadow/advisory data collected today
+        # ============================================================
+        ml = report.get("ml_learning", {})
+        if ml:
+            lines.append("## ML Learning Report")
+            lines.append("")
+            if ml.get("total_rows", 0) == 0:
+                lines.append(
+                    "No shadow ML rows were collected for this day. "
+                    "This section will fill after the bot sees live setups."
+                )
+                lines.append("")
+            else:
+                missed = ml.get("missed_opportunities", {})
+                pullbacks = ml.get("pullback_candidates", {})
+                exits_ml = ml.get("exit_helper", {})
+                execution = ml.get("execution_quality", {})
+                entry_model = ml.get("entry_model", {})
+                entry_shadow = ml.get("entry_shadow", {})
+
+                lines.append("| Dataset | Tracked | Labeled | Result |")
+                lines.append("|---------|---------|---------|--------|")
+                lines.append(
+                    f"| Entry ML candidates | {entry_model.get('total', 0)} | "
+                    f"{entry_model.get('labeled', 0)} | "
+                    f"{entry_model.get('profitable', 0)} profitable "
+                    f"({entry_model.get('positive_rate', 0)}%), "
+                    f"avg {entry_model.get('avg_outcome_pct', 0)}% |"
+                )
+                lines.append(
+                    f"| Entry ML reject shadow | {entry_shadow.get('total', 0)} | "
+                    f"{entry_shadow.get('labeled', 0)} | "
+                    f"{entry_shadow.get('correct', 0)} correct "
+                    f"({entry_shadow.get('positive_rate', 0)}%) |"
+                )
+                lines.append(
+                    f"| Missed setups | {missed.get('total', 0)} | "
+                    f"{missed.get('labeled', 0)} | "
+                    f"{missed.get('went_up', 0)} went up "
+                    f"({missed.get('positive_rate', 0)}%) |"
+                )
+                lines.append(
+                    f"| Pullback entries | {pullbacks.get('total', 0)} | "
+                    f"{pullbacks.get('labeled', 0)} | "
+                    f"{pullbacks.get('worked', 0)} worked "
+                    f"({pullbacks.get('positive_rate', 0)}%) |"
+                )
+                lines.append(
+                    f"| Exit helper | {exits_ml.get('total', 0)} | "
+                    f"{exits_ml.get('labeled', 0)} | "
+                    f"{exits_ml.get('hold_helped', 0)} hold-helped "
+                    f"({exits_ml.get('positive_rate', 0)}%) |"
+                )
+                lines.append(
+                    f"| Execution quality | {execution.get('total', 0)} | "
+                    f"{execution.get('labeled', 0)} | "
+                    f"{execution.get('good_fills', 0)} good fills "
+                    f"({execution.get('good_rate', 0)}%), "
+                    f"avg slippage {execution.get('avg_slippage_pct', 0)}% |"
+                )
+                lines.append("")
+
+                notes = []
+                best_entry = entry_model.get("best")
+                if best_entry:
+                    notes.append(
+                        f"Best labeled entry ML sample: {best_entry['symbol']} "
+                        f"finished {best_entry['value']}%."
+                    )
+                best_shadow_miss = entry_shadow.get("best_missed")
+                if best_shadow_miss:
+                    notes.append(
+                        f"Biggest wrong ML rejection: {best_shadow_miss['symbol']} "
+                        f"moved {best_shadow_miss['value']}% after rejection."
+                    )
+                best_missed = missed.get("best")
+                if best_missed:
+                    notes.append(
+                        f"Best missed setup: {best_missed['symbol']} "
+                        f"moved {best_missed['value']}% after rejection."
+                    )
+                best_pullback = pullbacks.get("best")
+                if best_pullback:
+                    notes.append(
+                        f"Best pullback candidate: {best_pullback['symbol']} "
+                        f"moved {best_pullback['value']}% after the signal."
+                    )
+                worst_execution = execution.get("worst")
+                if worst_execution:
+                    notes.append(
+                        f"Worst execution slippage: {worst_execution['symbol']} "
+                        f"at {worst_execution['value']}%."
+                    )
+                if notes:
+                    for note in notes:
+                        lines.append(f"- {note}")
+                    lines.append("")
+
+                top_ml_reasons = missed.get("top_reasons", [])
+                if top_ml_reasons:
+                    lines.append("Most common missed-setup reasons:")
+                    for reason in top_ml_reasons:
+                        lines.append(f"- **{reason['count']}x** — {reason['reason']}")
+                    lines.append("")
+
+        # ============================================================
+        # ML PROGRESS — Compare learning over time
+        # ============================================================
+        progress = report.get("ml_progress", {})
+        if progress:
+            lines.append("## ML Progress")
+            lines.append("")
+            previous_day = progress.get("previous_day")
+            if previous_day:
+                rows_change = progress.get("rows_change", 0)
+                direction = "+" if rows_change >= 0 else ""
+                lines.append(
+                    f"Compared with {previous_day}: "
+                    f"{progress.get('rows_today', 0)} shadow rows today "
+                    f"({direction}{rows_change} vs previous report)."
+                )
+            else:
+                lines.append("No previous ML report found yet. This is the baseline.")
+            lines.append("")
+            lines.append(
+                f"All-time shadow ML data: {progress.get('all_time_rows', 0)} rows, "
+                f"{progress.get('all_time_labeled', 0)} labeled."
+            )
+            lines.append("")
+
+            datasets = progress.get("datasets", [])
+            if datasets:
+                lines.append("| Dataset | Today Labeled | Today Rate | Previous Rate | Change |")
+                lines.append("|---------|---------------|------------|---------------|--------|")
+                for row in datasets:
+                    change = row.get("rate_change", 0.0)
+                    sign = "+" if change >= 0 else ""
+                    lines.append(
+                        f"| {row.get('label')} | {row.get('labeled_today', 0)} | "
+                        f"{row.get('rate_today', 0)}% | "
+                        f"{row.get('previous_rate', 0)}% | {sign}{change}% |"
+                    )
+                lines.append("")
+
+            models = progress.get("models", [])
+            if models:
+                lines.append("| Shadow Model | Status | Samples | Accuracy | Positive Rate |")
+                lines.append("|--------------|--------|---------|----------|---------------|")
+                for model in models:
+                    accuracy = model.get("test_accuracy")
+                    pos_rate = model.get("positive_rate")
+                    accuracy_str = (
+                        f"{float(accuracy) * 100:.1f}%"
+                        if accuracy is not None else "collecting"
+                    )
+                    pos_str = (
+                        f"{float(pos_rate) * 100:.1f}%"
+                        if pos_rate is not None else "collecting"
+                    )
+                    lines.append(
+                        f"| {model.get('model')} | {model.get('status')} | "
+                        f"{model.get('samples', 0)} | {accuracy_str} | {pos_str} |"
+                    )
+                lines.append("")
 
         # ============================================================
         # SCANNER STATS

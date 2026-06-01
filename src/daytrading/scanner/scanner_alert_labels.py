@@ -11,6 +11,7 @@ HOD_ENTRY_GATE_ALERTS = frozenset({
     "New HOD Breakout",
     "Today HOD Breakout",
     "HOD Reclaim",
+    "Intraday Low Reclaim",
     "Low Float - High Rel Vol",
     "Squeeze - Up 5% in 5min",
     "Squeeze - Up 10% in 10min",
@@ -77,6 +78,7 @@ def classify_hod_momentum_alerts(
     include_hod_breakout: bool = False,
     include_today_hod_breakout: bool = False,
     include_hod_reclaim: bool = False,
+    include_intraday_low_reclaim: bool = False,
     max_float: float = 20_000_000,
 ) -> List[str]:
     """Return alert type names for low-float HOD momentum ($2–$20, float <= max_float)."""
@@ -91,6 +93,8 @@ def classify_hod_momentum_alerts(
         alerts.append("Today HOD Breakout")
     if include_hod_reclaim:
         alerts.append("HOD Reclaim")
+    if include_intraday_low_reclaim:
+        alerts.append("Intraday Low Reclaim")
 
     if rel_vol >= 3.0:
         alerts.append("Low Float - High Rel Vol")
@@ -116,6 +120,8 @@ def alert_row_class(alert_name: str) -> str:
     if alert_name == "Today HOD Breakout":
         return "hod-today-breakout"
     if alert_name == "HOD Reclaim":
+        return "hod-reclaim"
+    if alert_name == "Intraday Low Reclaim":
         return "hod-reclaim"
     if alert_name == "Former Momo Stock":
         return "hod-former-momo"

@@ -11,6 +11,7 @@ import logging
 import os
 import threading
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
 from flask import Flask, Response, jsonify, render_template_string, request
@@ -66,6 +67,66 @@ def create_app(hub: DashboardHub) -> Flask:
             return jsonify(stats)
         except Exception as exc:
             return jsonify({"enabled": False, "reason": str(exc)})
+
+    @app.route("/api/analytics-report")
+    def analytics_report():
+        """Return the latest nightly analytics report for dashboard display."""
+        try:
+            report_dir = None
+            if getattr(_hub, "journal", None):
+                base_dir = getattr(_hub.journal, "base_dir", None)
+                if base_dir:
+                    report_dir = os.path.join(os.path.dirname(base_dir), "reports")
+            report_dir = report_dir or os.environ.get("DAYTRADING_REPORT_DIR", "data/reports")
+            report_dir = os.path.abspath(report_dir)
+            if not os.path.isdir(report_dir):
+                return jsonify({
+                    "ok": True,
+                    "report": None,
+                    "message": "No nightly analytics report directory yet",
+                })
+
+            requested_day = request.args.get("day")
+            candidates = []
+            for name in os.listdir(report_dir):
+                if not name.endswith(".json"):
+                    continue
+                day = name[:-5]
+                if requested_day and day != requested_day:
+                    continue
+                candidates.append((day, os.path.join(report_dir, name)))
+            if not candidates:
+                msg = "No nightly analytics report found"
+                if requested_day:
+                    msg += f" for {requested_day}"
+                return jsonify({"ok": True, "report": None, "message": msg})
+
+            day, path = sorted(candidates, reverse=True)[0]
+            with open(path) as f:
+                report = json.load(f)
+            if getattr(_hub, "journal", None):
+                try:
+                    from daytrading.analyst.collector import NightlyAnalyst
+                    analyst = NightlyAnalyst(
+                        db_path=_hub.journal.db_path,
+                        report_dir=report_dir,
+                    )
+                    # Refresh ML sections from current JSONL/model files so older reports
+                    # still show previously collected ML data after dashboard upgrades.
+                    report["ml_learning"] = analyst._analyze_ml_learning(day)
+                    report["ml_progress"] = analyst._analyze_ml_progress(day)
+                except Exception as exc:
+                    logger.debug("Analytics report ML refresh skipped: %s", exc)
+            return jsonify({
+                "ok": True,
+                "day": day,
+                "report": report,
+                "generated_at": report.get("generated_at"),
+                "loaded_at": datetime.now(timezone.utc).isoformat(),
+            })
+        except Exception as exc:
+            logger.error("Failed to load analytics report: %s", exc)
+            return jsonify({"ok": False, "error": str(exc)}), 500
 
     @app.route("/api/screenshot", methods=["POST"])
     def save_screenshot():
@@ -124,14 +185,34 @@ def create_app(hub: DashboardHub) -> Flask:
         if not broker:
             return jsonify({"ok": False, "error": "broker not available"}), 503
         try:
-            broker.close_all_positions()
+            _hub.trading_paused = True
+            _hub._broadcast("trading_control", {"paused": True})
+            if hasattr(broker, "emergency_close_all_positions"):
+                result = broker.emergency_close_all_positions(attempts=4, settle_seconds=1.0)
+            else:
+                if hasattr(broker, "cancel_all_orders"):
+                    broker.cancel_all_orders()
+                broker.close_all_positions()
+                result = {
+                    "ok": True,
+                    "flat": True,
+                    "cancelled_orders": None,
+                    "submitted_orders": [],
+                    "remaining_positions": {},
+                    "errors": [],
+                }
             exit_mgr = getattr(_hub, "_exit_manager", None)
-            if exit_mgr:
+            if exit_mgr and result.get("flat", False):
                 for sym in list(exit_mgr.tracked.keys()):
                     exit_mgr.untrack(sym)
-            _hub._broadcast("trading_control", {"force_closed": True})
-            logger.info("FORCE CLOSE ALL via dashboard")
-            return jsonify({"ok": True, "message": "All positions closed"})
+            _hub._broadcast("trading_control", {
+                "force_closed": result.get("flat", False),
+                "paused": True,
+            })
+            logger.warning("EMERGENCY FORCE CLOSE via dashboard: %s", result)
+            status = 200 if result.get("flat", False) else 500
+            result.setdefault("message", "All positions closed" if result.get("flat", False) else "Positions remain open")
+            return jsonify(result), status
         except Exception as exc:
             logger.error("Force close failed: %s", exc)
             return jsonify({"ok": False, "error": str(exc)}), 500
@@ -602,6 +683,24 @@ tr:hover { background:var(--surface2); }
   </div>
   <div class="card" style="margin-top:16px">
     <div class="card-header">
+      <h3>ML Learning Report</h3>
+      <div style="display:flex;gap:8px;align-items:center">
+        <span id="ml-report-day" style="font-size:11px;color:var(--text2)">Not loaded</span>
+        <button id="ml-report-refresh-btn" style="padding:6px 10px;border:1px solid var(--border);background:var(--surface2);color:var(--text);border-radius:6px;cursor:pointer">Refresh</button>
+      </div>
+    </div>
+    <div id="ml-learning-wrap">
+      <div class="empty"><div class="icon">&#129302;</div>ML learning report loading...</div>
+    </div>
+  </div>
+  <div class="card" style="margin-top:16px">
+    <div class="card-header"><h3>ML Progress</h3></div>
+    <div id="ml-progress-wrap">
+      <div class="empty"><div class="icon">&#128200;</div>ML progress loading...</div>
+    </div>
+  </div>
+  <div class="card" style="margin-top:16px">
+    <div class="card-header">
       <h3>AI Trade Insights</h3>
       <span id="ai-score" style="font-size:13px;color:var(--text2)"></span>
     </div>
@@ -684,7 +783,9 @@ let state = {
   watchlist_scan: [], rt_movers: [], hod_momentum_alerts: [], trading_watchlist: [],
   watchlist_pinned: ['SPY'],
   hod_momentum_filter: 'all', rt_new_total: 0,
-  news: {}, journal: {events: [], loaded: false, error: null, last_update: null}
+  news: {}, journal: {events: [], loaded: false, error: null, last_update: null},
+  logs: [],
+  ml_report: {report: null, loaded: false, error: null, message: null, last_update: null}
 };
 
 // Tab switching
@@ -696,6 +797,9 @@ document.querySelectorAll('.tab').forEach(tab => {
     document.getElementById('page-' + tab.dataset.page).classList.add('active');
     if (tab.dataset.page === 'journal') {
       loadJournal(true);
+    }
+    if (tab.dataset.page === 'analytics') {
+      loadMLReport(true);
     }
   });
 });
@@ -1042,7 +1146,15 @@ function renderMovers() { /* RT mover scanner removed — HOD-only */ }
 
 
 function renderLogs() {
-  // Logs are appended in real-time via SSE
+  let logs = state.logs || [];
+  let panel = document.getElementById('log-panel');
+  if (!panel) return;
+  if (logs.length === 0) {
+    panel.innerHTML = '<div class="empty"><div class="icon">&#128196;</div>No log messages yet</div>';
+    return;
+  }
+  panel.innerHTML = '';
+  logs.slice(-200).forEach(addLogLine);
 }
 
 function renderNews() {
@@ -1073,7 +1185,11 @@ function renderNews() {
 
 function renderAnalytics() {
   let exits = (state.recent_trades||[]).filter(t => t.trade_type === 'exit' && t.pnl != null);
-  if (exits.length === 0) return;
+  if (exits.length === 0) {
+    renderMLReport();
+    renderAI();
+    return;
+  }
 
   let wins = exits.filter(t => t.pnl >= 0);
   let losses = exits.filter(t => t.pnl < 0);
@@ -1186,7 +1302,102 @@ function renderAnalytics() {
   }
 
   // AI Insights
+  renderMLReport();
   renderAI();
+}
+
+function pctText(v) {
+  if (v === null || v === undefined || isNaN(Number(v))) return 'n/a';
+  return Number(v).toFixed(1).replace(/\.0$/, '') + '%';
+}
+
+function renderMLReport() {
+  let box = state.ml_report || {};
+  let report = box.report || null;
+  let learningWrap = document.getElementById('ml-learning-wrap');
+  let progressWrap = document.getElementById('ml-progress-wrap');
+  let dayEl = document.getElementById('ml-report-day');
+  if (!learningWrap || !progressWrap) return;
+
+  if (dayEl) {
+    dayEl.textContent = report && report.day
+      ? 'Report ' + report.day
+      : (box.last_update ? 'Checked ' + shortTime(box.last_update) : 'Not loaded');
+  }
+  if (box.error) {
+    let err = '<div class="empty"><div class="icon">&#9888;&#65039;</div>' + escapeHtml(box.error) + '</div>';
+    learningWrap.innerHTML = err;
+    progressWrap.innerHTML = err;
+    return;
+  }
+  if (!report) {
+    let msg = box.message || 'No nightly report yet. It appears after the bot generates a report after market close.';
+    learningWrap.innerHTML = '<div class="empty"><div class="icon">&#129302;</div>' + escapeHtml(msg) + '</div>';
+    progressWrap.innerHTML = '<div class="empty"><div class="icon">&#128200;</div>' + escapeHtml(msg) + '</div>';
+    return;
+  }
+
+  let ml = report.ml_learning || {};
+  let missed = ml.missed_opportunities || {};
+  let pull = ml.pullback_candidates || {};
+  let exit = ml.exit_helper || {};
+  let exec = ml.execution_quality || {};
+  let entry = ml.entry_model || {};
+  let shadow = ml.entry_shadow || {};
+
+  let html = '<table><tr><th>Dataset</th><th>Tracked</th><th>Labeled</th><th>Result</th></tr>';
+  html += '<tr><td><strong>Entry ML candidates</strong></td><td>' + (entry.total||0) + '</td><td>' + (entry.labeled||0) + '</td><td><span class="text-green">' + (entry.profitable||0) + '</span> profitable (' + pctText(entry.positive_rate) + '), avg ' + (entry.avg_outcome_pct||0) + '%</td></tr>';
+  html += '<tr><td><strong>Entry ML reject shadow</strong></td><td>' + (shadow.total||0) + '</td><td>' + (shadow.labeled||0) + '</td><td><span class="text-green">' + (shadow.correct||0) + '</span> correct / <span class="text-red">' + (shadow.wrong||0) + '</span> wrong (' + pctText(shadow.positive_rate) + ')</td></tr>';
+  html += '<tr><td><strong>Missed setups</strong></td><td>' + (missed.total||0) + '</td><td>' + (missed.labeled||0) + '</td><td><span class="text-green">' + (missed.went_up||0) + '</span> went up (' + pctText(missed.positive_rate) + ')</td></tr>';
+  html += '<tr><td><strong>Pullback entries</strong></td><td>' + (pull.total||0) + '</td><td>' + (pull.labeled||0) + '</td><td><span class="text-green">' + (pull.worked||0) + '</span> worked (' + pctText(pull.positive_rate) + ')</td></tr>';
+  html += '<tr><td><strong>Exit helper</strong></td><td>' + (exit.total||0) + '</td><td>' + (exit.labeled||0) + '</td><td><span class="text-green">' + (exit.hold_helped||0) + '</span> hold helped (' + pctText(exit.positive_rate) + ')</td></tr>';
+  html += '<tr><td><strong>Execution quality</strong></td><td>' + (exec.total||0) + '</td><td>' + (exec.labeled||0) + '</td><td><span class="text-green">' + (exec.good_fills||0) + '</span> good fills (' + pctText(exec.good_rate) + '), avg slip ' + (exec.avg_slippage_pct||0) + '%</td></tr>';
+  html += '</table>';
+  let notes = [];
+  if (entry.best) notes.push('Best entry ML sample: <strong>' + escapeHtml(entry.best.symbol) + '</strong> finished ' + entry.best.value + '%.');
+  if (shadow.best_missed) notes.push('Biggest wrong ML reject: <strong>' + escapeHtml(shadow.best_missed.symbol) + '</strong> moved ' + shadow.best_missed.value + '% after rejection.');
+  if (missed.best) notes.push('Best missed setup: <strong>' + escapeHtml(missed.best.symbol) + '</strong> moved ' + missed.best.value + '% after rejection.');
+  if (pull.best) notes.push('Best pullback: <strong>' + escapeHtml(pull.best.symbol) + '</strong> moved ' + pull.best.value + '% after signal.');
+  if (exec.worst) notes.push('Worst slippage: <strong>' + escapeHtml(exec.worst.symbol) + '</strong> at ' + exec.worst.value + '%.');
+  if (notes.length) {
+    html += '<div style="margin-top:10px;font-size:12px;color:var(--text2)">';
+    notes.forEach(n => { html += '<div style="margin-top:4px">' + n + '</div>'; });
+    html += '</div>';
+  }
+  learningWrap.innerHTML = html;
+
+  let prog = report.ml_progress || {};
+  let phtml = '<div style="font-size:13px;color:var(--text2);margin-bottom:10px">';
+  if (prog.previous_day) {
+    let ch = prog.rows_change || 0;
+    phtml += 'Compared with <strong style="color:var(--text)">' + escapeHtml(prog.previous_day) + '</strong>: '
+      + (prog.rows_today||0) + ' rows today (' + (ch >= 0 ? '+' : '') + ch + ' vs previous).';
+  } else {
+    phtml += 'No previous ML report found yet. This report is the baseline.';
+  }
+  phtml += '<br>All-time shadow data: <strong style="color:var(--text)">' + (prog.all_time_rows||0) + '</strong> rows, <strong style="color:var(--text)">' + (prog.all_time_labeled||0) + '</strong> labeled.</div>';
+
+  let datasets = prog.datasets || [];
+  if (datasets.length) {
+    phtml += '<table><tr><th>Dataset</th><th>Today Labeled</th><th>Today Rate</th><th>Previous</th><th>Change</th></tr>';
+    datasets.forEach(row => {
+      let change = Number(row.rate_change || 0);
+      let cls = change >= 0 ? 'text-green' : 'text-red';
+      phtml += '<tr><td><strong>' + escapeHtml(row.label || row.dataset) + '</strong></td><td>' + (row.labeled_today||0) + '</td><td>' + pctText(row.rate_today) + '</td><td>' + pctText(row.previous_rate) + '</td><td><span class="' + cls + '">' + (change >= 0 ? '+' : '') + change.toFixed(1).replace(/\.0$/, '') + '%</span></td></tr>';
+    });
+    phtml += '</table>';
+  }
+
+  let models = prog.models || [];
+  if (models.length) {
+    phtml += '<div style="margin-top:12px"><table><tr><th>Shadow Model</th><th>Status</th><th>Samples</th><th>Accuracy</th><th>Positive Rate</th></tr>';
+    models.forEach(m => {
+      let active = m.status === 'trained';
+      phtml += '<tr><td><strong>' + escapeHtml(m.model || '') + '</strong></td><td><span class="pill ' + (active ? 'pill-green' : 'pill-yellow') + '">' + escapeHtml(m.status || 'unknown') + '</span></td><td>' + (m.samples||0) + '</td><td>' + (m.test_accuracy == null ? 'collecting' : pctText(Number(m.test_accuracy) * 100)) + '</td><td>' + (m.positive_rate == null ? 'collecting' : pctText(Number(m.positive_rate) * 100)) + '</td></tr>';
+    });
+    phtml += '</table></div>';
+  }
+  progressWrap.innerHTML = phtml;
 }
 
 function renderAI() {
@@ -1351,6 +1562,37 @@ function loadJournal(force) {
     });
 }
 
+function loadMLReport(force) {
+  let current = state.ml_report || {};
+  let now = Date.now();
+  if (!force && current.last_fetch_ms && (now - current.last_fetch_ms) < 30000) return;
+  fetch('/api/analytics-report')
+    .then(r => r.json())
+    .then(data => {
+      if (!data.ok) throw new Error(data.error || 'failed to load analytics report');
+      state.ml_report = {
+        report: data.report || null,
+        loaded: true,
+        error: null,
+        message: data.message || null,
+        last_update: data.loaded_at || new Date().toISOString(),
+        last_fetch_ms: Date.now()
+      };
+      renderMLReport();
+    })
+    .catch(err => {
+      state.ml_report = {
+        report: (state.ml_report && state.ml_report.report) || null,
+        loaded: true,
+        error: err && err.message ? err.message : 'Failed to load analytics report',
+        message: null,
+        last_update: (state.ml_report && state.ml_report.last_update) || null,
+        last_fetch_ms: Date.now()
+      };
+      renderMLReport();
+    });
+}
+
 
 document.querySelectorAll('.hod-filter-btn').forEach(btn => {
   btn.addEventListener('click', () => {
@@ -1387,6 +1629,7 @@ function updateStatus() {
   let phaseColors = {'OPEN':'pill-green','PRE-MARKET':'pill-yellow','AFTER-HOURS':'pill-purple','CLOSED':'pill-red'};
   pill.className = 'pill ' + (phaseColors[phase]||'pill-red');
   pill.textContent = phase;
+  updateTradeControls();
 }
 
 function flashScanner() {
@@ -1424,9 +1667,11 @@ function dedupeScans(scans) {
 // Apply full state from server push (SSE snapshot event — no HTTP poll)
 function applySnapshot(data) {
   let savedJournal = state.journal;
+  let savedMLReport = state.ml_report;
     state = data;
   state.journal = savedJournal || {events: [], loaded: false, error: null, last_update: null};
-  state.trading_paused = data.trading_paused || false;
+  state.ml_report = savedMLReport || {report: null, loaded: false, error: null, message: null, last_update: null};
+  state.trading_paused = data.trading_paused === true;
     state.recent_scans = dedupeScans(state.recent_scans || []);
     state.rt_movers = data.rt_movers || [];
   state.hod_momentum_alerts = data.hod_momentum_alerts || [];
@@ -1434,14 +1679,20 @@ function applySnapshot(data) {
   state.watchlist_pinned = data.watchlist_pinned || ['SPY'];
     state.rt_new_total = 0;
     state.news = data.news || {};
-    renderAll();
+  state.logs = data.logs || [];
+  renderAll();
   updateTradeControls();
   loadJournal(true);
+  loadMLReport(true);
 }
 
 let jrRefreshBtn = document.getElementById('jr-refresh-btn');
 if (jrRefreshBtn) {
   jrRefreshBtn.addEventListener('click', function() { loadJournal(true); });
+}
+let mlReportRefreshBtn = document.getElementById('ml-report-refresh-btn');
+if (mlReportRefreshBtn) {
+  mlReportRefreshBtn.addEventListener('click', function() { loadMLReport(true); });
 }
 
 // SSE stream for real-time updates with auto-reconnect
@@ -1576,6 +1827,21 @@ connectSSE();
 fetch('/api/snapshot').then(r=>r.json()).then(data => {
   if (data && data.market_phase) applySnapshot(data);
   }).catch(()=>{});
+loadMLReport(true);
+
+// Keep pause/resume controls truthful even if an SSE event is missed.
+function syncTradingControlState() {
+  fetch('/api/snapshot').then(r=>r.json()).then(data => {
+    if (!data) return;
+    state.trading_paused = data.trading_paused === true;
+    state.market_open = data.market_open;
+    state.stream_connected = data.stream_connected;
+    if (data.market_phase) state.market_phase = data.market_phase;
+    if (data.stats) state.stats = Object.assign(state.stats || {}, data.stats);
+    updateStatus();
+  }).catch(()=>{});
+}
+setInterval(syncTradingControlState, 5000);
 
 // ML Stats polling (every 30s)
 function fetchMLStats() {
@@ -1594,6 +1860,7 @@ function fetchMLStats() {
     html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px;">';
     html += '<div><span style="color:var(--text2)">Passed:</span> <b style="color:var(--green)">' + data.entries_passed + '</b></div>';
     html += '<div><span style="color:var(--text2)">ML Rejected:</span> <b style="color:var(--red)">' + data.entries_rejected_by_ml + '</b></div>';
+    html += '<div><span style="color:var(--text2)">Rule Rejected:</span> <b style="color:var(--yellow)">' + (data.entries_rejected_by_rules || 0) + '</b></div>';
     html += '<div><span style="color:var(--text2)">Reject Rate:</span> <b>' + data.rejection_rate_pct + '%</b></div>';
     html += '<div><span style="color:var(--text2)">Shadow Acc:</span> <b style="color:' + (data.shadow_accuracy_pct >= 50 ? 'var(--green)' : 'var(--red)') + '">' + data.shadow_accuracy_pct + '%</b></div>';
     html += '</div>';
@@ -1610,14 +1877,16 @@ setInterval(fetchMLStats, 30000);
 
 // Trading control buttons
 function updateTradeControls() {
-  let paused = state.trading_paused;
+  let paused = state.trading_paused === true;
   let btnStop = document.getElementById('btn-stop');
   let btnStart = document.getElementById('btn-start');
   let pill = document.getElementById('trade-status-pill');
+  if (!btnStop || !btnStart || !pill) return;
   btnStop.disabled = paused;
   btnStart.disabled = !paused;
   pill.textContent = paused ? 'PAUSED' : 'ACTIVE';
   pill.className = 'pill ' + (paused ? 'pill-red' : 'pill-green');
+  pill.title = paused ? 'Trading is paused: no new entries will be placed' : 'Trading is active';
 }
 
 document.getElementById('btn-stop').addEventListener('click', function() {
@@ -1643,15 +1912,25 @@ document.getElementById('btn-start').addEventListener('click', function() {
 
 document.getElementById('btn-force-close').addEventListener('click', function() {
   if (!confirm('FORCE CLOSE ALL positions? This will cancel all open orders and liquidate everything immediately.')) return;
+  let btn = document.getElementById('btn-force-close');
+  btn.disabled = true;
+  addLogLine({level:'WARNING', ts: new Date().toISOString(), message: 'EMERGENCY CLOSE requested'});
   fetch('/api/force-close', {method:'POST'}).then(r=>r.json()).then(data => {
-    if (data.ok) {
-      addLogLine({level:'WARNING', ts: new Date().toISOString(), message: 'ALL POSITIONS FORCE CLOSED'});
+    if (data.flat) {
+      state.trading_paused = true;
+      updateTradeControls();
+      addLogLine({level:'WARNING', ts: new Date().toISOString(), message: 'ALL POSITIONS FORCE CLOSED; trading paused'});
       state.positions = {};
       renderOverview();
     } else {
-      alert('Force close failed: ' + (data.error || 'unknown error'));
+      let remaining = data.remaining_positions ? Object.keys(data.remaining_positions).join(', ') : '';
+      alert('Emergency close did not flatten everything. Remaining: ' + (remaining || 'unknown') + '. Check Alpaca now.');
     }
-  }).catch(err => { alert('Force close failed: ' + err.message); });
+  }).catch(err => {
+    alert('Emergency close failed: ' + err.message);
+  }).finally(() => {
+    btn.disabled = false;
+  });
 });
 
 // Journal tab only — loaded on demand when that page is visible
@@ -1661,6 +1940,12 @@ setInterval(function() {
     loadJournal(false);
   }
 }, 10000);
+setInterval(function() {
+  let page = document.getElementById('page-analytics');
+  if (page && page.classList.contains('active')) {
+    loadMLReport(false);
+  }
+}, 30000);
 </script>
 </body>
 </html>

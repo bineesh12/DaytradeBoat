@@ -185,8 +185,13 @@ class MLMonitor:
                 )
                 return
 
-            # Check 2: Shadow accuracy too low (need enough shadow results)
-            if total_shadow >= 5 and self._stats.shadow_accuracy < self.MIN_SHADOW_ACCURACY:
+            # Check 2: Shadow accuracy too low.
+            # Shadow outcomes are noisy during the first few rejects, so wait
+            # for the same minimum sample size before disabling the live model.
+            if (
+                total_shadow >= self.MIN_SAMPLES_FOR_DISABLE
+                and self._stats.shadow_accuracy < self.MIN_SHADOW_ACCURACY
+            ):
                 self._model_enabled = False
                 self._stats.model_disabled = True
                 self._stats.disable_reason = (

@@ -68,6 +68,20 @@ class TestStopLoss:
         exits = em.check_exits({"ABC": 5.02}, _ts(5))
         assert len(exits) == 0
 
+    def test_dollar_stop_exits_before_wide_broker_stop(self) -> None:
+        em = ExitManager(max_unrealized_loss=50.0)
+        em.track(_long_pos(entry=5.59, stop=5.28, qty=294))
+        exits = em.check_exits({"ABC": 5.40}, _ts(30))
+        assert len(exits) == 1
+        assert exits[0].quantity == 294
+        assert ExitReason.STOP_LOSS.value in exits[0].reason
+
+    def test_dollar_stop_does_not_exit_inside_loss_cap(self) -> None:
+        em = ExitManager(max_unrealized_loss=50.0)
+        em.track(_long_pos(entry=5.59, stop=5.28, qty=160))
+        exits = em.check_exits({"ABC": 5.40}, _ts(30))
+        assert len(exits) == 0
+
 
 class TestHalfSellAt2to1:
     def test_half_sell_at_first_target(self) -> None:

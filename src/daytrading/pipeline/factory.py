@@ -21,6 +21,7 @@ from daytrading.scanner.scalping.vwap_pullback import VWAPPullbackScanner
 from daytrading.scanner.scalping.opening_range_breakout import OpeningRangeBreakoutScanner
 from daytrading.scanner.scalping.hod_reclaim import HODReclaimScanner
 from daytrading.scanner.scalping.pullback_base import PullbackBaseScanner
+from daytrading.scanner.scalping.abc_continuation import ABCContinuationScanner
 from daytrading.strategy.scalping.momentum_pattern import MomentumPatternVerifier
 from daytrading.models import PortfolioState, TradingStyle
 
@@ -57,7 +58,7 @@ def create_scalping_pipeline(
     pattern_reward_risk_ratio: float = 2.0,
     pattern_trail_ticks: int = 5,
     pattern_max_hold_sec: int = 600,
-    pattern_max_dollar_risk: float = 100.0,
+    pattern_max_dollar_risk: float = 50.0,
 
     # Classifier
     min_avg_volume: float = 5_000,
@@ -120,6 +121,10 @@ def create_scalping_pipeline(
         max_price=max_price,
         max_base_range_pct=5.0,
     )
+    abc_scanner = ABCContinuationScanner(
+        min_price=min_price,
+        max_price=max_price,
+    )
 
     # --- Verifier (Warrior Trading momentum pattern: 2:1 R/R, pattern-based stops) ---
     pattern_verifier = MomentumPatternVerifier(
@@ -148,7 +153,7 @@ def create_scalping_pipeline(
     all_scanners = [
         momentum_scanner, bull_flag_scanner, flat_top_scanner,
         vwap_pullback_scanner, orb_scanner, hod_scanner,
-        pullback_base_scanner,
+        pullback_base_scanner, abc_scanner,
     ]
 
     scalp_config = StyleConfig(
@@ -161,6 +166,7 @@ def create_scalping_pipeline(
             "opening_range_breakout": pattern_verifier,
             "hod_reclaim": pattern_verifier,
             "pullback_base": pattern_verifier,
+            "abc_continuation": pattern_verifier,
         },
     )
 
@@ -193,14 +199,16 @@ def create_scalping_pipeline(
             "opening_range_breakout": pattern_verifier,
             "hod_reclaim": pattern_verifier,
             "pullback_base": pattern_verifier,
+            "abc_continuation": pattern_verifier,
         },
         broker=broker,
         portfolio=portfolio,
-        exit_manager=ExitManager(),
+        exit_manager=ExitManager(max_unrealized_loss=pattern_max_dollar_risk),
         router=router,
         reentry_detector=None,
         max_positions=max_positions,
         max_position_shares=max_position_shares,
         max_order_shares=max_order_shares,
+        max_dollar_risk_per_trade=pattern_max_dollar_risk,
         enable_daily_loser_blacklist=enable_daily_loser_blacklist,
     )

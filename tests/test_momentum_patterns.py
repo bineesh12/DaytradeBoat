@@ -10,6 +10,7 @@ import pytest
 from daytrading.models import Bar, PortfolioState, ScanResult, SignalAction
 from daytrading.scanner.scalping.bull_flag import BullFlagScanner
 from daytrading.scanner.scalping.flat_top_breakout import FlatTopBreakoutScanner
+from daytrading.scanner.scalping.abc_continuation import ABCContinuationScanner
 from daytrading.strategy.scalping.momentum_pattern import MomentumPatternVerifier
 
 
@@ -90,6 +91,30 @@ def _make_flat_top_bars() -> list[Bar]:
     return bars
 
 
+def _make_abc_bars() -> list[Bar]:
+    """Build A push, B pullback, C continuation trigger."""
+    now = datetime.now(timezone.utc)
+    bars: list[Bar] = []
+    for i in range(4):
+        bars.append(_bar(i, close=4.00, open_=3.99, high=4.02, low=3.98, volume=40_000, base_ts=now, n=30))
+
+    # A leg: strong move from 4.00 to 4.45.
+    a_prices = [(4.00, 4.12), (4.12, 4.25), (4.25, 4.36), (4.36, 4.45)]
+    for j, (o, c) in enumerate(a_prices):
+        i = 4 + j
+        bars.append(_bar(i, close=c, open_=o, high=c + 0.03, low=o - 0.02, volume=140_000, base_ts=now, n=30))
+
+    # B: controlled pullback, roughly 35-45% retrace.
+    b_prices = [(4.45, 4.34), (4.34, 4.30), (4.31, 4.28)]
+    for j, (o, c) in enumerate(b_prices):
+        i = 8 + j
+        bars.append(_bar(i, close=c, open_=o, high=o + 0.02, low=c - 0.02, volume=55_000, base_ts=now, n=30))
+
+    # C: breaks B high with volume returning.
+    bars.append(_bar(11, close=4.49, open_=4.30, high=4.52, low=4.29, volume=90_000, base_ts=now, n=30))
+    return bars
+
+
 class TestBullFlagScanner:
     def test_detects_bull_flag(self) -> None:
         bars = _make_bull_flag_bars()
@@ -144,6 +169,29 @@ class TestFlatTopScanner:
         scanner = FlatTopBreakoutScanner()
         hits = scanner.scan({"TST": bars})
         assert len(hits) == 0
+
+
+class TestABCContinuationScanner:
+    def test_detects_abc_continuation(self) -> None:
+        bars = _make_abc_bars()
+        scanner = ABCContinuationScanner(min_a_leg_pct=5.0, min_price=1.0, max_price=20.0)
+        hits = scanner.scan({"TST": bars})
+        assert len(hits) >= 1
+        hit = hits[0]
+        assert hit.scanner_name == "abc_continuation"
+        assert hit.criteria["pattern"] == "abc_continuation"
+        assert hit.criteria["a_leg_pct"] >= 5.0
+        assert 20.0 <= hit.criteria["b_retrace_pct"] <= 60.0
+        assert hit.criteria["b_low"] > 0
+        assert hit.criteria["c_volume_surge"] >= 1.1
+
+    def test_rejects_too_deep_b_pullback(self) -> None:
+        bars = _make_abc_bars()
+        # Make B low retrace almost the whole A leg.
+        bars[-2] = _bar(10, close=4.05, open_=4.22, high=4.24, low=4.03, volume=55_000, base_ts=bars[-1].ts, n=30)
+        scanner = ABCContinuationScanner(min_a_leg_pct=5.0, min_price=1.0, max_price=20.0)
+        hits = scanner.scan({"TST": bars})
+        assert hits == []
 
 
 class TestMomentumPatternVerifier:
@@ -301,6 +349,20 @@ class TestMomentumPatternVerifier:
         signal = verifier.verify(hit, PortfolioState(cash=100_000))
         assert signal is None
         assert "above VWAP" in verifier._last_reject
+
+    @patch("daytrading.strategy.scalping.momentum_pattern.check_entry_quality", return_value=None)
+    def test_generates_signal_for_abc_continuation(self, _mock_guard: object) -> None:
+        bars = _make_abc_bars()
+        scanner = ABCContinuationScanner(min_a_leg_pct=5.0, min_price=1.0, max_price=20.0)
+        hit = scanner.scan({"TST": bars})[0]
+        verifier = MomentumPatternVerifier(max_risk_per_share=0.50)
+        signal = verifier.verify(hit, PortfolioState(cash=100_000))
+
+        assert signal is not None
+        assert signal.action == SignalAction.ENTER_LONG
+        assert signal.stop_loss is not None
+        assert signal.stop_loss == pytest.approx(hit.criteria["b_low"] - 0.02)
+        assert "Abc Continuation" in signal.reason
 
     @patch("daytrading.strategy.scalping.momentum_pattern.check_entry_quality", return_value=None)
     def test_allows_strong_pullback_base(self, _mock_guard: object) -> None:

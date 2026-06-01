@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from daytrading.exits.manager import ExitManager, TrackedPosition
-from daytrading.models import Fill, Side, SignalAction, TradeSignal
+from daytrading.models import Fill, OrderStatus, PortfolioState, Side, SignalAction, TradeSignal
 from daytrading.pipeline.factory import create_scalping_pipeline
 from daytrading.runner import AlpacaRunner
 
@@ -111,6 +111,64 @@ def test_partial_exit_record_refreshes_broker_stop_for_remaining_qty() -> None:
     )
 
     assert calls == [("refresh", "OLOX")]
+
+
+def test_failed_fast_exit_attempts_are_logged_for_shadow_ml(monkeypatch) -> None:
+    class ExitManagerStub:
+        def __init__(self) -> None:
+            self._positions = {
+                "MASK": SimpleNamespace(
+                    entry_price=5.59,
+                    sold_half=False,
+                    remaining_qty=294,
+                    risk_per_share=0.10,
+                    stop_loss=5.49,
+                )
+            }
+
+        @property
+        def tracked(self):
+            return dict(self._positions)
+
+        def check_exits(self, prices, now):
+            return [
+                TradeSignal(
+                    symbol="MASK",
+                    action=SignalAction.EXIT_LONG,
+                    quantity=294,
+                    entry_price=prices["MASK"],
+                    reason="take_profit",
+                )
+            ]
+
+    logged = []
+
+    def fake_log_execution_quality(**kwargs):
+        logged.append(kwargs)
+
+    monkeypatch.setattr(
+        "daytrading.ml.shadow_collector.log_execution_quality",
+        fake_log_execution_quality,
+    )
+
+    runner = object.__new__(AlpacaRunner)
+    runner._pipeline = SimpleNamespace(
+        exit_manager=ExitManagerStub(),
+        portfolio=PortfolioState(cash=10_000),
+        set_cooldown=lambda *args, **kwargs: None,
+    )
+    runner._broker = SimpleNamespace(
+        submit=lambda *args, **kwargs: (None, OrderStatus.CANCELLED)
+    )
+    runner._live_prices = lambda symbols: {"MASK": 6.94}
+
+    runner._check_exits_only()
+
+    assert [row["source"] for row in logged] == [
+        "fast_exit_limit",
+        "fast_exit_guarded_marketable",
+    ]
+    assert all(row["status"] is OrderStatus.CANCELLED for row in logged)
 
 
 def test_paused_runner_blocks_breakout_scalp_entries() -> None:

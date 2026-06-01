@@ -57,6 +57,135 @@ def get_ml_monitor():
     return _ml_monitor
 
 
+def record_rule_rejection() -> None:
+    """Record a non-ML rule rejection for dashboard visibility."""
+    if _ml_monitor:
+        _ml_monitor.record_rule_rejection()
+
+
+def _recent_volume_stats(today_bars: Sequence[Bar]) -> tuple[float, float, float]:
+    """Return (day volume, recent average volume, recent/earlier RVOL)."""
+    if not today_bars:
+        return 0.0, 0.0, 0.0
+
+    day_volume = float(sum(b.volume for b in today_bars))
+    recent_n = min(5, len(today_bars))
+    recent = list(today_bars[-recent_n:])
+    recent_avg = float(sum(b.volume for b in recent) / recent_n) if recent_n else 0.0
+    earlier = list(today_bars[:-recent_n])
+    if not earlier:
+        return day_volume, recent_avg, 0.0
+    earlier_avg = float(sum(b.volume for b in earlier) / len(earlier))
+    bar_rvol = recent_avg / earlier_avg if earlier_avg > 0 else 0.0
+    return day_volume, recent_avg, bar_rvol
+
+
+def _liquidity_score(
+    price: float,
+    today_bars: Sequence[Bar],
+    quotes: Optional[Sequence[Quote]] = None,
+    avg_daily_volume: Optional[float] = None,
+) -> tuple[int, str]:
+    """Score executable liquidity from volume, recent tape, spread, and size."""
+    day_volume, recent_avg, bar_rvol = _recent_volume_stats(today_bars)
+    daily_rvol = (
+        day_volume / float(avg_daily_volume)
+        if avg_daily_volume and avg_daily_volume > 0
+        else 0.0
+    )
+    effective_rvol = max(bar_rvol, daily_rvol)
+    score = 0
+    parts: list[str] = []
+
+    if day_volume >= 2_000_000:
+        score += 30
+        parts.append("dayVol=30")
+    elif day_volume >= 1_000_000:
+        score += 25
+        parts.append("dayVol=25")
+    elif day_volume >= 500_000:
+        score += 20
+        parts.append("dayVol=20")
+    elif day_volume >= 200_000:
+        score += 12
+        parts.append("dayVol=12")
+    else:
+        parts.append("dayVol=0")
+
+    if recent_avg >= 75_000:
+        score += 25
+        parts.append("recentVol=25")
+    elif recent_avg >= 50_000:
+        score += 20
+        parts.append("recentVol=20")
+    elif recent_avg >= 25_000:
+        score += 14
+        parts.append("recentVol=14")
+    elif recent_avg >= 10_000:
+        score += 8
+        parts.append("recentVol=8")
+    else:
+        parts.append("recentVol=0")
+
+    if effective_rvol >= 3.0:
+        score += 20
+        parts.append("rvol{:.1f}x=20".format(effective_rvol))
+    elif effective_rvol >= 2.0:
+        score += 18
+        parts.append("rvol{:.1f}x=18".format(effective_rvol))
+    elif effective_rvol >= 1.5:
+        score += 15
+        parts.append("rvol{:.1f}x=15".format(effective_rvol))
+    elif effective_rvol >= 1.0:
+        score += 10
+        parts.append("rvol{:.1f}x=10".format(effective_rvol))
+    elif effective_rvol > 0:
+        score += 4
+        parts.append("rvol{:.1f}x=4".format(effective_rvol))
+    elif recent_avg >= 50_000:
+        score += 10
+        parts.append("rvol=10")
+    else:
+        score += 5
+        parts.append("rvol=5")
+
+    valid_quotes = [q for q in list(quotes or [])[-5:] if q.ask > q.bid > 0]
+    if valid_quotes and price > 0:
+        avg_spread_pct = (
+            sum((q.ask - q.bid) / price for q in valid_quotes) / len(valid_quotes)
+        ) * 100
+        if avg_spread_pct <= 0.15:
+            score += 15
+            parts.append("spread=15")
+        elif avg_spread_pct <= 0.30:
+            score += 10
+            parts.append("spread=10")
+        elif avg_spread_pct <= 0.50:
+            score += 5
+            parts.append("spread=5")
+        else:
+            parts.append("spread=0")
+
+        avg_size = sum(min(q.bid_size, q.ask_size) for q in valid_quotes) / len(valid_quotes)
+        if avg_size >= 2_000:
+            score += 10
+            parts.append("size=10")
+        elif avg_size >= 500:
+            score += 7
+            parts.append("size=7")
+        elif avg_size >= 100:
+            score += 4
+            parts.append("size=4")
+        else:
+            score += 1
+            parts.append("size=1")
+    else:
+        score += 16
+        parts.append("quote=neutral")
+
+    return min(100, int(score)), ",".join(parts)
+
+
 def _log_candidate(
     symbol: str, price: float, score: int, passed: bool,
     reject_reason: Optional[str], ml_prob: Optional[float],
@@ -154,13 +283,17 @@ def check_entry_quality(
     Uses a scoring system: hard rejects first, then score 7 conditions.
     Score >= 60/100 passes.
     """
+    def _rule_reject(reason: str) -> str:
+        record_rule_rejection()
+        return reason
+
     if not bars or len(bars) < 3:
-        return "insufficient bars"
+        return _rule_reject("insufficient bars")
 
     latest = bars[-1]
     price = latest.close
     if price <= 0:
-        return "invalid price"
+        return _rule_reject("invalid price")
 
     # --- Split bars into today vs historical ---
     today_bars: Sequence[Bar] = bars
@@ -180,7 +313,9 @@ def check_entry_quality(
 
     # 1. Price must be in a tradeable range
     if price < min_price or price > max_price:
-        return "price ${:.2f} outside range ${:.2f}-${:.2f}".format(price, min_price, max_price)
+        return _rule_reject(
+            "price ${:.2f} outside range ${:.2f}-${:.2f}".format(price, min_price, max_price)
+        )
 
     # 2. Staleness — data too old to act on (5 minutes)
     #    Exception: if stock was running hot before going quiet, it's likely
@@ -208,10 +343,14 @@ def check_entry_quality(
                             is_likely_halt = True
 
                 if not is_likely_halt:
-                    return "stale data ({:.0f}s old, max={}s)".format(age, max_bar_age_seconds)
+                    return _rule_reject(
+                        "stale data ({:.0f}s old, max={}s)".format(age, max_bar_age_seconds)
+                    )
                 # Halted stock: allow through but cap staleness at 15 min
                 if age > 900:
-                    return "stale data ({:.0f}s old, likely halted too long)".format(age)
+                    return _rule_reject(
+                        "stale data ({:.0f}s old, likely halted too long)".format(age)
+                    )
         except Exception:
             pass
 
@@ -222,7 +361,7 @@ def check_entry_quality(
         last_vwap = vwap_vals[-1] if vwap_vals else 0.0
         if not math.isnan(last_vwap) and last_vwap > 0:
             if price < last_vwap * 0.995:
-                return "below VWAP ({:.2f} < {:.2f})".format(price, last_vwap)
+                return _rule_reject("below VWAP ({:.2f} < {:.2f})".format(price, last_vwap))
 
     # 4. Dead cat bounce — price crashed too far from session HOD
     if len(today_bars) >= 5:
@@ -231,8 +370,10 @@ def check_entry_quality(
         if today_high > 0 and session_open_price > 0:
             drop_from_high = (today_high - price) / today_high
             if drop_from_high > 0.20:
-                return "dead cat bounce: price {:.2f} is {:.0f}% below HOD {:.2f}".format(
-                    price, drop_from_high * 100, today_high)
+                return _rule_reject(
+                    "dead cat bounce: price {:.2f} is {:.0f}% below HOD {:.2f}".format(
+                        price, drop_from_high * 100, today_high)
+                )
 
     # 5. Minimum upward movement — avoid flat names with no momentum edge
     if len(today_bars) >= 3:
@@ -240,33 +381,80 @@ def check_entry_quality(
         if session_open_price > 0:
             day_change_pct_hard = ((price - session_open_price) / session_open_price) * 100
             if day_change_pct_hard < min_day_change_pct:
-                return "not enough movement: day change {:.1f}% (need {:.1f}%+)".format(
-                    day_change_pct_hard, min_day_change_pct)
+                return _rule_reject(
+                    "not enough movement: day change {:.1f}% (need {:.1f}%+)".format(
+                        day_change_pct_hard, min_day_change_pct)
+                )
 
     # 6. Minimum day volume — low-liquidity stocks produce unreliable breakouts
     day_volume = sum(b.volume for b in today_bars)
+    _, recent_avg_volume, hard_gate_rvol = _recent_volume_stats(today_bars)
+    daily_rvol = (
+        day_volume / float(avg_daily_volume)
+        if avg_daily_volume and avg_daily_volume > 0
+        else 0.0
+    )
+    sub5_has_relative_momentum = (
+        price < 5.0
+        and day_volume >= 200_000
+        and recent_avg_volume >= 20_000
+        and max(daily_rvol, hard_gate_rvol) >= max(min_rvol, 1.8)
+    )
     if day_volume < 200_000:
-        return "low day volume {:.0f} for ${:.2f} stock (need 200K+)".format(day_volume, price)
+        return _rule_reject(
+            "low day volume {:.0f} for ${:.2f} stock (need 200K+)".format(day_volume, price)
+        )
+    if price < 5.0 and day_volume < 500_000 and not sub5_has_relative_momentum:
+        return _rule_reject(
+            "thin sub-$5 liquidity {:.0f} volume, RVOL {:.1f}x (need 500K+ or strong RVOL before ML)".format(
+                day_volume, max(daily_rvol, hard_gate_rvol)
+            )
+        )
     if price >= 20.0 and day_volume < 1_000_000:
-        return "low day volume {:.0f} for ${:.2f} stock (need 1M+)".format(day_volume, price)
+        return _rule_reject(
+            "low day volume {:.0f} for ${:.2f} stock (need 1M+)".format(day_volume, price)
+        )
     elif price >= 10.0 and day_volume < 500_000:
-        return "low day volume {:.0f} for ${:.2f} stock (need 500K+)".format(day_volume, price)
+        return _rule_reject(
+            "low day volume {:.0f} for ${:.2f} stock (need 500K+)".format(day_volume, price)
+        )
 
     # 7. Spread filter — wide spread means illiquid stock, bad fills
     if quotes and len(quotes) >= 3:
         recent_quotes = list(quotes[-5:])
         avg_spread = sum(q.ask - q.bid for q in recent_quotes if q.ask > q.bid > 0) / len(recent_quotes)
         if price > 0 and avg_spread / price > 0.005:
-            return "spread too wide ({:.2f}c = {:.2f}% of ${:.2f})".format(
-                avg_spread * 100, (avg_spread / price) * 100, price)
+            return _rule_reject(
+                "spread too wide ({:.2f}c = {:.2f}% of ${:.2f})".format(
+                    avg_spread * 100, (avg_spread / price) * 100, price)
+            )
 
-    # 8. Tape confirmation — sellers dominating means breakout is failing
+    # 8. Full liquidity score — avoid weak chop even when simple volume passes
+    liquidity_score, liquidity_parts = _liquidity_score(
+        price, today_bars, quotes, avg_daily_volume=avg_daily_volume,
+    )
+    if price < 5.0 and liquidity_score < 65 and not (
+        sub5_has_relative_momentum and liquidity_score >= 55
+    ):
+        return _rule_reject(
+            "thin liquidity score {}/100 for sub-$5 stock ({})".format(
+                liquidity_score, liquidity_parts)
+        )
+    if liquidity_score < 50:
+        return _rule_reject(
+            "watch-only liquidity score {}/100 ({})".format(
+                liquidity_score, liquidity_parts)
+        )
+
+    # 9. Tape confirmation — sellers dominating means breakout is failing
     if ticks and len(ticks) >= 20:
         from daytrading.indicators.scalping import order_flow_imbalance
         imb_values = order_flow_imbalance(list(ticks), window=min(30, len(ticks)))
         current_imb = imb_values[-1] if imb_values else 0.0
         if current_imb <= -0.3:
-            return "tape shows selling pressure (imbalance={:.2f}, need >-0.3)".format(current_imb)
+            return _rule_reject(
+                "tape shows selling pressure (imbalance={:.2f}, need >-0.3)".format(current_imb)
+            )
 
     # =================================================================
     # SCORING SYSTEM — weighted conditions, threshold 60/100
