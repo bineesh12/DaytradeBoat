@@ -66,7 +66,23 @@ def test_hod_breakout_and_reclaim() -> None:
     assert "HOD Reclaim" in alerts
 
 
+def test_intraday_low_reclaim_is_entry_gate_alert() -> None:
+    alerts = classify_hod_momentum_alerts(
+        price=2.65,
+        float_shares=5_000_000,
+        rel_vol=1.0,
+        bar_rvol=4.5,
+        change_session_pct=-2.0,
+        change_5m_pct=4.2,
+        change_10m_pct=8.5,
+        include_intraday_low_reclaim=True,
+    )
+
+    assert alerts == ["Intraday Low Reclaim"]
+
+
 def test_alert_row_classes() -> None:
     assert alert_row_class("New HOD Breakout") == "hod-breakout"
     assert alert_row_class("HOD Reclaim") == "hod-reclaim"
+    assert alert_row_class("Intraday Low Reclaim") == "hod-reclaim"
     assert alert_row_class("Low Float - High Rel Vol") == "hod-low-float"

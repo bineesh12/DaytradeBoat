@@ -84,6 +84,7 @@ class TradingPipeline:
         max_positions: int = 5,
         max_position_shares: float = 500,
         max_order_shares: float = 200,
+        max_dollar_risk_per_trade: float = 50.0,
         enable_daily_loser_blacklist: bool = False,
     ) -> None:
         self._scanners = list(scanners)
@@ -97,6 +98,7 @@ class TradingPipeline:
         self._max_positions = max_positions
         self._max_position_shares = max_position_shares
         self._max_order_shares = max_order_shares
+        self._max_dollar_risk_per_trade = max_dollar_risk_per_trade
         self._original_sizes: Dict[str, float] = {}  # for re-entry size calc
         self._cached_regimes: Dict[str, MarketRegime] = {}  # persist trend data across cycles
         self._scan_only = False
@@ -202,6 +204,102 @@ class TradingPipeline:
         except Exception:
             pass
         return trade_pnl
+
+    @staticmethod
+    def _latest_quote(quotes: Optional[Dict[str, Sequence[Quote]]], symbol: str) -> Optional[Quote]:
+        if not quotes:
+            return None
+        seq = quotes.get(symbol)
+        if seq:
+            return seq[-1]
+        return None
+
+    @staticmethod
+    def _latest_price_for_symbol(
+        universe: Dict[str, Sequence[Bar]], symbol: str, fallback: float = 0.0,
+    ) -> float:
+        bars = universe.get(symbol)
+        if bars:
+            return float(bars[-1].close)
+        return float(fallback or 0.0)
+
+    def _log_shadow_missed(
+        self,
+        *,
+        symbol: str,
+        reason: str,
+        universe: Dict[str, Sequence[Bar]],
+        quotes: Optional[Dict[str, Sequence[Quote]]],
+        scanner: str = "",
+        fallback_price: float = 0.0,
+    ) -> None:
+        try:
+            from daytrading.ml.shadow_collector import log_missed_opportunity
+            bars = universe.get(symbol, [])
+            quote = self._latest_quote(quotes, symbol)
+            price = self._latest_price_for_symbol(universe, symbol, fallback_price)
+            if price > 0:
+                log_missed_opportunity(
+                    symbol=symbol,
+                    price=price,
+                    reason=reason,
+                    scanner=scanner,
+                    bars=bars,
+                    quotes=[quote] if quote else None,
+                )
+        except Exception:
+            pass
+
+    def _log_shadow_pullback(
+        self,
+        hit: ScanResult,
+        universe: Dict[str, Sequence[Bar]],
+        quotes: Optional[Dict[str, Sequence[Quote]]],
+    ) -> None:
+        try:
+            pattern = str(hit.criteria.get("pattern", ""))
+            if hit.scanner_name not in ("pullback_base", "vwap_pullback", "hod_reclaim", "abc_continuation") and (
+                pattern not in ("pullback_base", "vwap_pullback", "hod_reclaim", "abc_continuation")
+            ):
+                return
+            from daytrading.ml.shadow_collector import log_pullback_candidate
+            bars = hit.bars or list(universe.get(hit.symbol, []))
+            quote = self._latest_quote(quotes, hit.symbol)
+            price = float(hit.criteria.get("close") or self._latest_price_for_symbol(
+                universe, hit.symbol,
+            ))
+            if price > 0:
+                log_pullback_candidate(
+                    symbol=hit.symbol,
+                    price=price,
+                    scanner=hit.scanner_name,
+                    criteria=hit.criteria,
+                    bars=bars,
+                    quotes=[quote] if quote else None,
+                )
+        except Exception:
+            pass
+
+    @staticmethod
+    def _log_shadow_execution(
+        *,
+        order: Order,
+        bar: Bar,
+        status: OrderStatus,
+        fill: Optional[Fill],
+        source: str,
+    ) -> None:
+        try:
+            from daytrading.ml.shadow_collector import log_execution_quality
+            log_execution_quality(
+                order=order,
+                bar=bar,
+                status=status,
+                fill=fill,
+                source=source,
+            )
+        except Exception:
+            pass
 
     def run_cycle(
         self,
@@ -387,6 +485,7 @@ class TradingPipeline:
 
                 result.scan_hits.extend(style_hits)
                 for hit in style_hits:
+                    self._log_shadow_pullback(hit, universe, quotes)
                     verifier = cfg.verifiers.get(hit.scanner_name)
                     if verifier is None:
                         continue
@@ -396,9 +495,24 @@ class TradingPipeline:
                         if reject is None:
                             reject = self._get_last_reject(hit.symbol, verifier)
                         self._scan_rejections[hit.symbol] = reject or "did not pass verifier"
+                        self._log_shadow_missed(
+                            symbol=hit.symbol,
+                            reason=self._scan_rejections[hit.symbol],
+                            universe=universe,
+                            quotes=quotes,
+                            scanner=hit.scanner_name,
+                        )
                         continue
                     if signal.action is SignalAction.SKIP:
                         result.skipped.append(signal)
+                        self._log_shadow_missed(
+                            symbol=signal.symbol,
+                            reason=signal.reason or "strategy skip",
+                            universe=universe,
+                            quotes=quotes,
+                            scanner=hit.scanner_name,
+                            fallback_price=signal.entry_price,
+                        )
                         continue
                     # Enrich signal with trend_strength from classifier (check cache too)
                     regime = result.regimes.get(hit.symbol) or self._cached_regimes.get(hit.symbol)
@@ -421,6 +535,7 @@ class TradingPipeline:
                 result.scan_hits.extend(hits)
                 logger.info("Scanner %s found %d hits", scanner.name, len(hits))
             for hit in result.scan_hits:
+                self._log_shadow_pullback(hit, universe, quotes)
                 verifier = self._verifiers.get(hit.scanner_name)
                 if verifier is None:
                     continue
@@ -428,9 +543,24 @@ class TradingPipeline:
                 if signal is None:
                     reject = self._get_last_reject(hit.symbol, verifier)
                     self._scan_rejections[hit.symbol] = reject or "did not pass verifier"
+                    self._log_shadow_missed(
+                        symbol=hit.symbol,
+                        reason=self._scan_rejections[hit.symbol],
+                        universe=universe,
+                        quotes=quotes,
+                        scanner=hit.scanner_name,
+                    )
                     continue
                 if signal.action is SignalAction.SKIP:
                     result.skipped.append(signal)
+                    self._log_shadow_missed(
+                        symbol=signal.symbol,
+                        reason=signal.reason or "strategy skip",
+                        universe=universe,
+                        quotes=quotes,
+                        scanner=hit.scanner_name,
+                        fallback_price=signal.entry_price,
+                    )
                     continue
                 self._scan_rejections.pop(hit.symbol, None)
                 result.signals.append(signal)
@@ -484,6 +614,14 @@ class TradingPipeline:
                     self._scan_rejections[signal.symbol] = (
                         "not on HOD momentum alert board"
                     )
+                    self._log_shadow_missed(
+                        symbol=signal.symbol,
+                        reason="not on HOD momentum alert board",
+                        universe=universe,
+                        quotes=quotes,
+                        scanner=signal.scan_result.scanner_name if signal.scan_result else "",
+                        fallback_price=signal.entry_price,
+                    )
                     continue
 
                 # Circuit breaker: stop all new entries after max daily loss
@@ -493,6 +631,14 @@ class TradingPipeline:
                         signal.symbol, self._daily_pnl,
                     )
                     result.skipped.append(signal)
+                    self._log_shadow_missed(
+                        symbol=signal.symbol,
+                        reason="circuit breaker",
+                        universe=universe,
+                        quotes=quotes,
+                        scanner=signal.scan_result.scanner_name if signal.scan_result else "",
+                        fallback_price=signal.entry_price,
+                    )
                     continue
 
                 # Daily loser blacklist: don't re-enter a stock that lost today
@@ -502,6 +648,14 @@ class TradingPipeline:
                         signal.symbol,
                     )
                     result.skipped.append(signal)
+                    self._log_shadow_missed(
+                        symbol=signal.symbol,
+                        reason="daily loser blacklist",
+                        universe=universe,
+                        quotes=quotes,
+                        scanner=signal.scan_result.scanner_name if signal.scan_result else "",
+                        fallback_price=signal.entry_price,
+                    )
                     continue
 
                 last_exit_ts = self._exit_cooldowns.get(signal.symbol)
@@ -514,6 +668,14 @@ class TradingPipeline:
                             signal.symbol, elapsed, remaining,
                         )
                         result.skipped.append(signal)
+                        self._log_shadow_missed(
+                            symbol=signal.symbol,
+                            reason="cooldown",
+                            universe=universe,
+                            quotes=quotes,
+                            scanner=signal.scan_result.scanner_name if signal.scan_result else "",
+                            fallback_price=signal.entry_price,
+                        )
                         continue
 
                 # Per-symbol max entries: prevent over-trading one stock
@@ -523,11 +685,27 @@ class TradingPipeline:
                         signal.symbol, self._max_entries_per_symbol,
                     )
                     result.skipped.append(signal)
+                    self._log_shadow_missed(
+                        symbol=signal.symbol,
+                        reason="max entries",
+                        universe=universe,
+                        quotes=quotes,
+                        scanner=signal.scan_result.scanner_name if signal.scan_result else "",
+                        fallback_price=signal.entry_price,
+                    )
                     continue
 
             if self._at_position_limit():
                 logger.warning("Position limit %d reached, skipping %s", self._max_positions, signal.symbol)
                 result.skipped.append(signal)
+                self._log_shadow_missed(
+                    symbol=signal.symbol,
+                    reason="position limit",
+                    universe=universe,
+                    quotes=quotes,
+                    scanner=signal.scan_result.scanner_name if signal.scan_result else "",
+                    fallback_price=signal.entry_price,
+                )
                 continue
 
             # News sentiment gate: block negative, boost positive
@@ -543,6 +721,14 @@ class TradingPipeline:
                         headlines[0] if headlines else "negative news",
                     )
                     result.skipped.append(signal)
+                    self._log_shadow_missed(
+                        symbol=signal.symbol,
+                        reason="negative news",
+                        universe=universe,
+                        quotes=quotes,
+                        scanner=signal.scan_result.scanner_name if signal.scan_result else "",
+                        fallback_price=signal.entry_price,
+                    )
                     continue
 
                 if news_score >= 0.3:
@@ -571,10 +757,17 @@ class TradingPipeline:
                         )
                         result.rejected_orders += 1
                         result.rejection_details.append({"symbol": signal.symbol, "reason": "R:R {:.1f} < {:.1f}".format(reward / risk, min_rr)})
+                        self._log_shadow_missed(
+                            symbol=signal.symbol,
+                            reason="R:R {:.1f} < {:.1f}".format(reward / risk, min_rr),
+                            universe=universe,
+                            quotes=quotes,
+                            scanner=signal.scan_result.scanner_name if signal.scan_result else "",
+                            fallback_price=signal.entry_price,
+                        )
                         continue
 
-                    # Cap max dollar risk per trade to $100
-                    max_dollar_risk = 100.0
+                    max_dollar_risk = self._max_dollar_risk_per_trade
                     if risk > 0:
                         dollar_risk = risk * signal.quantity
                         if dollar_risk > max_dollar_risk:
@@ -586,6 +779,14 @@ class TradingPipeline:
                                 )
                                 result.rejected_orders += 1
                                 result.rejection_details.append({"symbol": signal.symbol, "reason": "risk_cap ${:.2f}".format(dollar_risk)})
+                                self._log_shadow_missed(
+                                    symbol=signal.symbol,
+                                    reason="risk cap",
+                                    universe=universe,
+                                    quotes=quotes,
+                                    scanner=signal.scan_result.scanner_name if signal.scan_result else "",
+                                    fallback_price=signal.entry_price,
+                                )
                                 continue
                             logger.info(
                                 "RISK CAP %s: %.0f → %d shares ($%.2f → $%.2f risk)",
@@ -633,6 +834,14 @@ class TradingPipeline:
                 logger.warning("No bar data for %s, cannot execute", signal.symbol)
                 result.rejected_orders += 1
                 result.rejection_details.append({"symbol": signal.symbol, "reason": "no_bar_data"})
+                self._log_shadow_missed(
+                    symbol=signal.symbol,
+                    reason="no bar data",
+                    universe=universe,
+                    quotes=quotes,
+                    scanner=signal.scan_result.scanner_name if signal.scan_result else "",
+                    fallback_price=signal.entry_price,
+                )
                 continue
 
             ok = allow_order(
@@ -657,6 +866,14 @@ class TradingPipeline:
                     logger.info("GUARD REJECT %s: %s", signal.symbol, guard_reason)
                     result.rejected_orders += 1
                     result.rejection_details.append({"symbol": signal.symbol, "reason": "guard: {}".format(guard_reason)})
+                    self._log_shadow_missed(
+                        symbol=signal.symbol,
+                        reason="guard: {}".format(guard_reason),
+                        universe=universe,
+                        quotes=quotes,
+                        scanner=signal.scan_result.scanner_name if signal.scan_result else "",
+                        fallback_price=signal.entry_price,
+                    )
                     continue
 
             # Defer to execution timer if enabled, otherwise submit immediately
@@ -675,6 +892,9 @@ class TradingPipeline:
                 continue
 
             fill, status = self._broker.submit(order, bar, self._portfolio)
+            self._log_shadow_execution(
+                order=order, bar=bar, status=status, fill=fill, source="pipeline_entry",
+            )
             if status is OrderStatus.FILLED and fill is not None:
                 apply_fill(self._portfolio, fill)
                 result.fills.append(fill)

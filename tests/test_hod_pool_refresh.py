@@ -21,6 +21,9 @@ class _RunnerStub:
         self._hod_bar_pool: list = []
         self._hod_min_price = 2.0
         self._hod_max_price = 20.0
+        self._hod_sub2_enabled = True
+        self._hod_sub2_min_price = 1.0
+        self._hod_sub2_max_price = 2.0
         self._hod_pool_max = 50
         self._bar_buffer = defaultdict(list)
         self._quote_buffer = defaultdict(list)
@@ -62,6 +65,8 @@ class TestHodPoolPriceBand:
         runner = _RunnerStub()
         runner._bar_buffer["X"] = [_bar("X", 8.0)]
         assert runner._symbol_in_hod_price_band("X") is True
+        runner._bar_buffer["MTEK"] = [_bar("MTEK", 1.55)]
+        assert runner._symbol_in_hod_price_band("MTEK") is True
         runner._bar_buffer["Y"] = [_bar("Y", 30.0)]
         assert runner._symbol_in_hod_price_band("Y") is False
 
@@ -118,3 +123,33 @@ class TestBuildFloatPool:
         )
 
         assert "WNW" in pool
+
+    def test_allows_strict_sub2_momentum_candidate(self) -> None:
+        class _Checker:
+            def warm_from_store(self, symbols):
+                return 1, 0
+
+            def get_float_cached(self, symbol):
+                return {"MTEK": 5_000_000, "NOISE": 5_000_000}.get(symbol)
+
+            def get_float(self, symbol):
+                raise AssertionError("cached float should be enough")
+
+        candidates = [
+            {"symbol": "MTEK", "price": 1.55, "change_pct": 18.0, "volume": 1_500_000},
+            {"symbol": "NOISE", "price": 1.65, "change_pct": 4.0, "volume": 1_500_000},
+        ]
+
+        pool = AlpacaRunner.build_float_filtered_hod_pool(
+            candidates,
+            _Checker(),
+            sub2_enabled=True,
+            sub2_min_price=1.0,
+            sub2_max_price=2.0,
+            sub2_min_change_pct=10.0,
+            sub2_min_day_volume=1_000_000,
+            sub2_max_float=10_000_000,
+        )
+
+        assert "MTEK" in pool
+        assert "NOISE" not in pool

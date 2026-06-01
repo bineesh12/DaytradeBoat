@@ -50,6 +50,15 @@ class HODMomentumScanner:
         min_day_volume: float = 200_000,
         require_break_prior_day_high: bool = True,
         rth_only: bool = False,
+        intraday_reclaim_min_from_low_pct: float = 10.0,
+        intraday_reclaim_min_day_volume: float = 1_000_000,
+        intraday_reclaim_max_from_hod_pct: float = 12.0,
+        sub2_enabled: bool = True,
+        sub2_min_price: float = 1.0,
+        sub2_max_price: float = 2.0,
+        sub2_min_session_change_pct: float = 10.0,
+        sub2_min_day_volume: float = 1_000_000,
+        sub2_max_float: float = 10_000_000,
         bar_cooldown_keys: Optional[Set[str]] = None,
         debug: bool = False,
     ) -> None:
@@ -62,9 +71,18 @@ class HODMomentumScanner:
         self._min_day_volume = min_day_volume
         self._require_break_prior_day = require_break_prior_day_high
         self._rth_only = rth_only
+        self._intraday_reclaim_min_from_low_pct = intraday_reclaim_min_from_low_pct
+        self._intraday_reclaim_min_day_volume = intraday_reclaim_min_day_volume
+        self._intraday_reclaim_max_from_hod_pct = intraday_reclaim_max_from_hod_pct
+        self._sub2_enabled = sub2_enabled
+        self._sub2_min_price = sub2_min_price
+        self._sub2_max_price = sub2_max_price
+        self._sub2_min_session_change_pct = sub2_min_session_change_pct
+        self._sub2_min_day_volume = sub2_min_day_volume
+        self._sub2_max_float = sub2_max_float
         self._debug = debug
         self._reclaim = HODReclaimScanner(
-            min_price=min_price,
+            min_price=sub2_min_price if sub2_enabled else min_price,
             max_price=max_price,
         )
         self._bar_cooldown_keys: Set[str] = bar_cooldown_keys if bar_cooldown_keys is not None else set()
@@ -101,7 +119,12 @@ class HODMomentumScanner:
                 time_str = latest.ts.isoformat()
             else:
                 time_str = datetime.now(timezone.utc).isoformat()
-            if not (self._min_price <= price <= self._max_price):
+            standard_price_band = self._min_price <= price <= self._max_price
+            sub2_price_band = (
+                self._sub2_enabled
+                and self._sub2_min_price <= price < self._sub2_max_price
+            )
+            if not (standard_price_band or sub2_price_band):
                 reject_stats["price_band"] = reject_stats.get("price_band", 0) + 1
                 continue
 
@@ -119,18 +142,25 @@ class HODMomentumScanner:
                 continue
 
             day_vol = ctx.day_volume
-            if day_vol < self._min_day_volume:
+            min_day_volume = (
+                self._sub2_min_day_volume if sub2_price_band else self._min_day_volume
+            )
+            if day_vol < min_day_volume:
                 reject_stats["low_volume"] = reject_stats.get("low_volume", 0) + 1
                 continue
 
             session_open = ctx.session_open
             change_session = session_change_pct(price, ctx)
+            if sub2_price_band and change_session < self._sub2_min_session_change_pct:
+                reject_stats["sub2_weak_change"] = reject_stats.get("sub2_weak_change", 0) + 1
+                continue
 
             float_shares = (
                 self._float_checker.get_float_cached(symbol)
                 if self._float_checker else None
             )
-            if float_shares is None or float_shares > self._max_float:
+            max_float = self._sub2_max_float if sub2_price_band else self._max_float
+            if float_shares is None or float_shares > max_float:
                 reject_stats["float"] = reject_stats.get("float", 0) + 1
                 continue
 
@@ -141,14 +171,31 @@ class HODMomentumScanner:
             ch10 = change_pct_10m(today)
             low = ctx.session_low
             change_from_low = (price - low) / low * 100 if low > 0 else 0.0
+            session_high = ctx.session_high
+            distance_from_hod_pct = (
+                (session_high - price) / session_high * 100
+                if session_high > 0 else 100.0
+            )
 
             prior_hod = max(b.high for b in today[:-1]) if len(today) > 1 else 0.0
             prior_day_high = ctx.prior_day_high
+            include_intraday_reclaim = (
+                change_from_low >= self._intraday_reclaim_min_from_low_pct
+                and day_vol >= self._intraday_reclaim_min_day_volume
+                and distance_from_hod_pct <= self._intraday_reclaim_max_from_hod_pct
+                and (
+                    (ch5 is not None and ch5 >= 4.0)
+                    or (ch10 is not None and ch10 >= 8.0)
+                    or bar_rvol >= 4.0
+                )
+                and latest.close >= latest.open
+            )
 
             if (self._require_break_prior_day
                     and prior_day_high is not None
                     and prior_day_high > 0
-                    and price <= prior_day_high):
+                    and price <= prior_day_high
+                    and not include_intraday_reclaim):
                 # Exception: massive gappers that pulled back below prior day high
                 # but are still within 20% of session HOD
                 prior_close = ctx.prior_day_close
@@ -241,7 +288,8 @@ class HODMomentumScanner:
                 include_hod_breakout=include_new_hod,
                 include_today_hod_breakout=include_today_hod,
                 include_hod_reclaim=include_reclaim,
-                max_float=self._max_float,
+                include_intraday_low_reclaim=include_intraday_reclaim,
+                max_float=max_float,
             )
 
             # Gapper Continuation: one-time alert for massive gappers still near HOD
@@ -249,7 +297,6 @@ class HODMomentumScanner:
                 if change_from_close is not None and change_from_close >= 30.0:
                     session_high = ctx.session_high
                     if session_high > 0:
-                        distance_from_hod_pct = (session_high - price) / session_high * 100
                         if distance_from_hod_pct <= 20.0:
                             alert_names = ["Gapper Continuation"]
                             self._gapper_fired.add(symbol)

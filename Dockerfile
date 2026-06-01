@@ -7,14 +7,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml ./
+
+RUN pip install --no-cache-dir \
+    "python-dotenv>=0.19" \
+    "flask>=2.0,<3.1" \
+    "werkzeug>=2.0,<3.1" \
+    "requests>=2.28" \
+    "yfinance>=0.2" \
+    "alpaca-py>=0.30" \
+    "numpy>=1.24,<2.0" \
+    "pandas>=2.0,<2.3" \
+    "xgboost==1.7.6" \
+    "scikit-learn>=1.3,<1.7"
+
 COPY src/ ./src/
 
-RUN pip install --no-cache-dir ".[data,alpaca,ml]"
+RUN pip install --no-cache-dir --no-deps .
 
 COPY data/ ./data/
 COPY retrain-model.sh ./retrain-model.sh
-COPY entrypoint.sh ./entrypoint.sh
-RUN chmod +x /app/retrain-model.sh /app/entrypoint.sh
+RUN chmod +x /app/retrain-model.sh
 
 RUN mkdir -p /app/data/models
 
@@ -23,4 +35,4 @@ EXPOSE 8080
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app/src
 
-CMD ["/app/entrypoint.sh"]
+CMD ["python", "-m", "daytrading.runner"]

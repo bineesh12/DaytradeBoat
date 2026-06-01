@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 try:
     from alpaca.trading.client import TradingClient
     from alpaca.trading.enums import OrderSide, OrderStatus as AlpacaOrderStatus, TimeInForce
-    from alpaca.trading.requests import LimitOrderRequest
+    from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
     _HAS_ALPACA = True
 except ImportError:
     _HAS_ALPACA = False
@@ -59,6 +59,9 @@ class AlpacaBroker:
         self._poll_interval = poll_interval
         self._cancel_grace_seconds = 2.0
         self._marketable_limit_slippage_pct = 0.0075
+        self._buy_limit_slippage_pct = 0.0075
+        self._low_liquidity_buy_slippage_pct = 0.005
+        self._momentum_buy_slippage_pct = 0.01
         self._sell_limit_slippage_pct = 0.0075
         self._limit_buffer_pct = limit_buffer_pct
         self._slippage_guard = slippage_guard
@@ -125,22 +128,8 @@ class AlpacaBroker:
                     sell_guard = float(getattr(self, "_sell_limit_slippage_pct", 0.0075))
                     adj_price = round(base * (1.0 - sell_guard), 2)
             else:
-                # Dynamic slippage: momentum stocks need more room to fill
-                # Base: 1.5% for stocks under $5, 1% for $5-20, 0.8% for $20+
                 base = order.limit_price
-                if base < 5.0:
-                    max_slippage_pct = 0.015
-                elif base < 20.0:
-                    max_slippage_pct = 0.01
-                else:
-                    max_slippage_pct = 0.008
-
-                # If the bar shows strong momentum (big green candle), allow extra room
-                if bar.close > bar.open and bar.high > bar.low:
-                    bar_range_pct = (bar.high - bar.low) / bar.low if bar.low > 0 else 0
-                    if bar_range_pct > 0.02:
-                        max_slippage_pct = min(max_slippage_pct + 0.005, 0.025)
-
+                max_slippage_pct = self._buy_slippage_window_pct(bar)
                 max_limit = round(base * (1.0 + max_slippage_pct), 2)
 
                 if smart_price is not None:
@@ -177,6 +166,24 @@ class AlpacaBroker:
             return None, OrderStatus.REJECTED
 
         return self._wait_for_fill(alpaca_order.id, order)
+
+    def _buy_slippage_window_pct(self, bar: Bar) -> float:
+        """Return the maximum buy chase window for the current execution bar.
+
+        Thin momentum names can still be traded, but only if the broker can
+        fill close to the signal. This prevents KITT-style fills where a
+        low-liquidity setup slips ~1.7% before the position even starts.
+        """
+        bar_volume = float(getattr(bar, "volume", 0.0) or 0.0)
+        if bar_volume < 50_000:
+            return float(getattr(self, "_low_liquidity_buy_slippage_pct", 0.005))
+
+        base_window = float(getattr(self, "_buy_limit_slippage_pct", 0.0075))
+        if bar.close > bar.open and bar.high > bar.low:
+            bar_range_pct = (bar.high - bar.low) / bar.low if bar.low > 0 else 0.0
+            if bar_volume >= 100_000 and bar_range_pct > 0.02:
+                return float(getattr(self, "_momentum_buy_slippage_pct", 0.01))
+        return base_window
 
     def _wait_for_fill(
         self,
@@ -441,3 +448,133 @@ class AlpacaBroker:
         """Liquidate everything (end-of-day safety)."""
         self._client.close_all_positions(cancel_orders=True)
         logger.info("Closed all positions")
+
+    def emergency_close_all_positions(
+        self,
+        *,
+        attempts: int = 3,
+        settle_seconds: float = 1.0,
+    ) -> dict:
+        """Cancel all orders and keep closing positions until Alpaca is flat.
+
+        Dashboard emergency-close must be stronger than the normal EOD close:
+        open sell/stop orders can hold shares for a few seconds and make a
+        fresh close order reject. This method cancels, waits for held orders to
+        clear, retries, and returns the actual remaining broker state.
+        """
+        from alpaca.trading.enums import QueryOrderStatus
+        from alpaca.trading.requests import GetOrdersRequest
+
+        cancelled_total = 0
+        submitted = []
+        errors = []
+
+        def open_orders():
+            try:
+                req = GetOrdersRequest(status=QueryOrderStatus.OPEN)
+                return list(self._client.get_orders(filter=req) or [])
+            except Exception as exc:
+                errors.append("get open orders: {}".format(exc))
+                return []
+
+        def fresh_positions():
+            try:
+                return list(self._client.get_all_positions() or [])
+            except Exception as exc:
+                errors.append("get positions: {}".format(exc))
+                return []
+
+        def cancel_open_orders() -> int:
+            count = 0
+            for order in open_orders():
+                try:
+                    self._client.cancel_order_by_id(str(order.id))
+                    count += 1
+                except Exception as exc:
+                    errors.append("cancel {}: {}".format(getattr(order, "id", ""), exc))
+            if count:
+                self._invalidate_position_cache()
+            return count
+
+        for attempt in range(1, max(1, attempts) + 1):
+            cancelled_total += cancel_open_orders()
+            deadline = time.monotonic() + max(0.0, settle_seconds)
+            while time.monotonic() < deadline:
+                if not open_orders():
+                    break
+                time.sleep(0.1)
+
+            positions = fresh_positions()
+            if not positions:
+                self._invalidate_position_cache()
+                return {
+                    "ok": True,
+                    "flat": True,
+                    "attempts": attempt,
+                    "cancelled_orders": cancelled_total,
+                    "submitted_orders": submitted,
+                    "remaining_positions": {},
+                    "errors": errors,
+                }
+
+            try:
+                self._client.close_all_positions(cancel_orders=True)
+                submitted.append({"type": "close_all_positions", "attempt": attempt})
+            except Exception as exc:
+                errors.append("close_all_positions: {}".format(exc))
+
+            time.sleep(max(0.2, settle_seconds))
+
+            # If the bulk close did not flatten everything, submit explicit
+            # market closes for remaining quantities.
+            for pos in fresh_positions():
+                try:
+                    qty = abs(float(pos.qty))
+                    if qty <= 0:
+                        continue
+                    side_val = getattr(pos, "side", "")
+                    side_str = side_val.value if hasattr(side_val, "value") else str(side_val)
+                    order_side = OrderSide.SELL if side_str.lower() == "long" else OrderSide.BUY
+                    req = MarketOrderRequest(
+                        symbol=pos.symbol,
+                        qty=qty,
+                        side=order_side,
+                        time_in_force=TimeInForce.DAY,
+                    )
+                    order = self._client.submit_order(order_data=req)
+                    submitted.append({
+                        "type": "market_close",
+                        "symbol": pos.symbol,
+                        "qty": qty,
+                        "side": order_side.value,
+                        "id": str(order.id),
+                    })
+                except Exception as exc:
+                    errors.append("market close {}: {}".format(getattr(pos, "symbol", ""), exc))
+
+            time.sleep(max(0.2, settle_seconds))
+
+        remaining = {
+            p.symbol: {
+                "qty": float(p.qty),
+                "side": str(getattr(p, "side", "")),
+                "avg_entry": float(p.avg_entry_price),
+                "current_price": float(p.current_price) if p.current_price else None,
+            }
+            for p in fresh_positions()
+        }
+        self._invalidate_position_cache()
+        flat = not remaining
+        logger.warning(
+            "Emergency close completed flat=%s remaining=%s cancelled=%d errors=%s",
+            flat, list(remaining.keys()), cancelled_total, errors,
+        )
+        return {
+            "ok": flat,
+            "flat": flat,
+            "attempts": max(1, attempts),
+            "cancelled_orders": cancelled_total,
+            "submitted_orders": submitted,
+            "remaining_positions": remaining,
+            "errors": errors,
+        }

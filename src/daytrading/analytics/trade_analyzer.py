@@ -80,7 +80,9 @@ class TradeAnalyzer:
 
     def analyze(self, trades: List[TradeRecord]) -> AnalysisResult:
         """Run full analysis on trade history. Returns insights and actions."""
-        exits = [t for t in trades if t.exit_price > 0 and t.pnl is not None]
+        exits = self._group_partial_exits([
+            t for t in trades if t.exit_price > 0 and t.pnl is not None
+        ])
         result = AnalysisResult()
 
         if len(exits) < self._min_trades:
@@ -115,6 +117,67 @@ class TradeAnalyzer:
                 pass
 
         return result
+
+    def _group_partial_exits(self, trades: List[TradeRecord]) -> List[TradeRecord]:
+        """Collapse broker partial-fill leftovers into one analytical trade.
+
+        Alpaca can report one position exit as several small fills. Counting each
+        leftover as a separate loser makes weak-symbol blocking too noisy.
+        """
+        grouped: List[TradeRecord] = []
+        for trade in sorted(trades, key=lambda t: (t.symbol, t.entry_time, t.exit_time)):
+            if not grouped:
+                grouped.append(trade)
+                continue
+
+            prev = grouped[-1]
+            same_trade = (
+                prev.symbol == trade.symbol
+                and prev.side == trade.side
+                and prev.scanner == trade.scanner
+                and prev.exit_reason == trade.exit_reason
+                and abs(prev.entry_price - trade.entry_price) <= max(0.02, trade.entry_price * 0.002)
+                and self._seconds_between(prev.exit_time, trade.exit_time) <= 90
+            )
+            if not same_trade:
+                grouped.append(trade)
+                continue
+
+            total_qty = prev.quantity + trade.quantity
+            if total_qty > 0:
+                entry_price = (
+                    prev.entry_price * prev.quantity + trade.entry_price * trade.quantity
+                ) / total_qty
+                exit_price = (
+                    prev.exit_price * prev.quantity + trade.exit_price * trade.quantity
+                ) / total_qty
+            else:
+                entry_price = trade.entry_price
+                exit_price = trade.exit_price
+
+            grouped[-1] = TradeRecord(
+                symbol=prev.symbol,
+                side=prev.side,
+                quantity=total_qty,
+                entry_price=entry_price,
+                exit_price=exit_price,
+                pnl=prev.pnl + trade.pnl,
+                exit_reason=prev.exit_reason,
+                entry_time=min(prev.entry_time, trade.entry_time),
+                exit_time=max(prev.exit_time, trade.exit_time),
+                scanner=prev.scanner,
+                hold_seconds=max(prev.hold_seconds, trade.hold_seconds),
+            )
+        return grouped
+
+    @staticmethod
+    def _seconds_between(left: str, right: str) -> float:
+        try:
+            a = datetime.fromisoformat(left.replace("Z", "+00:00"))
+            b = datetime.fromisoformat(right.replace("Z", "+00:00"))
+            return abs((b - a).total_seconds())
+        except Exception:
+            return 999999.0
 
     def reset_blocks(self) -> None:
         """Clear all blocked symbols — call on each new session/restart."""

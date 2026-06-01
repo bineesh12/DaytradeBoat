@@ -20,7 +20,7 @@ from typing import Optional
 
 from daytrading.indicators.core import vwap
 from daytrading.models import PortfolioState, ScanResult, SignalAction, TradeSignal
-from daytrading.strategy.entry_guard import check_entry_quality
+from daytrading.strategy.entry_guard import check_entry_quality, record_rule_rejection
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +58,10 @@ class MomentumPatternVerifier:
     @property
     def name(self) -> str:
         return "momentum_pattern"
+
+    def _reject(self, reason: str) -> None:
+        self._last_reject = reason
+        record_rule_rejection()
 
     def _get_avg_volume(self, symbol: str) -> Optional[float]:
         if self._float_checker is not None and hasattr(self._float_checker, "get_avg_volume"):
@@ -174,25 +178,25 @@ class MomentumPatternVerifier:
     ) -> Optional[TradeSignal]:
         bars = scan_result.bars
         if len(bars) < 3:
-            self._last_reject = "insufficient bar data"
+            self._reject("insufficient bar data")
             return None
 
         latest = bars[-1]
         price = latest.close
 
         if not (self._min_price <= price <= self._max_price):
-            self._last_reject = "price ${:.2f} outside range".format(price)
+            self._reject("price ${:.2f} outside range".format(price))
             return None
 
         pos = portfolio.positions.get(scan_result.symbol)
         if pos and not pos.is_flat:
-            self._last_reject = "already in position"
+            self._reject("already in position")
             return None
 
         pattern = scan_result.criteria.get("pattern", "")
         direction = scan_result.criteria.get("direction", "")
         if direction != "up":
-            self._last_reject = "not an upward pattern"
+            self._reject("not an upward pattern")
             return None
 
         # Momentum burst scanner hits use the recent low as stop
@@ -201,16 +205,17 @@ class MomentumPatternVerifier:
         known_patterns = (
             "bull_flag", "flat_top_breakout", "vwap_pullback",
             "opening_range_breakout", "hod_reclaim", "pullback_base",
+            "abc_continuation",
         )
         if not is_momentum_burst and pattern not in known_patterns:
-            self._last_reject = "unknown pattern: {}".format(pattern)
+            self._reject("unknown pattern: {}".format(pattern))
             return None
 
         if pattern in ("vwap_pullback", "pullback_base"):
             late_reject = self._late_pullback_reject(pattern, bars)
             if late_reject is not None:
                 logger.info("ENTRY GUARD REJECT %s: %s", scan_result.symbol, late_reject)
-                self._last_reject = late_reject
+                self._reject(late_reject)
                 return None
 
         bars_5m = None
@@ -253,13 +258,13 @@ class MomentumPatternVerifier:
         elif pattern == "bull_flag":
             pullback_low = float(scan_result.criteria.get("pullback_low", 0))
             if pullback_low <= 0:
-                self._last_reject = "no pullback low"
+                self._reject("no pullback low")
                 return None
             pattern_stop = pullback_low - 0.02
         elif pattern == "flat_top_breakout":
             resistance = float(scan_result.criteria.get("resistance", 0))
             if resistance <= 0:
-                self._last_reject = "no resistance level"
+                self._reject("no resistance level")
                 return None
             pattern_stop = resistance - 0.05
         elif pattern == "vwap_pullback":
@@ -302,8 +307,14 @@ class MomentumPatternVerifier:
             else:
                 recent_low = min(b.low for b in bars[-5:]) if len(bars) >= 5 else price * 0.97
                 pattern_stop = recent_low - 0.02
+        elif pattern == "abc_continuation":
+            b_low = float(scan_result.criteria.get("b_low", 0))
+            if b_low <= 0:
+                self._reject("no ABC B-low")
+                return None
+            pattern_stop = b_low - 0.02
         else:
-            self._last_reject = "unhandled pattern"
+            self._reject("unhandled pattern")
             return None
 
         # Use the technical stop as-is. Only sanity-check it.
@@ -311,7 +322,7 @@ class MomentumPatternVerifier:
 
         risk_per_share = price - stop_price
         if risk_per_share <= 0:
-            self._last_reject = "stop above entry"
+            self._reject("stop above entry")
             return None
 
         risk_pct = risk_per_share / price
@@ -346,8 +357,10 @@ class MomentumPatternVerifier:
                         "ENTRY GUARD REJECT %s: hot HOD reclaim risk too wide: $%.2f (%.0f%% of $%.2f)",
                         scan_result.symbol, hot_risk, hot_risk_pct * 100, price,
                     )
-                    self._last_reject = "hot HOD reclaim risk too wide: ${:.2f} ({:.0f}% of ${:.2f})".format(
-                        hot_risk, hot_risk_pct * 100, price)
+                    self._reject(
+                        "hot HOD reclaim risk too wide: ${:.2f} ({:.0f}% of ${:.2f})".format(
+                            hot_risk, hot_risk_pct * 100, price)
+                    )
                     return None
             elif 0.005 < tight_risk_pct <= max_risk_pct:
                 stop_price = tight_stop
@@ -359,14 +372,18 @@ class MomentumPatternVerifier:
             else:
                 logger.info("ENTRY GUARD REJECT %s: risk too wide: $%.2f (%.0f%% of $%.2f) — skip loose setup",
                             scan_result.symbol, risk_per_share, risk_pct * 100, price)
-                self._last_reject = "risk too wide: ${:.2f} ({:.0f}% of ${:.2f}) — skip loose setup".format(
-                    risk_per_share, risk_pct * 100, price)
+                self._reject(
+                    "risk too wide: ${:.2f} ({:.0f}% of ${:.2f}) — skip loose setup".format(
+                        risk_per_share, risk_pct * 100, price)
+                )
                 return None
         if risk_pct < 0.005:
             logger.info("ENTRY GUARD REJECT %s: risk too tight: $%.2f (%.1f%% of $%.2f) — will stop on noise",
                         scan_result.symbol, risk_per_share, risk_pct * 100, price)
-            self._last_reject = "risk too tight: ${:.2f} ({:.1f}% of ${:.2f}) — will stop on noise".format(
-                risk_per_share, risk_pct * 100, price)
+            self._reject(
+                "risk too tight: ${:.2f} ({:.1f}% of ${:.2f}) — will stop on noise".format(
+                    risk_per_share, risk_pct * 100, price)
+            )
             return None
 
         target_price = price + (risk_per_share * self._rr_ratio)

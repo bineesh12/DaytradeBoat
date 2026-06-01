@@ -61,15 +61,32 @@ def test_auto_disable_low_shadow_accuracy():
     for i in range(25):
         m.record_entry_passed()
 
-    # Shadow results: 1 correct, 5 wrong = 16.7% accuracy.
-    m._stats.shadow_correct = 1
-    m._stats.shadow_wrong = 5
+    # Shadow results: 4 correct, 21 wrong = 16% accuracy.
+    m._stats.shadow_correct = 4
+    m._stats.shadow_wrong = 21
 
     m._check_auto_disable()
 
     assert m.stats.model_disabled is True
     assert m.is_model_enabled is False
     assert "shadow accuracy" in m.stats.disable_reason
+
+
+def test_no_disable_with_few_shadow_outcomes():
+    """Shadow accuracy should not disable ML before enough shadow labels exist."""
+    m = MLMonitor()
+
+    # Enough scored entries overall, but only 15 shadow outcomes. This was too
+    # noisy and caused premature live disables like 4 correct / 11 wrong.
+    for i in range(25):
+        m.record_entry_passed()
+    m._stats.shadow_correct = 4
+    m._stats.shadow_wrong = 11
+
+    m._check_auto_disable()
+
+    assert m.stats.model_disabled is False
+    assert m.is_model_enabled is True
 
 
 def test_no_disable_with_few_samples():

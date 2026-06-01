@@ -322,6 +322,10 @@ class TestScalpingPipeline:
         pipeline = create_scalping_pipeline(initial_cash=10_000)
         assert pipeline.portfolio.cash == 10_000
 
+    def test_factory_defaults_to_50_dollar_risk_cap(self) -> None:
+        pipeline = create_scalping_pipeline(initial_cash=10_000)
+        assert pipeline._max_dollar_risk_per_trade == 50.0
+
     def test_factory_respects_price_range(self) -> None:
         pipeline = create_scalping_pipeline(initial_cash=10_000, min_price=2.0, max_price=15.0)
         # $25 stock should be rejected by the classifier

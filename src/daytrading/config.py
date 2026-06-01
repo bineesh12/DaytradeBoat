@@ -99,6 +99,9 @@ class Settings:
         self.enable_daily_loser_blacklist: bool = _env_bool(
             "ENABLE_DAILY_LOSER_BLACKLIST", True,
         )
+        self.max_dollar_risk_per_trade: float = _env_float(
+            "MAX_DOLLAR_RISK_PER_TRADE", 50.0,
+        )
 
         # Extended hours — allow scanning/entries 4:00 PM–8:00 PM ET (paper testing)
         self.after_hours_enabled: bool = _env_bool("AFTER_HOURS_ENABLED", False)
@@ -112,6 +115,24 @@ class Settings:
         )
         self.hod_momentum_max_price: float = _env_float(
             "HOD_MOMENTUM_MAX_PRICE", 20.0,
+        )
+        self.hod_sub2_momentum_enabled: bool = _env_bool(
+            "HOD_SUB2_MOMENTUM_ENABLED", True,
+        )
+        self.hod_sub2_momentum_min_price: float = _env_float(
+            "HOD_SUB2_MOMENTUM_MIN_PRICE", 1.0,
+        )
+        self.hod_sub2_momentum_max_price: float = _env_float(
+            "HOD_SUB2_MOMENTUM_MAX_PRICE", 2.0,
+        )
+        self.hod_sub2_momentum_min_change_pct: float = _env_float(
+            "HOD_SUB2_MOMENTUM_MIN_CHANGE_PCT", 10.0,
+        )
+        self.hod_sub2_momentum_min_day_volume: float = _env_float(
+            "HOD_SUB2_MOMENTUM_MIN_DAY_VOLUME", 1_000_000,
+        )
+        self.hod_sub2_momentum_max_float: float = _env_float(
+            "HOD_SUB2_MOMENTUM_MAX_FLOAT", 10_000_000,
         )
         # Requires SIP feed (alpaca_feed=sip). Not the RT mover scanner — HOD tick only.
         self.hod_momentum_tick_enabled: bool = _env_bool(
