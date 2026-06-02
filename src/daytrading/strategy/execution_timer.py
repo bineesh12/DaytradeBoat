@@ -7,7 +7,7 @@ this module watches 10-second bars for a better entry moment:
   2. Green 10s candle after a small dip (close > open, low < prev close)
   3. Any green 10s candle with volume
 
-If no favorable micro-signal appears within max_wait_bars (default 3 = 30 sec),
+If no favorable micro-signal appears within max_wait_bars (default 1 = 10 sec),
 the trade executes at market to avoid missing the move entirely.
 """
 
@@ -44,11 +44,11 @@ class ExecutionTimer:
       3. Each 10-sec bar, call check() to see if any signal is ready
       4. Returns signals that should execute NOW
 
-    Fallback: if max_wait_bars (30 sec) pass with no good micro-entry,
+    Fallback: if max_wait_bars pass with no good micro-entry,
     the signal is released for immediate execution.
     """
 
-    def __init__(self, max_wait_bars: int = 3, enabled: bool = True) -> None:
+    def __init__(self, max_wait_bars: int = 1, enabled: bool = True) -> None:
         self._max_wait = max_wait_bars
         self._enabled = enabled
         self._pending: Dict[str, PendingEntry] = {}
@@ -185,8 +185,15 @@ class ExecutionTimer:
 
         pattern = str(hit.criteria.get("pattern", ""))
         scanner = hit.scanner_name
-        if pattern not in ("hod_reclaim", "vwap_pullback", "breakout_scalp"):
-            if scanner not in ("hod_reclaim", "vwap_pullback", "breakout_scalp"):
+        hot_patterns = {
+            "hod_reclaim",
+            "vwap_pullback",
+            "breakout_scalp",
+            "momentum_burst",
+            "abc_continuation",
+        }
+        if pattern not in hot_patterns:
+            if scanner not in hot_patterns:
                 return None
 
         price = float(hit.criteria.get("close") or signal.entry_price or 0.0)
@@ -201,6 +208,10 @@ class ExecutionTimer:
         latest_volume = float(hit.criteria.get("volume") or 0.0)
         if pattern == "breakout_scalp" or scanner == "breakout_scalp":
             return 8.0
+        if pattern in ("momentum_burst", "abc_continuation") or scanner in (
+            "momentum_burst", "abc_continuation",
+        ):
+            return 10.0
         if rally_pct >= 25.0 and latest_volume >= 100_000:
             return 12.0
         return None

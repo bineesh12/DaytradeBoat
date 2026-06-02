@@ -117,6 +117,45 @@ def test_daily_reset_re_enables():
     assert m.stats.entries_passed == 0
 
 
+def test_rule_rejections_are_grouped_by_symbol_and_reason():
+    """Repeated same-symbol rule rejects should not inflate dashboard stats."""
+    m = MLMonitor()
+
+    m.record_rule_rejection("ANY", "stale data (300s old, max=300s)")
+    m.record_rule_rejection("ANY", "stale data (450s old, max=300s)")
+    m.record_rule_rejection("DXST", "late pullback too far from HOD 18.1% (max 10.0%)")
+    m.record_rule_rejection("DXST", "late pullback too far from HOD 21.4% (max 10.0%)")
+    m.record_rule_rejection("DXST", "below VWAP (4.90 < 5.10)")
+
+    assert m.stats.entries_rejected_by_rules == 3
+
+    m.reset_daily()
+    m.record_rule_rejection("ANY", "stale data (700s old, max=300s)")
+
+    assert m.stats.entries_rejected_by_rules == 1
+
+
+def test_duplicate_ml_rejections_do_not_inflate_disable_stats():
+    """Repeated same-setup ML rejects should count once for dashboard stats."""
+    m = MLMonitor()
+
+    for _ in range(10):
+        m.record_ml_rejection("GNTA", 2.31, 0.17, 70)
+
+    assert m.stats.entries_rejected_by_ml == 1
+    assert len(m._shadow_entries) == 1
+
+
+def test_soft_pass_shadow_does_not_count_as_ml_block():
+    """Strong rule-score soft passes learn in shadow without counting as blocks."""
+    m = MLMonitor()
+
+    m.record_ml_rejection("ASTI", 8.75, 0.299, 100, counted=False)
+
+    assert m.stats.entries_rejected_by_ml == 0
+    assert len(m._shadow_entries) == 1
+
+
 def test_stats_to_dict():
     """Stats dict has all expected fields."""
     m = MLMonitor()

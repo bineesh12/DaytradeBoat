@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import time
 from collections import deque
@@ -91,6 +92,8 @@ class MLMonitor:
         self._lock = threading.Lock()
         self._model_enabled = True
         self._prices: Dict[str, float] = {}  # latest known prices
+        self._rule_rejection_keys: set = set()
+        self._ml_rejection_keys: set = set()
 
     @property
     def is_model_enabled(self) -> bool:
@@ -105,10 +108,32 @@ class MLMonitor:
         with self._lock:
             self._stats.entries_passed += 1
 
-    def record_ml_rejection(self, symbol: str, price: float, ml_prob: float, score: int) -> None:
-        """Called when ML rejects an entry that passed rules."""
+    def _ml_rejection_key(self, symbol: str, price: float, score: int) -> tuple:
+        price_bucket = round(price, 2) if price > 0 else 0.0
+        score_bucket = int(score // 5) * 5
+        return (symbol, price_bucket, score_bucket)
+
+    def record_ml_rejection(
+        self,
+        symbol: str,
+        price: float,
+        ml_prob: float,
+        score: int,
+        *,
+        counted: bool = True,
+    ) -> None:
+        """Called when ML rejects or disagrees with an entry that passed rules.
+
+        ``counted=False`` is for strong rule-score soft passes: we still track
+        shadow outcome, but do not treat it as a live ML block for auto-disable.
+        """
         with self._lock:
-            self._stats.entries_rejected_by_ml += 1
+            key = self._ml_rejection_key(symbol, price, score)
+            if key in self._ml_rejection_keys:
+                return
+            self._ml_rejection_keys.add(key)
+            if counted:
+                self._stats.entries_rejected_by_ml += 1
             self._shadow_entries.append(ShadowEntry(
                 symbol=symbol,
                 price=price,
@@ -117,9 +142,32 @@ class MLMonitor:
                 score=score,
             ))
 
-    def record_rule_rejection(self) -> None:
-        """Called when rules reject (before ML even scores)."""
+    @staticmethod
+    def _normalize_rule_reason(reason: Optional[str]) -> str:
+        """Collapse changing numbers so repeated rejects group together."""
+        if not reason:
+            return ""
+        return re.sub(r"\d+(?:\.\d+)?", "#", reason)
+
+    def record_rule_rejection(
+        self,
+        symbol: Optional[str] = None,
+        reason: Optional[str] = None,
+    ) -> None:
+        """Called when rules reject before ML scores.
+
+        Count each symbol/reason once per day so a stale symbol rejected every
+        scan cycle does not make the dashboard look stricter than it is.
+        """
         with self._lock:
+            if symbol or reason:
+                key = (
+                    symbol or "",
+                    self._normalize_rule_reason(reason),
+                )
+                if key in self._rule_rejection_keys:
+                    return
+                self._rule_rejection_keys.add(key)
             self._stats.entries_rejected_by_rules += 1
 
     def update_price(self, symbol: str, price: float) -> None:
@@ -233,6 +281,8 @@ class MLMonitor:
         with self._lock:
             was_disabled = self._stats.model_disabled
             self._stats = MLMonitorStats()
+            self._rule_rejection_keys.clear()
+            self._ml_rejection_keys.clear()
             if was_disabled:
                 # Re-enable for new day — give model fresh chance
                 self._model_enabled = True

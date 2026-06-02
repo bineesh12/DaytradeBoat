@@ -54,6 +54,7 @@ class MomentumPatternVerifier:
         self._bar_aggregator = None  # set by factory/runner for 5m context
         self._tick_buffer = None  # set by runner: Dict[str, deque] of recent ticks
         self._quote_buffer = None  # set by runner: Dict[str, deque] of recent quotes
+        self._current_symbol: Optional[str] = None
 
     @property
     def name(self) -> str:
@@ -61,7 +62,7 @@ class MomentumPatternVerifier:
 
     def _reject(self, reason: str) -> None:
         self._last_reject = reason
-        record_rule_rejection()
+        record_rule_rejection(symbol=self._current_symbol, reason=reason)
 
     def _get_avg_volume(self, symbol: str) -> Optional[float]:
         if self._float_checker is not None and hasattr(self._float_checker, "get_avg_volume"):
@@ -109,6 +110,72 @@ class MomentumPatternVerifier:
         return price * 0.94
 
     @staticmethod
+    def _is_fresh_late_reclaim(
+        pattern: str,
+        bars: list,
+        *,
+        session_high: float,
+        distance_from_hod: float,
+        day_move_pct: float,
+    ) -> bool:
+        """Allow a late pullback only after a fresh base reclaim.
+
+        This keeps the normal no-chase HOD-distance rule intact, but gives
+        strong runners a second chance after they build a tight base and reclaim
+        it with volume. It is meant for DXST/OLOX-style continuation watches,
+        not for buying a falling pullback.
+        """
+        if pattern not in ("vwap_pullback", "pullback_base") or len(bars) < 12:
+            return False
+        if session_high <= 0 or day_move_pct < 25.0:
+            return False
+
+        max_reclaim_distance = 18.0 if pattern == "pullback_base" else 16.0
+        if distance_from_hod > max_reclaim_distance:
+            return False
+
+        latest = bars[-1]
+        if latest.close <= latest.open or latest.close <= 0:
+            return False
+        candle_range = latest.high - latest.low
+        body_ratio = (
+            (latest.close - latest.open) / candle_range
+            if candle_range > 0 else 0.0
+        )
+        if body_ratio < 0.40:
+            return False
+
+        base = list(bars[-5:-1])
+        if len(base) < 4:
+            return False
+        base_high = max(b.high for b in base)
+        base_low = min(b.low for b in base)
+        if base_low <= 0:
+            return False
+        base_range_pct = (base_high - base_low) / base_low * 100.0
+        max_base_range_pct = min(8.0, 4.0 + day_move_pct / 20.0)
+        if base_range_pct > max_base_range_pct:
+            return False
+        if latest.close <= base_high * 1.002:
+            return False
+        if latest.low < base_low:
+            return False
+
+        avg_base_vol = sum(b.volume for b in base) / len(base)
+        recent_volume = sum(b.volume for b in bars[-3:])
+        if recent_volume < 75_000:
+            return False
+        if avg_base_vol > 0 and latest.volume < avg_base_vol * 1.10:
+            return False
+
+        vwap_vals = vwap(bars)
+        current_vwap = vwap_vals[-1] if vwap_vals else 0.0
+        if current_vwap <= 0:
+            return False
+        above_vwap_pct = (latest.close - current_vwap) / current_vwap * 100.0
+        return above_vwap_pct >= 1.0
+
+    @staticmethod
     def _late_pullback_reject(pattern: str, bars: list) -> Optional[str]:
         """Extra quality gate for slower pullback entries."""
         if len(bars) < 10:
@@ -127,12 +194,25 @@ class MomentumPatternVerifier:
         day_move_pct = (session_high - session_open) / session_open * 100
         distance_from_hod = (session_high - price) / session_high * 100
 
+        fresh_late_reclaim = False
         max_hod_distance = 8.0 if pattern == "vwap_pullback" else 10.0
         if distance_from_hod > max_hod_distance:
-            return (
-                "late pullback too far from HOD {:.1f}% "
-                "(max {:.1f}%)"
-            ).format(distance_from_hod, max_hod_distance)
+            fresh_late_reclaim = MomentumPatternVerifier._is_fresh_late_reclaim(
+                pattern,
+                bars,
+                session_high=session_high,
+                distance_from_hod=distance_from_hod,
+                day_move_pct=day_move_pct,
+            )
+            if not fresh_late_reclaim:
+                return (
+                    "late pullback too far from HOD {:.1f}% "
+                    "(max {:.1f}%; watching for fresh reclaim)"
+                ).format(distance_from_hod, max_hod_distance)
+            logger.info(
+                "ENTRY GUARD LATE RECLAIM %s: %.1f%% from HOD but fresh base reclaim",
+                pattern, distance_from_hod,
+            )
 
         if pattern == "pullback_base" and day_move_pct < 20.0:
             return (
@@ -163,7 +243,11 @@ class MomentumPatternVerifier:
                 "late pullback tape too slow {:.0f} recent volume "
                 "(need 75K+)"
             ).format(recent_volume)
-        if earlier_avg > 0 and recent_avg < earlier_avg * 0.60:
+        if (
+            earlier_avg > 0
+            and recent_avg < earlier_avg * 0.60
+            and not fresh_late_reclaim
+        ):
             return (
                 "late pullback volume faded {:.1f}x prior "
                 "(need 0.6x+)"
@@ -176,6 +260,7 @@ class MomentumPatternVerifier:
         scan_result: ScanResult,
         portfolio: PortfolioState,
     ) -> Optional[TradeSignal]:
+        self._current_symbol = scan_result.symbol
         bars = scan_result.bars
         if len(bars) < 3:
             self._reject("insufficient bar data")

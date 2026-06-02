@@ -211,6 +211,8 @@ def log_missed_opportunity(
     bars: Optional[Sequence[Bar]] = None,
     quotes: Optional[Sequence[Quote]] = None,
     ml_prob: Optional[float] = None,
+    scanner_score: Optional[float] = None,
+    criteria: Optional[dict] = None,
 ) -> None:
     """Log a watchlist setup skipped or rejected by rules/ML."""
     try:
@@ -221,6 +223,8 @@ def log_missed_opportunity(
             "reason": reason,
             "scanner": scanner,
             "ml_prob": ml_prob,
+            "scanner_score": scanner_score,
+            "criteria": dict(criteria or {}),
             "label": None,
         })
         _append(MISSED_FILE, base)

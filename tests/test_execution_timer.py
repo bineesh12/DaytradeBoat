@@ -43,6 +43,28 @@ def _hot_hod_signal(symbol: str = "HOT", price: float = 3.15) -> TradeSignal:
     )
 
 
+def _hot_momentum_signal(symbol: str = "MOMO", price: float = 4.84) -> TradeSignal:
+    return TradeSignal(
+        symbol=symbol,
+        action=SignalAction.ENTER_LONG,
+        quantity=100,
+        entry_price=price,
+        reason="momentum burst",
+        scan_result=ScanResult(
+            symbol=symbol,
+            scanner_name="momentum_burst",
+            ts=datetime.now(timezone.utc),
+            score=30.0,
+            criteria={
+                "pattern": "momentum_burst",
+                "direction": "up",
+                "close": price,
+                "volume": 300_000,
+            },
+        ),
+    )
+
+
 def _10s_bar(
     symbol: str,
     ts: datetime,
@@ -145,6 +167,18 @@ class TestExecutionTimerTimeouts:
         released = timer.check_timeouts()
         assert len(released) == 1
         assert released[0].symbol == "HOT"
+
+    def test_hot_momentum_signal_uses_short_timeout(self) -> None:
+        timer = ExecutionTimer(max_wait_bars=3, enabled=True)
+        sig = _hot_momentum_signal()
+        timer.queue(sig)
+        pending = timer._pending["MOMO"]
+        assert pending.max_wait_seconds == 10.0
+
+        pending.queued_at = datetime.now(timezone.utc) - timedelta(seconds=11)
+        released = timer.check_timeouts()
+        assert len(released) == 1
+        assert released[0].symbol == "MOMO"
 
     def test_normal_signal_keeps_standard_timeout(self) -> None:
         timer = ExecutionTimer(max_wait_bars=3, enabled=True)

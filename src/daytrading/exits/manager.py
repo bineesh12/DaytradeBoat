@@ -34,6 +34,7 @@ TICK = 0.01
 STEP_PCT = 0.01            # 1% of entry price — lock breakeven quickly to protect capital
 STEP_PCT_AFTER_HALF = 0.04  # 4% steps after selling half (let winner run)
 MOMENTUM_THRESHOLD = 7  # ticks moved from entry to be considered "high momentum"
+QUICK_SCALP_PARTIAL_PCT = 0.01  # harvest first quick scalp pop before it fades
 
 
 @dataclass
@@ -382,7 +383,31 @@ class ExitManager:
                 pos.remaining_qty = 0
                 return [sig]
 
-        # --- Exit #1: Sell half at first profit target (2:1 R:R) ---
+        # --- Quick scalp partial: sell half at +1% before moving to breakeven ---
+        if (
+            is_long
+            and not pos.sold_half
+            and pos.remaining_qty > 1
+            and self._uses_quick_scalp_partial(pos)
+        ):
+            quick_partial_price = pos.entry_price * (1 + QUICK_SCALP_PARTIAL_PCT)
+            if price >= quick_partial_price:
+                half_qty = max(1, int(pos.remaining_qty / 2))
+                logger.info(
+                    "QUICK PARTIAL %s @ %.4f | hit +%.1f%% scalp pop %.4f | "
+                    "selling %d of %d shares, moving stop to breakeven %.4f",
+                    pos.symbol, price, QUICK_SCALP_PARTIAL_PCT * 100,
+                    quick_partial_price, half_qty, int(pos.remaining_qty),
+                    pos.entry_price,
+                )
+                pos.sold_half = True
+                pos.remaining_qty -= half_qty
+                pos.stop_loss = pos.entry_price
+                pos.breakeven_locked = True
+                sig = self._make_exit(pos, half_qty, price, ExitReason.TAKE_PROFIT)
+                return [sig]
+
+        # --- Exit #1: Sell half at first profit target (1:1 R:R) ---
         if is_long and not pos.sold_half and pos.first_target_price > 0:
             if price >= pos.first_target_price:
                 half_qty = max(1, int(pos.remaining_qty / 2))
@@ -626,4 +651,20 @@ class ExitManager:
             quantity=qty,
             entry_price=price,
             reason="{}: {}".format(reason.value, pos.reason),
+        )
+
+    @staticmethod
+    def _uses_quick_scalp_partial(pos: TrackedPosition) -> bool:
+        reason = (pos.reason or "").lower()
+        return any(
+            key in reason
+            for key in (
+                "momentum",
+                "quick",
+                "scalp",
+                "pullback",
+                "abc",
+                "hod",
+                "breakout",
+            )
         )

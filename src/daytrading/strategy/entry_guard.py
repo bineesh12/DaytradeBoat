@@ -38,6 +38,7 @@ except Exception:
 # XGBoost model — loaded once at import time, None if unavailable
 _xgb_model = None
 _XGB_THRESHOLD = 0.30
+_ML_SOFT_PASS_SCORE = 80
 try:
     import xgboost as xgb
     _model_path = os.path.join(
@@ -57,10 +58,16 @@ def get_ml_monitor():
     return _ml_monitor
 
 
-def record_rule_rejection() -> None:
+def record_rule_rejection(
+    symbol: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> None:
     """Record a non-ML rule rejection for dashboard visibility."""
     if _ml_monitor:
-        _ml_monitor.record_rule_rejection()
+        try:
+            _ml_monitor.record_rule_rejection(symbol=symbol, reason=reason)
+        except TypeError:
+            _ml_monitor.record_rule_rejection()
 
 
 def _recent_volume_stats(today_bars: Sequence[Bar]) -> tuple[float, float, float]:
@@ -284,7 +291,7 @@ def check_entry_quality(
     Score >= 60/100 passes.
     """
     def _rule_reject(reason: str) -> str:
-        record_rule_rejection()
+        record_rule_rejection(symbol=symbol, reason=reason)
         return reason
 
     if not bars or len(bars) < 3:
@@ -686,17 +693,31 @@ def check_entry_quality(
             dmat = xgb.DMatrix([features])
             ml_prob_val = float(_xgb_model.predict(dmat)[0])
             if ml_prob_val < _XGB_THRESHOLD:
-                logger.info("ENTRY GUARD ML REJECT %s: prob=%.0f%% < %.0f%% [score=%d]",
-                            symbol, ml_prob_val * 100, _XGB_THRESHOLD * 100, score)
-                if _ml_monitor:
-                    _ml_monitor.record_ml_rejection(symbol, price, ml_prob_val, score)
-                _log_candidate(symbol, price, score, False,
-                               "ML low confidence ({:.0f}%)".format(ml_prob_val * 100),
-                               ml_prob_val, ", ".join(breakdown),
-                               float_shares, today_bars, bar_rvol,
-                               _session_high, _session_open, _prior_close_est)
-                return "ML model low confidence ({:.0f}%, need {:.0f}%)".format(
-                    ml_prob_val * 100, _XGB_THRESHOLD * 100)
+                if score >= _ML_SOFT_PASS_SCORE:
+                    logger.info(
+                        "ENTRY GUARD ML SOFT PASS %s: prob=%.0f%% < %.0f%% but rule score=%d >= %d",
+                        symbol, ml_prob_val * 100, _XGB_THRESHOLD * 100,
+                        score, _ML_SOFT_PASS_SCORE,
+                    )
+                    if _ml_monitor:
+                        try:
+                            _ml_monitor.record_ml_rejection(
+                                symbol, price, ml_prob_val, score, counted=False,
+                            )
+                        except TypeError:
+                            _ml_monitor.record_ml_rejection(symbol, price, ml_prob_val, score)
+                else:
+                    logger.info("ENTRY GUARD ML REJECT %s: prob=%.0f%% < %.0f%% [score=%d]",
+                                symbol, ml_prob_val * 100, _XGB_THRESHOLD * 100, score)
+                    if _ml_monitor:
+                        _ml_monitor.record_ml_rejection(symbol, price, ml_prob_val, score)
+                    _log_candidate(symbol, price, score, False,
+                                   "ML low confidence ({:.0f}%)".format(ml_prob_val * 100),
+                                   ml_prob_val, ", ".join(breakdown),
+                                   float_shares, today_bars, bar_rvol,
+                                   _session_high, _session_open, _prior_close_est)
+                    return "ML model low confidence ({:.0f}%, need {:.0f}%)".format(
+                        ml_prob_val * 100, _XGB_THRESHOLD * 100)
         except Exception as exc:
             logger.debug("ML scoring skipped for %s: %s", symbol, exc)
 

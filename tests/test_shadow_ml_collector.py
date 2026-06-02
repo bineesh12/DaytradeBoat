@@ -60,6 +60,21 @@ def test_missed_opportunity_is_labeled_after_wait(shadow_tmp):
     assert row["future_return_pct"] == pytest.approx(3.5)
 
 
+def test_missed_opportunity_records_scanner_score_and_criteria(shadow_tmp):
+    sc.log_missed_opportunity(
+        symbol="DXST",
+        price=4.48,
+        reason="ML model low confidence",
+        scanner="vwap_pullback",
+        scanner_score=210.3,
+        criteria={"pattern": "vwap_pullback", "rally_pct": 67.8},
+    )
+
+    [row] = _rows(sc.MISSED_FILE)
+    assert row["scanner_score"] == 210.3
+    assert row["criteria"]["pattern"] == "vwap_pullback"
+
+
 def test_pullback_candidate_gets_negative_label(shadow_tmp):
     old = _bar(close=10.0, minutes_ago=5)
     sc.log_pullback_candidate(

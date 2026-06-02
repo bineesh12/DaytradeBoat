@@ -98,6 +98,23 @@ class TestHalfSellAt2to1:
         assert tracked.stop_loss == pytest.approx(5.00)
         assert tracked.remaining_qty == 50
 
+    def test_momentum_scalp_sells_half_at_one_percent(self) -> None:
+        em = ExitManager()
+        pos = _long_pos(entry=5.00, stop=4.80)
+        pos.reason = "Momentum Burst CING"
+        em.track(pos)
+
+        exits = em.check_exits({"ABC": 5.05}, _ts(10))
+
+        assert len(exits) == 1
+        assert exits[0].quantity == 50
+        assert "take_profit" in exits[0].reason.lower()
+        tracked = em.tracked.get("ABC")
+        assert tracked is not None
+        assert tracked.sold_half is True
+        assert tracked.stop_loss == pytest.approx(5.00)
+        assert tracked.remaining_qty == 50
+
 
 class TestBreakevenAfterHalf:
     def test_remaining_stopped_at_breakeven(self) -> None:

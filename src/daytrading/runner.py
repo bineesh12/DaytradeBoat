@@ -104,7 +104,7 @@ class AlpacaRunner:
         from daytrading.data.bar_aggregator import BarAggregator
         from daytrading.strategy.execution_timer import ExecutionTimer
         self._bar_aggregator = BarAggregator()
-        self._exec_timer = ExecutionTimer(max_wait_bars=3, enabled=True)
+        self._exec_timer = ExecutionTimer(max_wait_bars=1, enabled=True)
         self._timed_signal_queue: deque = deque()
 
         self._skip_counts: Dict[str, int] = defaultdict(int)
@@ -186,6 +186,7 @@ class AlpacaRunner:
         self._hod_seed_max_per_minute = 30
         self._hod_seed_minute_start = time.time()
         self._hod_seed_processed_this_minute = 0
+        self._last_session_reset_day: Optional[str] = None
 
     @classmethod
     def from_env(
@@ -1632,6 +1633,8 @@ class AlpacaRunner:
         last_market_check = 0.0
         last_cycle_time = time.time()
         last_market_phase = phase
+        if phase == "OPEN":
+            self._last_session_reset_day = self._now_et().date().isoformat()
 
         try:
             while not self._shutdown:
@@ -1640,6 +1643,7 @@ class AlpacaRunner:
                 # Trading window: 4:00 AM ET through 3:30 PM (or 8:00 PM if after-hours on).
                 now_et = self._now_et()
                 in_trading_window = self._is_in_trading_window(now_et)
+                self._maybe_daily_session_reset(now_et, self._market_phase())
                 if getattr(self, "_after_hours_enabled", False):
                     flatten_after = now_et.replace(
                         hour=20, minute=0, second=0, microsecond=0,
@@ -1712,7 +1716,7 @@ class AlpacaRunner:
                         self._load_history()
                     if phase == "PRE-MARKET" and last_market_phase != "PRE-MARKET":
                         logger.info("PRE-MARKET — daily session reset + refreshing HOD bar pool")
-                        self._daily_session_reset()
+                        self._maybe_daily_session_reset(now_et, phase, force=True)
                         self._request_pool_refresh_now()
                     if phase == "OPEN" and last_market_phase != "OPEN":
                         logger.info("Market OPEN — refreshing HOD bar pool")
@@ -2227,7 +2231,32 @@ class AlpacaRunner:
                 except Exception:
                     pass
 
-    def _daily_session_reset(self) -> None:
+    def _maybe_daily_session_reset(
+        self,
+        current_et: datetime,
+        phase: str,
+        *,
+        force: bool = False,
+    ) -> bool:
+        """Run the once-per-trading-day reset at the premarket boundary."""
+        if not self._is_trading_day(current_et):
+            return False
+        day_key = current_et.date().isoformat()
+        if self._last_session_reset_day == day_key:
+            return False
+        premarket_start = current_et.replace(hour=4, minute=0, second=0, microsecond=0)
+        reset_phase = phase in ("PRE-MARKET", "OPEN")
+        if not force and (current_et < premarket_start or not reset_phase):
+            return False
+        if phase == "OPEN" and not force:
+            logger.warning(
+                "Daily session reset for %s was missed before premarket; running now",
+                day_key,
+            )
+        self._daily_session_reset(day_key)
+        return True
+
+    def _daily_session_reset(self, day_key: Optional[str] = None) -> None:
         """Reset all session state for a new trading day.
 
         Called when entering PRE-MARKET phase. Clears stale bar buffers,
@@ -2266,6 +2295,8 @@ class AlpacaRunner:
         # Reset daily P&L tracking
         self._pipeline._daily_pnl = 0.0
         self._pipeline._daily_losers.clear()
+        self._last_synced_order_ids.clear()
+        self._recorded_exit_fill_keys.clear()
 
         # Reset EOD flatten flag
         self._eod_flattened = False
@@ -2283,6 +2314,20 @@ class AlpacaRunner:
         except Exception:
             pass
 
+        if self._trade_analyzer is not None:
+            try:
+                self._trade_analyzer.reset_blocks()
+            except Exception:
+                pass
+
+        try:
+            self._hub.reset_daily_overview()
+            self._hub.add_log("INFO", "Daily overview reset for {}".format(
+                day_key or self._now_et().date().isoformat()))
+        except Exception:
+            pass
+
+        self._last_session_reset_day = day_key or self._now_et().date().isoformat()
         logger.info("Session reset complete — watchlist: %s", self._watchlist)
 
     def _load_history(self) -> None:
@@ -2964,6 +3009,12 @@ class AlpacaRunner:
                     volume=0, ts=datetime.now(timezone.utc),
                 )
 
+            chase_reject = self._timed_entry_chase_reject(signal, bar)
+            if chase_reject:
+                logger.info("TIMED ENTRY skip %s — %s", sym, chase_reject)
+                self._hub.add_log("WARNING", "ENTRY SKIP {}: {}".format(sym, chase_reject))
+                return
+
             fill, status = self._broker.submit(order, bar, self._pipeline.portfolio)
             try:
                 from daytrading.ml.shadow_collector import log_execution_quality
@@ -3017,14 +3068,92 @@ class AlpacaRunner:
         except Exception as exc:
             logger.error("Timed signal execution error for %s: %s", signal.symbol, exc)
 
+    def _timed_entry_chase_reject(
+        self,
+        signal: TradeSignal,
+        fallback_bar: Bar,
+    ) -> Optional[str]:
+        """Cancel delayed timed entries that have become chase entries."""
+        if signal.action is not SignalAction.ENTER_LONG:
+            return None
+        original = float(signal.entry_price or 0.0)
+        if original <= 0:
+            return None
+
+        live = 0.0
+        try:
+            live = float(self._live_prices([signal.symbol]).get(signal.symbol) or 0.0)
+        except Exception:
+            live = 0.0
+        if live <= 0:
+            try:
+                live = float(self._latest_price(signal.symbol) or 0.0)
+            except Exception:
+                live = 0.0
+        if live <= 0:
+            live = float(fallback_bar.close or original)
+
+        hit = signal.scan_result
+        pattern = ""
+        scanner = ""
+        if hit is not None:
+            pattern = str(hit.criteria.get("pattern", ""))
+            scanner = str(hit.scanner_name or "")
+
+        hot_patterns = {
+            "momentum_burst",
+            "abc_continuation",
+            "vwap_pullback",
+            "hod_reclaim",
+            "pullback_base",
+            "breakout_scalp",
+        }
+        is_hot = pattern in hot_patterns or scanner in hot_patterns
+        max_chase_pct = 0.025 if original >= 5.0 else 0.035
+        if pattern in ("abc_continuation", "pullback_base", "vwap_pullback"):
+            max_chase_pct = min(max_chase_pct, 0.025)
+        if is_hot and live > original * (1.0 + max_chase_pct):
+            return (
+                "live price {:.4f} ran {:.1f}% above signal {:.4f} "
+                "(max {:.1f}%)"
+            ).format(live, (live - original) / original * 100.0, original, max_chase_pct * 100.0)
+
+        quotes = list(self._quote_buffer.get(signal.symbol, []))
+        recent_quotes = [q for q in quotes[-3:] if q.ask > q.bid > 0]
+        if recent_quotes:
+            avg_spread_pct = sum(
+                (q.ask - q.bid) / ((q.ask + q.bid) / 2.0) * 100.0
+                for q in recent_quotes
+            ) / len(recent_quotes)
+            max_spread = 0.9 if live < 5.0 else 0.6
+            if avg_spread_pct > max_spread:
+                return "spread widened to {:.2f}% (max {:.1f}%)".format(
+                    avg_spread_pct, max_spread)
+
+        if is_hot and self._bar_aggregator is not None:
+            latest_10s = self._bar_aggregator.get_latest_10s(signal.symbol, count=1)
+            if latest_10s:
+                b = latest_10s[-1]
+                if b.close < b.open and live >= original:
+                    return "latest 10s candle turned red during entry wait"
+
+        return None
+
     @staticmethod
     def _is_hot_hod_timed_signal(signal: TradeSignal) -> bool:
         hit = signal.scan_result
         if hit is None:
             return False
         pattern = str(hit.criteria.get("pattern", ""))
-        if pattern not in ("hod_reclaim", "vwap_pullback", "breakout_scalp"):
-            if hit.scanner_name not in ("hod_reclaim", "vwap_pullback", "breakout_scalp"):
+        hot_patterns = {
+            "hod_reclaim",
+            "vwap_pullback",
+            "breakout_scalp",
+            "momentum_burst",
+            "abc_continuation",
+        }
+        if pattern not in hot_patterns:
+            if hit.scanner_name not in hot_patterns:
                 return False
         price = float(hit.criteria.get("close") or signal.entry_price or 0.0)
         if not (2.0 <= price <= 20.0):

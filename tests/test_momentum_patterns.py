@@ -299,6 +299,40 @@ class TestMomentumPatternVerifier:
         assert signal is None
         assert "too far from HOD" in verifier._last_reject
 
+    @patch("daytrading.strategy.scalping.momentum_pattern.check_entry_quality", return_value=None)
+    def test_allows_late_pullback_after_fresh_base_reclaim(self, _mock_guard: object) -> None:
+        now = datetime.now(timezone.utc)
+        bars = []
+        for i in range(6):
+            bars.append(_bar(i, close=4.50 + i * 0.03, open_=4.48 + i * 0.03,
+                             high=4.53 + i * 0.03, low=4.46 + i * 0.03,
+                             volume=35_000, base_ts=now, n=16))
+        bars.extend([
+            _bar(6, close=5.40, open_=4.70, high=5.55, low=4.68, volume=220_000, base_ts=now, n=16),
+            _bar(7, close=6.20, open_=5.42, high=6.45, low=5.40, volume=280_000, base_ts=now, n=16),
+            _bar(8, close=6.72, open_=6.18, high=6.80, low=6.10, volume=310_000, base_ts=now, n=16),
+            _bar(9, close=5.48, open_=5.62, high=5.72, low=5.40, volume=45_000, base_ts=now, n=16),
+            _bar(10, close=5.50, open_=5.44, high=5.62, low=5.38, volume=40_000, base_ts=now, n=16),
+            _bar(11, close=5.54, open_=5.47, high=5.64, low=5.42, volume=42_000, base_ts=now, n=16),
+            _bar(12, close=5.56, open_=5.50, high=5.66, low=5.45, volume=44_000, base_ts=now, n=16),
+            _bar(13, close=5.86, open_=5.58, high=5.91, low=5.52, volume=75_000, base_ts=now, n=16),
+        ])
+        hit = ScanResult(
+            symbol="TST",
+            scanner_name="pullback_base",
+            ts=now,
+            score=1.0,
+            criteria={"pattern": "pullback_base", "direction": "up", "base_low": 5.38},
+            bars=bars,
+        )
+        verifier = MomentumPatternVerifier()
+
+        signal = verifier.verify(hit, PortfolioState(cash=100_000))
+
+        assert signal is not None
+        assert signal.action == SignalAction.ENTER_LONG
+        assert "Pullback Base" in signal.reason
+
     def test_rejects_pullback_base_without_big_move(self) -> None:
         now = datetime.now(timezone.utc)
         bars = [

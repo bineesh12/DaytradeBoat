@@ -232,12 +232,16 @@ class TradingPipeline:
         quotes: Optional[Dict[str, Sequence[Quote]]],
         scanner: str = "",
         fallback_price: float = 0.0,
+        hit: Optional[ScanResult] = None,
     ) -> None:
         try:
             from daytrading.ml.shadow_collector import log_missed_opportunity
-            bars = universe.get(symbol, [])
+            bars = list(hit.bars) if hit is not None and hit.bars else universe.get(symbol, [])
             quote = self._latest_quote(quotes, symbol)
-            price = self._latest_price_for_symbol(universe, symbol, fallback_price)
+            hit_price = 0.0
+            if hit is not None:
+                hit_price = float(hit.criteria.get("close") or hit.criteria.get("price") or 0.0)
+            price = hit_price or self._latest_price_for_symbol(universe, symbol, fallback_price)
             if price > 0:
                 log_missed_opportunity(
                     symbol=symbol,
@@ -246,6 +250,8 @@ class TradingPipeline:
                     scanner=scanner,
                     bars=bars,
                     quotes=[quote] if quote else None,
+                    scanner_score=float(hit.score) if hit is not None else None,
+                    criteria=hit.criteria if hit is not None else None,
                 )
         except Exception:
             pass
@@ -501,6 +507,7 @@ class TradingPipeline:
                             universe=universe,
                             quotes=quotes,
                             scanner=hit.scanner_name,
+                            hit=hit,
                         )
                         continue
                     if signal.action is SignalAction.SKIP:
@@ -549,6 +556,7 @@ class TradingPipeline:
                         universe=universe,
                         quotes=quotes,
                         scanner=hit.scanner_name,
+                        hit=hit,
                     )
                     continue
                 if signal.action is SignalAction.SKIP:

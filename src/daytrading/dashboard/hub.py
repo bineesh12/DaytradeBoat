@@ -390,6 +390,25 @@ class DashboardHub:
         with self._lock:
             self.total_rejected += 1
 
+    def reset_daily_overview(self) -> None:
+        """Clear dashboard session counters for a fresh trading day."""
+        with self._lock:
+            self.total_trades = 0
+            self.winning_trades = 0
+            self.losing_trades = 0
+            self.total_pnl = 0.0
+            self.total_scan_hits = 0
+            self._seen_scan_keys.clear()
+            self.total_signals = 0
+            self.total_rejected = 0
+            self.cycle_count = 0
+            self.trades.clear()
+            self.scanner_hits.clear()
+            self.pnl_history.clear()
+            self.symbol_status.clear()
+            self.ai_analysis = {}
+        self._broadcast("daily_reset", {"ts": _now_str()})
+
     def add_log(self, level: str, message: str) -> None:
         entry = {"level": level, "message": message, "ts": _now_str()}
         with self._lock:
