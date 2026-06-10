@@ -265,6 +265,9 @@ def log_exit_snapshot(
     sold_half: bool = False,
     breakeven_locked: bool = False,
     reason: str = "",
+    entry_strategy: str = "",
+    entry_pattern: str = "",
+    entry_score: Optional[float] = None,
     bars: Optional[Sequence[Bar]] = None,
 ) -> None:
     """Log an open-position snapshot for hold/sell learning."""
@@ -280,6 +283,9 @@ def log_exit_snapshot(
             "breakeven_locked": bool(breakeven_locked),
             "unrealized_pct": round(pnl_pct, 4),
             "reason": reason,
+            "entry_strategy": entry_strategy,
+            "entry_pattern": entry_pattern,
+            "entry_score": round(float(entry_score), 4) if entry_score is not None else None,
             "label": None,
         })
         _append(EXIT_FILE, base)
@@ -316,6 +322,7 @@ def log_execution_quality(
     fill: Optional[Fill] = None,
     source: str = "",
     quote: Optional[Quote] = None,
+    context: Optional[dict] = None,
 ) -> None:
     """Log order/fill quality for future slippage-risk learning."""
     try:
@@ -352,6 +359,7 @@ def log_execution_quality(
                     if bar.low > 0 else 0.0
                 ),
                 **_latest_quote_features([quote] if quote else None),
+                **(context or {}),
             },
         }
         _append(EXECUTION_FILE, record)

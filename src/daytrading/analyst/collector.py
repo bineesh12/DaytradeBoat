@@ -21,6 +21,8 @@ from daytrading.market_calendar import is_us_market_holiday
 
 logger = logging.getLogger(__name__)
 
+SQLITE_BUSY_TIMEOUT_MS = 30000
+
 
 def _is_market_holiday(d: date) -> bool:
     """Check if the given date is a weekend or US stock market holiday."""
@@ -33,6 +35,14 @@ def _safe_div(a: float, b: float) -> float:
 
 class NightlyAnalyst:
     """Collects trade data from the journal DB and produces a nightly report."""
+
+    LIVE_SETUP_LABELS = {
+        "vwap_pullback": "VWAP pullback",
+        "abc_continuation": "ABC continuation",
+        "first_pullback_reclaim": "First pullback reclaim",
+        "hod_reclaim": "HOD reclaim",
+        "pullback_base": "Pullback base",
+    }
 
     def __init__(
         self,
@@ -61,7 +71,9 @@ class NightlyAnalyst:
 
         logger.info("NIGHTLY ANALYST: starting analysis for %s", day)
 
-        conn = sqlite3.connect(self._db_path)
+        conn = sqlite3.connect(self._db_path, timeout=SQLITE_BUSY_TIMEOUT_MS / 1000)
+        conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+        conn.execute("PRAGMA query_only = ON")
         conn.row_factory = sqlite3.Row
 
         trades = self._load_trades(conn, day)
@@ -71,14 +83,56 @@ class NightlyAnalyst:
         conn.close()
 
         if not trades:
-            logger.info("NIGHTLY ANALYST: no trades for %s — skipping", day)
-            return {"day": day, "status": "no_trades"}
+            ml_learning = self._analyze_ml_learning(day)
+            if ml_learning.get("total_rows", 0) <= 0:
+                logger.info("NIGHTLY ANALYST: no trades for %s — skipping", day)
+                return {"day": day, "status": "no_trades"}
+            logger.info("NIGHTLY ANALYST: no trades for %s — saving ML-only report", day)
+            report = {
+                "day": day,
+                "status": "ml_only",
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "summary": {
+                    "total_entries": 0,
+                    "total_exits": 0,
+                    "total_pnl": 0.0,
+                    "win_count": 0,
+                    "loss_count": 0,
+                    "win_rate": 0.0,
+                    "avg_winner": 0.0,
+                    "avg_loser": 0.0,
+                    "largest_winner": 0.0,
+                    "largest_loser": 0.0,
+                    "profit_factor": 0.0,
+                    "symbols_traded": [],
+                },
+                "trade_details": [],
+                "realized_trade_details": [],
+                "pattern_analysis": [],
+                "exit_analysis": [],
+                "time_analysis": {},
+                "risk_analysis": {},
+                "scanner_analysis": self._analyze_scanners(scan_hits, trades),
+                "rejection_analysis": self._analyze_rejections(mistakes),
+                "ml_learning": ml_learning,
+                "ml_progress": self._analyze_ml_progress(day),
+                "setup_performance": self._analyze_setup_performance(day, trades),
+                "problems": [],
+                "cycle_stats": {
+                    "total_cycles": len(cycles),
+                    "total_scan_hits": sum(c.get("scan_hits", 0) for c in cycles),
+                    "total_signals": sum(c.get("signals", 0) for c in cycles),
+                },
+            }
+            self._save_report(day, report)
+            return report
 
         report = {
             "day": day,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "summary": self._build_summary(trades),
             "trade_details": trades,
+            "realized_trade_details": self._build_realized_trade_details(trades),
             "pattern_analysis": self._analyze_patterns(trades),
             "exit_analysis": self._analyze_exits(trades),
             "time_analysis": self._analyze_timing(trades),
@@ -87,6 +141,7 @@ class NightlyAnalyst:
             "rejection_analysis": self._analyze_rejections(mistakes),
             "ml_learning": self._analyze_ml_learning(day),
             "ml_progress": self._analyze_ml_progress(day),
+            "setup_performance": self._analyze_setup_performance(day, trades),
             "problems": self._identify_problems(trades, mistakes),
             "cycle_stats": {
                 "total_cycles": len(cycles),
@@ -95,6 +150,10 @@ class NightlyAnalyst:
             },
         }
 
+        self._save_report(day, report)
+        return report
+
+    def _save_report(self, day: str, report: Dict[str, Any]) -> None:
         json_path = os.path.join(self._report_dir, f"{day}.json")
         md_path = os.path.join(self._report_dir, f"{day}.md")
 
@@ -106,7 +165,6 @@ class NightlyAnalyst:
             f.write(md_content)
 
         logger.info("NIGHTLY ANALYST: report saved to %s", md_path)
-        return report
 
     # ------------------------------------------------------------------
     # Data loading
@@ -312,6 +370,124 @@ class NightlyAnalyst:
             ) if risk_data else 0,
         }
 
+    @staticmethod
+    def _parse_ts(value: Any) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _is_entry_lot(trade: Dict) -> bool:
+        trade_type = str(trade.get("trade_type") or "").lower()
+        side = str(trade.get("side") or "").lower()
+        return trade_type in {"entry", "scale_up", "reentry"} or (
+            side == "buy" and trade_type != "exit"
+        )
+
+    @staticmethod
+    def _is_exit_trade(trade: Dict) -> bool:
+        trade_type = str(trade.get("trade_type") or "").lower()
+        side = str(trade.get("side") or "").lower()
+        return trade_type == "exit" or (side == "sell" and trade.get("pnl") is not None)
+
+    def _build_realized_trade_details(self, trades: List[Dict]) -> List[Dict]:
+        """Pair exits with actual open lots so reports don't invent bad trades.
+
+        The journal can contain multiple entries/re-adds for the same symbol.
+        Pairing an exit with "the latest entry for that symbol" creates false
+        negative hold times and wrong entry prices. This uses FIFO lots, which
+        matches the way the account position is averaged for long scalps.
+        """
+        open_lots: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        details: List[Dict[str, Any]] = []
+
+        for trade in sorted(trades, key=lambda t: str(t.get("ts") or "")):
+            symbol = str(trade.get("symbol") or "").upper()
+            if not symbol:
+                continue
+            qty = float(trade.get("quantity") or 0.0)
+            if qty <= 0:
+                continue
+
+            if self._is_entry_lot(trade):
+                entry_price = float(trade.get("entry_price") or 0.0)
+                if entry_price <= 0:
+                    continue
+                open_lots[symbol].append({
+                    "quantity": qty,
+                    "entry_price": entry_price,
+                    "ts": trade.get("ts"),
+                    "strategy": trade.get("strategy") or "unknown",
+                })
+                continue
+
+            if not self._is_exit_trade(trade):
+                continue
+
+            exit_price = float(trade.get("exit_price") or 0.0)
+            remaining = qty
+            matched: List[Dict[str, Any]] = []
+            lots = open_lots[symbol]
+            while remaining > 0 and lots:
+                lot = lots[0]
+                take = min(remaining, float(lot.get("quantity") or 0.0))
+                if take <= 0:
+                    lots.pop(0)
+                    continue
+                matched.append({
+                    "quantity": take,
+                    "entry_price": float(lot.get("entry_price") or 0.0),
+                    "ts": lot.get("ts"),
+                    "strategy": lot.get("strategy") or "unknown",
+                })
+                lot["quantity"] = float(lot.get("quantity") or 0.0) - take
+                remaining -= take
+                if lot["quantity"] <= 0.0001:
+                    lots.pop(0)
+
+            matched_qty = sum(m["quantity"] for m in matched)
+            if matched_qty > 0:
+                entry_price = _safe_div(
+                    sum(m["entry_price"] * m["quantity"] for m in matched),
+                    matched_qty,
+                )
+                entry_ts_values = [
+                    ts for ts in (self._parse_ts(m.get("ts")) for m in matched)
+                    if ts is not None
+                ]
+                entry_ts = min(entry_ts_values) if entry_ts_values else None
+                strategy = (
+                    trade.get("strategy")
+                    or next((m["strategy"] for m in matched if m.get("strategy")), None)
+                    or "unknown"
+                )
+            else:
+                entry_price = float(trade.get("entry_price") or 0.0)
+                entry_ts = None
+                strategy = trade.get("strategy") or "unknown"
+
+            exit_ts = self._parse_ts(trade.get("ts"))
+            hold_seconds = None
+            if entry_ts is not None and exit_ts is not None:
+                hold_seconds = (exit_ts - entry_ts).total_seconds()
+
+            details.append({
+                "symbol": symbol,
+                "entry_price": round(entry_price, 4) if entry_price > 0 else None,
+                "exit_price": round(exit_price, 4) if exit_price > 0 else None,
+                "pnl": trade.get("pnl") or 0.0,
+                "quantity": qty,
+                "reason": trade.get("reason") or "unknown",
+                "strategy": strategy,
+                "hold_seconds": hold_seconds,
+                "ts": trade.get("ts"),
+            })
+
+        return details
+
     def _analyze_scanners(self, scan_hits: List[Dict], trades: List[Dict]) -> Dict:
         """How many scan hits turned into trades, and which scanners are productive."""
         by_scanner: Dict[str, Dict] = defaultdict(lambda: {"hits": 0, "verified": 0})
@@ -507,6 +683,135 @@ class NightlyAnalyst:
             "best_missed": best_missed,
         }
 
+    @classmethod
+    def _setup_key(cls, value: Any) -> Optional[str]:
+        key = str(value or "").strip().lower()
+        if not key:
+            return None
+        aliases = {
+            "vwap": "vwap_pullback",
+            "vwap_bounce": "vwap_pullback",
+            "hod": "hod_reclaim",
+            "hod_breakout": "hod_reclaim",
+            "new_hod_breakout": "hod_reclaim",
+            "today_hod_breakout": "hod_reclaim",
+            "abc": "abc_continuation",
+            "first_pullback": "first_pullback_reclaim",
+        }
+        key = aliases.get(key, key)
+        if key in cls.LIVE_SETUP_LABELS:
+            return key
+        return None
+
+    @classmethod
+    def _setup_from_row(cls, row: Dict) -> Optional[str]:
+        criteria = row.get("criteria")
+        if isinstance(criteria, dict):
+            key = cls._setup_key(criteria.get("pattern") or criteria.get("scanner"))
+            if key:
+                return key
+        for field in ("scanner", "entry_pattern", "entry_strategy", "strategy", "pattern"):
+            key = cls._setup_key(row.get(field))
+            if key:
+                return key
+        return None
+
+    def _analyze_setup_performance(self, day: str, trades: List[Dict]) -> List[Dict]:
+        """Score each live setup using trades plus shadow learning rows."""
+        rows: Dict[str, Dict[str, Any]] = {
+            key: {
+                "setup": key,
+                "label": label,
+                "trades": 0,
+                "wins": 0,
+                "losses": 0,
+                "total_pnl": 0.0,
+                "avg_pnl": 0.0,
+                "win_rate": 0.0,
+                "missed_total": 0,
+                "missed_labeled": 0,
+                "missed_went_up": 0,
+                "missed_rate": 0.0,
+                "pullback_total": 0,
+                "pullback_labeled": 0,
+                "pullback_worked": 0,
+                "pullback_rate": 0.0,
+                "exit_total": 0,
+                "exit_labeled": 0,
+                "exit_hold_helped": 0,
+                "exit_hold_helped_rate": 0.0,
+            }
+            for key, label in self.LIVE_SETUP_LABELS.items()
+        }
+
+        pnl_by_setup: Dict[str, List[float]] = defaultdict(list)
+        for trade in trades:
+            if trade.get("trade_type") != "exit" or trade.get("pnl") is None:
+                continue
+            key = self._setup_key(trade.get("strategy"))
+            if not key:
+                continue
+            try:
+                pnl_by_setup[key].append(float(trade.get("pnl") or 0.0))
+            except (TypeError, ValueError):
+                continue
+
+        for key, pnls in pnl_by_setup.items():
+            row = rows[key]
+            wins = [p for p in pnls if p > 0]
+            row["trades"] = len(pnls)
+            row["wins"] = len(wins)
+            row["losses"] = len(pnls) - len(wins)
+            row["total_pnl"] = round(sum(pnls), 2)
+            row["avg_pnl"] = round(_safe_div(sum(pnls), len(pnls)), 2)
+            row["win_rate"] = round(_safe_div(len(wins), len(pnls)) * 100.0, 1)
+
+        for item in self._load_ml_rows("missed_opportunities.jsonl", day):
+            key = self._setup_from_row(item)
+            if not key:
+                continue
+            row = rows[key]
+            row["missed_total"] += 1
+            if item.get("label") is not None:
+                row["missed_labeled"] += 1
+                if int(item.get("label") or 0) == 1:
+                    row["missed_went_up"] += 1
+
+        for item in self._load_ml_rows("pullback_candidates.jsonl", day):
+            key = self._setup_from_row(item)
+            if not key:
+                continue
+            row = rows[key]
+            row["pullback_total"] += 1
+            if item.get("label") is not None:
+                row["pullback_labeled"] += 1
+                if int(item.get("label") or 0) == 1:
+                    row["pullback_worked"] += 1
+
+        for item in self._load_ml_rows("exit_snapshots.jsonl", day):
+            key = self._setup_from_row(item)
+            if not key:
+                continue
+            row = rows[key]
+            row["exit_total"] += 1
+            if item.get("label") is not None:
+                row["exit_labeled"] += 1
+                if int(item.get("label") or 0) == 1:
+                    row["exit_hold_helped"] += 1
+
+        for row in rows.values():
+            row["missed_rate"] = round(
+                _safe_div(row["missed_went_up"], row["missed_labeled"]) * 100.0, 1,
+            )
+            row["pullback_rate"] = round(
+                _safe_div(row["pullback_worked"], row["pullback_labeled"]) * 100.0, 1,
+            )
+            row["exit_hold_helped_rate"] = round(
+                _safe_div(row["exit_hold_helped"], row["exit_labeled"]) * 100.0, 1,
+            )
+
+        return list(rows.values())
+
     def _analyze_ml_learning(self, day: str) -> Dict:
         """Summarize advisory shadow ML data collected during the trading day."""
         missed = self._load_ml_rows("missed_opportunities.jsonl", day)
@@ -687,29 +992,7 @@ class NightlyAnalyst:
         win_rate = _safe_div(len(wins), len(exits)) * 100
 
         # --- Build per-trade detail for the report ---
-        entry_map: Dict[str, Dict] = {}
-        for t in entries:
-            entry_map[t["symbol"]] = t
-        trade_details = []
-        for t in exits:
-            ent = entry_map.get(t["symbol"])
-            hold_sec = None
-            if ent:
-                try:
-                    e_ts = datetime.fromisoformat(ent["ts"].replace("Z", "+00:00"))
-                    x_ts = datetime.fromisoformat(t["ts"].replace("Z", "+00:00"))
-                    hold_sec = (x_ts - e_ts).total_seconds()
-                except Exception:
-                    pass
-            trade_details.append({
-                "symbol": t["symbol"],
-                "entry_price": ent["entry_price"] if ent else None,
-                "exit_price": t.get("exit_price"),
-                "pnl": t["pnl"],
-                "reason": t.get("reason") or "unknown",
-                "strategy": t.get("strategy") or (ent.get("strategy") if ent else "unknown"),
-                "hold_seconds": hold_sec,
-            })
+        trade_details = self._build_realized_trade_details(trades)
 
         # ---- CRITICAL: Zero win rate ----
         if len(wins) == 0 and len(exits) >= 3:
@@ -819,7 +1102,10 @@ class NightlyAnalyst:
         # ---- HIGH: Very short hold times ----
         quick_exits = 0
         for td in trade_details:
-            if td["hold_seconds"] is not None and td["hold_seconds"] < 60:
+            if (
+                td["hold_seconds"] is not None
+                and 0 <= td["hold_seconds"] < 60
+            ):
                 quick_exits += 1
         if quick_exits >= len(exits) * 0.5 and len(exits) >= 3:
             problems.append({
@@ -980,7 +1266,9 @@ class NightlyAnalyst:
         # TRADE-BY-TRADE LOG
         # ============================================================
         problems = report.get("problems", [])
-        trade_details = problems[0].get("_trade_details", []) if problems else []
+        trade_details = report.get("realized_trade_details") or (
+            problems[0].get("_trade_details", []) if problems else []
+        )
         if trade_details:
             lines.append("## Every Trade Today")
             lines.append("")
@@ -1072,6 +1360,39 @@ class NightlyAnalyst:
                 lines.append(
                     f"| {p['pattern']} | {p['trades']} | {p['wins']} | {p['losses']} | "
                     f"{p['win_rate']}% | ${p['total_pnl']:+.2f} |"
+                )
+            lines.append("")
+
+        setups = report.get("setup_performance", [])
+        if setups:
+            lines.append("## Live Setup Scorecard")
+            lines.append("")
+            lines.append(
+                "This focuses only on the five live setups we are tuning. "
+                "Watch-only scanners can still collect learning data, but they "
+                "do not count as live setup performance."
+            )
+            lines.append("")
+            lines.append(
+                "| Setup | Trades | Win Rate | P&L | Pullbacks Worked | "
+                "Missed Went Up | Hold Helped |"
+            )
+            lines.append(
+                "|-------|--------|----------|-----|------------------|"
+                "----------------|-------------|"
+            )
+            for row in setups:
+                lines.append(
+                    f"| {row.get('label', row.get('setup'))} | "
+                    f"{row.get('trades', 0)} | "
+                    f"{row.get('win_rate', 0)}% | "
+                    f"${row.get('total_pnl', 0):+.2f} | "
+                    f"{row.get('pullback_worked', 0)}/{row.get('pullback_labeled', 0)} "
+                    f"({row.get('pullback_rate', 0)}%) | "
+                    f"{row.get('missed_went_up', 0)}/{row.get('missed_labeled', 0)} "
+                    f"({row.get('missed_rate', 0)}%) | "
+                    f"{row.get('exit_hold_helped', 0)}/{row.get('exit_labeled', 0)} "
+                    f"({row.get('exit_hold_helped_rate', 0)}%) |"
                 )
             lines.append("")
 

@@ -29,12 +29,14 @@ from daytrading.config import Settings
 from daytrading.market_calendar import ET, is_us_trading_day, now_et
 from daytrading.dashboard.hub import DashboardHub
 from daytrading.dashboard.server import start_dashboard
-from daytrading.data.alpaca_feed import AlpacaHistoricalFeed, AlpacaStreamFeed
+from daytrading.data.alpaca_feed import AlpacaHistoricalFeed, AlpacaStreamFeed, configure_alpaca_stream_logging
 from daytrading.data.float_checker import FloatChecker
 from daytrading.data.float_store import FloatStore
+from daytrading.data.market_data_service import MarketDataService
 from daytrading.data.news_checker import NewsChecker
 from daytrading.data.watchlist_scanner import WatchlistScanner
 from daytrading.execution.alpaca_broker import AlpacaBroker
+from daytrading.execution.entry_executor import EntryExecutionContext, EntryExecutor
 from daytrading.execution.live_prices import resolve_live_prices
 from daytrading.execution.position_reconciler import PositionReconciler
 from daytrading.exits.manager import ExitManager
@@ -43,7 +45,9 @@ from daytrading.exits.tape_pressure import TapePressureExit
 from daytrading.journal.store import TradingJournal
 from daytrading.pipeline.engine import PipelineResult, TradingPipeline
 from daytrading.pipeline.factory import create_scalping_pipeline
-from daytrading.models import Bar, Fill, Order, PortfolioState, Position, Quote, ScanResult, Side, SignalAction, Tick, TradeSignal
+from daytrading.models import Bar, Fill, Order, OrderStatus, PortfolioState, Position, Quote, ScanResult, Side, SignalAction, Tick, TradeSignal
+from daytrading.strategy.entry_guard import check_entry_quality, tick_aware_spread_ok
+from daytrading.strategy.entry_policy import EntryDecision, EntryPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +58,71 @@ TradeEvent = namedtuple("TradeEvent", ["symbol", "tick"])
 BarsLoadedEvent = namedtuple("BarsLoadedEvent", ["bars_by_symbol", "prior_day_stats"])
 PoolRefreshEvent = namedtuple("PoolRefreshEvent", ["new_pool", "bars", "prior_day_stats"])
 FastScanEvent = namedtuple("FastScanEvent", ["new_movers"])
+
+HOT_WATCH_PATTERNS = frozenset({
+    "abc_continuation",
+    "first_pullback_reclaim",
+    "pullback_base",
+    "vwap_pullback",
+    "hod_reclaim",
+    "level_breakout_reclaim",
+    "shallow_stair_continuation",
+    "early_vwap_reclaim_scout",
+    "flat_top_breakout",
+})
+
+_FLOAT_SPLIT_SANITY_LAST_CHECK: Dict[str, float] = {}
+
+
+def _ensure_market_data_service(runner) -> MarketDataService:
+    service = getattr(runner, "_market_data", None)
+    if service is None:
+        queue_max = 500
+        existing_queue = getattr(runner, "_candidate_hydrate_queue", None)
+        if hasattr(existing_queue, "maxsize") and int(existing_queue.maxsize or 0) > 0:
+            queue_max = int(existing_queue.maxsize)
+        service = MarketDataService(
+            candidate_queue_max=queue_max,
+            candidate_batch_max=getattr(runner, "_candidate_hydrate_batch_max", 10),
+            hot_watch_max_symbols=getattr(runner, "_hot_watch_max_symbols", 40),
+        )
+        if isinstance(existing_queue, queue.PriorityQueue):
+            service._candidate_queue = existing_queue
+        existing_pending = getattr(runner, "_candidate_hydrate_pending", None)
+        if isinstance(existing_pending, set):
+            service._candidate_pending = existing_pending
+        existing_hot = getattr(runner, "_hot_watch", None)
+        if isinstance(existing_hot, dict):
+            service.hot_watch.update(existing_hot)
+        runner._market_data = service
+        runner._candidate_hydrate_queue = service.candidate_queue
+        runner._candidate_hydrate_pending = service._candidate_pending
+        if isinstance(existing_hot, dict):
+            runner._hot_watch = service.hot_watch
+        return service
+    existing_hot = getattr(runner, "_hot_watch", None)
+    if isinstance(existing_hot, dict) and existing_hot is not service.hot_watch:
+        service.hot_watch.clear()
+        service.hot_watch.update(existing_hot)
+        runner._hot_watch = service.hot_watch
+    return service
+
+
+def _ensure_entry_executor(runner) -> EntryExecutor:
+    policy = getattr(runner, "_entry_policy", None)
+    if policy is None:
+        policy = EntryPolicy(
+            guard=lambda *args, **kwargs: check_entry_quality(*args, **kwargs),
+        )
+        runner._entry_policy = policy
+    executor = getattr(runner, "_entry_executor", None)
+    if executor is None:
+        executor = EntryExecutor(policy, runner._record_entry_decision)
+        runner._entry_executor = executor
+    else:
+        executor.set_policy(policy)
+        executor.set_recorder(runner._record_entry_decision)
+    return executor
 
 
 class AlpacaRunner:
@@ -104,7 +173,7 @@ class AlpacaRunner:
         from daytrading.data.bar_aggregator import BarAggregator
         from daytrading.strategy.execution_timer import ExecutionTimer
         self._bar_aggregator = BarAggregator()
-        self._exec_timer = ExecutionTimer(max_wait_bars=1, enabled=True)
+        self._exec_timer = ExecutionTimer(max_wait_bars=3, enabled=True)
         self._timed_signal_queue: deque = deque()
 
         self._skip_counts: Dict[str, int] = defaultdict(int)
@@ -113,6 +182,14 @@ class AlpacaRunner:
         self._new_data = Event()
         self._hub = DashboardHub()
         self._journal = TradingJournal()
+        self._entry_policy = EntryPolicy(
+            guard=lambda *args, **kwargs: check_entry_quality(*args, **kwargs),
+        )
+        self._entry_executor = EntryExecutor(self._entry_policy, self._record_entry_decision)
+        try:
+            self._pipeline._entry_policy = self._entry_policy
+        except Exception:
+            pass
         self._hub.journal = self._journal
         self._hub._broker = self._broker
         self._hub._exit_manager = self._pipeline.exit_manager
@@ -125,12 +202,28 @@ class AlpacaRunner:
         self._float_checker: Optional[FloatChecker] = None
         self._last_synced_order_ids: set = set()
         self._recorded_exit_fill_keys: set = set()
+        self._accidental_short_cleanup_enabled = True
+        self._accidental_short_max_qty = float(
+            os.getenv("DAYTRADING_ACCIDENTAL_SHORT_MAX_QTY", "0") or 0.0
+        )
+        self._accidental_short_cooldown_sec = 30.0
+        self._accidental_short_cleanup_at: Dict[str, float] = {}
+        # Persistent per-symbol anti-chase anchor. Pins the price where a
+        # timed-entry setup FIRST deferred so re-queues of a grinding name
+        # cannot crawl the chase ceiling up with the price.
+        # symbol -> (anchor_price, last_seen_monotonic)
+        self._timed_entry_anchor: Dict[str, tuple] = {}
+        self._timed_entry_anchor_ttl_sec = 300.0
         self._trade_analyzer = None
         self._analysis_interval = 10  # run analysis every N cycles
         self._reconciler = PositionReconciler()
         self._hod_active: Dict[str, datetime] = {}
         self._hod_last_alert_at: Dict[str, datetime] = {}
+        self._hod_tradeable_alert_at: Dict[str, datetime] = {}
         self._hod_watchlist_ttl_minutes = 5.0
+        self._hod_watchlist_min_day_volume = 500_000
+        self._hod_watchlist_min_rel_vol = 1.0
+        self._hod_watchlist_min_bar_rvol = 1.2
         self._news_pinned: Set[str] = set()
         self._hod_alert_store = None
         self._hod_tick_tracker = None
@@ -174,6 +267,29 @@ class AlpacaRunner:
         self._fast_scan_thread: Optional[Thread] = None
         self._fast_scan_interval_sec = 30
         self._fast_scan_known: Set[str] = set()
+        self._fast_scan_process_max = 80
+        self._candidate_hydrate_thread: Optional[Thread] = None
+        self._market_data = MarketDataService(
+            candidate_queue_max=2_000,
+            candidate_batch_max=10,
+            hot_watch_max_symbols=40,
+        )
+        self._candidate_hydrate_queue: queue.PriorityQueue = self._market_data.candidate_queue
+        self._candidate_hydrate_pending: Set[str] = set()
+        self._candidate_hydrate_lock = Lock()
+        self._candidate_hydrate_seq = 0
+        self._candidate_hydrate_batch_max = 10
+        self._deferred_fast_scan_movers: List[Dict] = []
+        self._hot_watch_enabled = True
+        self._hot_watch_ttl_minutes = 8.0
+        self._hot_watch_strong_ttl_minutes = 15.0
+        self._priority_bar_refresh: Set[str] = set()
+        self._hot_watch_runner_ttl_minutes = 25.0
+        self._hot_watch_max_symbols = 40
+        self._hot_watch_min_change_pct = 5.0
+        self._hot_watch_min_day_volume = 200_000
+        self._hot_watch_sub5_min_day_volume = 500_000
+        self._hot_watch_min_score = 0.30
 
         # Watchlist bar refresh — keep 1m bars fresh for pattern scanners
         self._last_watchlist_bar_refresh: float = 0.0
@@ -187,6 +303,10 @@ class AlpacaRunner:
         self._hod_seed_minute_start = time.time()
         self._hod_seed_processed_this_minute = 0
         self._last_session_reset_day: Optional[str] = None
+        self._nightly_analysis_day: Optional[str] = None
+
+    def _market_data_service(self) -> MarketDataService:
+        return _ensure_market_data_service(self)
 
     @classmethod
     def from_env(
@@ -341,6 +461,7 @@ class AlpacaRunner:
         runner._hod_bar_pool = hod_bar_pool
         runner._hod_watchlist_ttl_minutes = cfg.hod_momentum_watchlist_ttl_minutes
         runner._watchlist_pinned = pinned
+        runner._max_watchlist = max(1, cfg.max_watchlist_symbols)
         runner._scanner = scanner
         runner._sip_feed = cfg.alpaca_feed.lower() == "sip"
         runner._news_checker = news_checker
@@ -361,6 +482,24 @@ class AlpacaRunner:
         runner._bar_fetch_batch_delay_sec = cfg.bar_fetch_batch_delay_sec
         runner._hod_seed_batch_size = cfg.hod_seed_batch_size
         runner._hod_seed_max_per_minute = cfg.hod_seed_max_per_minute
+        runner._hot_watch_enabled = cfg.hot_watch_enabled
+        runner._hot_watch_ttl_minutes = cfg.hot_watch_ttl_minutes
+        runner._hot_watch_strong_ttl_minutes = cfg.hot_watch_strong_ttl_minutes
+        runner._hot_watch_runner_ttl_minutes = cfg.hot_watch_runner_ttl_minutes
+        runner._hot_watch_max_symbols = cfg.hot_watch_max_symbols
+        runner._hot_watch_min_change_pct = cfg.hot_watch_min_change_pct
+        runner._hot_watch_min_day_volume = cfg.hot_watch_min_day_volume
+        runner._hot_watch_sub5_min_day_volume = cfg.hot_watch_sub5_min_day_volume
+        runner._hot_watch_min_score = cfg.hot_watch_min_score
+        runner._timed_entry_anchor_ttl_sec = cfg.strategy.timed_entry_anchor_ttl_sec
+        runner._fast_scan_process_max = max(1, cfg.fast_scan_process_max)
+        _ensure_market_data_service(runner).configure(
+            candidate_queue_max=max(1, cfg.candidate_hydrate_queue_max),
+            candidate_batch_max=max(1, cfg.candidate_hydrate_batch_max),
+            hot_watch_max_symbols=max(1, cfg.hot_watch_max_symbols),
+        )
+        runner._candidate_hydrate_queue = _ensure_market_data_service(runner).candidate_queue
+        runner._candidate_hydrate_batch_max = max(1, cfg.candidate_hydrate_batch_max)
         runner._setup_hod_momentum(cfg, pipeline)
         logger.info(
             "Warrior-mode: pool=%d, refresh=%dmin, seed=%d/min, "
@@ -377,9 +516,14 @@ class AlpacaRunner:
             )
         else:
             logger.info("After-hours trading OFF — entries stop at 3:30 PM ET")
-        logger.info(
-            "HOD-only mode: trading watchlist follows alert board; RT mover scanner off",
-        )
+        if cfg.hot_watch_enabled:
+            logger.info(
+                "HOD + hot-watch mode: HOD alert board plus structured early pullback watch",
+            )
+        else:
+            logger.info(
+                "HOD-only mode: trading watchlist follows alert board; RT mover scanner off",
+            )
 
         return runner
 
@@ -400,6 +544,7 @@ class AlpacaRunner:
         sub2_min_change_pct: float = 10.0,
         sub2_min_day_volume: float = 1_000_000,
         sub2_max_float: float = 10_000_000,
+        split_sanity_cooldown_sec: float = 3600.0,
     ) -> List[str]:
         """Keep ranked snapshot passers in price band with float <= max_float.
 
@@ -467,6 +612,7 @@ class AlpacaRunner:
         passed: List[str] = []
         need_network: List[dict] = []
         SPLIT_SANITY_CAP = 10_000_000_000  # $10B implied market cap = stale post-split data
+        now_mono = time.time()
         for row in eligible:
             if len(passed) >= pool_max:
                 break
@@ -484,6 +630,15 @@ class AlpacaRunner:
             shares = float_checker.get_float_cached(sym)
             if shares is not None:
                 if price > 0 and shares * price > SPLIT_SANITY_CAP:
+                    if shares >= 1_000_000_000.0:
+                        continue
+                    last_check = _FLOAT_SPLIT_SANITY_LAST_CHECK.get(sym)
+                    if (
+                        last_check is not None
+                        and now_mono - last_check < split_sanity_cooldown_sec
+                    ):
+                        continue
+                    _FLOAT_SPLIT_SANITY_LAST_CHECK[sym] = now_mono
                     logger.warning(
                         "SPLIT DETECTED %s — cached float %.0f × $%.2f = $%.0fB implied mcap, re-fetching",
                         sym, shares, price, shares * price / 1e9,
@@ -712,11 +867,38 @@ class AlpacaRunner:
     def _request_pool_refresh_now(self) -> None:
         self._pool_refresh_event.set()
 
+    def _handle_market_phase_transition(
+        self,
+        previous_phase: str,
+        current_phase: str,
+        current_et: datetime,
+    ) -> None:
+        """Handle session transitions without blocking the main cycle loop."""
+        if current_phase == "PRE-MARKET" and previous_phase != "PRE-MARKET":
+            logger.info("PRE-MARKET — daily session reset + refreshing HOD bar pool")
+            self._maybe_daily_session_reset(current_et, current_phase, force=True)
+            self._request_pool_refresh_now()
+            return
+
+        if current_phase == "OPEN" and previous_phase != "OPEN":
+            logger.info("Market OPEN — refreshing HOD bar pool")
+            self._request_pool_refresh_now()
+            return
+
+        if (
+            getattr(self, "_after_hours_enabled", False)
+            and current_phase == "AFTER-HOURS"
+            and previous_phase != "AFTER-HOURS"
+        ):
+            logger.info("AFTER-HOURS — refreshing HOD bar pool")
+            self._request_pool_refresh_now()
+
     def _sync_tick_tracker_pool(self) -> None:
         """Update tick tracker with current pool + watchlist symbols."""
         if not self._hod_tick_tracker:
             return
-        tracked = set(self._hod_bar_pool) | set(self._watchlist)
+        self._prune_hot_watch()
+        tracked = set(self._hod_bar_pool) | set(self._watchlist) | _ensure_market_data_service(self).hot_watch_keys()
         self._hod_tick_tracker.set_tracked_symbols(tracked)
         self._hod_tick_tracker.cleanup_stale()
         self._stream.set_trade_filter(tracked)
@@ -757,6 +939,104 @@ class AlpacaRunner:
         )
         self._fast_scan_thread.start()
 
+    def _start_candidate_hydration_worker(self) -> None:
+        if (
+            self._candidate_hydrate_thread
+            and self._candidate_hydrate_thread.is_alive()
+        ):
+            return
+        service = _ensure_market_data_service(self)
+        self._candidate_hydrate_thread = Thread(
+            target=service.run_candidate_hydration_worker,
+            kwargs={
+                "stop_requested": lambda: self._shutdown,
+                "pause_state": self._candidate_hydration_pause_state,
+                "process_batch": self._process_candidate_hydration_batch,
+                "publish_status": self._publish_candidate_hydration_status,
+            },
+            daemon=True,
+            name="candidate-hydration",
+        )
+        self._candidate_hydrate_thread.start()
+
+    def _candidate_hydration_priority(self, mover: Dict) -> int:
+        sym = str(mover.get("symbol", "")).upper()
+        if sym in self._hod_active or sym in self._watchlist_set:
+            return 0
+        volume = float(mover.get("volume", 0.0) or 0.0)
+        abs_change = float(
+            mover.get("abs_change_pct", mover.get("change_pct", 0.0)) or 0.0
+        )
+        if abs_change >= 20.0 and volume >= 500_000:
+            return 1
+        if abs_change >= 10.0 and volume >= 200_000:
+            return 2
+        return 3
+
+    def _enqueue_candidate_hydration(
+        self,
+        movers: Sequence[Dict],
+        *,
+        source: str = "fast scan",
+    ) -> int:
+        queued = 0
+        for mover in movers:
+            sym = str(mover.get("symbol", "")).upper().strip()
+            if not sym:
+                continue
+            priority = self._candidate_hydration_priority(mover)
+            if _ensure_market_data_service(self).enqueue_candidate(mover, priority=priority, source=source):
+                queued += 1
+            else:
+                try:
+                    self._hub.on_candidate_hydration(dropped=1)
+                except Exception:
+                    pass
+                logger.debug("Candidate hydration skipped/dropped %s", sym)
+        if queued:
+            logger.debug(
+                "Candidate hydration queued %d movers from %s", queued, source,
+            )
+            try:
+                self._hub.on_candidate_hydration(
+                    queued=queued,
+                    pending=_ensure_market_data_service(self).candidate_pending_size(),
+                    last_source=source,
+                )
+            except Exception:
+                pass
+        return queued
+
+    def _pull_candidate_hydration_batch(self) -> List[Dict]:
+        return _ensure_market_data_service(self).pull_candidate_batch(self._candidate_hydrate_batch_max)
+
+    def _candidate_hydration_pause_state(self) -> tuple[bool, bool]:
+        pending_entry = self._has_pending_timed_entry()
+        return (
+            pending_entry
+            or self._pool_refresh_in_progress
+            or self._bar_hydrate_paused(),
+            pending_entry,
+        )
+
+    def _process_candidate_hydration_batch(self, batch: List[Dict]) -> int:
+        try:
+            loaded_count = self._handle_fast_scan_movers(batch, push_event=True)
+            logger.debug(
+                "Candidate hydration processed %d movers (loaded=%d)",
+                len(batch), loaded_count,
+            )
+            return loaded_count
+        except Exception as exc:
+            logger.warning("Candidate hydration batch failed: %s", exc)
+            return 0
+
+    def _publish_candidate_hydration_status(self, **payload) -> None:
+        try:
+            self._hub.on_candidate_hydration(**payload)
+        except Exception:
+            pass
+
     def _fast_scan_worker_loop(self) -> None:
         time.sleep(5)
         while not self._shutdown:
@@ -792,6 +1072,10 @@ class AlpacaRunner:
             sym = c["symbol"]
             # Force-add strong movers even if seen before
             is_strong = c.get("abs_change_pct", 0) >= 10.0 and c.get("volume", 0) >= 200_000
+            hot_watch_candidate = (
+                not _ensure_market_data_service(self).hot_watch_contains(sym)
+                and self._hot_watch_reject_reason(c, None) is None
+            )
             if sym in current_pool:
                 bars = self._bar_buffer.get(sym)
                 bars_stale = True
@@ -806,10 +1090,10 @@ class AlpacaRunner:
                             bars_stale = False
                     else:
                         bars_stale = False
-                if is_strong and (not bars or bars_stale):
+                if hot_watch_candidate or (is_strong and (not bars or bars_stale)):
                     new_movers.append(c)
                 continue
-            if sym in self._fast_scan_known and not is_strong:
+            if sym in self._fast_scan_known and not is_strong and not hot_watch_candidate:
                 continue
             new_movers.append(c)
 
@@ -817,24 +1101,29 @@ class AlpacaRunner:
             logger.debug("Fast scan: no new movers (%.1fs)", time.time() - t0)
             return
 
+        total_new = len(new_movers)
+        process_movers = new_movers[: self._fast_scan_process_max]
         for c in new_movers:
             self._fast_scan_known.add(c["symbol"])
 
         try:
-            self._event_queue.put_nowait(FastScanEvent(new_movers))
+            self._event_queue.put_nowait(FastScanEvent(process_movers))
         except queue.Full:
             pass
 
         logger.info(
-            "Fast scan: %d new movers in %.1fs — %s",
-            len(new_movers),
+            "Fast scan: %d new movers in %.1fs, processing top %d — %s",
+            total_new,
             time.time() - t0,
-            ", ".join(c["symbol"] for c in new_movers[:10]),
+            len(process_movers),
+            ", ".join(c["symbol"] for c in process_movers[:10]),
         )
         self._hub.add_log(
             "INFO",
-            "Fast scan: {} new movers — {}".format(
-                len(new_movers), ", ".join(c["symbol"] for c in new_movers[:10]),
+            "Fast scan: {} new movers, processing top {} — {}".format(
+                total_new,
+                len(process_movers),
+                ", ".join(c["symbol"] for c in process_movers[:10]),
             ),
         )
 
@@ -919,6 +1208,7 @@ class AlpacaRunner:
         pipeline.set_hod_entry_gate(
             self.is_hod_active,
             require=cfg.hod_momentum_require_alert_for_entry,
+            bypass_checker=self.is_hot_watch_entry_allowed,
         )
         if cfg.hod_momentum_require_alert_for_entry:
             logger.info(
@@ -949,6 +1239,18 @@ class AlpacaRunner:
             prev = self._hod_last_alert_at.get(sym)
             if prev is None or alert_ts > prev:
                 self._hod_last_alert_at[sym] = alert_ts
+            if self._is_tradeable_hod_watchlist_alert(row):
+                prev_tradeable = self._hod_tradeable_alert_at.get(sym)
+                if prev_tradeable is None or alert_ts > prev_tradeable:
+                    self._hod_tradeable_alert_at[sym] = alert_ts
+            else:
+                logger.debug(
+                    "HOD watchlist watch-only %s: day_vol=%.0f rel_vol=%.1fx bar_rvol=%.1fx",
+                    sym,
+                    float(row.get("day_volume") or 0.0),
+                    float(row.get("rel_vol") or 0.0),
+                    float(row.get("bar_rvol") or 0.0),
+                )
             alert_name = row.get("alert_name", "")
             if alert_name in gate_alerts:
                 prev_active = self._hod_active.get(sym)
@@ -957,12 +1259,320 @@ class AlpacaRunner:
         self._hub.on_hod_momentum_alerts(alerts)
         self._sync_watchlist_to_hod_alerts()
 
+    def _is_tradeable_hod_watchlist_alert(self, row: dict) -> bool:
+        """Return True when a HOD alert is liquid enough for active routing.
+
+        The HOD board can show early movers with modest volume, but the active
+        trading watchlist should avoid names that will almost certainly fail the
+        initial entry guard for weak tape/liquidity.
+        """
+        try:
+            price = float(row.get("price") or 0.0)
+            day_volume = float(row.get("day_volume") or 0.0)
+            rel_vol = float(row.get("rel_vol") or 0.0)
+            bar_rvol = float(row.get("bar_rvol") or 0.0)
+        except (TypeError, ValueError):
+            return False
+
+        effective_min_price = self._hod_min_price
+        if self._hod_sub2_enabled:
+            effective_min_price = max(1.5, self._hod_sub2_min_price)
+        if price < effective_min_price or price > self._hod_max_price:
+            return False
+        if day_volume >= 1_000_000:
+            return True
+        if day_volume < self._hod_watchlist_min_day_volume:
+            return False
+        return (
+            rel_vol >= self._hod_watchlist_min_rel_vol
+            or bar_rvol >= self._hod_watchlist_min_bar_rvol
+        )
+
     def is_hod_active(self, symbol: str) -> bool:
         ts = self._hod_active.get(symbol)
         if ts is None:
             return False
         elapsed = (datetime.now(timezone.utc) - ts).total_seconds()
         return elapsed < self._hod_alert_ttl_minutes * 60
+
+    def _prune_hot_watch(self) -> None:
+        service = _ensure_market_data_service(self)
+        if service.hot_watch_len() <= 0:
+            return
+        now = datetime.now(timezone.utc)
+        changed = False
+        for sym, meta in service.hot_watch_items():
+            added_at = meta.get("added_at")
+            if not isinstance(added_at, datetime):
+                service.hot_watch_delete(sym)
+                changed = True
+                continue
+            ttl_minutes = float(meta.get("ttl_minutes", self._hot_watch_ttl_minutes))
+            if (now - added_at).total_seconds() >= ttl_minutes * 60:
+                service.hot_watch_delete(sym)
+                changed = True
+                self._journal.record("hot_watch", {
+                    "symbol": sym,
+                    "stage": "expired",
+                    "reason": "ttl expired",
+                    "age_seconds": round((now - added_at).total_seconds(), 1),
+                    "mode": meta.get("mode", "watch"),
+                    "ttl_minutes": ttl_minutes,
+                })
+        if changed:
+            self._publish_hot_watch()
+            self._publish_trading_watchlist()
+
+    def _hot_watch_snapshot(self) -> List[dict]:
+        now = datetime.now(timezone.utc)
+        rows: List[dict] = []
+        for sym, meta in _ensure_market_data_service(self).hot_watch_items():
+            mover = meta.get("mover", {}) if isinstance(meta.get("mover"), dict) else {}
+            live = self._hot_watch_live_metrics(sym)
+            added_at = meta.get("added_at")
+            ttl_minutes = float(meta.get("ttl_minutes", self._hot_watch_ttl_minutes))
+            remaining = 0.0
+            if isinstance(added_at, datetime):
+                remaining = max(0.0, ttl_minutes * 60 - (now - added_at).total_seconds())
+            rows.append({
+                "symbol": sym,
+                "mode": meta.get("mode", "watch"),
+                "ttl_minutes": ttl_minutes,
+                "remaining_seconds": round(remaining, 1),
+                "price": mover.get("price"),
+                "change_pct": mover.get("change_pct"),
+                "abs_change_pct": mover.get("abs_change_pct"),
+                "volume": mover.get("volume"),
+                "score": mover.get("score"),
+                "float": meta.get("float"),
+                "short_change_pct": live.get("short_change_pct"),
+                "pullback_from_high_pct": live.get("pullback_from_high_pct"),
+                "session_high": live.get("session_high"),
+                "reason": meta.get("reason", ""),
+                "added_at": added_at.isoformat() if isinstance(added_at, datetime) else "",
+                "last_seen": (
+                    meta.get("last_seen").isoformat()
+                    if isinstance(meta.get("last_seen"), datetime)
+                    else ""
+                ),
+            })
+        mode_rank = {"runner_watch": 0, "strong_watch": 1, "watch": 2}
+        rows.sort(key=lambda r: (
+            mode_rank.get(str(r.get("mode")), 9),
+            -float(r.get("score") or 0.0),
+            str(r.get("symbol") or ""),
+        ))
+        return rows
+
+    def _hot_watch_live_metrics(self, symbol: str) -> Dict[str, Optional[float]]:
+        bars = list(self._bar_buffer.get(symbol, []))
+        if not bars:
+            return {
+                "short_change_pct": None,
+                "pullback_from_high_pct": None,
+                "session_high": None,
+            }
+
+        latest = bars[-1]
+        price = float(getattr(latest, "close", 0.0) or 0.0)
+        lookback = bars[-6] if len(bars) >= 6 else bars[0]
+        lookback_close = float(getattr(lookback, "close", 0.0) or 0.0)
+        short_change = None
+        if price > 0 and lookback_close > 0:
+            short_change = (price - lookback_close) / lookback_close * 100.0
+
+        session_high = max(float(getattr(b, "high", 0.0) or 0.0) for b in bars)
+        pullback = None
+        if price > 0 and session_high > 0:
+            pullback = (price - session_high) / session_high * 100.0
+
+        return {
+            "short_change_pct": round(short_change, 2) if short_change is not None else None,
+            "pullback_from_high_pct": round(pullback, 2) if pullback is not None else None,
+            "session_high": round(session_high, 4) if session_high else None,
+        }
+
+    def _publish_hot_watch(self) -> None:
+        self._hub.on_hot_watch(self._hot_watch_snapshot())
+
+    def is_hot_watch_active(self, symbol: str) -> bool:
+        self._prune_hot_watch()
+        return _ensure_market_data_service(self).hot_watch_contains(symbol)
+
+    def is_hot_watch_entry_allowed(self, signal: TradeSignal) -> bool:
+        """Allow HOD-gate bypass only for structured hot-watch setups."""
+        sym = signal.symbol
+        if not self.is_hot_watch_active(sym):
+            return False
+        scanner = ""
+        pattern = ""
+        if signal.scan_result is not None:
+            scanner = signal.scan_result.scanner_name or ""
+            pattern = str(signal.scan_result.criteria.get("pattern", "") or "")
+        allowed = scanner in HOT_WATCH_PATTERNS or pattern in HOT_WATCH_PATTERNS
+        self._journal.record("hot_watch", {
+            "symbol": sym,
+            "stage": "entry_gate",
+            "allowed": allowed,
+            "scanner": scanner,
+            "pattern": pattern,
+            "reason": "structured pattern" if allowed else "pattern not hot-watch eligible",
+        })
+        return allowed
+
+    def _hot_watch_reject_reason(self, mover: Dict, flt: Optional[float]) -> Optional[str]:
+        if not self._hot_watch_enabled:
+            return "hot watch disabled"
+
+        sym = mover.get("symbol")
+        if not sym:
+            return "missing symbol"
+        if "." in sym:
+            return "warrant/unit symbol"
+        if sym in self._watchlist_pinned:
+            return "pinned symbol"
+
+        price = float(mover.get("price", 0.0) or 0.0)
+        if price < self._hod_sub2_min_price or price > self._hod_max_price:
+            return "price outside hot-watch band"
+
+        change = abs(float(mover.get("abs_change_pct", mover.get("change_pct", 0.0)) or 0.0))
+        if change < self._hot_watch_min_change_pct:
+            return "change {:.1f}% < {:.1f}%".format(
+                change, self._hot_watch_min_change_pct,
+            )
+
+        volume = float(mover.get("volume", 0.0) or 0.0)
+        min_volume = self._hot_watch_min_day_volume
+        if price < 5.0:
+            min_volume = self._hot_watch_sub5_min_day_volume
+        if self._market_phase() == "PRE-MARKET":
+            # The fast scanner uses current/recent minute volume before the
+            # open so stale prior-day volume cannot create fake hot movers.
+            # Treat this as tape volume, not full day volume.
+            min_volume = 50_000 if price < 5.0 else 40_000
+        if volume < min_volume:
+            return "volume {:.0f} < {:.0f}".format(volume, min_volume)
+
+        score = float(mover.get("score", 0.0) or 0.0)
+        if score < self._hot_watch_min_score:
+            return "score {:.2f} < {:.2f}".format(score, self._hot_watch_min_score)
+
+        if flt is not None and flt > self._hod_max_float:
+            return "float {:.1f}M > {:.1f}M".format(
+                flt / 1_000_000, self._hod_max_float / 1_000_000,
+            )
+
+        return None
+
+    def _hot_watch_mode(self, mover: Dict) -> tuple[str, float]:
+        """Return watch mode and TTL from current mover strength."""
+        price = float(mover.get("price", 0.0) or 0.0)
+        change = abs(float(mover.get("abs_change_pct", mover.get("change_pct", 0.0)) or 0.0))
+        volume = float(mover.get("volume", 0.0) or 0.0)
+        score = float(mover.get("score", 0.0) or 0.0)
+
+        if (
+            change >= 25.0
+            and volume >= max(self._hot_watch_sub5_min_day_volume, 1_000_000)
+            and score >= max(self._hot_watch_min_score, 0.35)
+        ):
+            return "runner_watch", self._hot_watch_runner_ttl_minutes
+
+        strong_volume = 1_000_000 if price < 5.0 else 500_000
+        if (
+            change >= 10.0
+            and volume >= strong_volume
+            and score >= self._hot_watch_min_score
+        ):
+            return "strong_watch", self._hot_watch_strong_ttl_minutes
+
+        return "watch", self._hot_watch_ttl_minutes
+
+    def _promote_hot_watch(
+        self,
+        mover: Dict,
+        *,
+        flt: Optional[float],
+        reason: str,
+    ) -> None:
+        sym = mover.get("symbol")
+        if not sym:
+            return
+        self._prune_hot_watch()
+        service = _ensure_market_data_service(self)
+        already_active = service.hot_watch_contains(sym)
+        if not already_active and service.hot_watch_len() >= self._hot_watch_max_symbols:
+            oldest = service.hot_watch_oldest_symbol()
+            if oldest:
+                service.hot_watch_delete(oldest)
+            if oldest:
+                self._journal.record("hot_watch", {
+                    "symbol": oldest,
+                    "stage": "removed",
+                    "reason": "max hot-watch symbols",
+                })
+
+        now = datetime.now(timezone.utc)
+        already_active = service.hot_watch_contains(sym)
+        mode, ttl_minutes = self._hot_watch_mode(mover)
+        prior = service.hot_watch_get(sym, {})
+        prior_added = prior.get("added_at", now)
+        prior_ttl = float(prior.get("ttl_minutes", ttl_minutes))
+        prior_mode = str(prior.get("mode", mode))
+        if already_active and ttl_minutes > prior_ttl:
+            prior_added = now
+        elif already_active:
+            if mode in {"strong_watch", "runner_watch"} and ttl_minutes >= prior_ttl:
+                prior_added = now
+            else:
+                mode = prior_mode
+            ttl_minutes = max(ttl_minutes, prior_ttl)
+
+        service.hot_watch_set(sym, {
+            "added_at": prior_added,
+            "last_seen": now,
+            "mover": dict(mover),
+            "float": flt,
+            "reason": reason,
+            "mode": mode,
+            "ttl_minutes": ttl_minutes,
+        })
+        self._ensure_streaming_symbols([sym])
+        self._enqueue_hod_seed_symbols([sym])
+        self._journal.record("hot_watch", {
+            "symbol": sym,
+            "stage": "promoted" if not already_active else "refreshed",
+            "reason": reason,
+            "price": mover.get("price"),
+            "change_pct": mover.get("change_pct"),
+            "abs_change_pct": mover.get("abs_change_pct"),
+            "volume": mover.get("volume"),
+            "score": mover.get("score"),
+            "float": flt,
+            "mode": mode,
+            "ttl_minutes": ttl_minutes,
+        })
+        if not already_active:
+            logger.info(
+                "HOT WATCH +%s [%s %.0fm]: %s chg=%.1f%% vol=%.0f score=%.2f",
+                sym,
+                mode,
+                ttl_minutes,
+                reason,
+                float(mover.get("abs_change_pct", mover.get("change_pct", 0.0)) or 0.0),
+                float(mover.get("volume", 0.0) or 0.0),
+                float(mover.get("score", 0.0) or 0.0),
+            )
+            self._hub.add_log(
+                "INFO",
+                "Hot watch +{} [{} {:.0f}m]: {}".format(
+                    sym, mode, ttl_minutes, reason,
+                ),
+            )
+        self._publish_hot_watch()
+        self._publish_trading_watchlist()
+        return
 
     def _on_breakout_scalp_alert(self, symbol: str, price: float) -> None:
         """Called from tick_tracker when a HOD alert fires — queue for instant scalp."""
@@ -1011,6 +1621,15 @@ class AlpacaRunner:
                     self._hod_seed_queue.append(sym)
         self._hod_seed_event.set()
 
+    def _request_priority_bar_refresh(self, symbol: str) -> None:
+        """Prioritize a hot/watchlist symbol that failed because bars were stale."""
+        sym = symbol.upper().strip()
+        if not sym or sym in self._watchlist_pinned:
+            return
+        if sym not in self._watchlist_set and not _ensure_market_data_service(self).hot_watch_contains(sym):
+            return
+        self._priority_bar_refresh.add(sym)
+
     def _pull_hod_seed_batch(self, max_count: int) -> List[str]:
         batch: List[str] = []
         with self._hod_seed_lock:
@@ -1058,21 +1677,43 @@ class AlpacaRunner:
     def _bar_hydrate_paused(self) -> bool:
         return time.time() < self._hydrate_paused_until
 
-    def _record_bar_fetch_failures(self, failure_count: int) -> None:
+    def _record_bar_fetch_failures(
+        self,
+        failure_count: int,
+        attempted_count: int = 0,
+    ) -> None:
         if failure_count <= 0:
             return
         now = time.time()
-        self._network_failure_times.extend([now] * failure_count)
+        failure_ratio = (
+            failure_count / attempted_count if attempted_count > 0 else 1.0
+        )
+        if attempted_count > 0 and attempted_count < 5:
+            logger.debug(
+                "Bar hydration small-batch miss: %d/%d symbols failed; no pause",
+                failure_count, attempted_count,
+            )
+            return
+        if attempted_count > 0 and failure_ratio < 0.65 and failure_count < 15:
+            logger.debug(
+                "Bar hydration partial miss: %d/%d symbols failed; no pause",
+                failure_count, attempted_count,
+            )
+            return
+        self._network_failure_times.append(now)
         cutoff = now - 60.0
         self._network_failure_times = [
             t for t in self._network_failure_times if t >= cutoff
         ]
-        if len(self._network_failure_times) >= 10:
-            self._hydrate_paused_until = now + 30.0
+        if len(self._network_failure_times) >= 3:
+            self._hydrate_paused_until = now + 20.0
             self._network_failure_times.clear()
             logger.warning(
-                "Network unstable — pausing bar hydration for 30s "
-                "(WebSocket stays connected)",
+                "Network unstable - pausing bar hydration for 20s after "
+                "repeated weak fetch batches (last failures=%d/%d; "
+                "WebSocket stays connected)",
+                failure_count,
+                attempted_count,
             )
 
     def _process_hod_seed_batch(self, symbols: Sequence[str]) -> None:
@@ -1141,7 +1782,14 @@ class AlpacaRunner:
 
     def _trade_symbol_set(self) -> Set[str]:
         """Symbols eligible for the trading pipeline this cycle."""
-        return set(self._watchlist) | self._protected_watchlist_symbols()
+        if hasattr(self, "_prune_hot_watch"):
+            self._prune_hot_watch()
+        hot = _ensure_market_data_service(self).hot_watch_keys()
+        return (
+            set(self._watchlist)
+            | hot
+            | self._protected_watchlist_symbols()
+        )
 
     def _trade_universe(
         self, bar_universe: Dict[str, List[Bar]],
@@ -1155,11 +1803,17 @@ class AlpacaRunner:
         now = datetime.now(timezone.utc)
         ttl_secs = self._hod_watchlist_ttl_minutes * 60
         active: Set[str] = set(self._news_pinned)
-        for sym, ts in list(self._hod_last_alert_at.items()):
+        tradeable_alerts = getattr(
+            self,
+            "_hod_tradeable_alert_at",
+            self._hod_last_alert_at,
+        )
+        for sym, ts in list(tradeable_alerts.items()):
             if (now - ts).total_seconds() < ttl_secs:
                 active.add(sym)
             else:
-                del self._hod_last_alert_at[sym]
+                del tradeable_alerts[sym]
+                self._hod_last_alert_at.pop(sym, None)
         return active
 
     def _sync_watchlist_to_hod_alerts(self, alerts: Optional[List[dict]] = None) -> None:
@@ -1201,8 +1855,9 @@ class AlpacaRunner:
         self._publish_trading_watchlist()
 
     def _publish_trading_watchlist(self) -> None:
+        active_symbols = sorted(self._trade_symbol_set())
         self._hub.on_trading_watchlist(
-            list(self._watchlist),
+            active_symbols,
             pinned=sorted(self._watchlist_pinned),
         )
 
@@ -1211,11 +1866,17 @@ class AlpacaRunner:
             self._hub.on_hod_momentum_alerts(self._hod_alert_store.snapshot())
 
     def _ensure_streaming_symbols(self, symbols: Sequence[str]) -> None:
-        """Queue WS bar/quote subscribe (safe from background threads)."""
-        if not symbols:
+        """Queue live bar/quote/trade subscriptions for active symbols."""
+        syms = [s.upper() for s in symbols if s]
+        if not syms:
             return
-        self._stream.subscribe(list(symbols), bars=True, quotes=True)
-        self._stream.flush_pending_subscriptions()
+        self._stream.subscribe(syms, bars=True, quotes=True)
+        if self._hod_tick_tracker:
+            self._hod_tick_tracker.add_known_symbols(syms)
+            self._stream.add_trade_filter_symbols(syms)
+            logger.info("10s tick feed requested for %d symbols — %s", len(syms), syms[:8])
+        else:
+            self._stream.flush_pending_subscriptions()
 
     def _add_symbols_to_watchlist(self, symbols: Sequence[str]) -> None:
         new_symbols = [s for s in symbols if s not in self._watchlist_set]
@@ -1227,9 +1888,7 @@ class AlpacaRunner:
         )
         self._watchlist.extend(new_symbols)
         self._watchlist_set.update(new_symbols)
-        self._stream.subscribe(new_symbols, bars=True, quotes=True)
-        if self._hod_tick_tracker:
-            self._hod_tick_tracker.add_known_symbols(new_symbols)
+        self._ensure_streaming_symbols(new_symbols)
         self._enqueue_hod_seed_symbols(new_symbols)
         self._hub.add_log("INFO", "HOD watchlist +{}".format(", ".join(new_symbols)))
 
@@ -1301,7 +1960,9 @@ class AlpacaRunner:
                 start=session_start_utc,
                 end=now_utc,
             )
-            self._record_bar_fetch_failures(self._hist.last_fetch_failures)
+            self._record_bar_fetch_failures(
+                self._hist.last_fetch_failures, len(symbols),
+            )
             return bars
         except Exception as exc:
             logger.warning("Session bar fetch failed: %s", exc)
@@ -1342,7 +2003,9 @@ class AlpacaRunner:
                 start=session_start_utc,
                 end=now_utc,
             )
-            self._record_bar_fetch_failures(self._hist.last_fetch_failures)
+            self._record_bar_fetch_failures(
+                self._hist.last_fetch_failures, len(symbols),
+            )
             today_et = now_et.date()
             for symbol, symbol_bars in bars.items():
                 today_bars: List[Bar] = []
@@ -1534,6 +2197,7 @@ class AlpacaRunner:
         start_dashboard(self._hub, port=self._dashboard_port)
         self._start_hod_seed_worker()
         self._start_pool_refresh_worker()
+        self._start_candidate_hydration_worker()
         self._start_fast_scan_worker()
 
         # Push initial account info and trade history to dashboard
@@ -1559,6 +2223,7 @@ class AlpacaRunner:
         if self._watchlist_data:
             self._hub.on_watchlist_scan(self._watchlist_data)
 
+        self._publish_hot_watch()
         self._publish_trading_watchlist()
         self._publish_hod_alert_board()
 
@@ -1701,33 +2366,15 @@ class AlpacaRunner:
                         self._eod_flattened = True
                         self._news_pinned.clear()
 
-                        # Run nightly analysis after flattening (weekdays with trades only)
-                        if self._pipeline._daily_pnl != 0 or len(self._pipeline._daily_losers) > 0:
-                            self._run_nightly_analysis()
+                self._maybe_run_after_market_training(now_et, self._market_phase())
 
                 if now_ts - last_market_check > 60:
                     last_market_check = now_ts
                     phase = self._market_phase()
-                    reload_phases = ("PRE-MARKET", "OPEN")
-                    if getattr(self, "_after_hours_enabled", False):
-                        reload_phases = ("PRE-MARKET", "OPEN", "AFTER-HOURS")
-                    if phase != last_market_phase and phase in reload_phases:
-                        logger.info("Market phase %s → %s — reloading history", last_market_phase, phase)
-                        self._load_history()
-                    if phase == "PRE-MARKET" and last_market_phase != "PRE-MARKET":
-                        logger.info("PRE-MARKET — daily session reset + refreshing HOD bar pool")
-                        self._maybe_daily_session_reset(now_et, phase, force=True)
-                        self._request_pool_refresh_now()
-                    if phase == "OPEN" and last_market_phase != "OPEN":
-                        logger.info("Market OPEN — refreshing HOD bar pool")
-                        self._request_pool_refresh_now()
-                    if (
-                        getattr(self, "_after_hours_enabled", False)
-                        and phase == "AFTER-HOURS"
-                        and last_market_phase != "AFTER-HOURS"
-                    ):
-                        logger.info("AFTER-HOURS — refreshing HOD bar pool")
-                        self._request_pool_refresh_now()
+                    if phase != last_market_phase:
+                        self._handle_market_phase_transition(
+                            last_market_phase, phase, now_et,
+                        )
                     if phase != last_market_phase:
                         logger.info("Market phase: %s", phase)
                     last_market_phase = phase
@@ -1743,7 +2390,11 @@ class AlpacaRunner:
                         stream_connected = True
                         self._hub.on_market_status(True, True, phase)
 
-                got_data = self._new_data.wait(timeout=self._cycle_interval)
+                wait_timeout = self._cycle_interval
+                next_entry_timeout = self._exec_timer.seconds_until_next_timeout()
+                if next_entry_timeout is not None:
+                    wait_timeout = min(wait_timeout, max(0.25, next_entry_timeout))
+                got_data = self._new_data.wait(timeout=wait_timeout)
                 if self._shutdown:
                     break
 
@@ -1775,12 +2426,27 @@ class AlpacaRunner:
                 for timed_sig in self._exec_timer.check_timeouts():
                     self._execute_timed_signal(timed_sig)
 
+                timed_entry_pending = self._has_pending_timed_entry()
+                if (
+                    in_trading_window
+                    and not timed_entry_pending
+                    and self._deferred_fast_scan_movers
+                ):
+                    movers = self._take_deferred_fast_scan_movers([])
+                    self._enqueue_candidate_hydration(
+                        movers,
+                        source="deferred fast scan",
+                    )
+
                 # Process instant breakout scalps from HOD tick alerts
-                if in_trading_window:
+                if in_trading_window and not timed_entry_pending:
                     self._process_breakout_scalps()
 
                 should_run = False
-                if got_data:
+                if timed_entry_pending:
+                    if got_data:
+                        self._new_data.clear()
+                elif got_data:
                     self._new_data.clear()
                     should_run = True
                 elif now_ts - last_cycle_time >= poll_interval and self._bar_buffer:
@@ -1797,7 +2463,7 @@ class AlpacaRunner:
                             self._check_exits_only()
                         self._hub.on_cycle_heartbeat(
                             cycle_count,
-                            "entry window closed",
+                            "new-entry pipeline paused by time window",
                         )
         except KeyboardInterrupt:
             logger.info("Keyboard interrupt received")
@@ -1917,6 +2583,7 @@ class AlpacaRunner:
         """
         try:
             alpaca_positions = self._broker.get_positions()
+            self._cleanup_accidental_shorts(alpaca_positions)
             rec = self._reconciler.reconcile(
                 alpaca_positions,
                 self._pipeline.portfolio,
@@ -1941,6 +2608,7 @@ class AlpacaRunner:
         """Reconcile portfolio + exit manager with Alpaca (broker is source of truth)."""
         try:
             alpaca_positions = self._broker.get_positions()
+            self._cleanup_accidental_shorts(alpaca_positions)
             self._reconciler.reconcile(
                 alpaca_positions,
                 self._pipeline.portfolio,
@@ -1953,6 +2621,124 @@ class AlpacaRunner:
             self._hub.on_position_update(self._pipeline.portfolio.positions, prices)
         except Exception as exc:
             logger.debug("Position sync error: %s", exc)
+
+    def _cleanup_accidental_shorts(self, broker_positions: Dict[str, dict]) -> None:
+        """Cover unexpected broker shorts in this long-only strategy."""
+        if not getattr(self, "_accidental_short_cleanup_enabled", True):
+            return
+        if not broker_positions:
+            return
+
+        now_ts = time.time()
+        max_qty = float(getattr(self, "_accidental_short_max_qty", 0.0) or 0.0)
+        cooldown_sec = float(getattr(self, "_accidental_short_cooldown_sec", 30.0))
+        cleanup_at = getattr(self, "_accidental_short_cleanup_at", None)
+        if cleanup_at is None:
+            cleanup_at = {}
+            self._accidental_short_cleanup_at = cleanup_at
+
+        for symbol, data in list(broker_positions.items()):
+            try:
+                qty = float(data.get("qty", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if qty >= 0:
+                continue
+
+            cover_qty = abs(qty)
+            last_attempt = float(cleanup_at.get(symbol, 0.0))
+            if now_ts - last_attempt < cooldown_sec:
+                continue
+            cleanup_at[symbol] = now_ts
+
+            if max_qty > 0 and cover_qty > max_qty:
+                msg = (
+                    f"ACCIDENTAL SHORT {symbol}: broker shows {qty:.0f} shares; "
+                    f"auto-cover skipped because max cleanup size is {max_qty:.0f}"
+                )
+                logger.error(msg)
+                if hasattr(self, "_hub"):
+                    self._hub.add_log("ERROR", msg)
+                continue
+
+            price = float(
+                data.get("current_price")
+                or data.get("avg_entry")
+                or data.get("avg_entry_price")
+                or 0.0
+            )
+            if price <= 0:
+                msg = f"ACCIDENTAL SHORT {symbol}: no valid cover price for {cover_qty:.0f} shares"
+                logger.error(msg)
+                if hasattr(self, "_hub"):
+                    self._hub.add_log("ERROR", msg)
+                continue
+
+            order = Order(symbol=symbol, side=Side.BUY, quantity=cover_qty)
+            bar = Bar(
+                symbol=symbol,
+                ts=datetime.now(timezone.utc),
+                open=price,
+                high=price,
+                low=price,
+                close=price,
+                volume=0,
+            )
+            logger.warning(
+                "ACCIDENTAL SHORT COVER %s: buying %.0f shares to flatten broker short",
+                symbol, cover_qty,
+            )
+            fill, status = self._submit_fast_exit_order(order, bar)
+            if fill is None:
+                msg = (
+                    f"ACCIDENTAL SHORT COVER FAILED {symbol}: "
+                    f"{cover_qty:.0f} shares status={status.value}"
+                )
+                logger.error(msg)
+                if hasattr(self, "_hub"):
+                    self._hub.add_log("ERROR", msg)
+                continue
+
+            try:
+                from daytrading.execution.broker import apply_fill
+
+                pos = self._pipeline.portfolio.positions.get(symbol)
+                if pos is not None and pos.quantity < 0:
+                    apply_fill(self._pipeline.portfolio, fill)
+            except Exception as exc:
+                logger.debug("Could not apply accidental short cover locally: %s", exc)
+
+            self._pipeline.exit_manager.untrack(symbol)
+            self._clear_broker_stop(symbol)
+            if hasattr(self, "_exec_timer"):
+                self._exec_timer.cancel(symbol)
+            if hasattr(self, "_timed_signal_queue"):
+                self._timed_signal_queue = deque(
+                    s for s in self._timed_signal_queue if s.symbol != symbol
+                )
+
+            msg = (
+                f"ACCIDENTAL SHORT COVERED {symbol}: bought {fill.quantity:.0f} "
+                f"@ ${fill.price:.2f}"
+            )
+            logger.warning(msg)
+            if hasattr(self, "_hub"):
+                self._hub.add_log("WARNING", msg)
+            if hasattr(self, "_journal"):
+                self._journal.record(
+                    "short_cleanup",
+                    {
+                        "symbol": symbol,
+                        "quantity": fill.quantity,
+                        "price": fill.price,
+                        "side": fill.side.value,
+                        "reason": "accidental_short_cover",
+                        "broker_qty": qty,
+                    },
+                    ts=fill.ts,
+                )
+            self._seed_recent_order_ids()
+            broker_positions.pop(symbol, None)
 
     def _price_buffers_snapshot(self) -> tuple:
         quotes = {s: list(q) for s, q in self._quote_buffer.items() if q}
@@ -1968,6 +2754,42 @@ class AlpacaRunner:
             quotes=quotes,
             bars=bars,
         )
+
+    def _has_pending_timed_entry(self) -> bool:
+        return bool(self._exec_timer.pending_symbols or self._timed_signal_queue)
+
+    def _defer_fast_scan_movers(self, movers: List[Dict]) -> None:
+        if not movers:
+            return
+        existing = {
+            str(m.get("symbol", "")).upper()
+            for m in self._deferred_fast_scan_movers
+        }
+        for mover in movers:
+            sym = str(mover.get("symbol", "")).upper()
+            if sym and sym not in existing:
+                self._deferred_fast_scan_movers.append(mover)
+                existing.add(sym)
+        max_pending = max(self._fast_scan_process_max * 2, 40)
+        if len(self._deferred_fast_scan_movers) > max_pending:
+            self._deferred_fast_scan_movers = self._deferred_fast_scan_movers[-max_pending:]
+        logger.debug(
+            "Fast scan deferred while timed entry pending: %d movers queued",
+            len(self._deferred_fast_scan_movers),
+        )
+
+    def _take_deferred_fast_scan_movers(self, movers: List[Dict]) -> List[Dict]:
+        if not self._deferred_fast_scan_movers:
+            return movers
+        combined: List[Dict] = []
+        seen: Set[str] = set()
+        for mover in self._deferred_fast_scan_movers + list(movers):
+            sym = str(mover.get("symbol", "")).upper()
+            if sym and sym not in seen:
+                combined.append(mover)
+                seen.add(sym)
+        self._deferred_fast_scan_movers = []
+        return combined
 
     def _arm_broker_protection(
         self,
@@ -2005,6 +2827,9 @@ class AlpacaRunner:
         tracked = self._pipeline.exit_manager.tracked.get(signal.symbol)
         stop = (tracked.stop_loss if tracked else None) or signal.stop_loss
         self._arm_broker_protection(signal.symbol, fill.quantity, stop)
+        # Setup consumed — drop its chase anchor so a future setup re-anchors.
+        if getattr(self, "_timed_entry_anchor", None) is not None:
+            self._timed_entry_anchor.pop(signal.symbol, None)
         self._push_positions_from_alpaca()
 
     def _refresh_broker_stop(self, symbol: str) -> None:
@@ -2068,6 +2893,22 @@ class AlpacaRunner:
             label_exit_snapshots(fill.symbol, fill.price)
         except Exception:
             pass
+        try:
+            bars = list(self._bar_buffer.get(fill.symbol, deque()))
+            if bars:
+                universe = {fill.symbol: bars}
+                quotes = {fill.symbol: list(self._quote_buffer.get(fill.symbol, deque()))}
+                self._pipeline.missed_a_plus.record_early_exit(
+                    symbol=fill.symbol,
+                    entry_price=entry_price,
+                    exit_price=fill.price,
+                    reason=reason or "exit",
+                    universe=universe,
+                    quotes=quotes,
+                    now=fill.ts if isinstance(fill.ts, datetime) else datetime.now(timezone.utc),
+                )
+        except Exception:
+            pass
         self._hub.on_exit_fill(fill, entry_price=entry_price)
         self._hub.add_log(
             "INFO",
@@ -2105,7 +2946,24 @@ class AlpacaRunner:
         )
 
         tracked = self._pipeline.exit_manager.tracked.get(fill.symbol)
-        if tracked is None or tracked.remaining_qty <= 0:
+        portfolio_pos = getattr(self._pipeline, "portfolio", None)
+        portfolio_pos = (
+            portfolio_pos.positions.get(fill.symbol)
+            if portfolio_pos is not None and hasattr(portfolio_pos, "positions")
+            else None
+        )
+        broker_should_be_flat = (
+            fill.side is Side.SELL
+            and portfolio_pos is not None
+            and (
+                portfolio_pos.is_flat
+                or portfolio_pos.quantity <= 0
+            )
+        )
+        if tracked is None or tracked.remaining_qty <= 0 or broker_should_be_flat:
+            self._pipeline.exit_manager.untrack(fill.symbol)
+            if hasattr(self, "_reconciler"):
+                self._reconciler.clear_pending(fill.symbol)
             self._clear_broker_stop(fill.symbol)
         else:
             self._refresh_broker_stop(fill.symbol)
@@ -2128,9 +2986,7 @@ class AlpacaRunner:
         try:
             from alpaca.trading.requests import GetOrdersRequest
             from alpaca.trading.enums import QueryOrderStatus
-            today_start = datetime.utcnow().replace(
-                hour=0, minute=0, second=0, microsecond=0,
-            )
+            today_start = self._session_start_utc()
             req = GetOrdersRequest(
                 status=QueryOrderStatus.CLOSED, after=today_start,
                 limit=200, symbols=[symbol],
@@ -2154,6 +3010,21 @@ class AlpacaRunner:
             logger.debug("Entry price lookup for %s failed: %s", symbol, exc)
         return 0.0
 
+    def _session_start_utc(self) -> datetime:
+        now_et = self._now_et()
+        session_start_et = now_et.replace(
+            hour=4, minute=0, second=0, microsecond=0,
+        )
+        return session_start_et.astimezone(timezone.utc).replace(tzinfo=None)
+
+    def _order_is_from_current_session(self, order: object) -> bool:
+        fill_time = getattr(order, "filled_at", None) or getattr(order, "submitted_at", None)
+        if fill_time is None:
+            return False
+        if getattr(fill_time, "tzinfo", None) is not None:
+            fill_time = fill_time.astimezone(timezone.utc).replace(tzinfo=None)
+        return fill_time >= self._session_start_utc()
+
     def _check_new_fills(self) -> None:
         """Check Alpaca for recently filled orders not yet in the dashboard."""
         try:
@@ -2167,6 +3038,9 @@ class AlpacaRunner:
             for o in orders:
                 oid = str(o.id)
                 if oid in self._last_synced_order_ids:
+                    continue
+                if not self._order_is_from_current_session(o):
+                    self._last_synced_order_ids.add(oid)
                     continue
 
                 status_val = o.status.value if hasattr(o.status, 'value') else str(o.status)
@@ -2237,7 +3111,7 @@ class AlpacaRunner:
         phase: str,
         *,
         force: bool = False,
-    ) -> bool:
+    ) -> int:
         """Run the once-per-trading-day reset at the premarket boundary."""
         if not self._is_trading_day(current_et):
             return False
@@ -2292,10 +3166,15 @@ class AlpacaRunner:
             self._hod_seed_queue.clear()
             self._hod_seed_pending.clear()
 
+        # Clear per-symbol timed-entry chase anchors for the new day
+        if getattr(self, "_timed_entry_anchor", None):
+            self._timed_entry_anchor.clear()
+
         # Reset daily P&L tracking
         self._pipeline._daily_pnl = 0.0
         self._pipeline._daily_losers.clear()
-        self._last_synced_order_ids.clear()
+        if hasattr(self._pipeline, "_daily_loss_counts"):
+            self._pipeline._daily_loss_counts.clear()
         self._recorded_exit_fill_keys.clear()
 
         # Reset EOD flatten flag
@@ -2328,6 +3207,11 @@ class AlpacaRunner:
             pass
 
         self._last_session_reset_day = day_key or self._now_et().date().isoformat()
+        if getattr(self, "_broker", None) is not None:
+            try:
+                self._sync_trade_history()
+            except Exception as exc:
+                logger.debug("Trade history restore after daily reset failed: %s", exc)
         logger.info("Session reset complete — watchlist: %s", self._watchlist)
 
     def _load_history(self) -> None:
@@ -2465,7 +3349,7 @@ class AlpacaRunner:
                 tick = evt.tick
                 if self._hod_tick_tracker is not None:
                     self._hod_tick_tracker.on_trade(tick)
-                if tick.symbol in self._watchlist_set:
+                if tick.symbol in self._watchlist_set or self.is_hot_watch_active(tick.symbol):
                     self._pipeline.trade_guard.halt_tracker.update_price(
                         tick.symbol, tick.price, tick.ts,
                     )
@@ -2482,7 +3366,7 @@ class AlpacaRunner:
                             tracked_pos.highest_price = tick.price
                         # Only trail on ticks AFTER half-sell (let pre-half winners run to target)
                         if tracked_pos.sold_half:
-                            trail_stop = round(tracked_pos.highest_price * 0.99, 4)
+                            trail_stop = self._tick_trail_stop_for(tracked_pos)
                             if trail_stop > tracked_pos.stop_loss:
                                 tracked_pos.stop_loss = trail_stop
                             if tick.price <= tracked_pos.stop_loss:
@@ -2490,7 +3374,10 @@ class AlpacaRunner:
 
                     # Tape pressure profit-protection exit (pre- and post-half)
                     if tracked_pos and tracked_pos.remaining_qty > 0:
-                        if tick.price > tracked_pos.entry_price:
+                        if (
+                            not self._uses_runner_core_management(tracked_pos)
+                            and tick.price > tracked_pos.entry_price
+                        ):
                             hold_secs = (datetime.now(timezone.utc) - tracked_pos.entry_ts).total_seconds()
                             tick_list = list(self._tick_buffer.get(tick.symbol, []))
                             quote_list = list(self._quote_buffer.get(tick.symbol, []))
@@ -2510,6 +3397,7 @@ class AlpacaRunner:
 
             elif isinstance(evt, BarsLoadedEvent):
                 today_et = self._now_et().date()
+                loaded_any = False
                 for symbol, symbol_bars in evt.bars_by_symbol.items():
                     today_bars = [
                         b for b in symbol_bars
@@ -2520,10 +3408,12 @@ class AlpacaRunner:
                             today_bars[-self._max_bars_per_symbol:],
                             maxlen=self._max_bars_per_symbol,
                         )
+                        loaded_any = True
                 if evt.prior_day_stats:
                     self._prior_day_stats.update(evt.prior_day_stats)
                 for sym in evt.bars_by_symbol:
                     self._seed_hod_session(sym)
+                got_bars = got_bars or loaded_any
 
             elif isinstance(evt, PoolRefreshEvent):
                 self._hod_bar_pool = list(evt.new_pool)
@@ -2549,8 +3439,14 @@ class AlpacaRunner:
                 )
 
             elif isinstance(evt, FastScanEvent):
-                self._handle_fast_scan_movers(evt.new_movers)
-                got_bars = True
+                if self._has_pending_timed_entry():
+                    self._defer_fast_scan_movers(evt.new_movers)
+                    continue
+                movers = self._take_deferred_fast_scan_movers(evt.new_movers)
+                self._enqueue_candidate_hydration(
+                    movers,
+                    source="fast scan event",
+                )
 
         if drained > 5000:
             logger.info("Drained %d events from queue", drained)
@@ -2563,17 +3459,49 @@ class AlpacaRunner:
         except Exception:
             return True
 
-    def _handle_fast_scan_movers(self, new_movers: List[Dict]) -> None:
-        """Process new movers from fast scan: float check → add to pool → hydrate."""
+    def _handle_fast_scan_movers(
+        self,
+        new_movers: List[Dict],
+        *,
+        push_event: bool = False,
+    ) -> bool:
+        """Process new movers from fast scan: float check → add to pool → hydrate.
+
+        When called from the candidate worker, fetched bars are returned through
+        BarsLoadedEvent so the main loop remains the only writer to bar buffers.
+        """
         if not self._float_checker or not new_movers:
-            return
+            return 0
 
         hydrate_symbols = []
+        skipped_fresh = 0
         pool_set = set(self._hod_bar_pool)
         now_ts = datetime.now(timezone.utc)
         for mover in new_movers:
             sym = mover["symbol"]
             is_strong = mover.get("abs_change_pct", 0) >= 10.0 and mover.get("volume", 0) >= 200_000
+            flt = self._float_checker.get_float_cached(sym)
+
+            hot_reject = self._hot_watch_reject_reason(mover, flt)
+            if hot_reject is None:
+                self._promote_hot_watch(
+                    mover,
+                    flt=flt,
+                    reason="fast scan mover",
+                )
+            else:
+                self._journal.record("hot_watch", {
+                    "symbol": sym,
+                    "stage": "rejected",
+                    "reason": hot_reject,
+                    "price": mover.get("price"),
+                    "change_pct": mover.get("change_pct"),
+                    "abs_change_pct": mover.get("abs_change_pct"),
+                    "volume": mover.get("volume"),
+                    "score": mover.get("score"),
+                    "float": flt,
+                })
+
             in_pool = sym in pool_set
             bars = self._bar_buffer.get(sym)
             bars_stale = True
@@ -2589,14 +3517,11 @@ class AlpacaRunner:
             if in_pool:
                 if is_strong and (not bars or bars_stale):
                     hydrate_symbols.append(sym)
+                else:
+                    skipped_fresh += 1
                 continue
             if len(self._hod_bar_pool) >= self._hod_pool_max:
                 break
-            flt = self._float_checker.get_float_cached(sym)
-            if flt is None and is_strong:
-                flt = self._float_checker.get_float(sym)
-            elif flt is not None and flt > self._hod_max_float and is_strong:
-                flt = self._float_checker.get_float(sym)
             if flt is not None and flt > self._hod_max_float:
                 continue
             if flt is None and not is_strong:
@@ -2606,43 +3531,69 @@ class AlpacaRunner:
             hydrate_symbols.append(sym)
 
         if not hydrate_symbols:
-            return
+            self._sync_tick_tracker_pool()
+            if skipped_fresh:
+                try:
+                    self._hub.on_candidate_hydration(skipped_fresh=skipped_fresh)
+                except Exception:
+                    pass
+            return 0
 
         logger.info(
-            "Fast scan → hydrating %d HOD movers: %s",
+            "Candidate hydrate → loading %d HOD movers: %s",
             len(hydrate_symbols),
             ", ".join(hydrate_symbols[:10]),
         )
         self._hub.add_log(
             "INFO",
-            "Fast scan hydrating {} HOD movers — {}".format(
+            "Candidate hydrate {} HOD movers — {}".format(
                 len(hydrate_symbols), ", ".join(hydrate_symbols[:10]),
             ),
         )
 
-        batch = hydrate_symbols[:self._hod_hydrate_batch_max]
+        candidate_batch_max = getattr(self, "_candidate_hydrate_batch_max", 10)
+        max_batch = min(self._hod_hydrate_batch_max, candidate_batch_max)
+        batch = hydrate_symbols[:max_batch]
+        loaded_count = 0
         try:
             bars_by_symbol = self._fetch_session_bars(batch)
             prior_stats = self._fetch_prior_day_stats(batch)
-            today_et = self._now_et().date()
-            for symbol, symbol_bars in bars_by_symbol.items():
-                today_bars = [
-                    b for b in symbol_bars
-                    if b.ts is None or self._bar_is_today(b, today_et)
-                ]
-                if today_bars:
-                    self._bar_buffer[symbol] = deque(
-                        today_bars[-self._max_bars_per_symbol:],
-                        maxlen=self._max_bars_per_symbol,
-                    )
-            if prior_stats:
-                self._prior_day_stats.update(prior_stats)
-            for sym in bars_by_symbol:
-                self._seed_hod_session(sym)
+            if push_event:
+                loaded_count = len(bars_by_symbol)
+                if bars_by_symbol or prior_stats:
+                    try:
+                        self._event_queue.put_nowait(
+                            BarsLoadedEvent(bars_by_symbol, prior_stats)
+                        )
+                    except queue.Full:
+                        logger.warning("Event queue full; dropped candidate bars")
+            else:
+                today_et = self._now_et().date()
+                for symbol, symbol_bars in bars_by_symbol.items():
+                    today_bars = [
+                        b for b in symbol_bars
+                        if b.ts is None or self._bar_is_today(b, today_et)
+                    ]
+                    if today_bars:
+                        self._bar_buffer[symbol] = deque(
+                            today_bars[-self._max_bars_per_symbol:],
+                            maxlen=self._max_bars_per_symbol,
+                        )
+                        loaded_count += 1
+                if prior_stats:
+                    self._prior_day_stats.update(prior_stats)
+                for sym in bars_by_symbol:
+                    self._seed_hod_session(sym)
         except Exception as exc:
-            logger.warning("Fast scan hydrate failed: %s", exc)
+            logger.warning("Candidate hydrate failed: %s", exc)
 
+        if skipped_fresh:
+            try:
+                self._hub.on_candidate_hydration(skipped_fresh=skipped_fresh)
+            except Exception:
+                pass
         self._sync_tick_tracker_pool()
+        return loaded_count
 
     def _check_exits_only(self) -> None:
         """Fast exit check every second using live Alpaca prices.
@@ -2686,7 +3637,7 @@ class AlpacaRunner:
                     close=prices.get(sig.symbol, 0),
                     volume=0, ts=now,
                 )
-                fill, status = self._broker.submit(order, bar, self._pipeline.portfolio)
+                fill, status = self._submit_fast_exit_order(order, bar)
                 try:
                     from daytrading.ml.shadow_collector import log_execution_quality
                     log_execution_quality(
@@ -2716,6 +3667,17 @@ class AlpacaRunner:
                     self._push_positions_from_alpaca()
                     self._pipeline.set_cooldown(fill.symbol)
                 else:
+                    if not self._broker_has_compatible_exit_position(
+                        sig.symbol,
+                        Side.SELL if sig.action is SignalAction.EXIT_LONG else Side.BUY,
+                    ):
+                        logger.info(
+                            "FAST EXIT %s: broker already flat/incompatible after clamp; syncing state",
+                            sig.symbol,
+                        )
+                        self._push_positions_from_alpaca()
+                        self._pipeline.set_cooldown(sig.symbol)
+                        continue
                     # STOP LOSS MUST EXECUTE — retry with market order
                     logger.warning(
                         "FAST EXIT limit not filled for %s — retrying with guarded marketable limit",
@@ -2727,7 +3689,7 @@ class AlpacaRunner:
                         quantity=sig.quantity,
                         limit_price=None,  # broker converts to guarded marketable limit
                     )
-                    fill2, status2 = self._broker.submit(market_order, bar, self._pipeline.portfolio)
+                    fill2, status2 = self._submit_fast_exit_order(market_order, bar)
                     try:
                         from daytrading.ml.shadow_collector import log_execution_quality
                         log_execution_quality(
@@ -2769,6 +3731,113 @@ class AlpacaRunner:
                             tracked_pos.breakeven_locked = False
         except Exception as exc:
             logger.warning("Fast exit check error: %s", exc)
+
+    def _submit_fast_exit_order(self, order: Order, bar: Bar):
+        """Submit an urgent exit with a short fill wait before retry logic.
+
+        Entry orders can wait for a better fill. Stop exits should not: if the
+        first limit does not fill quickly, the caller retries with a guarded
+        marketable limit.
+        """
+        order = self._clamp_fast_exit_order_to_broker_position(order)
+        if order is None:
+            return None, OrderStatus.CANCELLED
+
+        old_wait = getattr(self._broker, "_max_wait", None)
+        try:
+            if old_wait is not None:
+                self._broker._max_wait = min(float(old_wait), 1.0)
+            return self._broker.submit(order, bar, self._pipeline.portfolio)
+        finally:
+            if old_wait is not None:
+                self._broker._max_wait = old_wait
+
+    def _broker_has_compatible_exit_position(self, symbol: str, side: Side) -> bool:
+        """Return whether Alpaca still shows quantity compatible with an exit side."""
+        get_positions = getattr(self._broker, "get_positions", None)
+        if not callable(get_positions):
+            return True
+        try:
+            invalidate = getattr(self._broker, "_invalidate_position_cache", None)
+            if callable(invalidate):
+                invalidate()
+            broker_positions = get_positions() or {}
+        except Exception as exc:
+            logger.warning("FAST EXIT %s: broker position recheck failed: %s", symbol, exc)
+            return True
+        pos = broker_positions.get(symbol)
+        if not pos:
+            return False
+        try:
+            broker_qty = float(pos.get("qty", 0.0) if isinstance(pos, dict) else getattr(pos, "qty", 0.0))
+        except (TypeError, ValueError):
+            return True
+        if side is Side.SELL:
+            return broker_qty > 0
+        return broker_qty < 0
+
+    def _clamp_fast_exit_order_to_broker_position(self, order: Order) -> Optional[Order]:
+        """Cap urgent exit quantity to the fresh broker position.
+
+        Fast exits can run immediately after a partial fill, cancelled order, or
+        broker-held protective stop. In that window local tracking may still say
+        more shares exist than Alpaca will accept. Clamp to broker reality before
+        submitting the urgent exit/retry.
+        """
+        get_positions = getattr(self._broker, "get_positions", None)
+        if not callable(get_positions):
+            return order
+
+        try:
+            invalidate = getattr(self._broker, "_invalidate_position_cache", None)
+            if callable(invalidate):
+                invalidate()
+            broker_positions = get_positions() or {}
+        except Exception as exc:
+            logger.warning("FAST EXIT %s: broker position refresh failed: %s", order.symbol, exc)
+            return order
+
+        pos = broker_positions.get(order.symbol)
+        if not pos:
+            logger.warning(
+                "FAST EXIT %s: broker shows no position; skipping %.0f-share exit",
+                order.symbol, order.quantity,
+            )
+            return None
+
+        try:
+            broker_qty = float(pos.get("qty", 0.0) if isinstance(pos, dict) else getattr(pos, "qty", 0.0))
+        except (TypeError, ValueError):
+            return order
+
+        if order.side is Side.SELL:
+            available_qty = max(0, int(broker_qty))
+        else:
+            available_qty = max(0, int(abs(broker_qty))) if broker_qty < 0 else 0
+
+        if available_qty <= 0:
+            logger.warning(
+                "FAST EXIT %s: broker qty %.0f incompatible with %s exit; skipping",
+                order.symbol, broker_qty, order.side.value,
+            )
+            return None
+
+        requested_qty = int(order.quantity)
+        if requested_qty <= available_qty:
+            return order
+
+        logger.warning(
+            "FAST EXIT %s: clamping exit quantity %.0f → %d from fresh broker qty %.0f",
+            order.symbol, order.quantity, available_qty, broker_qty,
+        )
+        return Order(
+            symbol=order.symbol,
+            side=order.side,
+            quantity=float(available_qty),
+            limit_price=order.limit_price,
+            stop_price=order.stop_price,
+            client_order_id=order.client_order_id,
+        )
 
     def _instant_trail_exit(self, symbol: str, price: float) -> None:
         """Immediately exit a position when the tick-level trailing stop is hit."""
@@ -2819,6 +3888,29 @@ class AlpacaRunner:
                 logger.warning("TICK TRAIL EXIT order not filled %s (status=%s)", symbol, status)
         except Exception as exc:
             logger.error("Tick trail exit error %s: %s", symbol, exc)
+
+    @staticmethod
+    def _tick_trail_stop_for(tracked_pos) -> float:
+        """Return the tick trailing stop for a tracked position.
+
+        Ordinary scalps keep the tight 1% tick trail. Confirmed runners have
+        already paid the first partial, so the remaining shares get wider room
+        to catch CHAI/VERU-style continuation.
+        """
+        trail_pct = 0.01
+        if getattr(tracked_pos, "runner_confirmed", False):
+            trail_pct = float(getattr(tracked_pos, "runner_trail_pct", 0.03) or 0.03)
+            trail_pct = max(0.01, min(trail_pct, 0.06))
+        return round(float(tracked_pos.highest_price) * (1.0 - trail_pct), 4)
+
+    @staticmethod
+    def _uses_runner_core_management(tracked_pos) -> bool:
+        """Let confirmed runner cores use runner trail/re-add instead of fast scalp exits."""
+        return bool(
+            getattr(tracked_pos, "runner_confirmed", False)
+            and getattr(tracked_pos, "sold_half", False)
+            and getattr(tracked_pos, "remaining_qty", 0) > 0
+        )
 
     def _tape_pressure_exit(self, symbol: str, price: float) -> None:
         """Exit a position when tape pressure detects selling — protect profit."""
@@ -2892,6 +3984,11 @@ class AlpacaRunner:
             if not pos.breakeven_locked:
                 return
 
+            # Confirmed runners already paid the first partial. Let the wider
+            # runner trail/re-add playbook manage normal 10s pullbacks.
+            if self._uses_runner_core_management(pos):
+                return
+
             # Only activate after price has run at least +2% from entry
             if pos.entry_price > 0:
                 max_run_pct = (pos.highest_price - pos.entry_price) / pos.entry_price
@@ -2952,121 +4049,104 @@ class AlpacaRunner:
         except Exception as exc:
             logger.error("10s candle exit error %s: %s", symbol, exc)
 
+    def _record_missed_a_plus_signal(
+        self,
+        signal: TradeSignal,
+        *,
+        layer: str,
+        reason: str,
+        fallback_price: float = 0.0,
+    ) -> None:
+        try:
+            bars = list(self._bar_buffer.get(signal.symbol, deque()))
+            if signal.scan_result is not None and signal.scan_result.bars:
+                bars = list(signal.scan_result.bars)
+            if not bars:
+                return
+            universe = {signal.symbol: bars}
+            quotes = {signal.symbol: list(self._quote_buffer.get(signal.symbol, deque()))}
+            self._pipeline.missed_a_plus.record_blocked(
+                layer=layer,
+                reason=reason,
+                universe=universe,
+                quotes=quotes,
+                signal=signal,
+                fallback_price=fallback_price or signal.entry_price,
+            )
+            self._pipeline.missed_a_plus.update_prices(
+                universe, now=datetime.now(timezone.utc),
+            )
+            self._hub.on_missed_a_plus(self._pipeline.missed_a_plus_report())
+        except Exception:
+            pass
+
+    def _record_entry_decision(
+        self,
+        decision: EntryDecision,
+        *,
+        source: str = "runner",
+    ) -> None:
+        """Persist one compact structured funnel record for entry debugging."""
+        try:
+            payload = decision.to_payload()
+            payload["source"] = source
+            payload["market_phase"] = self._market_phase()
+            self._journal.record("entry_decision", payload, ts=decision.ts)
+        except Exception:
+            pass
+
+    def _record_entry_reject(
+        self,
+        signal: TradeSignal,
+        *,
+        stage: str,
+        reason: str,
+        source: str = "runner",
+        price: float = 0.0,
+        metadata: Optional[dict] = None,
+    ) -> EntryDecision:
+        executor = _ensure_entry_executor(self)
+        return executor.reject(
+            symbol=signal.symbol,
+            stage=stage,
+            reason=reason,
+            blocked_layer=stage,
+            signal=signal,
+            source=source,
+            price=price or signal.entry_price,
+            metadata=metadata,
+        )
+
+    def _entry_execution_context(self) -> EntryExecutionContext:
+        class _NoopJournal:
+            def record(self, *args, **kwargs) -> None:
+                return None
+
+        return EntryExecutionContext(
+            new_entries_blocked=self._new_entries_blocked,
+            pipeline=self._pipeline,
+            bar_buffer=getattr(self, "_bar_buffer", {}),
+            hub=self._hub,
+            broker=self._broker,
+            journal=getattr(self, "_journal", _NoopJournal()),
+            chase_reject=self._timed_entry_chase_reject,
+            record_entry_reject=self._record_entry_reject,
+            record_missed_a_plus=self._record_missed_a_plus_signal,
+            shared_entry_quality_reject=self._shared_entry_quality_reject,
+            execution_learning_context=self._execution_learning_context,
+            is_hot_hod_timed_signal=self._is_hot_hod_timed_signal,
+            retry_hot_hod_timed_entry=self._retry_hot_hod_timed_entry,
+            on_position_opened=self._on_position_opened,
+            market_phase=self._market_phase,
+            seed_recent_order_ids=self._seed_recent_order_ids,
+        )
+
     def _execute_timed_signal(self, signal: TradeSignal) -> None:
         """Execute a deferred signal that the execution timer released."""
-        try:
-            from daytrading.execution.broker import apply_fill
-            from daytrading.models import Side, SignalAction
-
-            sym = signal.symbol
-            if self._new_entries_blocked(sym, "TIMED ENTRY"):
-                return
-
-            # Re-check cooldown (may have been set after signal was queued)
-            last_exit_ts = self._pipeline._exit_cooldowns.get(sym)
-            if last_exit_ts is not None:
-                elapsed = (datetime.now(timezone.utc) - last_exit_ts).total_seconds()
-                if elapsed < self._pipeline._cooldown_seconds:
-                    logger.info(
-                        "TIMED ENTRY skip %s — on cooldown (%.0fs ago)", sym, elapsed,
-                    )
-                    return
-
-            # Don't enter if already holding
-            pos = self._pipeline.portfolio.positions.get(sym)
-            if pos and not pos.is_flat:
-                logger.info("TIMED ENTRY skip %s — already in position", sym)
-                return
-
-            # Daily loser blacklist
-            if sym in self._pipeline._daily_losers:
-                logger.info("TIMED ENTRY skip %s — daily loser blacklist", sym)
-                return
-
-            # Per-symbol max entries
-            if self._pipeline._symbol_entry_counts.get(sym, 0) >= self._pipeline._max_entries_per_symbol:
-                logger.info(
-                    "TIMED ENTRY skip %s — max entries reached (%d)",
-                    sym, self._pipeline._max_entries_per_symbol,
-                )
-                return
-
-            order = Order(
-                symbol=sym,
-                side=Side.BUY if signal.action is SignalAction.ENTER_LONG else Side.SELL,
-                quantity=signal.quantity,
-                limit_price=signal.entry_price,
-            )
-            # Use latest known price for the bar
-            bars = self._bar_buffer.get(signal.symbol, deque())
-            if bars:
-                bar = bars[-1]
-            else:
-                bar = Bar(
-                    symbol=signal.symbol,
-                    open=signal.entry_price, high=signal.entry_price,
-                    low=signal.entry_price, close=signal.entry_price,
-                    volume=0, ts=datetime.now(timezone.utc),
-                )
-
-            chase_reject = self._timed_entry_chase_reject(signal, bar)
-            if chase_reject:
-                logger.info("TIMED ENTRY skip %s — %s", sym, chase_reject)
-                self._hub.add_log("WARNING", "ENTRY SKIP {}: {}".format(sym, chase_reject))
-                return
-
-            fill, status = self._broker.submit(order, bar, self._pipeline.portfolio)
-            try:
-                from daytrading.ml.shadow_collector import log_execution_quality
-                log_execution_quality(
-                    order=order, bar=bar, status=status, fill=fill, source="timed_entry",
-                )
-            except Exception:
-                pass
-            if (
-                fill is None
-                and self._is_hot_hod_timed_signal(signal)
-                and signal.action is SignalAction.ENTER_LONG
-            ):
-                fill, status = self._retry_hot_hod_timed_entry(signal, status, bar)
-            if fill:
-                apply_fill(self._pipeline.portfolio, fill)
-                self._pipeline._symbol_entry_counts[sym] = self._pipeline._symbol_entry_counts.get(sym, 0) + 1
-                strategy = (
-                    signal.scan_result.scanner_name if signal.scan_result
-                    else signal.reason or "unknown"
-                )
-                self._on_position_opened(
-                    signal, fill, strategy=strategy, execution_method="10s_timed",
-                )
-                logger.info(
-                    "TIMED ENTRY %s %s %.0f @ $%.4f (strategy=%s)",
-                    fill.side.value, fill.symbol, fill.quantity, fill.price, strategy,
-                )
-                self._hub.on_fill(fill, "entry")
-                self._hub.add_log("INFO", "ENTRY {} {} {:.0f} @ ${:.2f} (10s timed)".format(
-                    fill.side.value.upper(), fill.symbol, fill.quantity, fill.price))
-                self._journal.record("trade_fill", {
-                    "symbol": fill.symbol,
-                    "side": fill.side.value,
-                    "quantity": fill.quantity,
-                    "price": fill.price,
-                    "ts": fill.ts,
-                    "trade_type": "entry",
-                    "strategy": strategy,
-                    "execution_method": "10s_timed",
-                    "market_context": {
-                        "phase": self._market_phase(),
-                    },
-                }, ts=fill.ts)
-                self._seed_recent_order_ids()
-            else:
-                logger.warning(
-                    "TIMED ENTRY order not filled for %s (status=%s)",
-                    signal.symbol, status,
-                )
-        except Exception as exc:
-            logger.error("Timed signal execution error for %s: %s", signal.symbol, exc)
+        _ensure_entry_executor(self).execute_timed_signal(
+            self._entry_execution_context(),
+            signal,
+        )
 
     def _timed_entry_chase_reject(
         self,
@@ -3074,9 +4154,9 @@ class AlpacaRunner:
         fallback_bar: Bar,
     ) -> Optional[str]:
         """Cancel delayed timed entries that have become chase entries."""
-        if signal.action is not SignalAction.ENTER_LONG:
+        if signal.action not in (SignalAction.ENTER_LONG, SignalAction.SCALE_UP_LONG):
             return None
-        original = float(signal.entry_price or 0.0)
+        original = self._timed_entry_chase_anchor(signal)
         if original <= 0:
             return None
 
@@ -3105,12 +4185,51 @@ class AlpacaRunner:
             "abc_continuation",
             "vwap_pullback",
             "hod_reclaim",
+            "level_breakout_reclaim",
             "pullback_base",
+            "shallow_stair_continuation",
+            "early_vwap_reclaim_scout",
+            "abc_reentry",
             "breakout_scalp",
+            "opening_range_breakout",
+            "runner_readd",
         }
         is_hot = pattern in hot_patterns or scanner in hot_patterns
+
+        if pattern == "opening_range_breakout" or scanner == "opening_range_breakout":
+            if live < original * 0.97:
+                return "live price {:.4f} pulled back too far from breakout signal {:.4f}".format(
+                    live, original,
+                )
+        if pattern == "level_breakout_reclaim" or scanner == "level_breakout_reclaim":
+            criteria = hit.criteria if hit is not None else {}
+            try:
+                breakout_level = float(
+                    criteria.get("breakout_level")
+                    or criteria.get("base_high")
+                    or 0.0
+                )
+            except (TypeError, ValueError):
+                breakout_level = 0.0
+            if breakout_level > 0 and live < breakout_level:
+                return "live price {:.4f} lost breakout level {:.4f}".format(
+                    live, breakout_level,
+                )
+            if breakout_level > 0 and live > breakout_level * 1.025:
+                return "live price {:.4f} too extended from breakout level {:.4f} (max 2.5%)".format(
+                    live, breakout_level,
+                )
+
         max_chase_pct = 0.025 if original >= 5.0 else 0.035
-        if pattern in ("abc_continuation", "pullback_base", "vwap_pullback"):
+        if pattern in (
+            "abc_continuation",
+            "level_breakout_reclaim",
+            "pullback_base",
+            "vwap_pullback",
+            "early_vwap_reclaim_scout",
+            "runner_readd",
+            "abc_reentry",
+        ):
             max_chase_pct = min(max_chase_pct, 0.025)
         if is_hot and live > original * (1.0 + max_chase_pct):
             return (
@@ -3121,16 +4240,19 @@ class AlpacaRunner:
         quotes = list(self._quote_buffer.get(signal.symbol, []))
         recent_quotes = [q for q in quotes[-3:] if q.ask > q.bid > 0]
         if recent_quotes:
-            avg_spread_pct = sum(
-                (q.ask - q.bid) / ((q.ask + q.bid) / 2.0) * 100.0
-                for q in recent_quotes
-            ) / len(recent_quotes)
+            avg_spread = sum(q.ask - q.bid for q in recent_quotes) / len(recent_quotes)
+            avg_mid = sum((q.ask + q.bid) / 2.0 for q in recent_quotes) / len(recent_quotes)
+            avg_spread_pct = avg_spread / avg_mid * 100.0 if avg_mid > 0 else 0.0
             max_spread = 0.9 if live < 5.0 else 0.6
-            if avg_spread_pct > max_spread:
-                return "spread widened to {:.2f}% (max {:.1f}%)".format(
-                    avg_spread_pct, max_spread)
+            if not tick_aware_spread_ok(avg_spread, avg_mid or live, max_spread / 100.0):
+                return "spread widened to {:.2f}% ({:.2f}c, max {:.1f}% or 1 tick)".format(
+                    avg_spread_pct, avg_spread * 100.0, max_spread)
 
-        if is_hot and self._bar_aggregator is not None:
+        if (
+            is_hot
+            and self._bar_aggregator is not None
+            and not self._is_timed_scout_signal(signal)
+        ):
             latest_10s = self._bar_aggregator.get_latest_10s(signal.symbol, count=1)
             if latest_10s:
                 b = latest_10s[-1]
@@ -3138,6 +4260,231 @@ class AlpacaRunner:
                     return "latest 10s candle turned red during entry wait"
 
         return None
+
+    def _timed_entry_chase_anchor(self, signal: TradeSignal) -> float:
+        """Persistent per-symbol anti-chase anchor.
+
+        Pins the price where a timed-entry setup FIRST deferred, keyed by
+        symbol. When a grinding name is cancelled and re-queued higher on each
+        scan, the anchor keeps the original level so the chase ceiling cannot
+        crawl up with the price. The anchor refreshes its liveness while the
+        setup keeps re-deferring and is dropped once stale (TTL) so a genuinely
+        new setup on the same symbol re-anchors. The pinned value is stamped
+        into the signal criteria as ``setup_anchor`` so the execution timer's
+        early-strength release measures from the same level.
+        """
+        sym = signal.symbol
+        now = time.monotonic()
+        ttl = float(getattr(self, "_timed_entry_anchor_ttl_sec", 300.0) or 0.0)
+        store = getattr(self, "_timed_entry_anchor", None)
+        if store is None:
+            store = {}
+            self._timed_entry_anchor = store
+        anchor = 0.0
+        existing = store.get(sym)
+        if existing is not None:
+            anchor_price, last_seen = existing
+            if anchor_price > 0 and (now - last_seen) <= ttl:
+                anchor = anchor_price
+                store[sym] = (anchor_price, now)  # keep original, refresh liveness
+        if anchor <= 0:
+            anchor = self._timed_entry_anchor_candidate(signal)
+            if anchor > 0:
+                store[sym] = (anchor, now)
+        if anchor > 0 and signal.scan_result is not None:
+            try:
+                signal.scan_result.criteria["setup_anchor"] = anchor
+            except Exception:
+                pass
+        return anchor
+
+    @staticmethod
+    def _timed_entry_anchor_candidate(signal: TradeSignal) -> float:
+        """First-defer anchor price: prefer stable structural levels, then the
+        queued price, then the live close / signal price."""
+        hit = signal.scan_result
+        criteria = hit.criteria if hit is not None else {}
+        for key in (
+            "breakout_level",
+            "base_high",
+            "queued_entry_price",
+            "trigger_price",
+            "close",
+        ):
+            try:
+                value = float(criteria.get(key) or 0.0)
+            except (TypeError, ValueError):
+                value = 0.0
+            if value > 0:
+                return value
+        return float(signal.entry_price or 0.0)
+
+    def _execution_learning_context(
+        self,
+        signal: TradeSignal,
+        bar: Bar,
+    ) -> dict:
+        """Small stable feature pack for fill-quality learning."""
+        hit = signal.scan_result
+        criteria = hit.criteria if hit is not None else {}
+        pattern = str(criteria.get("pattern") or (hit.scanner_name if hit else "") or "")
+        setup_quality = str(criteria.get("setup_quality") or "")
+        try:
+            size_factor = float(criteria.get("size_factor") or 1.0)
+        except (TypeError, ValueError):
+            size_factor = 1.0
+        signal_price = float(signal.entry_price or 0.0)
+        live_price = float(bar.close or signal_price or 0.0)
+        chase_pct = (
+            (live_price - signal_price) / signal_price * 100.0
+            if signal_price > 0 and live_price > 0 else 0.0
+        )
+        breakout_level = 0.0
+        try:
+            breakout_level = float(
+                criteria.get("breakout_level")
+                or criteria.get("base_high")
+                or 0.0
+            )
+        except (TypeError, ValueError):
+            breakout_level = 0.0
+        from_level_pct = (
+            (live_price - breakout_level) / breakout_level * 100.0
+            if breakout_level > 0 and live_price > 0 else 0.0
+        )
+        return {
+            "pattern": pattern,
+            "setup_quality": setup_quality,
+            "size_factor": round(size_factor, 2),
+            "signal_price": round(signal_price, 4),
+            "chase_pct": round(chase_pct, 4),
+            "breakout_level": round(breakout_level, 4),
+            "from_breakout_level_pct": round(from_level_pct, 4),
+        }
+
+    def _shared_entry_quality_reject(
+        self,
+        symbol: str,
+        bars: Sequence[Bar],
+        *,
+        signal: Optional[TradeSignal] = None,
+        stage: str = "runner_final_entry_guard",
+        source: str = "runner",
+    ) -> Optional[str]:
+        """Run live buy/re-entry/add paths through shared entry policy."""
+        decision = self._shared_entry_quality_decision(
+            symbol, bars, signal=signal, stage=stage, source=source,
+        )
+        return decision.reject_reason
+
+    def _shared_entry_quality_decision(
+        self,
+        symbol: str,
+        bars: Sequence[Bar],
+        *,
+        signal: Optional[TradeSignal] = None,
+        stage: str = "runner_final_entry_guard",
+        source: str = "runner",
+    ) -> EntryDecision:
+        """Run live buy/re-entry/add paths through shared entry policy."""
+        executor = _ensure_entry_executor(self)
+        if signal is not None and signal.action not in (
+            SignalAction.ENTER_LONG,
+            SignalAction.REENTER_LONG,
+            SignalAction.SCALE_UP_LONG,
+        ):
+            return executor.record_decision(
+                self._entry_policy.decision(
+                    symbol=symbol,
+                    stage=stage,
+                    passed=True,
+                    signal=signal,
+                    metadata={"skipped": "non-entry action"},
+                ),
+                source=source,
+            )
+        if not bars:
+            if signal is None:
+                signal = TradeSignal(
+                    symbol=symbol,
+                    action=SignalAction.ENTER_LONG,
+                    quantity=0,
+                    entry_price=0.0,
+                    reason="no bars for shared entry quality",
+                )
+            return executor.reject(
+                symbol=symbol,
+                stage=stage,
+                reason="no bars for shared entry quality",
+                blocked_layer="entry_guard",
+                signal=signal,
+                source=source,
+            )
+
+        bars_5m = None
+        aggregator = getattr(self, "_bar_aggregator", None)
+        if aggregator is not None:
+            try:
+                bars_5m = aggregator.get_5m_bars(symbol)
+            except Exception:
+                bars_5m = None
+
+        float_shares = None
+        avg_daily_volume = None
+        float_checker = getattr(self, "_float_checker", None)
+        if float_checker is not None:
+            try:
+                float_shares = float_checker.get_float_cached(symbol)
+            except Exception:
+                float_shares = None
+            try:
+                avg_cache = getattr(float_checker, "_avg_vol_cache", None)
+                if isinstance(avg_cache, dict):
+                    avg_daily_volume = avg_cache.get(symbol.upper()) or avg_cache.get(symbol)
+            except Exception:
+                avg_daily_volume = None
+
+        criteria = signal.scan_result.criteria if signal and signal.scan_result else {}
+        scanner_name = signal.scan_result.scanner_name if signal and signal.scan_result else ""
+        if signal is None:
+            signal = TradeSignal(
+                symbol=symbol,
+                action=SignalAction.ENTER_LONG,
+                quantity=0,
+                entry_price=float(bars[-1].close or 0.0),
+                reason="shared entry quality",
+                scan_result=ScanResult(
+                    symbol=symbol,
+                    scanner_name=scanner_name or "shared_entry_quality",
+                    ts=datetime.now(timezone.utc),
+                    score=0.0,
+                    criteria={"pattern": str(criteria.get("pattern") or scanner_name or "")},
+                ),
+            )
+        return executor.evaluate_quality(
+            signal,
+            bars=bars,
+            stage=stage,
+            source=source,
+            min_day_change_pct=0.0,
+            avg_daily_volume=avg_daily_volume,
+            bars_5m=bars_5m,
+            float_shares=float_shares,
+            ticks=list(self._tick_buffer.get(symbol, [])),
+            quotes=list(self._quote_buffer.get(symbol, [])),
+        )
+
+    def _execute_timed_scale_up(self, signal: TradeSignal) -> None:
+        """Execute a protected-runner re-add released by the 10s timer."""
+        _ensure_entry_executor(self).execute_timed_scale_up(
+            self._entry_execution_context(),
+            signal,
+        )
+
+    @staticmethod
+    def _is_timed_scout_signal(signal: TradeSignal) -> bool:
+        reason = str(signal.reason or "")
+        return "continuation_scout" in reason or "pullback_scout" in reason
 
     @staticmethod
     def _is_hot_hod_timed_signal(signal: TradeSignal) -> bool:
@@ -3151,12 +4498,16 @@ class AlpacaRunner:
             "breakout_scalp",
             "momentum_burst",
             "abc_continuation",
+            "pullback_base",
+            "level_breakout_reclaim",
+            "shallow_stair_continuation",
+            "early_vwap_reclaim_scout",
         }
         if pattern not in hot_patterns:
             if hit.scanner_name not in hot_patterns:
                 return False
         price = float(hit.criteria.get("close") or signal.entry_price or 0.0)
-        if not (2.0 <= price <= 20.0):
+        if not (1.5 <= price <= 20.0):
             return False
         if pattern == "breakout_scalp" or hit.scanner_name == "breakout_scalp":
             return True
@@ -3207,6 +4558,17 @@ class AlpacaRunner:
                 quantity=signal.quantity,
                 limit_price=live,
             )
+            quality_reject = self._shared_entry_quality_reject(
+                signal.symbol, list(self._bar_buffer.get(signal.symbol, deque())), signal=signal,
+                stage="timed_hot_retry_final_guard",
+                source="timed_entry_hot_retry",
+            )
+            if quality_reject:
+                logger.info(
+                    "TIMED ENTRY hot retry skipped %s — shared entry quality %s",
+                    signal.symbol, quality_reject,
+                )
+                return None, first_status
             logger.info(
                 "TIMED ENTRY hot retry %s %.0f @ %.4f (signal %.4f, cap %.1f%%)",
                 signal.symbol, signal.quantity, live, original, max_chase_pct * 100,
@@ -3217,6 +4579,7 @@ class AlpacaRunner:
                 log_execution_quality(
                     order=retry_order, bar=retry_bar, status=status, fill=fill,
                     source="timed_entry_hot_retry",
+                    context=self._execution_learning_context(signal, retry_bar),
                 )
             except Exception:
                 pass
@@ -3228,10 +4591,10 @@ class AlpacaRunner:
     def _process_breakout_scalps(self) -> None:
         """Process pending breakout scalps queued by HOD tick alerts.
 
-        Instant entry for fast HOD/tape movers. This deliberately uses a
-        separate quick-scalp guard instead of the normal ML/pullback guard.
-        The goal is quick profit on explosive tape, with smaller size and a
-        short hold window.
+        Fast entry for HOD/tape movers, but still gated by the normal entry
+        quality/ML layer and fresh 10s confirmation before any order is sent.
+        The goal is quick profit on explosive tape with smaller size and a
+        short hold window, without bypassing the shared safety checks.
         Max 1 breakout scalp open, 5-min cooldown per symbol.
         """
         if not self._pending_breakout_scalps:
@@ -3285,14 +4648,74 @@ class AlpacaRunner:
                 logger.debug("BREAKOUT SCALP skip %s — only %d bars", sym, len(bars))
                 continue
 
+            alert_reject = self._quick_scalp_hod_alert_reject(sym)
+            if alert_reject is not None:
+                logger.info("BREAKOUT SCALP reject %s: %s", sym, alert_reject)
+                probe_signal = self._quick_scalp_probe_signal(sym, alert_price, "breakout_scalp")
+                self._record_entry_reject(
+                    probe_signal,
+                    stage="breakout_scalp_alert",
+                    reason=alert_reject,
+                    source="breakout_scalp",
+                    price=alert_price,
+                )
+                continue
+
+            recent_reject = self._quick_scalp_recent_normal_reject(sym)
+            if recent_reject is not None:
+                logger.info("BREAKOUT SCALP reject %s: %s", sym, recent_reject)
+                probe_signal = self._quick_scalp_probe_signal(sym, alert_price, "breakout_scalp")
+                self._record_entry_reject(
+                    probe_signal,
+                    stage="breakout_scalp_recent_reject",
+                    reason=recent_reject,
+                    source="breakout_scalp",
+                    price=alert_price,
+                )
+                continue
+
             reject = self._check_quick_scalp_entry(sym, bars)
             if reject is not None:
                 logger.info("BREAKOUT SCALP reject %s: %s", sym, reject)
+                probe_signal = self._quick_scalp_probe_signal(sym, bars[-1].close, "breakout_scalp")
+                self._record_entry_reject(
+                    probe_signal,
+                    stage="breakout_scalp_shape",
+                    reason=reject,
+                    source="breakout_scalp",
+                    price=bars[-1].close,
+                )
+                continue
+
+            quality_reject = self._quick_scalp_shared_quality_reject(sym, bars)
+            if quality_reject is not None:
+                logger.info("BREAKOUT SCALP reject %s: shared entry quality %s", sym, quality_reject)
+                continue
+
+            ten_second_reject = self._quick_scalp_10s_reject(sym)
+            if ten_second_reject is not None:
+                logger.info("BREAKOUT SCALP reject %s: %s", sym, ten_second_reject)
+                probe_signal = self._quick_scalp_probe_signal(sym, bars[-1].close, "breakout_scalp")
+                self._record_entry_reject(
+                    probe_signal,
+                    stage="breakout_scalp_10s",
+                    reason=ten_second_reject,
+                    source="breakout_scalp",
+                    price=bars[-1].close,
+                )
                 continue
 
             rr = self._quick_scalp_tick_rr(sym, bars, alert_price)
             if rr is None:
                 logger.info("BREAKOUT SCALP reject %s: no usable tick R:R", sym)
+                probe_signal = self._quick_scalp_probe_signal(sym, bars[-1].close, "breakout_scalp")
+                self._record_entry_reject(
+                    probe_signal,
+                    stage="breakout_scalp_rr",
+                    reason="no usable tick R:R",
+                    source="breakout_scalp",
+                    price=bars[-1].close,
+                )
                 continue
             price, stop_price, target_price, rr_note = rr
             risk_per_share = price - stop_price
@@ -3366,8 +4789,110 @@ class AlpacaRunner:
                 }, ts=fill.ts)
                 self._seed_recent_order_ids()
                 break
+            logger.warning("BREAKOUT SCALP order not filled %s (status=%s)", sym, status)
+            self._record_entry_reject(
+                signal,
+                stage="breakout_scalp_order",
+                reason="order_{}".format(status.value if status else "not_filled"),
+                source="breakout_scalp",
+                price=price,
+                metadata={"status": status.value if status else "not_filled"},
+            )
+
+    def _quick_scalp_hod_alert_reject(self, symbol: str) -> Optional[str]:
+        """Block instant HOD scalps when the latest alert is watch-only/rejected."""
+        store = getattr(self, "_hod_alert_store", None)
+        if store is None:
+            return None
+        try:
+            rows = store.snapshot()
+        except Exception:
+            return None
+        if not isinstance(rows, list):
+            return None
+
+        sym = symbol.upper()
+        latest = None
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("symbol", "")).upper() != sym:
+                continue
+            latest = row
+            break
+        if latest is None:
+            return None
+
+        reason = latest.get("reject_reason")
+        if reason:
+            text = str(reason)
+            lower = text.lower()
+            if (
+                "watch only" in lower
+                and "momentum_burst" in lower
+                and self._quick_scalp_allows_extreme_hod_runner_alert(latest)
+            ):
+                logger.info(
+                    "BREAKOUT SCALP %s: extreme HOD runner alert promoted past "
+                    "watch-only prefilter; shared ML/entry guard and 10s "
+                    "confirmation still required",
+                    sym,
+                )
             else:
-                logger.warning("BREAKOUT SCALP order not filled %s (status=%s)", sym, status)
+                hard_terms = (
+                    "watch only",
+                    "cached reject",
+                    "selling pressure",
+                    "tape too slow",
+                    "weak",
+                    "too far from hod",
+                    "thin liquidity",
+                    "below vwap",
+                    "spread too wide",
+                )
+                if any(term in lower for term in hard_terms):
+                    return "HOD alert not tradeable: {}".format(text)
+
+        try:
+            rel_vol = float(latest.get("rel_vol") or 0.0)
+            bar_rvol = float(latest.get("bar_rvol") or 0.0)
+        except (TypeError, ValueError):
+            return None
+        active_rvol = max(rel_vol, bar_rvol)
+        if active_rvol > 0 and active_rvol < 1.0:
+            return "HOD alert active RVOL too weak {:.2f}x (need 1.0x+)".format(active_rvol)
+
+        return None
+
+    @staticmethod
+    def _quick_scalp_allows_extreme_hod_runner_alert(row: dict) -> bool:
+        """Let elite HOD runner alerts reach the real entry gates.
+
+        This does not make momentum_burst a live scanner. It only prevents the
+        fast HOD scalp path from stopping at the alert label when the alert has
+        extreme runner evidence; the path still runs quick-scalp structure,
+        shared ML/rule entry quality, 10s confirmation, and R:R before submit.
+        """
+        try:
+            price = float(row.get("price") or 0.0)
+            change_session_pct = float(row.get("change_session_pct") or 0.0)
+            change_from_close_pct = float(row.get("change_from_close_pct") or 0.0)
+            day_volume = float(row.get("day_volume") or 0.0)
+            rel_vol = float(row.get("rel_vol") or 0.0)
+            bar_rvol = float(row.get("bar_rvol") or 0.0)
+            float_shares = float(row.get("float_shares") or 0.0)
+        except (TypeError, ValueError):
+            return False
+
+        if not (1.5 <= price <= 20.0):
+            return False
+        if day_volume < 2_000_000:
+            return False
+        if float_shares > 0 and float_shares > 20_000_000:
+            return False
+        if max(rel_vol, bar_rvol) < 1.0:
+            return False
+        return change_session_pct >= 80.0 or change_from_close_pct >= 120.0
 
     def _new_entries_blocked(self, symbol: Optional[str], source: str) -> bool:
         """Return True when global controls should block any new entry path."""
@@ -3444,12 +4969,125 @@ class AlpacaRunner:
             source, risk / price * 100, target_risk / price * 100)
         return price, stop_price, target_price, rr_note
 
+    def _quick_scalp_recent_normal_reject(self, symbol: str) -> Optional[str]:
+        """Block quick scalps when the regular entry path just saw a hard reject."""
+        pipeline = getattr(self, "_pipeline", None)
+        if pipeline is None:
+            return None
+        rejections = None
+        try:
+            rejections = getattr(pipeline, "scan_rejections", None)
+        except Exception:
+            rejections = None
+        if callable(rejections):
+            try:
+                rejections = rejections()
+            except Exception:
+                rejections = None
+        if rejections is None:
+            rejections = getattr(pipeline, "_scan_rejections", None)
+        if not isinstance(rejections, dict):
+            return None
+
+        reason = rejections.get(symbol)
+        if not reason:
+            reason = rejections.get(symbol.upper())
+        if not reason:
+            return None
+
+        lower = str(reason).lower()
+        hard_terms = (
+            "spread too wide",
+            "late continuation too weak",
+            "pullback too small",
+            "below vwap",
+            "tape too slow",
+            "selling pressure",
+            "red volume too heavy",
+            "weak reclaim volume",
+            "too far from hod",
+            "not strong above vwap",
+            "dead price action",
+            "dead cat bounce",
+            "thin liquidity",
+            "watch-only liquidity",
+            "low day volume",
+            "outside range",
+            "stale data",
+        )
+        if any(term in lower for term in hard_terms):
+            return "recent normal entry reject: {}".format(reason)
+        return None
+
+    def _quick_scalp_shared_quality_reject(
+        self,
+        symbol: str,
+        bars: Sequence[Bar],
+    ) -> Optional[str]:
+        """Run quick scalps through the shared entry guard and ML monitor."""
+        return self._shared_entry_quality_reject(
+            symbol,
+            bars,
+            stage="breakout_scalp_final_guard",
+            source="breakout_scalp",
+        )
+
+    @staticmethod
+    def _quick_scalp_probe_signal(
+        symbol: str,
+        price: float,
+        pattern: str,
+    ) -> TradeSignal:
+        return TradeSignal(
+            symbol=symbol,
+            action=SignalAction.ENTER_LONG,
+            quantity=0,
+            entry_price=float(price or 0.0),
+            reason=pattern,
+            scan_result=ScanResult(
+                symbol=symbol,
+                scanner_name=pattern,
+                ts=datetime.now(timezone.utc),
+                score=0.0,
+                criteria={"pattern": pattern, "setup_tier": "A+ setup"},
+            ),
+        )
+
+    def _quick_scalp_10s_reject(self, symbol: str) -> Optional[str]:
+        """Require fresh 10-second confirmation before instant breakout entry."""
+        aggregator = getattr(self, "_bar_aggregator", None)
+        if aggregator is None:
+            return "no 10s confirmation feed"
+        try:
+            bars_10s = aggregator.get_latest_10s(symbol, count=2)
+        except Exception:
+            return "no 10s confirmation feed"
+        if not bars_10s:
+            return "waiting for 10s confirmation"
+
+        latest = bars_10s[-1]
+        if latest.ts is not None:
+            try:
+                bar_time = latest.ts if latest.ts.tzinfo else latest.ts.replace(tzinfo=timezone.utc)
+                age = (datetime.now(timezone.utc) - bar_time).total_seconds()
+                if age > 30:
+                    return "stale 10s confirmation ({:.0f}s old)".format(age)
+            except Exception:
+                pass
+
+        if latest.close <= latest.open:
+            return "10s confirmation red/flat"
+        if len(bars_10s) >= 2:
+            prev = bars_10s[-2]
+            if prev.close > 0 and latest.high <= prev.high and latest.close < prev.close * 1.003:
+                return "10s confirmation no expansion"
+        return None
+
     def _check_quick_scalp_entry(self, symbol: str, bars: Sequence[Bar]) -> Optional[str]:
         """Fast-mover guard for HOD tick scalps.
 
-        This is intentionally different from the normal entry guard. It lets
-        explosive low-float momentum through earlier, but keeps hard execution
-        safety around volume, spread, tape pressure, and distance from HOD.
+        This local guard handles the HOD/tape-specific shape. The caller still
+        runs shared entry quality, ML, and 10s confirmation before ordering.
         """
         if len(bars) < 3:
             return "insufficient bars for quick scalp"
@@ -3458,6 +5096,8 @@ class AlpacaRunner:
         price = latest.close
         if price <= 0:
             return "invalid price"
+        if price < 1.5 or price > 20.0:
+            return "quick scalp price ${:.2f} outside range $1.50-$20.00".format(price)
 
         today = list(bars)
         if latest.ts is not None:
@@ -3516,15 +5156,14 @@ class AlpacaRunner:
                 if q.ask > q.bid > 0
             ]
             if recent_quotes:
-                avg_spread_pct = sum(
-                    (q.ask - q.bid) / ((q.ask + q.bid) / 2.0) * 100
-                    for q in recent_quotes
-                ) / len(recent_quotes)
+                avg_spread = sum(q.ask - q.bid for q in recent_quotes) / len(recent_quotes)
+                avg_mid = sum((q.ask + q.bid) / 2.0 for q in recent_quotes) / len(recent_quotes)
+                avg_spread_pct = avg_spread / avg_mid * 100 if avg_mid > 0 else 0.0
                 momentum_pct = max(day_change, recent_move)
                 max_spread = 1.5 if day_volume >= 1_000_000 and momentum_pct >= 50.0 else 0.8
-                if avg_spread_pct > max_spread:
-                    return "quick scalp spread too wide {:.2f}% (max {:.1f}%)".format(
-                        avg_spread_pct, max_spread)
+                if not tick_aware_spread_ok(avg_spread, avg_mid or price, max_spread / 100.0):
+                    return "quick scalp spread too wide {:.2f}% ({:.2f}c, max {:.1f}% or 1 tick)".format(
+                        avg_spread_pct, avg_spread * 100.0, max_spread)
 
         ticks = list(self._tick_buffer.get(symbol, []))
         if len(ticks) >= 10:
@@ -3600,8 +5239,15 @@ class AlpacaRunner:
 
         stale_syms = []
         now_utc = datetime.now(timezone.utc)
-        for sym in self._watchlist_set:
+        refresh_symbols = set(self._watchlist_set) | _ensure_market_data_service(self).hot_watch_keys()
+        priority_syms = [
+            sym for sym in list(self._priority_bar_refresh)
+            if sym in refresh_symbols and sym not in self._watchlist_pinned
+        ]
+        for sym in refresh_symbols:
             if sym in self._watchlist_pinned:
+                continue
+            if sym in self._priority_bar_refresh:
                 continue
             bars = self._bar_buffer.get(sym)
             if not bars:
@@ -3614,9 +5260,21 @@ class AlpacaRunner:
                     stale_syms.append(sym)
 
         if not stale_syms:
-            return
+            if priority_syms:
+                stale_syms = priority_syms
+            else:
+                return
 
-        batch = stale_syms[:10]
+        ordered = []
+        seen_refresh = set()
+        for sym in priority_syms + stale_syms:
+            if sym in seen_refresh:
+                continue
+            seen_refresh.add(sym)
+            ordered.append(sym)
+        batch = ordered[:10]
+        for sym in batch:
+            self._priority_bar_refresh.discard(sym)
         try:
             fresh = self._hist.get_bars(batch, limit=30)
             today_et = self._now_et().date()
@@ -3658,6 +5316,10 @@ class AlpacaRunner:
                 log_exit_snapshot,
                 update_deferred_outcomes,
             )
+            from daytrading.ml.data_collector import update_deferred_entry_outcomes
+            entry_labeled = update_deferred_entry_outcomes(bar_universe)
+            if entry_labeled:
+                logger.info("ML ENTRY LABELS: labeled %d deferred entry candidates", entry_labeled)
             update_deferred_outcomes(bar_universe)
             tracked = self._pipeline.exit_manager.tracked
             for sym, pos in tracked.items():
@@ -3673,6 +5335,9 @@ class AlpacaRunner:
                     sold_half=pos.sold_half,
                     breakeven_locked=pos.breakeven_locked,
                     reason=pos.reason,
+                    entry_strategy=getattr(pos, "entry_strategy", ""),
+                    entry_pattern=getattr(pos, "entry_pattern", ""),
+                    entry_score=getattr(pos, "entry_score", None),
                     bars=bars,
                 )
         except Exception:
@@ -3843,6 +5508,16 @@ class AlpacaRunner:
         hod_bar_count: int = 0,
     ) -> None:
         """Log events and push them to the dashboard."""
+        for decision in getattr(result, "entry_decisions", []) or []:
+            try:
+                payload = dict(decision)
+                payload["source"] = payload.get("source") or "pipeline"
+                payload["market_phase"] = self._market_phase()
+                payload["cycle"] = cycle_num
+                self._journal.record("entry_decision", payload)
+            except Exception:
+                pass
+
         # Push classifications to dashboard
         for sym, regime in result.regimes.items():
             self._hub.on_classification(sym, regime)
@@ -3866,6 +5541,16 @@ class AlpacaRunner:
             is_verified = hit.symbol not in rejections
             reject_reason = rejections.get(hit.symbol)
             self._hub.on_scan_hit(hit, verified=is_verified, reject_reason=reject_reason)
+            if self.is_hot_watch_active(hit.symbol):
+                self._journal.record("hot_watch", {
+                    "symbol": hit.symbol,
+                    "stage": "pattern_found",
+                    "scanner": hit.scanner_name,
+                    "score": hit.score,
+                    "verified": is_verified,
+                    "reject_reason": reject_reason,
+                    "criteria": dict(hit.criteria),
+                })
             self._journal.record("scan_hit", {
                 "symbol": hit.symbol,
                 "scanner": hit.scanner_name,
@@ -3876,6 +5561,8 @@ class AlpacaRunner:
                 "candle_snapshot": self._journal.candle_snapshot(hit.bars, limit=30),
             })
             if reject_reason:
+                if "stale data" in str(reject_reason).lower():
+                    self._request_priority_bar_refresh(hit.symbol)
                 self._journal.record("mistake", {
                     "symbol": hit.symbol,
                     "kind": "scan_rejection",
@@ -3998,8 +5685,11 @@ class AlpacaRunner:
                     "trade_type": "reentry",
                 }, ts=f.ts)
 
-        # Queue deferred signals into execution timer (10-sec micro-entry)
+        # Queue deferred signals into execution timer (10-sec micro-entry).
+        # Pin the per-symbol chase anchor on first defer so re-queues of a
+        # grinding name keep the original level instead of crawling up.
         for sig in getattr(result, 'deferred_signals', []):
+            self._timed_entry_chase_anchor(sig)
             self._exec_timer.queue(sig)
 
         # Seed order IDs from pipeline fills to prevent duplicate pushes
@@ -4078,6 +5768,14 @@ class AlpacaRunner:
             self._push_positions_from_alpaca()
         else:
             self._hub.on_position_update(self._pipeline.portfolio.positions, prices)
+
+        try:
+            self._pipeline.missed_a_plus.update_prices(
+                universe, now=datetime.now(timezone.utc),
+            )
+            self._hub.on_missed_a_plus(self._pipeline.missed_a_plus_report())
+        except Exception:
+            pass
 
         # Cycle complete
         self._hub.on_cycle_complete(cycle_num, result)
@@ -4255,6 +5953,63 @@ class AlpacaRunner:
         logger.info("WATCHLIST CLEANUP: removed %d stale symbols: %s — watchlist now %d: %s",
                     len(to_remove), to_remove, len(self._watchlist), self._watchlist)
 
+    def _nightly_marker_path(self, day_key: str) -> str:
+        report_dir = os.path.join(os.path.dirname(self._journal.base_dir), "reports")
+        return os.path.join(report_dir, f".nightly-{day_key}.done")
+
+    def _nightly_already_ran(self, day_key: str) -> bool:
+        if self._nightly_analysis_day == day_key:
+            return True
+        try:
+            return os.path.exists(self._nightly_marker_path(day_key))
+        except Exception:
+            return False
+
+    def _mark_nightly_ran(self, day_key: str) -> None:
+        self._nightly_analysis_day = day_key
+        try:
+            marker = self._nightly_marker_path(day_key)
+            os.makedirs(os.path.dirname(marker), exist_ok=True)
+            with open(marker, "w") as f:
+                f.write(datetime.now(timezone.utc).isoformat())
+        except Exception as exc:
+            logger.debug("Nightly marker write failed: %s", exc)
+
+    def _maybe_run_after_market_training(self, current_et: datetime, phase: str) -> bool:
+        """Run nightly report and ML retrain once after the market session ends."""
+        if not self._is_trading_day(current_et):
+            return False
+        day_key = current_et.date().isoformat()
+        if self._nightly_already_ran(day_key):
+            return False
+
+        close_hour = 20 if getattr(self, "_after_hours_enabled", False) else 16
+        cutoff = current_et.replace(hour=close_hour, minute=5, second=0, microsecond=0)
+        if current_et < cutoff:
+            return False
+
+        exit_manager = getattr(getattr(self, "_pipeline", None), "exit_manager", None)
+        open_positions = getattr(exit_manager, "tracked", {}) if exit_manager is not None else {}
+        if open_positions:
+            logger.info(
+                "AFTER-MARKET TRAINING: waiting for %d tracked positions to close",
+                len(open_positions),
+            )
+            return False
+
+        logger.info(
+            "AFTER-MARKET TRAINING: running nightly report + ML retrain for %s (%s)",
+            day_key,
+            phase,
+        )
+        try:
+            self._hub.add_log("INFO", f"After-market ML training started for {day_key}")
+        except Exception:
+            pass
+        self._run_nightly_analysis()
+        self._mark_nightly_ran(day_key)
+        return True
+
     def _run_nightly_analysis(self) -> None:
         """Run the nightly trade analyst after market close."""
         try:
@@ -4290,6 +6045,18 @@ class AlpacaRunner:
 
         # Daily ML model retrain after market close
         self._retrain_ml_model()
+        try:
+            from daytrading.analyst.collector import NightlyAnalyst
+            report_dir = os.path.join(os.path.dirname(self._journal.base_dir), "reports")
+            analyst = NightlyAnalyst(db_path=self._journal.db_path, report_dir=report_dir)
+            refreshed = analyst.run()
+            if refreshed.get("status") not in ("no_trades", "holiday"):
+                logger.info(
+                    "NIGHTLY ANALYST: refreshed report after ML training for %s",
+                    refreshed.get("day", "unknown"),
+                )
+        except Exception as exc:
+            logger.debug("Nightly report refresh after ML training failed: %s", exc)
 
     def _log_ml_daily_summary(self) -> None:
         """Log ML model performance stats at end of day."""
@@ -4425,6 +6192,7 @@ def main() -> None:
         format="%(asctime)s %(levelname)-8s %(name)s — %(message)s",
         datefmt="%H:%M:%S",
     )
+    configure_alpaca_stream_logging()
 
     print("""
     ╔══════════════════════════════════════════════╗

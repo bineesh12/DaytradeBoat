@@ -35,11 +35,11 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Sequence
 
 from daytrading.exits.manager import ExitManager, TrackedPosition, build_exit_tiers
-from daytrading.models import Bar, ExitReason, Side, SignalAction, TradeSignal
+from daytrading.models import Bar, ExitReason, ScanResult, Side, SignalAction, TradeSignal
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +57,12 @@ class ScaleUpConfig:
     pullback_pct: float = 0.3         # price must pull back ≥ 30% of the move
     bounce_pct: float = 0.5           # then bounce back ≥ 50% of the pullback
     stop_advance_cents: float = 3.0   # move stop up by this much on each scale
+    require_protected_runner: bool = False
+    require_clean_pullback_profile: bool = False
+    min_pullback_depth_pct: float = 1.0
+    max_pullback_depth_pct: float = 12.0
+    max_base_range_pct: float = 8.0
+    max_add_risk_pct: float = 3.0
 
 
 class PositionScaler:
@@ -90,6 +96,14 @@ class PositionScaler:
                 continue
 
             is_long = pos.side is Side.BUY
+            if cfg.require_protected_runner and (
+                not is_long
+                or not pos.sold_half
+                or not pos.breakeven_locked
+                or (pos.stop_loss is not None and pos.stop_loss < pos.entry_price * 0.995)
+            ):
+                continue
+
             profit_cents = (price - pos.entry_price) * 100.0 if is_long else (pos.entry_price - price) * 100.0
 
             if profit_cents < cfg.min_profit_cents:
@@ -131,9 +145,12 @@ class PositionScaler:
             if not bounced:
                 continue
 
-            # volume check: latest bar should have decent volume
             sym_bars = bars.get(symbol)
-            if sym_bars and len(sym_bars) >= 2:
+            profile = self._clean_pullback_profile(symbol, pos, price, sym_bars)
+            if cfg.require_clean_pullback_profile:
+                if profile is None:
+                    continue
+            elif sym_bars and len(sym_bars) >= 2:
                 if sym_bars[-1].volume < sym_bars[-2].volume * 0.6:
                     continue  # volume dying, don't scale up
 
@@ -148,11 +165,29 @@ class PositionScaler:
             # new stop: advance it
             stop_advance = cfg.stop_advance_cents / 100.0
             if is_long:
-                new_stop = (pos.stop_loss or pos.entry_price) + stop_advance
+                profile_stop = profile["stop_price"] if profile is not None else None
+                new_stop = profile_stop or (pos.stop_loss or pos.entry_price) + stop_advance
+                new_stop = max(new_stop, pos.entry_price)
+                if (
+                    (cfg.require_protected_runner or cfg.require_clean_pullback_profile)
+                    and price > 0
+                    and (price - new_stop) / price * 100.0 > cfg.max_add_risk_pct
+                ):
+                    continue
                 action = SignalAction.SCALE_UP_LONG
             else:
                 new_stop = (pos.stop_loss or pos.entry_price) - stop_advance
                 action = SignalAction.SCALE_UP_SHORT
+
+            criteria = {
+                "pattern": "runner_readd",
+                "direction": "up" if is_long else "down",
+                "close": price,
+                "volume": float(sym_bars[-1].volume) if sym_bars else 0.0,
+                "stop_price": new_stop,
+            }
+            if profile is not None:
+                criteria.update(profile)
 
             signals.append(TradeSignal(
                 symbol=symbol,
@@ -160,7 +195,19 @@ class PositionScaler:
                 quantity=scale_size,
                 entry_price=price,
                 stop_loss=new_stop,
-                reason=f"Scale #{count+1}: +{scale_size} shares @ ${price:.2f}, profit={profit_cents:.0f}¢",
+                reason=(
+                    f"Protected runner re-add #{count+1}: +{scale_size} shares "
+                    f"@ ${price:.2f}, profit={profit_cents:.0f}¢"
+                ),
+                scan_result=ScanResult(
+                    symbol=symbol,
+                    scanner_name="runner_readd",
+                    ts=datetime.now(timezone.utc),
+                    score=float(profile.get("score", 0.0) if profile else 0.0),
+                    criteria=criteria,
+                    bars=list(sym_bars or []),
+                ),
+                trend_strength=pos.trend_strength,
             ))
 
             self._scale_counts[symbol] = count + 1
@@ -174,6 +221,110 @@ class PositionScaler:
             )
 
         return signals
+
+    def _clean_pullback_profile(
+        self,
+        symbol: str,
+        pos: TrackedPosition,
+        price: float,
+        bars: Optional[Sequence[Bar]],
+    ) -> Optional[Dict[str, float]]:
+        """Validate 1-minute runner re-add structure.
+
+        Looks for the pattern the user described: strong impulse, controlled
+        lower-volume pullback, then green reclaim with rising volume.
+        """
+        cfg = self._config
+        if pos.side is not Side.BUY:
+            return None
+        if not bars or len(bars) < 8:
+            return None
+        recent = list(bars[-12:])
+        latest = recent[-1]
+        if latest.close <= latest.open:
+            return None
+
+        vwap = self._session_vwap(recent)
+        if vwap <= 0 or latest.close < vwap * 1.002:
+            return None
+
+        high = max(float(b.high or b.close) for b in recent[:-1])
+        pullback_low = min(float(b.low or b.close) for b in recent[-5:])
+        if high <= 0 or pullback_low <= 0:
+            return None
+        pullback_depth_pct = (high - pullback_low) / high * 100.0
+        if (
+            pullback_depth_pct < cfg.min_pullback_depth_pct
+            or pullback_depth_pct > cfg.max_pullback_depth_pct
+        ):
+            return None
+
+        base_high = max(float(b.high or b.close) for b in recent[-5:])
+        base_low = min(float(b.low or b.close) for b in recent[-5:])
+        base_range_pct = (base_high - base_low) / latest.close * 100.0 if latest.close > 0 else 999.0
+        if base_range_pct > cfg.max_base_range_pct:
+            return None
+
+        impulse_candidates = [
+            b for b in recent[:-3]
+            if b.close > b.open and float(b.volume or 0.0) > 0
+        ]
+        if not impulse_candidates:
+            return None
+        impulse = max(impulse_candidates, key=lambda b: float(b.volume or 0.0))
+        impulse_vol = float(impulse.volume or 0.0)
+        pullback_bars = recent[-5:-1]
+        red_pullback = [b for b in pullback_bars if b.close < b.open and float(b.volume or 0.0) > 0]
+        sample = red_pullback or [b for b in pullback_bars if float(b.volume or 0.0) > 0]
+        if not sample:
+            return None
+        pullback_avg_vol = sum(float(b.volume or 0.0) for b in sample) / len(sample)
+        reclaim_vol = float(latest.volume or 0.0)
+        if impulse_vol <= 0 or pullback_avg_vol <= 0:
+            return None
+        if pullback_avg_vol > impulse_vol * 0.85:
+            return None
+        if reclaim_vol < pullback_avg_vol * 1.05:
+            return None
+        if latest.high > latest.low:
+            upper_wick = float(latest.high - latest.close)
+            rng = float(latest.high - latest.low)
+            if rng > 0 and upper_wick / rng > 0.45:
+                return None
+
+        stop_price = max(pos.entry_price, pullback_low - max(0.01, latest.close * 0.003))
+        score = 50.0
+        score += min(20.0, max(0.0, (impulse_vol / pullback_avg_vol - 1.0) * 10.0))
+        score += min(20.0, max(0.0, (reclaim_vol / pullback_avg_vol - 1.0) * 15.0))
+        score += 10.0 if latest.close >= high * 0.985 else 0.0
+
+        return {
+            "vwap": round(vwap, 4),
+            "pullback_low": round(pullback_low, 4),
+            "base_low": round(base_low, 4),
+            "base_range_pct": round(base_range_pct, 3),
+            "pullback_pct": round(pullback_depth_pct, 3),
+            "impulse_volume": impulse_vol,
+            "pullback_volume": pullback_avg_vol,
+            "reclaim_volume": reclaim_vol,
+            "stop_price": round(stop_price, 4),
+            "score": round(min(score, 100.0), 3),
+        }
+
+    @staticmethod
+    def _session_vwap(bars: Sequence[Bar]) -> float:
+        total_volume = 0.0
+        total_value = 0.0
+        for bar in bars:
+            volume = float(bar.volume or 0.0)
+            if volume <= 0:
+                continue
+            typical = (float(bar.high) + float(bar.low) + float(bar.close)) / 3.0
+            total_value += typical * volume
+            total_volume += volume
+        if total_volume <= 0:
+            return 0.0
+        return total_value / total_volume
 
     def clear(self, symbol: str) -> None:
         """Reset scale-up tracking when a position is fully closed."""
@@ -209,6 +360,11 @@ class ReentryConfig:
     stop_cents: float = 3.0
     trail_cents: float = 2.0
     max_hold_seconds: int = 90
+    require_clean_continuation_profile: bool = False
+    min_pullback_depth_pct: float = 1.0
+    max_pullback_depth_pct: float = 12.0
+    max_base_range_pct: float = 8.0
+    max_reentry_risk_pct: float = 3.0
 
 
 class ReentryDetector:
@@ -296,13 +452,19 @@ class ReentryDetector:
                     pullback_depth = last_exit.exit_price - pb_price
                 else:
                     pullback_depth = pb_price - last_exit.exit_price
-                if pullback_depth > max_pb:
+                if pullback_depth > max_pb and not cfg.require_clean_continuation_profile:
                     # too deep — this might be a reversal, not a continuation
                     continue
 
             # volume check
             sym_bars = bars.get(symbol)
-            if sym_bars and len(sym_bars) >= 2:
+            profile = self._clean_continuation_profile(
+                symbol, last_exit, price, sym_bars,
+            )
+            if cfg.require_clean_continuation_profile:
+                if profile is None:
+                    continue
+            elif sym_bars and len(sym_bars) >= 2:
                 if sym_bars[-1].volume < sym_bars[-2].volume * 0.5:
                     continue
 
@@ -315,10 +477,28 @@ class ReentryDetector:
             stop_offset = cfg.stop_cents / 100.0
             if is_long:
                 action = SignalAction.REENTER_LONG
-                stop = price - stop_offset
+                stop = (
+                    profile["stop_price"]
+                    if profile is not None
+                    else price - stop_offset
+                )
+                if price > 0 and (price - stop) / price * 100.0 > cfg.max_reentry_risk_pct:
+                    continue
             else:
                 action = SignalAction.REENTER_SHORT
                 stop = price + stop_offset
+
+            criteria = {
+                "pattern": "abc_reentry",
+                "direction": "up" if is_long else "down",
+                "close": price,
+                "volume": float(sym_bars[-1].volume) if sym_bars else 0.0,
+                "stop_price": stop,
+                "setup_quality": "reentry_continuation" if profile else "simple_reentry",
+                "size_factor": cfg.reentry_size_pct,
+            }
+            if profile is not None:
+                criteria.update(profile)
 
             signals.append(TradeSignal(
                 symbol=symbol,
@@ -328,7 +508,18 @@ class ReentryDetector:
                 stop_loss=stop,
                 trailing_stop_offset=cfg.trail_cents / 100.0,
                 max_hold_seconds=cfg.max_hold_seconds,
-                reason=f"Re-entry #{reentry_count+1}: still running past ${last_exit.exit_price:.2f}",
+                reason=(
+                    f"ABC re-entry #{reentry_count+1}: reclaim after exit "
+                    f"${last_exit.exit_price:.2f}"
+                ),
+                scan_result=ScanResult(
+                    symbol=symbol,
+                    scanner_name="abc_reentry",
+                    ts=now,
+                    score=float(profile.get("score", 0.0) if profile else 0.0),
+                    criteria=criteria,
+                    bars=list(sym_bars or []),
+                ),
             ))
 
             self._reentry_counts[symbol] = reentry_count + 1
@@ -341,6 +532,99 @@ class ReentryDetector:
             )
 
         return signals
+
+    def _clean_continuation_profile(
+        self,
+        symbol: str,
+        last_exit: _ExitRecord,
+        price: float,
+        bars: Optional[Sequence[Bar]],
+    ) -> Optional[Dict[str, float]]:
+        """Validate ABC/pullback continuation after a full exit."""
+        cfg = self._config
+        if last_exit.side is not Side.BUY:
+            return None
+        if not bars or len(bars) < 8:
+            return None
+        recent = list(bars[-12:])
+        latest = recent[-1]
+        if latest.close <= latest.open:
+            return None
+
+        vwap_value = PositionScaler._session_vwap(recent)
+        if vwap_value <= 0 or latest.close < vwap_value * 1.002:
+            return None
+
+        a_high = max(float(b.high or b.close) for b in recent[:-1])
+        pullback_window = recent[-5:-1]
+        if len(pullback_window) < 3 or a_high <= 0:
+            return None
+        b_low = min(float(b.low or b.close) for b in pullback_window)
+        base_high = max(float(b.high or b.close) for b in pullback_window)
+        base_low = b_low
+        if b_low <= 0:
+            return None
+
+        pullback_depth_pct = (a_high - b_low) / a_high * 100.0
+        if (
+            pullback_depth_pct < cfg.min_pullback_depth_pct
+            or pullback_depth_pct > cfg.max_pullback_depth_pct
+        ):
+            return None
+
+        base_range_pct = (base_high - base_low) / latest.close * 100.0 if latest.close > 0 else 999.0
+        if base_range_pct > cfg.max_base_range_pct:
+            return None
+
+        if latest.close < base_high * 0.995:
+            return None
+
+        impulse_green = [
+            b for b in recent[:-4]
+            if b.close > b.open and float(b.volume or 0.0) > 0
+        ]
+        if not impulse_green:
+            return None
+        impulse_vol = max(float(b.volume or 0.0) for b in impulse_green)
+        pullback_sample = [
+            b for b in pullback_window
+            if float(b.volume or 0.0) > 0
+        ]
+        if not pullback_sample:
+            return None
+        pullback_avg_vol = sum(float(b.volume or 0.0) for b in pullback_sample) / len(pullback_sample)
+        reclaim_vol = float(latest.volume or 0.0)
+        if impulse_vol <= 0 or pullback_avg_vol <= 0:
+            return None
+        if pullback_avg_vol > impulse_vol * 0.90:
+            return None
+        if reclaim_vol < pullback_avg_vol * 1.10:
+            return None
+        if latest.high > latest.low:
+            upper_wick_ratio = (latest.high - latest.close) / (latest.high - latest.low)
+            if upper_wick_ratio > 0.45:
+                return None
+
+        stop_price = max(last_exit.entry_price, b_low - max(0.01, latest.close * 0.003))
+        score = 55.0
+        score += min(20.0, max(0.0, (impulse_vol / pullback_avg_vol - 1.0) * 8.0))
+        score += min(20.0, max(0.0, (reclaim_vol / pullback_avg_vol - 1.0) * 12.0))
+        score += 5.0 if latest.close > last_exit.exit_price else 0.0
+
+        return {
+            "vwap": round(vwap_value, 4),
+            "a_high": round(a_high, 4),
+            "b_low": round(b_low, 4),
+            "base_low": round(base_low, 4),
+            "base_high": round(base_high, 4),
+            "base_range_pct": round(base_range_pct, 3),
+            "pullback_pct": round(pullback_depth_pct, 3),
+            "impulse_volume": impulse_vol,
+            "pullback_volume": pullback_avg_vol,
+            "reclaim_volume": reclaim_vol,
+            "stop_price": round(stop_price, 4),
+            "score": round(min(score, 100.0), 3),
+        }
 
     def clear_session(self) -> None:
         """Reset all re-entry tracking for a new session."""

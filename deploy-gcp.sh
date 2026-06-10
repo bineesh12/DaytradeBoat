@@ -15,25 +15,46 @@ set -e
 PROJECT_ID=$(gcloud config get-value project)
 ZONE="us-east1-c"          # Close to Alpaca's servers (east coast)
 INSTANCE_NAME="daytrading-bot-c"
-MACHINE_TYPE="e2-small"    # 2 vCPU, 2GB RAM — ~$13/month
+MACHINE_TYPE="e2-medium"   # 2 vCPU, 4GB RAM — more headroom for live scans/journal
 IMAGE_NAME="daytrading-bot"
+IMAGE_URI="gcr.io/$PROJECT_ID/$IMAGE_NAME"
 
 echo "=== DayTrading Bot — Google Cloud Deploy ==="
 echo "Project: $PROJECT_ID"
 echo "Zone: $ZONE"
-echo "Machine: $MACHINE_TYPE (~\$13/month)"
+echo "Machine: $MACHINE_TYPE"
 echo ""
 
 # --- Step 1: Build and push Docker image ---
 echo "[1/3] Building Docker image..."
-gcloud builds submit --tag "gcr.io/$PROJECT_ID/$IMAGE_NAME" .
+gcloud builds submit --tag "$IMAGE_URI" .
+IMAGE_DIGEST=$(gcloud container images describe "$IMAGE_URI:latest" \
+    --format='get(image_summary.digest)' 2>/dev/null || true)
+if [ -n "$IMAGE_DIGEST" ]; then
+    DEPLOY_IMAGE="$IMAGE_URI@$IMAGE_DIGEST"
+    echo "Deploy image digest: $IMAGE_DIGEST"
+else
+    DEPLOY_IMAGE="$IMAGE_URI:latest"
+    echo "Deploy image digest lookup failed; falling back to latest tag"
+fi
 
 # --- Step 2: Create VM instance (if not exists) ---
 if gcloud compute instances describe $INSTANCE_NAME --zone=$ZONE &>/dev/null; then
     echo "[2/3] Instance exists — updating container..."
+    CURRENT_MACHINE_TYPE=$(gcloud compute instances describe $INSTANCE_NAME \
+        --zone=$ZONE \
+        --format='get(machineType)' | awk -F/ '{print $NF}')
+    if [ "$CURRENT_MACHINE_TYPE" != "$MACHINE_TYPE" ]; then
+        echo "Resizing instance: $CURRENT_MACHINE_TYPE -> $MACHINE_TYPE"
+        gcloud compute instances stop $INSTANCE_NAME --zone=$ZONE --quiet
+        gcloud compute instances set-machine-type $INSTANCE_NAME \
+            --zone=$ZONE \
+            --machine-type=$MACHINE_TYPE
+        gcloud compute instances start $INSTANCE_NAME --zone=$ZONE --quiet
+    fi
     gcloud compute instances update-container $INSTANCE_NAME \
         --zone=$ZONE \
-        --container-image="gcr.io/$PROJECT_ID/$IMAGE_NAME" \
+        --container-image="$DEPLOY_IMAGE" \
         --container-env-file=.env \
         --container-mount-host-path=host-path=/var/lib/daytrading-data,mount-path=/app/data
 else
@@ -41,7 +62,7 @@ else
     gcloud compute instances create-with-container $INSTANCE_NAME \
         --zone=$ZONE \
         --machine-type=$MACHINE_TYPE \
-        --container-image="gcr.io/$PROJECT_ID/$IMAGE_NAME" \
+        --container-image="$DEPLOY_IMAGE" \
         --container-env-file=.env \
         --container-restart-policy=always \
         --container-mount-host-path=host-path=/var/lib/daytrading-data,mount-path=/app/data \

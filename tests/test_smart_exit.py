@@ -115,6 +115,53 @@ class TestHalfSellAt2to1:
         assert tracked.stop_loss == pytest.approx(5.00)
         assert tracked.remaining_qty == 50
 
+    def test_runner_candidate_confirms_after_first_partial(self) -> None:
+        em = ExitManager()
+        pos = _long_pos(entry=5.00, stop=4.80)
+        pos.reason = "Quick Momentum Scalp CHAI breakout"
+        pos.runner_candidate = True
+        pos.trend_strength = 0.9
+        em.track(pos)
+
+        exits = em.check_exits({"ABC": 5.10}, _ts(10))
+
+        assert len(exits) == 1
+        tracked = em.tracked.get("ABC")
+        assert tracked is not None
+        assert tracked.sold_half is True
+        assert tracked.runner_confirmed is True
+        assert tracked.runner_trail_pct == pytest.approx(0.03)
+
+    def test_runner_candidate_banks_one_third_first_partial(self) -> None:
+        em = ExitManager()
+        pos = _long_pos(entry=5.00, stop=4.80, qty=90)
+        pos.reason = "Quick Momentum Scalp CHAI breakout"
+        pos.runner_candidate = True
+        pos.trend_strength = 0.9
+        em.track(pos)
+
+        exits = em.check_exits({"ABC": 5.10}, _ts(10))
+
+        assert len(exits) == 1
+        assert exits[0].quantity == 30
+        tracked = em.tracked.get("ABC")
+        assert tracked is not None
+        assert tracked.remaining_qty == 60
+
+    def test_ordinary_scalp_partial_does_not_confirm_runner(self) -> None:
+        em = ExitManager()
+        pos = _long_pos(entry=5.00, stop=4.80)
+        pos.reason = "Momentum Burst CING"
+        em.track(pos)
+
+        exits = em.check_exits({"ABC": 5.10}, _ts(10))
+
+        assert len(exits) == 1
+        tracked = em.tracked.get("ABC")
+        assert tracked is not None
+        assert tracked.sold_half is True
+        assert tracked.runner_confirmed is False
+
 
 class TestBreakevenAfterHalf:
     def test_remaining_stopped_at_breakeven(self) -> None:

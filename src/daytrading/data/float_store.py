@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Sequence
 
+SQLITE_BUSY_TIMEOUT_MS = 30000
+
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -42,13 +44,24 @@ class FloatStore:
         self._db_path = os.path.abspath(db_path or default_db_path())
         os.makedirs(os.path.dirname(self._db_path) or ".", exist_ok=True)
         self._lock = threading.Lock()
-        self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
+        self._conn = sqlite3.connect(
+            self._db_path,
+            check_same_thread=False,
+            timeout=SQLITE_BUSY_TIMEOUT_MS / 1000,
+        )
+        self._configure_connection(self._conn)
         self._conn.row_factory = sqlite3.Row
         self._init_db()
 
     @property
     def db_path(self) -> str:
         return self._db_path
+
+    @staticmethod
+    def _configure_connection(conn: sqlite3.Connection) -> None:
+        conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
 
     def _init_db(self) -> None:
         with self._lock:

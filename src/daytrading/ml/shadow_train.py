@@ -54,6 +54,7 @@ def _flatten_features(record: dict) -> Dict[str, float]:
         "slippage_pct",
         "intended_price",
         "fill_price",
+        "entry_score",
     ):
         if key not in record or record.get(key) is None:
             continue

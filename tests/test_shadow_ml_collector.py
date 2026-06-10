@@ -6,7 +6,17 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from daytrading.ml import shadow_collector as sc
-from daytrading.models import Bar, Fill, Order, OrderStatus, Side
+from daytrading.exits.manager import ExitManager
+from daytrading.models import (
+    Bar,
+    Fill,
+    Order,
+    OrderStatus,
+    ScanResult,
+    Side,
+    SignalAction,
+    TradeSignal,
+)
 
 
 def _bar(symbol: str = "OLOX", close: float = 10.0, minutes_ago: int = 0) -> Bar:
@@ -101,6 +111,9 @@ def test_exit_snapshots_label_after_trade_exit(shadow_tmp):
         remaining_qty=100,
         sold_half=False,
         breakeven_locked=True,
+        entry_strategy="vwap_pullback",
+        entry_pattern="vwap_pullback",
+        entry_score=46.24,
         bars=[_bar("MASK", close=5.00)],
     )
 
@@ -110,6 +123,36 @@ def test_exit_snapshots_label_after_trade_exit(shadow_tmp):
     [row] = _rows(sc.EXIT_FILE)
     assert row["label"] == 1
     assert row["future_return_pct"] == pytest.approx(1.6)
+    assert row["entry_strategy"] == "vwap_pullback"
+    assert row["entry_pattern"] == "vwap_pullback"
+    assert row["entry_score"] == pytest.approx(46.24)
+
+
+def test_exit_manager_preserves_entry_shadow_context():
+    scan = ScanResult(
+        symbol="MASK",
+        scanner_name="abc_continuation",
+        ts=datetime.now(timezone.utc),
+        score=88.5,
+        criteria={"pattern": "abc_continuation"},
+    )
+    signal = TradeSignal(
+        symbol="MASK",
+        action=SignalAction.ENTER_LONG,
+        quantity=100,
+        entry_price=5.00,
+        stop_loss=4.85,
+        reason="ABC continuation",
+        scan_result=scan,
+    )
+    manager = ExitManager()
+
+    manager.register_from_signal(signal, datetime.now(timezone.utc), fill_price=5.02)
+
+    pos = manager.tracked["MASK"]
+    assert pos.entry_strategy == "abc_continuation"
+    assert pos.entry_pattern == "abc_continuation"
+    assert pos.entry_score == pytest.approx(88.5)
 
 
 def test_execution_quality_labels_bad_slippage(shadow_tmp):

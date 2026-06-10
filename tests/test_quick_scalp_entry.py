@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from daytrading.models import Bar, Quote, Side, Tick, Timeframe
 from daytrading.runner import AlpacaRunner
@@ -12,11 +13,22 @@ TS = datetime(2026, 5, 29, 13, 30, tzinfo=timezone.utc)
 
 class _QuickScalpRunner:
     _check_quick_scalp_entry = AlpacaRunner._check_quick_scalp_entry
+    _quick_scalp_recent_normal_reject = AlpacaRunner._quick_scalp_recent_normal_reject
+    _quick_scalp_hod_alert_reject = AlpacaRunner._quick_scalp_hod_alert_reject
+    _shared_entry_quality_reject = AlpacaRunner._shared_entry_quality_reject
+    _quick_scalp_10s_reject = AlpacaRunner._quick_scalp_10s_reject
     _quick_scalp_tick_rr = AlpacaRunner._quick_scalp_tick_rr
+    _quick_scalp_allows_extreme_hod_runner_alert = staticmethod(
+        AlpacaRunner._quick_scalp_allows_extreme_hod_runner_alert
+    )
 
     def __init__(self) -> None:
         self._quote_buffer = defaultdict(lambda: deque(maxlen=100))
         self._tick_buffer = defaultdict(lambda: deque(maxlen=200))
+        self._bar_aggregator = None
+        self._float_checker = None
+        self._hod_alert_store = None
+        self._pipeline = SimpleNamespace(scan_rejections={})
 
 
 def _bar(
@@ -100,6 +112,213 @@ def test_quick_scalp_still_rejects_weak_move_even_near_hod() -> None:
     assert reject is not None
     assert "quick scalp movement too small day=" in reject
     assert "recent=" in reject
+
+
+def test_quick_scalp_allows_sub_two_runner_to_reach_quality_checks() -> None:
+    runner = _QuickScalpRunner()
+    _add_clean_execution_context(runner, symbol="NEXR")
+    bars = [
+        _bar(1.35, idx=0, open_=1.20, high=1.38, low=1.18, volume=1_200_000),
+        _bar(1.55, idx=1, high=1.58, low=1.32, volume=1_500_000),
+        _bar(1.72, idx=2, high=1.76, low=1.50, volume=1_600_000),
+        _bar(1.87, idx=3, high=1.88, low=1.70, volume=1_800_000),
+    ]
+
+    reject = runner._check_quick_scalp_entry("NEXR", bars)
+
+    assert reject != "quick scalp price $1.87 outside range $1.50-$20.00"
+
+
+def test_quick_scalp_still_rejects_below_dollar_fifty_runner() -> None:
+    runner = _QuickScalpRunner()
+    _add_clean_execution_context(runner, symbol="NEXR")
+    bars = [
+        _bar(1.25, idx=0, open_=1.20, high=1.30, low=1.18, volume=1_200_000),
+        _bar(1.32, idx=1, high=1.34, low=1.22, volume=1_500_000),
+        _bar(1.40, idx=2, high=1.43, low=1.30, volume=1_600_000),
+        _bar(1.49, idx=3, high=1.50, low=1.38, volume=1_800_000),
+    ]
+
+    reject = runner._check_quick_scalp_entry("NEXR", bars)
+
+    assert reject == "quick scalp price $1.49 outside range $1.50-$20.00"
+
+
+def test_extreme_hod_runner_alert_allows_sub_two_candidate() -> None:
+    row = {
+        "price": 1.87,
+        "change_session_pct": 92.0,
+        "change_from_close_pct": 135.0,
+        "day_volume": 8_000_000,
+        "rel_vol": 1.2,
+        "bar_rvol": 1.0,
+        "float_shares": 4_000_000,
+    }
+
+    assert _QuickScalpRunner._quick_scalp_allows_extreme_hod_runner_alert(row) is True
+
+
+def test_extreme_hod_runner_alert_still_rejects_below_dollar_fifty() -> None:
+    row = {
+        "price": 1.49,
+        "change_session_pct": 120.0,
+        "change_from_close_pct": 150.0,
+        "day_volume": 8_000_000,
+        "rel_vol": 1.2,
+        "bar_rvol": 1.0,
+        "float_shares": 4_000_000,
+    }
+
+    assert _QuickScalpRunner._quick_scalp_allows_extreme_hod_runner_alert(row) is False
+
+
+def test_quick_scalp_respects_recent_hard_entry_guard_reject() -> None:
+    runner = _QuickScalpRunner()
+    runner._pipeline = SimpleNamespace(
+        scan_rejections={
+            "STAK": "spread too wide (3.00c = 0.69% of $4.35)",
+        }
+    )
+
+    reject = runner._quick_scalp_recent_normal_reject("STAK")
+
+    assert reject == "recent normal entry reject: spread too wide (3.00c = 0.69% of $4.35)"
+
+
+def test_quick_scalp_rejects_watch_only_hod_alert() -> None:
+    runner = _QuickScalpRunner()
+    runner._hod_alert_store = SimpleNamespace(
+        snapshot=lambda: [{
+            "symbol": "SUNE",
+            "reject_reason": "watch only: momentum_burst collecting data, not live A+ setup",
+            "rel_vol": 0.71,
+            "bar_rvol": 0.71,
+        }]
+    )
+
+    reject = runner._quick_scalp_hod_alert_reject("SUNE")
+
+    assert reject == (
+        "HOD alert not tradeable: "
+        "watch only: momentum_burst collecting data, not live A+ setup"
+    )
+
+
+def test_quick_scalp_promotes_extreme_momentum_burst_to_real_entry_gates() -> None:
+    runner = _QuickScalpRunner()
+    runner._hod_alert_store = SimpleNamespace(
+        snapshot=lambda: [{
+            "symbol": "AHMA",
+            "reject_reason": "watch only: momentum_burst collecting data, not live A+ setup",
+            "price": 2.90,
+            "change_session_pct": 163.6,
+            "change_from_close_pct": 168.5,
+            "day_volume": 62_000_000,
+            "float_shares": 2_100_000,
+            "rel_vol": 4.2,
+            "bar_rvol": 0.33,
+        }]
+    )
+
+    assert runner._quick_scalp_hod_alert_reject("AHMA") is None
+
+
+def test_quick_scalp_does_not_promote_weak_watch_only_momentum_burst() -> None:
+    runner = _QuickScalpRunner()
+    runner._hod_alert_store = SimpleNamespace(
+        snapshot=lambda: [{
+            "symbol": "SUNE",
+            "reject_reason": "watch only: momentum_burst collecting data, not live A+ setup",
+            "price": 4.00,
+            "change_session_pct": 18.0,
+            "change_from_close_pct": 20.0,
+            "day_volume": 800_000,
+            "float_shares": 5_000_000,
+            "rel_vol": 1.2,
+            "bar_rvol": 1.1,
+        }]
+    )
+
+    reject = runner._quick_scalp_hod_alert_reject("SUNE")
+
+    assert reject == (
+        "HOD alert not tradeable: "
+        "watch only: momentum_burst collecting data, not live A+ setup"
+    )
+
+
+def test_quick_scalp_rejects_weak_active_hod_rvol() -> None:
+    runner = _QuickScalpRunner()
+    runner._hod_alert_store = SimpleNamespace(
+        snapshot=lambda: [{
+            "symbol": "SUNE",
+            "reject_reason": None,
+            "rel_vol": 0.71,
+            "bar_rvol": 0.71,
+        }]
+    )
+
+    reject = runner._quick_scalp_hod_alert_reject("SUNE")
+
+    assert reject == "HOD alert active RVOL too weak 0.71x (need 1.0x+)"
+
+
+def test_quick_scalp_requires_10s_confirmation_feed() -> None:
+    runner = _QuickScalpRunner()
+
+    reject = runner._quick_scalp_10s_reject("OLOX")
+
+    assert reject == "no 10s confirmation feed"
+
+
+def test_quick_scalp_rejects_red_10s_confirmation() -> None:
+    runner = _QuickScalpRunner()
+    red_bar = Bar(
+        symbol="OLOX",
+        ts=datetime.now(timezone.utc),
+        open=8.10,
+        high=8.12,
+        low=8.02,
+        close=8.04,
+        volume=22_000,
+        timeframe=Timeframe.SEC_10,
+    )
+    runner._bar_aggregator = SimpleNamespace(
+        get_latest_10s=lambda symbol, count=2: [red_bar],
+    )
+
+    reject = runner._quick_scalp_10s_reject("OLOX")
+
+    assert reject == "10s confirmation red/flat"
+
+
+def test_quick_scalp_allows_green_expanding_10s_confirmation() -> None:
+    runner = _QuickScalpRunner()
+    previous = Bar(
+        symbol="OLOX",
+        ts=datetime.now(timezone.utc) - timedelta(seconds=10),
+        open=8.00,
+        high=8.08,
+        low=7.98,
+        close=8.04,
+        volume=18_000,
+        timeframe=Timeframe.SEC_10,
+    )
+    latest = Bar(
+        symbol="OLOX",
+        ts=datetime.now(timezone.utc),
+        open=8.04,
+        high=8.16,
+        low=8.03,
+        close=8.14,
+        volume=24_000,
+        timeframe=Timeframe.SEC_10,
+    )
+    runner._bar_aggregator = SimpleNamespace(
+        get_latest_10s=lambda symbol, count=2: [previous, latest],
+    )
+
+    assert runner._quick_scalp_10s_reject("OLOX") is None
 
 
 def test_quick_scalp_allows_big_volume_runner_just_under_50k_recent_volume() -> None:

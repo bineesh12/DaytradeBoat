@@ -37,6 +37,59 @@ def test_shadow_mode_wrong_rejection():
     assert m.stats.shadow_wrong == 1
 
 
+def test_shadow_mode_marks_intraperiod_scalp_run_as_wrong_rejection():
+    """If ML rejects, then price gives a scalp and fades, ML was still wrong."""
+    m = MLMonitor()
+    m.record_ml_rejection("VSME", 4.00, 0.08, 95)
+
+    m.update_price("VSME", 4.20)
+    m.update_price("VSME", 3.95)
+
+    m._shadow_entries[0].reject_time = time.time() - 301
+    m.check_shadow_outcomes()
+
+    assert m.stats.shadow_correct == 0
+    assert m.stats.shadow_wrong == 1
+
+
+def test_elite_false_rejects_disable_model_quickly():
+    """Two high-score rejects that run 8%+ disable ML via the monitor."""
+    m = MLMonitor()
+
+    m.record_ml_rejection("VSME", 3.30, 0.08, 95)
+    m.update_price("VSME", 3.57)
+    m._shadow_entries[0].reject_time = time.time() - 301
+    m.check_shadow_outcomes()
+
+    assert m.is_model_enabled is True
+    assert m.stats.elite_false_rejects == 1
+
+    m.record_ml_rejection("WCT", 5.00, 0.09, 105)
+    m.update_price("WCT", 5.45)
+    m._shadow_entries[0].reject_time = time.time() - 301
+    m.check_shadow_outcomes()
+
+    assert m.is_model_enabled is False
+    assert m.stats.model_disabled is True
+    assert "elite false ML rejects" in m.stats.disable_reason
+
+
+def test_ordinary_small_wrong_reject_does_not_fast_disable_model():
+    """Fast disable is only for high-score rejects with a large usable move."""
+    m = MLMonitor()
+
+    for i in range(5):
+        symbol = f"SYM{i}"
+        m.record_ml_rejection(symbol, 10.0, 0.20, 70)
+        m.update_price(symbol, 10.20)
+        m._shadow_entries[0].reject_time = time.time() - 301
+        m.check_shadow_outcomes()
+
+    assert m.stats.shadow_wrong == 5
+    assert m.stats.elite_false_rejects == 0
+    assert m.is_model_enabled is True
+
+
 def test_auto_disable_high_rejection_rate():
     """Model is disabled if rejection rate exceeds the current threshold."""
     m = MLMonitor()

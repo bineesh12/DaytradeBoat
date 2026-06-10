@@ -36,6 +36,27 @@ from daytrading.models import Bar, Quote, Tick, Side, Timeframe
 
 logger = logging.getLogger(__name__)
 
+
+class _AlpacaSubscriptionNoiseFilter(logging.Filter):
+    """Drop noisy Alpaca SDK subscription echoes while keeping warnings/errors."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage().lower()
+        noisy = (
+            "subscribed to trades" in message
+            or "subscribed to quotes" in message
+            or "subscribed to bars" in message
+        )
+        return not (record.levelno <= logging.INFO and noisy)
+
+
+def configure_alpaca_stream_logging() -> None:
+    """Throttle Alpaca SDK websocket subscription chatter."""
+    sdk_logger = logging.getLogger("alpaca.data.live.websocket")
+    if not any(isinstance(f, _AlpacaSubscriptionNoiseFilter) for f in sdk_logger.filters):
+        sdk_logger.addFilter(_AlpacaSubscriptionNoiseFilter())
+
+
 try:
     from alpaca.data.historical.stock import StockHistoricalDataClient
     from alpaca.data.live.stock import StockDataStream
@@ -122,6 +143,7 @@ if _HAS_ALPACA:
 
         async def _run_forever(self) -> None:
             import websockets  # noqa: F811 — re-import inside async scope
+            self._loop = asyncio.get_running_loop()
 
             while not any(
                 v
@@ -448,6 +470,7 @@ class AlpacaStreamFeed:
         self._api_key = api_key
         self._secret_key = secret_key
         self._feed_str = feed
+        configure_alpaca_stream_logging()
         self._stream = _ResilientDataStream(api_key, secret_key, feed=_parse_feed(feed))
         self._thread: Optional[threading.Thread] = None
         self._running = False
@@ -465,6 +488,7 @@ class AlpacaStreamFeed:
         self._pending_quote_symbols: Set[str] = set()
         self._pending_trade_symbols: Set[str] = set()
         self._trade_filter_symbols: Set[str] = set()
+        self._flush_retry_scheduled = False
 
         # Lee-Ready tick classification state
         self._latest_quotes: Dict[str, Quote] = {}
@@ -507,6 +531,7 @@ class AlpacaStreamFeed:
             return
         loop = getattr(self._stream, "_loop", None)
         if loop is None or not loop.is_running():
+            self._schedule_pending_subscription_flush()
             return
 
         with self._sub_lock:
@@ -564,6 +589,21 @@ class AlpacaStreamFeed:
                 self._pending_bar_symbols.update(new_bars)
                 self._pending_quote_symbols.update(new_quotes)
                 self._pending_trade_symbols.update(new_trades)
+            self._schedule_pending_subscription_flush()
+
+    def _schedule_pending_subscription_flush(self, delay: float = 1.0) -> None:
+        """Retry subscription flush after the WebSocket loop becomes available."""
+        if self._flush_retry_scheduled:
+            return
+        self._flush_retry_scheduled = True
+
+        def _retry() -> None:
+            self._flush_retry_scheduled = False
+            self.flush_pending_subscriptions()
+
+        timer = threading.Timer(delay, _retry)
+        timer.daemon = True
+        timer.start()
 
     def subscribe_all_trades(self) -> None:
         """Subscribe to trades for ALL symbols using wildcard '*'.
@@ -585,12 +625,21 @@ class AlpacaStreamFeed:
         """
         old = self._trade_filter_symbols
         self._trade_filter_symbols = symbols
-        if self._subscribe_all_trades and self._running:
+        if self._subscribe_all_trades:
             new_syms = symbols - old
             if new_syms:
                 with self._sub_lock:
                     self._pending_trade_symbols.update(new_syms)
+        if self._subscribe_all_trades and self._running:
+            if new_syms:
                 self.flush_pending_subscriptions()
+
+    def add_trade_filter_symbols(self, symbols: Sequence[str]) -> None:
+        """Immediately add symbols to the per-symbol trade tick stream."""
+        syms = {s.upper() for s in symbols if s}
+        if not syms:
+            return
+        self.set_trade_filter(set(self._trade_filter_symbols) | syms)
 
     async def _handle_bar(self, data: Any) -> None:
         bar = Bar(
@@ -731,9 +780,11 @@ class AlpacaStreamFeed:
             )
             self._running = True
             self._thread.start()
+            self._schedule_pending_subscription_flush()
             logger.info("Alpaca stream started in background thread")
         else:
             self._running = True
+            self._schedule_pending_subscription_flush()
             _run_with_retry()
 
     def stop(self) -> None:

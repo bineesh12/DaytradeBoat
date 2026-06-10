@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from daytrading.models import Bar, ScanResult, SignalAction, Timeframe, TradeSignal
+from daytrading.models import Bar, Quote, ScanResult, SignalAction, Timeframe, TradeSignal
 from daytrading.runner import AlpacaRunner
+from daytrading.strategy.entry_policy import EntryPolicy
 
 
 class _Agg:
@@ -46,12 +47,78 @@ def _signal(symbol: str = "DXST", price: float = 5.00) -> TradeSignal:
     )
 
 
+def _opening_range_signal(symbol: str = "BGMS", price: float = 3.26) -> TradeSignal:
+    return TradeSignal(
+        symbol=symbol,
+        action=SignalAction.ENTER_LONG,
+        quantity=416,
+        entry_price=price,
+        stop_loss=3.14,
+        reason="Opening Range Breakout",
+        scan_result=ScanResult(
+            symbol=symbol,
+            scanner_name="opening_range_breakout",
+            ts=datetime.now(timezone.utc),
+            score=31.0,
+            criteria={
+                "pattern": "opening_range_breakout",
+                "close": price,
+                "orb_high": 3.16,
+                "stop_price": 3.14,
+            },
+        ),
+    )
+
+
+def _level_breakout_signal(symbol: str = "DAIC", price: float = 4.32) -> TradeSignal:
+    return TradeSignal(
+        symbol=symbol,
+        action=SignalAction.ENTER_LONG,
+        quantity=100,
+        entry_price=price,
+        stop_loss=3.98,
+        reason="Level Breakout Reclaim",
+        scan_result=ScanResult(
+            symbol=symbol,
+            scanner_name="level_breakout_reclaim",
+            ts=datetime.now(timezone.utc),
+            score=44.0,
+            criteria={
+                "pattern": "level_breakout_reclaim",
+                "close": price,
+                "breakout_level": 4.12,
+                "base_high": 4.12,
+                "stop_price": 3.98,
+            },
+        ),
+    )
+
+
 def _runner(live_price: float) -> AlpacaRunner:
     runner = AlpacaRunner.__new__(AlpacaRunner)
     runner._live_prices = lambda symbols: {symbols[0]: live_price}
     runner._latest_price = lambda symbol: live_price
     runner._quote_buffer = {}
     runner._bar_aggregator = None
+    return runner
+
+
+class _Journal:
+    def __init__(self) -> None:
+        self.records = []
+
+    def record(self, event_type, payload, ts=None):
+        self.records.append((event_type, payload, ts))
+
+
+def _policy_runner() -> AlpacaRunner:
+    runner = _runner(5.0)
+    runner._entry_policy = EntryPolicy()
+    runner._journal = _Journal()
+    runner._market_phase = lambda: "OPEN"
+    runner._tick_buffer = {}
+    runner._quote_buffer = {}
+    runner._float_checker = None
     return runner
 
 
@@ -72,6 +139,95 @@ def test_timed_entry_chase_guard_allows_near_signal_price() -> None:
     assert reason is None
 
 
+def test_shared_entry_quality_records_structured_decision(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "daytrading.strategy.entry_policy.check_entry_quality",
+        lambda *args, **kwargs: "entry score too low (75/100, need 80+)",
+    )
+    runner = _policy_runner()
+
+    reason = runner._shared_entry_quality_reject(
+        "DXST",
+        [_bar(close=5.0), _bar(close=5.05), _bar(close=5.10)],
+        signal=_signal(price=5.10),
+        stage="timed_entry_final_guard",
+        source="timed_entry",
+    )
+
+    assert "entry score too low" in reason
+    assert runner._journal.records
+    event_type, payload, _ = runner._journal.records[-1]
+    assert event_type == "entry_decision"
+    assert payload["source"] == "timed_entry"
+    assert payload["stage"] == "timed_entry_final_guard"
+    assert payload["blocked_layer"] == "entry_guard"
+    assert payload["passed"] is False
+
+
+def test_timed_entry_chase_guard_allows_one_tick_sub_two_spread() -> None:
+    runner = _runner(1.66)
+    now = datetime.now(timezone.utc)
+    runner._quote_buffer = {
+        "BATL": [
+            Quote(symbol="BATL", ts=now, bid=1.655, ask=1.665, bid_size=1500, ask_size=1500)
+            for _ in range(3)
+        ]
+    }
+
+    reason = runner._timed_entry_chase_reject(_signal(symbol="BATL", price=1.66), _bar(symbol="BATL", close=1.66))
+
+    assert reason is None
+
+
+def test_timed_entry_chase_guard_uses_queued_base_not_late_signal_price() -> None:
+    runner = _runner(2.34)
+    signal = _signal(symbol="BATL", price=2.30)
+    signal.scan_result.criteria["queued_entry_price"] = 1.66
+
+    reason = runner._timed_entry_chase_reject(signal, _bar(symbol="BATL", close=2.34))
+
+    assert reason is not None
+    assert "ran" in reason
+    assert "1.6600" in reason
+
+
+def test_timed_entry_chase_anchor_persists_across_requeues() -> None:
+    # A grinding name re-defers higher each scan. The anchor must stay pinned to
+    # where the setup FIRST deferred so the chase ceiling can't crawl up.
+    runner = _runner(2.34)
+    sym = "BATL"
+
+    # First defer near the base pins the anchor at 1.66.
+    first = _signal(symbol=sym, price=1.66)
+    assert runner._timed_entry_chase_anchor(first) == 1.66
+
+    # A later re-defer is a brand-new signal at a higher price with NO queued
+    # base of its own — the persisted anchor must still win.
+    later = _signal(symbol=sym, price=2.30)
+    assert runner._timed_entry_chase_anchor(later) == 1.66
+    # And it is stamped into criteria so the execution timer sees it too.
+    assert later.scan_result.criteria.get("setup_anchor") == 1.66
+
+    # The late entry is rejected, citing the original base — not 2.30.
+    reason = runner._timed_entry_chase_reject(later, _bar(symbol=sym, close=2.34))
+    assert reason is not None
+    assert "1.6600" in reason
+
+
+def test_timed_entry_chase_anchor_reanchors_after_stale_ttl() -> None:
+    # Once a setup goes stale (TTL elapsed) the same symbol re-anchors fresh.
+    runner = _runner(3.00)
+    runner._timed_entry_anchor_ttl_sec = 0.0  # everything is immediately stale
+    sym = "BATL"
+
+    first = _signal(symbol=sym, price=1.66)
+    assert runner._timed_entry_chase_anchor(first) == 1.66
+
+    later = _signal(symbol=sym, price=3.00)
+    # With a 0s TTL the prior anchor is stale, so a genuinely new setup re-anchors.
+    assert runner._timed_entry_chase_anchor(later) == 3.00
+
+
 def test_timed_entry_chase_guard_rejects_red_10s_release() -> None:
     runner = _runner(5.05)
     red_10s = Bar(
@@ -89,3 +245,58 @@ def test_timed_entry_chase_guard_rejects_red_10s_release() -> None:
     reason = runner._timed_entry_chase_reject(_signal(price=5.00), _bar(close=5.05))
 
     assert reason == "latest 10s candle turned red during entry wait"
+
+
+def test_timed_entry_chase_guard_rejects_failed_opening_range_reclaim() -> None:
+    runner = _runner(3.11)
+
+    reason = runner._timed_entry_chase_reject(
+        _opening_range_signal(),
+        _bar(symbol="BGMS", close=3.11),
+    )
+
+    assert reason == "live price 3.1100 pulled back too far from breakout signal 3.2600"
+
+
+def test_timed_entry_chase_guard_allows_opening_range_reclaim() -> None:
+    runner = _runner(3.18)
+
+    reason = runner._timed_entry_chase_reject(
+        _opening_range_signal(),
+        _bar(symbol="BGMS", close=3.18),
+    )
+
+    assert reason is None
+
+
+def test_timed_entry_chase_guard_rejects_lost_level_breakout() -> None:
+    runner = _runner(4.08)
+
+    reason = runner._timed_entry_chase_reject(
+        _level_breakout_signal(),
+        _bar(symbol="DAIC", close=4.08),
+    )
+
+    assert reason == "live price 4.0800 lost breakout level 4.1200"
+
+
+def test_timed_entry_chase_guard_allows_held_level_breakout() -> None:
+    runner = _runner(4.20)
+
+    reason = runner._timed_entry_chase_reject(
+        _level_breakout_signal(),
+        _bar(symbol="DAIC", close=4.20),
+    )
+
+    assert reason is None
+
+
+def test_timed_entry_chase_guard_rejects_extended_level_breakout() -> None:
+    runner = _runner(4.30)
+
+    reason = runner._timed_entry_chase_reject(
+        _level_breakout_signal(),
+        _bar(symbol="DAIC", close=4.30),
+    )
+
+    assert reason == "live price 4.3000 too extended from breakout level 4.1200 (max 2.5%)"

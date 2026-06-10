@@ -7,6 +7,7 @@ All settings use the DAYTRADING_ prefix.
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 
 
 try:
@@ -39,10 +40,79 @@ def _env_bool(name: str, default: bool) -> bool:
     return default
 
 
+@dataclass(frozen=True)
+class StrategyConfig:
+    """Tunable live-strategy knobs loaded once from env.
+
+    Keep fast-moving trading thresholds here instead of scattering magic
+    numbers across runner threads.
+    """
+
+    hot_watch_enabled: bool = True
+    hot_watch_ttl_minutes: float = 8.0
+    hot_watch_strong_ttl_minutes: float = 15.0
+    hot_watch_runner_ttl_minutes: float = 25.0
+    hot_watch_max_symbols: int = 40
+    hot_watch_min_change_pct: float = 5.0
+    hot_watch_min_day_volume: float = 200_000
+    hot_watch_sub5_min_day_volume: float = 500_000
+    hot_watch_min_score: float = 0.30
+    max_watchlist_symbols: int = 50
+    candidate_hydrate_queue_max: int = 500
+    candidate_hydrate_batch_max: int = 10
+    fast_scan_process_max: int = 80
+    timed_entry_anchor_ttl_sec: float = 300.0
+
+    @classmethod
+    def from_env(cls) -> "StrategyConfig":
+        return cls(
+            hot_watch_enabled=_env_bool("HOT_WATCH_ENABLED", cls.hot_watch_enabled),
+            hot_watch_ttl_minutes=_env_float("HOT_WATCH_TTL_MINUTES", cls.hot_watch_ttl_minutes),
+            hot_watch_strong_ttl_minutes=_env_float(
+                "HOT_WATCH_STRONG_TTL_MINUTES",
+                cls.hot_watch_strong_ttl_minutes,
+            ),
+            hot_watch_runner_ttl_minutes=_env_float(
+                "HOT_WATCH_RUNNER_TTL_MINUTES",
+                cls.hot_watch_runner_ttl_minutes,
+            ),
+            hot_watch_max_symbols=_env_int("HOT_WATCH_MAX_SYMBOLS", cls.hot_watch_max_symbols),
+            hot_watch_min_change_pct=_env_float(
+                "HOT_WATCH_MIN_CHANGE_PCT",
+                cls.hot_watch_min_change_pct,
+            ),
+            hot_watch_min_day_volume=_env_float(
+                "HOT_WATCH_MIN_DAY_VOLUME",
+                cls.hot_watch_min_day_volume,
+            ),
+            hot_watch_sub5_min_day_volume=_env_float(
+                "HOT_WATCH_SUB5_MIN_DAY_VOLUME",
+                cls.hot_watch_sub5_min_day_volume,
+            ),
+            hot_watch_min_score=_env_float("HOT_WATCH_MIN_SCORE", cls.hot_watch_min_score),
+            max_watchlist_symbols=_env_int("MAX_WATCHLIST_SYMBOLS", cls.max_watchlist_symbols),
+            candidate_hydrate_queue_max=_env_int(
+                "CANDIDATE_HYDRATE_QUEUE_MAX",
+                cls.candidate_hydrate_queue_max,
+            ),
+            candidate_hydrate_batch_max=_env_int(
+                "CANDIDATE_HYDRATE_BATCH_MAX",
+                cls.candidate_hydrate_batch_max,
+            ),
+            fast_scan_process_max=_env_int("FAST_SCAN_PROCESS_MAX", cls.fast_scan_process_max),
+            timed_entry_anchor_ttl_sec=_env_float(
+                "TIMED_ENTRY_ANCHOR_TTL_SEC",
+                cls.timed_entry_anchor_ttl_sec,
+            ),
+        )
+
+
 class Settings:
     """Load from environment / .env for API keys and runtime knobs."""
 
     def __init__(self) -> None:
+        self.strategy: StrategyConfig = StrategyConfig.from_env()
+
         # Alpaca API
         self.alpaca_api_key: str = _env("ALPACA_API_KEY")
         self.alpaca_secret_key: str = _env("ALPACA_SECRET_KEY")
@@ -151,7 +221,7 @@ class Settings:
             "HOD_MOMENTUM_WATCHLIST_TTL_MINUTES", 20.0,
         )
         self.hod_momentum_bar_pool_max: int = _env_int(
-            "HOD_MOMENTUM_BAR_POOL_MAX", 1000,
+            "HOD_MOMENTUM_BAR_POOL_MAX", 250,
         )
         self.hod_pool_refresh_minutes: int = _env_int(
             "HOD_POOL_REFRESH_MINUTES", 10,
@@ -192,6 +262,25 @@ class Settings:
         self.hod_momentum_former_momo_min_change_pct: float = _env_float(
             "HOD_MOMENTUM_FORMER_MOMO_MIN_CHANGE_PCT", 3.0,
         )
+
+        # Hot watch — early mover watch before HOD alert. This does not buy
+        # directly; it only lets structured pullback patterns reach rules + ML.
+        self.hot_watch_enabled: bool = self.strategy.hot_watch_enabled
+        self.hot_watch_ttl_minutes: float = self.strategy.hot_watch_ttl_minutes
+        self.hot_watch_strong_ttl_minutes: float = self.strategy.hot_watch_strong_ttl_minutes
+        self.hot_watch_runner_ttl_minutes: float = self.strategy.hot_watch_runner_ttl_minutes
+        self.hot_watch_max_symbols: int = self.strategy.hot_watch_max_symbols
+        self.hot_watch_min_change_pct: float = self.strategy.hot_watch_min_change_pct
+        self.hot_watch_min_day_volume: float = self.strategy.hot_watch_min_day_volume
+        self.hot_watch_sub5_min_day_volume: float = self.strategy.hot_watch_sub5_min_day_volume
+        self.hot_watch_min_score: float = self.strategy.hot_watch_min_score
+
+        # Live memory caps. Keep these bounded so candidate hydration and bar
+        # history do not overwhelm small GCP instances during busy mover days.
+        self.max_watchlist_symbols: int = self.strategy.max_watchlist_symbols
+        self.candidate_hydrate_queue_max: int = self.strategy.candidate_hydrate_queue_max
+        self.candidate_hydrate_batch_max: int = self.strategy.candidate_hydrate_batch_max
+        self.fast_scan_process_max: int = self.strategy.fast_scan_process_max
 
         # Tape-hot detection — volume spike on SIP tape triggers bar load + scan
         self.hod_tape_hot_volume_threshold: int = _env_int(

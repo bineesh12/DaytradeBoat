@@ -83,8 +83,8 @@ class TestPositionReconciler:
         assert pos.stop_loss == pytest.approx(12.34, abs=0.001)
         assert pos.risk_per_share == pytest.approx(0.10, abs=0.001)
 
-    def test_adopt_orphan_no_fixed_target(self) -> None:
-        """Adopted position should have no fixed target (candle-based exits only)."""
+    def test_adopt_orphan_rebuilds_first_target(self) -> None:
+        """Adopted positions should still take partial profit at the fallback 1:1 target."""
         rec = PositionReconciler()
         exit_mgr = ExitManager()
         portfolio = PortfolioState(cash=10_000)
@@ -96,8 +96,26 @@ class TestPositionReconciler:
         )
 
         pos = exit_mgr.tracked["TENX"]
-        assert pos.first_target_price == 0
+        assert pos.first_target_price == pytest.approx(12.54, abs=0.001)
         assert pos.sold_half is False
+
+    def test_adopt_orphan_can_half_sell_at_rebuilt_target(self) -> None:
+        rec = PositionReconciler()
+        exit_mgr = ExitManager()
+        portfolio = PortfolioState(cash=10_000)
+
+        rec.reconcile(
+            {"TENX": {"qty": 100, "avg_entry": 12.44}},
+            portfolio,
+            exit_mgr,
+        )
+
+        signals = exit_mgr.check_exits({"TENX": 12.55}, datetime.now(timezone.utc))
+
+        assert len(signals) == 1
+        assert signals[0].symbol == "TENX"
+        assert signals[0].quantity == 50
+        assert exit_mgr.tracked["TENX"].sold_half is True
 
     def test_adopt_orphan_trend_strength(self) -> None:
         """Adopted position should get moderate trend_strength for decent stale timeout."""
@@ -113,6 +131,26 @@ class TestPositionReconciler:
 
         pos = exit_mgr.tracked["TENX"]
         assert pos.trend_strength == 0.7
+
+    def test_unexpected_broker_short_is_flagged_and_tracked_for_cover(self) -> None:
+        rec = PositionReconciler()
+        exit_mgr = ExitManager()
+        portfolio = PortfolioState(cash=10_000)
+
+        result = rec.reconcile(
+            {"VERU": {"qty": -1, "avg_entry": 4.28, "current_price": 6.02}},
+            portfolio,
+            exit_mgr,
+        )
+
+        assert result.accidental_shorts == ["VERU"]
+        assert result.adopted == []
+        assert "VERU" in exit_mgr.tracked
+        tracked = exit_mgr.tracked["VERU"]
+        assert tracked.side is Side.SELL
+        assert tracked.remaining_qty == 1
+        assert tracked.stop_loss == pytest.approx(4.38)
+        assert portfolio.positions["VERU"].quantity == -1
 
 
 class TestAdoptedTrailingStop:

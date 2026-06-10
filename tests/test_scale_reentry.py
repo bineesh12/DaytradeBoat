@@ -26,7 +26,10 @@ from daytrading.exits.scaler import (
     ReentryDetector,
     ScaleUpConfig,
 )
-from daytrading.models import Bar, ExitReason, Side, SignalAction, TradeSignal
+from daytrading.execution.broker import PaperBroker
+from daytrading.models import Bar, ExitReason, PortfolioState, Position, Side, SignalAction, TradeSignal
+from daytrading.pipeline.engine import TradingPipeline
+from daytrading.pipeline.factory import create_scalping_pipeline
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -46,6 +49,43 @@ def _bar(symbol: str, close: float, volume: float = 100_000, offset_s: int = 0) 
         close=close,
         volume=volume,
     )
+
+
+def _ohlcv_bar(
+    symbol: str,
+    open_: float,
+    close: float,
+    high: float,
+    low: float,
+    volume: float,
+    offset_s: int = 0,
+) -> Bar:
+    return Bar(
+        symbol=symbol,
+        ts=_ts(offset_s),
+        open=open_,
+        high=high,
+        low=low,
+        close=close,
+        volume=volume,
+    )
+
+
+def _clean_runner_readd_bars(symbol: str = "RUN") -> List[Bar]:
+    rows = [
+        (5.00, 5.05, 5.07, 4.98, 40_000),
+        (5.05, 5.20, 5.23, 5.04, 120_000),
+        (5.20, 5.45, 5.48, 5.18, 240_000),
+        (5.45, 5.38, 5.46, 5.35, 80_000),
+        (5.38, 5.32, 5.40, 5.30, 70_000),
+        (5.32, 5.34, 5.36, 5.31, 50_000),
+        (5.34, 5.36, 5.38, 5.33, 60_000),
+        (5.36, 5.44, 5.46, 5.35, 110_000),
+    ]
+    return [
+        _ohlcv_bar(symbol, o, c, h, l, v, i * 60)
+        for i, (o, c, h, l, v) in enumerate(rows)
+    ]
 
 
 # ===================================================================
@@ -207,6 +247,81 @@ class TestPositionScaler:
                 expected_size = round(500 * (0.5 ** (i + 1)))
                 assert signals[0].quantity == expected_size
 
+    def test_protected_runner_readd_requires_sold_half(self) -> None:
+        em, pos = self._setup_winning_position()
+        pos.highest_price = 5.48
+        scaler = PositionScaler(ScaleUpConfig(
+            min_profit_cents=5.0,
+            require_protected_runner=True,
+            require_clean_pullback_profile=True,
+            pullback_pct=0.8,
+            bounce_pct=0.45,
+            max_add_risk_pct=4.0,
+        ))
+        scaler._pullback_seen["RUN"] = True
+        scaler._pullback_low["RUN"] = 5.30
+
+        signals = scaler.check_scale_ups(
+            em, {"RUN": 5.44}, {"RUN": _clean_runner_readd_bars("RUN")},
+        )
+
+        assert signals == []
+
+    def test_protected_runner_readd_requires_clean_pullback_profile(self) -> None:
+        em, pos = self._setup_winning_position()
+        pos.sold_half = True
+        pos.breakeven_locked = True
+        pos.stop_loss = pos.entry_price
+        pos.highest_price = 5.48
+        scaler = PositionScaler(ScaleUpConfig(
+            min_profit_cents=5.0,
+            require_protected_runner=True,
+            require_clean_pullback_profile=True,
+            pullback_pct=0.8,
+            bounce_pct=0.45,
+            max_add_risk_pct=4.0,
+        ))
+        scaler._pullback_seen["RUN"] = True
+        scaler._pullback_low["RUN"] = 5.30
+        bars = _clean_runner_readd_bars("RUN")
+        bars[4] = _ohlcv_bar("RUN", 5.38, 5.30, 5.40, 5.28, 260_000, 4 * 60)
+
+        signals = scaler.check_scale_ups(em, {"RUN": 5.44}, {"RUN": bars})
+
+        assert signals == []
+
+    def test_protected_runner_readd_emits_runner_readd_signal(self) -> None:
+        em, pos = self._setup_winning_position()
+        pos.sold_half = True
+        pos.breakeven_locked = True
+        pos.stop_loss = pos.entry_price
+        pos.highest_price = 5.48
+        scaler = PositionScaler(ScaleUpConfig(
+            min_profit_cents=5.0,
+            require_protected_runner=True,
+            require_clean_pullback_profile=True,
+            pullback_pct=0.8,
+            bounce_pct=0.45,
+            size_decay=0.6,
+            max_add_risk_pct=4.0,
+        ))
+        scaler._pullback_seen["RUN"] = True
+        scaler._pullback_low["RUN"] = 5.30
+
+        signals = scaler.check_scale_ups(
+            em, {"RUN": 5.44}, {"RUN": _clean_runner_readd_bars("RUN")},
+        )
+
+        assert len(signals) == 1
+        signal = signals[0]
+        assert signal.action is SignalAction.SCALE_UP_LONG
+        assert signal.quantity == 300
+        assert signal.stop_loss is not None
+        assert signal.stop_loss >= pos.entry_price
+        assert signal.scan_result is not None
+        assert signal.scan_result.scanner_name == "runner_readd"
+        assert signal.scan_result.criteria["pullback_low"] > 0
+
 
 # ===================================================================
 # ReentryDetector
@@ -270,6 +385,66 @@ class TestReentryDetector:
         assert signals[0].quantity == 250  # 500 * 0.5
         assert signals[0].stop_loss is not None
 
+    def test_clean_abc_reentry_requires_controlled_profile(self) -> None:
+        det = ReentryDetector(ReentryConfig(
+            cooldown_seconds=5,
+            min_continuation_cents=3.0,
+            reentry_size_pct=0.35,
+            require_clean_continuation_profile=True,
+            max_reentry_risk_pct=4.0,
+        ))
+        det.record_full_exit(
+            "RMSG", Side.BUY, exit_price=5.40, exit_ts=_ts(0),
+            highest_price=5.48, entry_price=5.00,
+        )
+
+        det.check_reentries(
+            {"RMSG": 5.30},
+            {"RMSG": [_bar("RMSG", 5.30)]},
+            _ts(70),
+            {"RMSG": 300},
+        )
+        bars = _clean_runner_readd_bars("RMSG")
+        signals = det.check_reentries(
+            {"RMSG": 5.44}, {"RMSG": bars}, _ts(130), {"RMSG": 300},
+        )
+
+        assert len(signals) == 1
+        sig = signals[0]
+        assert sig.action is SignalAction.REENTER_LONG
+        assert sig.quantity == 105
+        assert sig.scan_result is not None
+        assert sig.scan_result.scanner_name == "abc_reentry"
+        assert sig.scan_result.criteria["setup_quality"] == "reentry_continuation"
+        assert sig.stop_loss is not None
+        assert sig.stop_loss >= 5.00
+
+    def test_clean_abc_reentry_rejects_heavy_pullback_volume(self) -> None:
+        det = ReentryDetector(ReentryConfig(
+            cooldown_seconds=5,
+            min_continuation_cents=3.0,
+            reentry_size_pct=0.35,
+            require_clean_continuation_profile=True,
+        ))
+        det.record_full_exit(
+            "RMSG", Side.BUY, exit_price=5.40, exit_ts=_ts(0),
+            highest_price=5.48, entry_price=5.00,
+        )
+
+        det.check_reentries(
+            {"RMSG": 5.30},
+            {"RMSG": [_bar("RMSG", 5.30)]},
+            _ts(70),
+            {"RMSG": 300},
+        )
+        bars = _clean_runner_readd_bars("RMSG")
+        bars[4] = _ohlcv_bar("RMSG", 5.38, 5.30, 5.40, 5.28, 260_000, 4 * 60)
+        signals = det.check_reentries(
+            {"RMSG": 5.44}, {"RMSG": bars}, _ts(130), {"RMSG": 300},
+        )
+
+        assert signals == []
+
     def test_max_reentries_enforced(self) -> None:
         det = ReentryDetector(ReentryConfig(
             cooldown_seconds=1, max_reentries=1,
@@ -324,6 +499,173 @@ class TestReentryDetector:
         det.clear_session()
         assert len(det._exit_history) == 0
         assert len(det._reentry_counts) == 0
+
+    def test_factory_enables_reentry_detector(self) -> None:
+        pipeline = create_scalping_pipeline(initial_cash=10_000)
+
+        assert pipeline._reentry is not None
+        assert pipeline._reentry._config.enabled is True
+        assert pipeline._reentry._config.max_reentries == 2
+        assert pipeline._reentry._config.require_clean_continuation_profile is True
+        assert pipeline._scaler is not None
+        assert pipeline._scaler._config.require_protected_runner is True
+
+    def test_pipeline_defers_protected_runner_readd_to_execution_timer(self, monkeypatch) -> None:
+        portfolio = PortfolioState(cash=10_000)
+        portfolio.positions["RUN"] = Position(
+            symbol="RUN", quantity=250, avg_price=5.00,
+        )
+        exit_mgr = ExitManager()
+        exit_mgr.track(TrackedPosition(
+            symbol="RUN",
+            side=Side.BUY,
+            quantity=500,
+            remaining_qty=250,
+            entry_price=5.00,
+            stop_loss=5.00,
+            sold_half=True,
+            breakeven_locked=True,
+        ))
+        tracked = exit_mgr._positions["RUN"]
+        tracked.highest_price = 5.48
+        scaler = PositionScaler(ScaleUpConfig(
+            min_profit_cents=5.0,
+            require_protected_runner=True,
+            require_clean_pullback_profile=True,
+            pullback_pct=0.8,
+            bounce_pct=0.45,
+            size_decay=0.6,
+            max_add_risk_pct=4.0,
+        ))
+        scaler._pullback_seen["RUN"] = True
+        scaler._pullback_low["RUN"] = 5.30
+        pipeline = TradingPipeline(
+            scanners=[],
+            verifiers={},
+            broker=PaperBroker(),
+            portfolio=portfolio,
+            exit_manager=exit_mgr,
+            scaler=scaler,
+            max_position_shares=1000,
+            max_order_shares=1000,
+        )
+        pipeline._execution_timer = object()
+        monkeypatch.setattr(pipeline, "_final_entry_quality_reject", lambda *a, **k: None)
+
+        result = pipeline.run_cycle(
+            {"RUN": _clean_runner_readd_bars("RUN")},
+            now=_ts(500),
+        )
+
+        assert result.scale_up_fills == []
+        assert len(result.deferred_signals) == 1
+        assert result.deferred_signals[0].action is SignalAction.SCALE_UP_LONG
+
+    def test_pipeline_records_full_exit_and_reenters_on_next_pullback(self, monkeypatch) -> None:
+        portfolio = PortfolioState(cash=10_000)
+        portfolio.positions["VERU"] = Position(
+            symbol="VERU", quantity=100, avg_price=4.08,
+        )
+        exit_mgr = ExitManager()
+        exit_mgr.track(TrackedPosition(
+            symbol="VERU",
+            side=Side.BUY,
+            quantity=100,
+            remaining_qty=100,
+            entry_price=4.08,
+            stop_loss=4.50,
+        ))
+        reentry = ReentryDetector(ReentryConfig(
+            cooldown_seconds=5.0,
+            max_reentries=2,
+            reentry_size_pct=0.35,
+            min_continuation_cents=5.0,
+            pullback_max_cents=25.0,
+        ))
+        pipeline = TradingPipeline(
+            scanners=[],
+            verifiers={},
+            broker=PaperBroker(),
+            portfolio=portfolio,
+            exit_manager=exit_mgr,
+            reentry_detector=reentry,
+        )
+        pipeline._original_sizes["VERU"] = 100
+        monkeypatch.setattr(pipeline, "_final_entry_quality_reject", lambda *a, **k: None)
+
+        exit_result = pipeline.run_cycle(
+            {"VERU": [_bar("VERU", 4.50, 150_000, 10)]},
+            now=_ts(10),
+        )
+
+        assert len(exit_result.exit_fills) == 1
+        assert "VERU" not in exit_mgr.tracked
+        assert reentry._exit_history["VERU"][-1].exit_price == pytest.approx(4.50)
+        assert reentry._exit_history["VERU"][-1].entry_price == pytest.approx(4.08)
+
+        pullback_result = pipeline.run_cycle(
+            {"VERU": [_bar("VERU", 4.40, 100_000, 20)]},
+            now=_ts(20),
+        )
+        assert pullback_result.reentry_fills == []
+
+        reclaim_result = pipeline.run_cycle(
+            {"VERU": [
+                _bar("VERU", 4.40, 100_000, 30),
+                _bar("VERU", 4.58, 140_000, 40),
+            ]},
+            now=_ts(40),
+        )
+
+        assert len(reclaim_result.reentry_fills) == 1
+        fill = reclaim_result.reentry_fills[0]
+        assert fill.symbol == "VERU"
+        assert fill.quantity == 35
+        assert "VERU" in exit_mgr.tracked
+
+    def test_pipeline_defers_abc_reentry_to_execution_timer(self, monkeypatch) -> None:
+        portfolio = PortfolioState(cash=10_000)
+        exit_mgr = ExitManager()
+        reentry = ReentryDetector(ReentryConfig(
+            cooldown_seconds=5.0,
+            max_reentries=2,
+            reentry_size_pct=0.35,
+            min_continuation_cents=3.0,
+            require_clean_continuation_profile=True,
+            max_reentry_risk_pct=4.0,
+        ))
+        reentry.record_full_exit(
+            "RMSG", Side.BUY, exit_price=5.40, exit_ts=_ts(0),
+            highest_price=5.48, entry_price=5.00,
+        )
+        pipeline = TradingPipeline(
+            scanners=[],
+            verifiers={},
+            broker=PaperBroker(),
+            portfolio=portfolio,
+            exit_manager=exit_mgr,
+            reentry_detector=reentry,
+        )
+        pipeline._original_sizes["RMSG"] = 300
+        pipeline._execution_timer = object()
+        monkeypatch.setattr(pipeline, "_final_entry_quality_reject", lambda *a, **k: None)
+
+        pullback_result = pipeline.run_cycle(
+            {"RMSG": [_bar("RMSG", 5.30, 100_000, 70)]},
+            now=_ts(70),
+        )
+        assert pullback_result.deferred_signals == []
+
+        reclaim_result = pipeline.run_cycle(
+            {"RMSG": _clean_runner_readd_bars("RMSG")},
+            now=_ts(130),
+        )
+
+        assert reclaim_result.reentry_fills == []
+        assert len(reclaim_result.deferred_signals) == 1
+        assert reclaim_result.deferred_signals[0].action is SignalAction.REENTER_LONG
+        assert reclaim_result.deferred_signals[0].scan_result is not None
+        assert reclaim_result.deferred_signals[0].scan_result.scanner_name == "abc_reentry"
 
 
 # ===================================================================

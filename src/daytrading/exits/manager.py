@@ -35,6 +35,8 @@ STEP_PCT = 0.01            # 1% of entry price — lock breakeven quickly to pro
 STEP_PCT_AFTER_HALF = 0.04  # 4% steps after selling half (let winner run)
 MOMENTUM_THRESHOLD = 7  # ticks moved from entry to be considered "high momentum"
 QUICK_SCALP_PARTIAL_PCT = 0.01  # harvest first quick scalp pop before it fades
+RUNNER_MIN_CONFIRM_PCT = 0.018  # prove strength before giving the back half room
+RUNNER_TRAIL_PCT = 0.03         # protected runners trail 3% instead of 1%
 
 
 @dataclass
@@ -59,6 +61,9 @@ class TrackedPosition:
     stop_loss: Optional[float] = None
     max_hold_seconds: Optional[int] = None
     reason: str = ""
+    entry_strategy: str = ""
+    entry_pattern: str = ""
+    entry_score: float = 0.0
 
     tiers: List[ExitTier] = field(default_factory=list)
 
@@ -84,6 +89,12 @@ class TrackedPosition:
     consecutive_red: int = 0              # count of consecutive red candles
     prev_bar_open: float = 0.0           # previous bar open for red candle check
     _first_pullback_done: bool = False   # True after first red candle (grace period)
+
+    # Runner handling.  These stay false for ordinary scalps.  A position only
+    # becomes confirmed after it has already paid the first partial profit.
+    runner_candidate: bool = False
+    runner_confirmed: bool = False
+    runner_trail_pct: float = RUNNER_TRAIL_PCT
 
     # Volume tracking for momentum-aware red candle exits
     last_bar_volume: int = 0             # volume of the most recent completed bar
@@ -258,21 +269,43 @@ class ExitManager:
                 stop_loss = actual_price * 1.02
 
         # If slippage made the risk too tight, widen stop to maintain
-        # a minimum risk of 2% of entry price (same as dynamic risk calc).
+        # enough breathing room, but never widen beyond the configured dollar
+        # risk for the actual filled quantity.  Timed scalps can slip on entry;
+        # without this cap a fill can silently turn a ~$50 planned risk into a
+        # much larger loss before the software dollar stop reacts.
         # Example: signal $5.36, stop $5.25 (risk $0.11), but filled at $5.27
         # → effective risk $0.02 which is way too tight. Recalc to 2% = $0.105.
         if side is Side.BUY and actual_price > 0 and stop_loss > 0:
             effective_risk = actual_price - stop_loss
             min_risk = max(0.05, actual_price * 0.03)
+            target_risk = effective_risk
             if effective_risk < min_risk:
+                target_risk = min_risk
+            if signal.quantity > 0 and self._max_unrealized_loss > 0:
+                max_risk = self._max_unrealized_loss / signal.quantity
+                if target_risk > max_risk:
+                    target_risk = max_risk
+            if abs(target_risk - effective_risk) >= 0.005:
                 old_stop = stop_loss
-                stop_loss = round(actual_price - min_risk, 4)
+                stop_loss = round(actual_price - target_risk, 4)
                 logger.warning(
-                    "STOP ADJUST %s: slippage shrank risk to $%.2f "
+                    "STOP ADJUST %s: fill risk $%.2f adjusted "
                     "(entry %.2f, old stop %.2f) → new stop %.2f (risk $%.2f)",
                     signal.symbol, effective_risk, actual_price, old_stop,
-                    stop_loss, min_risk,
+                    stop_loss, target_risk,
                 )
+
+        scan = signal.scan_result
+        entry_strategy = scan.scanner_name if scan is not None else ""
+        entry_pattern = ""
+        entry_score = 0.0
+        if scan is not None:
+            entry_pattern = str(scan.criteria.get("pattern") or scan.scanner_name or "")
+            try:
+                entry_score = float(scan.score)
+            except (TypeError, ValueError):
+                entry_score = 0.0
+        runner_candidate = self._is_runner_candidate_signal(signal, entry_strategy, entry_pattern, entry_score)
 
         self.track(TrackedPosition(
             symbol=signal.symbol,
@@ -284,7 +317,11 @@ class ExitManager:
             stop_loss=stop_loss,
             max_hold_seconds=signal.max_hold_seconds,
             reason=signal.reason,
+            entry_strategy=entry_strategy,
+            entry_pattern=entry_pattern,
+            entry_score=entry_score,
             trend_strength=signal.trend_strength,
+            runner_candidate=runner_candidate,
         ))
 
     def check_exits(
@@ -392,34 +429,36 @@ class ExitManager:
         ):
             quick_partial_price = pos.entry_price * (1 + QUICK_SCALP_PARTIAL_PCT)
             if price >= quick_partial_price:
-                half_qty = max(1, int(pos.remaining_qty / 2))
+                partial_qty = self._first_partial_qty(pos)
                 logger.info(
                     "QUICK PARTIAL %s @ %.4f | hit +%.1f%% scalp pop %.4f | "
                     "selling %d of %d shares, moving stop to breakeven %.4f",
                     pos.symbol, price, QUICK_SCALP_PARTIAL_PCT * 100,
-                    quick_partial_price, half_qty, int(pos.remaining_qty),
+                    quick_partial_price, partial_qty, int(pos.remaining_qty),
                     pos.entry_price,
                 )
                 pos.sold_half = True
-                pos.remaining_qty -= half_qty
+                pos.remaining_qty -= partial_qty
                 pos.stop_loss = pos.entry_price
                 pos.breakeven_locked = True
-                sig = self._make_exit(pos, half_qty, price, ExitReason.TAKE_PROFIT)
+                self._maybe_confirm_runner(pos, price)
+                sig = self._make_exit(pos, partial_qty, price, ExitReason.TAKE_PROFIT)
                 return [sig]
 
         # --- Exit #1: Sell half at first profit target (1:1 R:R) ---
         if is_long and not pos.sold_half and pos.first_target_price > 0:
             if price >= pos.first_target_price:
-                half_qty = max(1, int(pos.remaining_qty / 2))
+                partial_qty = self._first_partial_qty(pos)
                 logger.info(
                     "HALF SELL %s @ %.4f | hit 1:1 target %.4f | selling %d of %d shares, moving stop to breakeven %.4f",
-                    pos.symbol, price, pos.first_target_price, half_qty, int(pos.remaining_qty), pos.entry_price,
+                    pos.symbol, price, pos.first_target_price, partial_qty, int(pos.remaining_qty), pos.entry_price,
                 )
                 pos.sold_half = True
-                pos.remaining_qty -= half_qty
+                pos.remaining_qty -= partial_qty
                 pos.stop_loss = pos.entry_price  # breakeven stop on remaining
                 pos.breakeven_locked = True
-                sig = self._make_exit(pos, half_qty, price, ExitReason.TAKE_PROFIT)
+                self._maybe_confirm_runner(pos, price)
+                sig = self._make_exit(pos, partial_qty, price, ExitReason.TAKE_PROFIT)
                 return [sig]
 
         # --- Exit #2: Red candle exit (full position only) ---
@@ -667,4 +706,83 @@ class ExitManager:
                 "hod",
                 "breakout",
             )
+        )
+
+    @staticmethod
+    def _first_partial_qty(pos: TrackedPosition) -> int:
+        """Bank less on runner candidates so more size can ride the move."""
+        remaining = int(pos.remaining_qty)
+        if remaining <= 1:
+            return max(1, remaining)
+        if pos.runner_candidate:
+            return max(1, int(remaining / 3))
+        return max(1, int(remaining / 2))
+
+    @staticmethod
+    def _is_runner_candidate_signal(
+        signal: TradeSignal,
+        entry_strategy: str,
+        entry_pattern: str,
+        entry_score: float,
+    ) -> bool:
+        """Return True for setups that deserve protected-runner handling.
+
+        This does not buy or hold blindly.  It only marks the position as
+        eligible; it still has to earn the first partial profit before the
+        back half gets wider trailing room.
+        """
+        text = " ".join(
+            str(v or "").lower()
+            for v in (
+                signal.reason,
+                entry_strategy,
+                entry_pattern,
+                signal.scan_result.scanner_name if signal.scan_result else "",
+            )
+        )
+        runner_patterns = (
+            "hod",
+            "breakout",
+            "reclaim",
+            "abc",
+            "runner",
+            "pullback",
+            "squeeze",
+            "momentum",
+        )
+        if not any(key in text for key in runner_patterns):
+            return False
+        if signal.trend_strength >= 0.8:
+            return True
+        if entry_score >= 80:
+            return True
+        criteria = signal.scan_result.criteria if signal.scan_result else {}
+        try:
+            day_change = float(
+                criteria.get("day_change_pct")
+                or criteria.get("change_pct")
+                or criteria.get("day_change")
+                or 0.0
+            )
+        except (TypeError, ValueError):
+            day_change = 0.0
+        try:
+            volume = float(criteria.get("volume") or criteria.get("day_volume") or 0.0)
+        except (TypeError, ValueError):
+            volume = 0.0
+        return day_change >= 20.0 and volume >= 1_000_000
+
+    @staticmethod
+    def _maybe_confirm_runner(pos: TrackedPosition, price: float) -> None:
+        if not pos.runner_candidate or pos.runner_confirmed or pos.entry_price <= 0:
+            return
+        max_run_pct = (max(pos.highest_price, price) - pos.entry_price) / pos.entry_price
+        if max_run_pct < RUNNER_MIN_CONFIRM_PCT:
+            return
+        pos.runner_confirmed = True
+        pos.runner_trail_pct = RUNNER_TRAIL_PCT
+        logger.info(
+            "RUNNER CONFIRMED %s | first partial paid, max run %.1f%% — "
+            "back half uses %.1f%% trail",
+            pos.symbol, max_run_pct * 100.0, pos.runner_trail_pct * 100.0,
         )

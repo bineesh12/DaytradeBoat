@@ -96,9 +96,25 @@ class DashboardHub:
         self.rt_movers: List[dict] = []
         # HOD Momentum alert feed (one row per alert type)
         self.hod_momentum_alerts: List[dict] = []
+        # Early fast-scan movers being watched for structured pullback entries
+        self.hot_watch: List[dict] = []
+        self.missed_a_plus: List[dict] = []
         # Active trading watchlist (HOD TTL + pinned + open positions)
         self.trading_watchlist: List[str] = []
         self.watchlist_pinned: List[str] = []
+        self.candidate_hydration: Dict[str, Any] = {
+            "queued": 0,
+            "hydrated": 0,
+            "skipped_fresh": 0,
+            "dropped": 0,
+            "batches": 0,
+            "pending": 0,
+            "paused_for_entry": False,
+            "last_batch_size": 0,
+            "last_loaded": 0,
+            "last_source": "",
+            "last_update": "",
+        }
 
         # History (ring buffers)
         self.trades: Deque[TradeRecord] = deque(maxlen=max_history)
@@ -164,6 +180,23 @@ class DashboardHub:
             self.hod_momentum_alerts = alerts[:200]
         self._broadcast("hod_momentum_alerts", {"alerts": self.hod_momentum_alerts})
 
+    def on_hot_watch(self, symbols: List[dict]) -> None:
+        """Replace active hot-watch candidate list."""
+        with self._lock:
+            self.hot_watch = symbols[:100]
+            merged = list(self.trading_watchlist)
+            seen = set(merged)
+            for item in self.hot_watch:
+                sym = str(item.get("symbol", "")).strip().upper()
+                if sym and sym not in seen:
+                    merged.append(sym)
+                    seen.add(sym)
+        self._broadcast("hot_watch", {"symbols": self.hot_watch})
+        self._broadcast("trading_watchlist", {
+            "symbols": merged,
+            "pinned": self.watchlist_pinned,
+        })
+
     def on_trading_watchlist(
         self,
         symbols: List[str],
@@ -179,6 +212,47 @@ class DashboardHub:
             "symbols": self.trading_watchlist,
             "pinned": self.watchlist_pinned,
         })
+
+    def on_candidate_hydration(
+        self,
+        *,
+        queued: int = 0,
+        hydrated: int = 0,
+        skipped_fresh: int = 0,
+        dropped: int = 0,
+        batches: int = 0,
+        pending: Optional[int] = None,
+        paused_for_entry: Optional[bool] = None,
+        last_batch_size: Optional[int] = None,
+        last_loaded: Optional[int] = None,
+        last_source: Optional[str] = None,
+    ) -> None:
+        with self._lock:
+            stats = self.candidate_hydration
+            stats["queued"] = int(stats.get("queued", 0)) + queued
+            stats["hydrated"] = int(stats.get("hydrated", 0)) + hydrated
+            stats["skipped_fresh"] = int(stats.get("skipped_fresh", 0)) + skipped_fresh
+            stats["dropped"] = int(stats.get("dropped", 0)) + dropped
+            stats["batches"] = int(stats.get("batches", 0)) + batches
+            if pending is not None:
+                stats["pending"] = pending
+            if paused_for_entry is not None:
+                stats["paused_for_entry"] = paused_for_entry
+            if last_batch_size is not None:
+                stats["last_batch_size"] = last_batch_size
+            if last_loaded is not None:
+                stats["last_loaded"] = last_loaded
+            if last_source is not None:
+                stats["last_source"] = last_source
+            stats["last_update"] = _now_str()
+            data = dict(stats)
+        self._broadcast("candidate_hydration", data)
+
+    def on_missed_a_plus(self, rows: List[dict]) -> None:
+        """Replace missed A+ setup report rows."""
+        with self._lock:
+            self.missed_a_plus = rows[:100]
+        self._broadcast("missed_a_plus", {"rows": self.missed_a_plus})
 
     def on_rt_movers(self, new_symbols: list, all_ranked: list) -> None:
         """Deprecated — RT mover scanner removed (HOD-only mode). No-op."""
@@ -342,9 +416,10 @@ class DashboardHub:
 
     def on_cycle_complete(self, cycle_num: int, result: Any) -> None:
         with self._lock:
-            self.cycle_count = cycle_num
+            self.cycle_count = max(self.cycle_count, cycle_num)
+            visible_cycle = self.cycle_count
         summary = {
-            "cycle": cycle_num,
+            "cycle": visible_cycle,
             "scan_hits": len(result.scan_hits),
             "signals": len(result.signals),
             "fills": len(result.fills),
@@ -355,16 +430,19 @@ class DashboardHub:
 
     def on_cycle_heartbeat(self, cycle_num: int, reason: str = "") -> None:
         """Mark loop progress when a full pipeline result is not available."""
+        log_entry = None
         with self._lock:
-            self.cycle_count = cycle_num
+            self.cycle_count = max(self.cycle_count, cycle_num)
+            visible_cycle = self.cycle_count
             if reason:
-                self.log_messages.append({
+                log_entry = {
                     "level": "INFO",
-                    "message": "Cycle {} heartbeat: {}".format(cycle_num, reason),
+                    "message": "Cycle {} heartbeat: {}".format(visible_cycle, reason),
                     "ts": _now_str(),
-                })
+                }
+                self.log_messages.append(log_entry)
         self._broadcast("cycle", {
-            "cycle": cycle_num,
+            "cycle": visible_cycle,
             "scan_hits": 0,
             "signals": 0,
             "fills": 0,
@@ -372,6 +450,8 @@ class DashboardHub:
             "rejected": 0,
             "reason": reason,
         })
+        if log_entry is not None:
+            self._broadcast("log", log_entry)
 
     def on_news(self, symbol: str, score: float, headlines: list) -> None:
         """Store and broadcast news sentiment for a symbol."""
@@ -406,7 +486,21 @@ class DashboardHub:
             self.scanner_hits.clear()
             self.pnl_history.clear()
             self.symbol_status.clear()
+            self.missed_a_plus.clear()
             self.ai_analysis = {}
+            self.candidate_hydration = {
+                "queued": 0,
+                "hydrated": 0,
+                "skipped_fresh": 0,
+                "dropped": 0,
+                "batches": 0,
+                "pending": 0,
+                "paused_for_entry": False,
+                "last_batch_size": 0,
+                "last_loaded": 0,
+                "last_source": "",
+                "last_update": "",
+            }
         self._broadcast("daily_reset", {"ts": _now_str()})
 
     def add_log(self, level: str, message: str) -> None:
@@ -461,8 +555,11 @@ class DashboardHub:
                 "watchlist_scan": self.watchlist_scan,
                 "rt_movers": self.rt_movers,
                 "hod_momentum_alerts": list(self.hod_momentum_alerts),
+                "hot_watch": list(self.hot_watch),
+                "missed_a_plus": list(self.missed_a_plus),
                 "trading_watchlist": list(self.trading_watchlist),
                 "watchlist_pinned": list(self.watchlist_pinned),
+                "candidate_hydration": dict(self.candidate_hydration),
                 "news": dict(self.news_data),
                 "ai_analysis": dict(self.ai_analysis),
                 "trading_paused": self.trading_paused,

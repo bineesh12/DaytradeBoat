@@ -7,7 +7,7 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 
 from daytrading.data.float_checker import FloatChecker
-from daytrading.data.float_store import FloatRecord, FloatStore
+from daytrading.data.float_store import SQLITE_BUSY_TIMEOUT_MS, FloatRecord, FloatStore
 from daytrading.runner import AlpacaRunner
 
 
@@ -21,6 +21,19 @@ def test_upsert_and_get_round_trip() -> None:
         assert rec.float_shares == 15_000_000_000
         assert rec.outstanding_shares == 16_000_000_000
         assert rec.avg_volume == 50_000_000
+        store.close()
+
+
+def test_sqlite_connection_is_configured_for_shared_journal_db() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        db = os.path.join(tmp, "test.db")
+        store = FloatStore(db_path=db)
+
+        busy_timeout = store._conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        journal_mode = store._conn.execute("PRAGMA journal_mode").fetchone()[0]
+
+        assert busy_timeout == SQLITE_BUSY_TIMEOUT_MS
+        assert journal_mode.lower() == "wal"
         store.close()
 
 
@@ -141,3 +154,30 @@ def test_build_pool_falls_back_to_network_for_uncached_float() -> None:
     assert pool == ["LOW"]
     assert checker.cached_calls == ["LOW", "BIG"]
     assert checker.network_calls == ["LOW", "BIG"]
+
+
+def test_build_pool_does_not_refetch_obvious_large_cap_split_sanity() -> None:
+    class _Checker:
+        def __init__(self) -> None:
+            self.network_calls: list = []
+
+        def warm_from_store(self, symbols):
+            return len(symbols), 0
+
+        def get_float_cached(self, symbol):
+            return 1_500_000_000
+
+        def get_float(self, symbol):
+            self.network_calls.append(symbol)
+            return 5_000_000
+
+    checker = _Checker()
+    pool = AlpacaRunner.build_float_filtered_hod_pool(
+        [{"symbol": "ADR", "price": 10.0, "volume": 1_000_000}],
+        checker,
+        max_float=20_000_000,
+        pool_max=50,
+    )
+
+    assert pool == []
+    assert checker.network_calls == []

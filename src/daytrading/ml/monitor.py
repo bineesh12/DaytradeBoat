@@ -34,6 +34,8 @@ class ShadowEntry:
     ml_prob: float
     reject_time: float  # time.time()
     score: int
+    max_price: float = 0.0
+    min_price: float = 0.0
 
 
 @dataclass
@@ -44,6 +46,7 @@ class MLMonitorStats:
     entries_rejected_by_rules: int = 0
     shadow_correct: int = 0  # ML rejected and price went down (good)
     shadow_wrong: int = 0    # ML rejected but price went up (bad)
+    elite_false_rejects: int = 0
     model_disabled: bool = False
     disable_reason: str = ""
 
@@ -71,6 +74,7 @@ class MLMonitorStats:
             "entries_rejected_by_rules": self.entries_rejected_by_rules,
             "shadow_correct": self.shadow_correct,
             "shadow_wrong": self.shadow_wrong,
+            "elite_false_rejects": self.elite_false_rejects,
             "shadow_accuracy_pct": round(self.shadow_accuracy * 100, 1),
             "rejection_rate_pct": round(self.rejection_rate * 100, 1),
             "model_disabled": self.model_disabled,
@@ -85,6 +89,9 @@ class MLMonitor:
     MAX_REJECTION_RATE = 0.92  # Disable if rejecting > 92%
     MIN_SHADOW_ACCURACY = 0.35  # Disable if shadow accuracy < 35%
     MIN_SAMPLES_FOR_DISABLE = 25  # Need at least N scored entries before auto-disable
+    ELITE_FALSE_REJECT_MIN_SCORE = 95
+    ELITE_FALSE_REJECT_RUN_PCT = 8.0
+    ELITE_FALSE_REJECT_DISABLE_COUNT = 2
 
     def __init__(self) -> None:
         self._stats = MLMonitorStats()
@@ -140,6 +147,8 @@ class MLMonitor:
                 ml_prob=ml_prob,
                 reject_time=time.time(),
                 score=score,
+                max_price=price,
+                min_price=price,
             ))
 
     @staticmethod
@@ -172,7 +181,12 @@ class MLMonitor:
 
     def update_price(self, symbol: str, price: float) -> None:
         """Update latest price for shadow tracking."""
-        self._prices[symbol] = price
+        with self._lock:
+            self._prices[symbol] = price
+            for entry in self._shadow_entries:
+                if entry.symbol == symbol and price > 0:
+                    entry.max_price = max(entry.max_price or entry.price, price)
+                    entry.min_price = min(entry.min_price or entry.price, price)
 
     def check_shadow_outcomes(self) -> None:
         """Check if any shadow entries have expired (5 min) and score them."""
@@ -193,17 +207,28 @@ class MLMonitor:
                 continue
 
             price_change_pct = (current_price - entry.price) / entry.price * 100
+            max_run_pct = (entry.max_price - entry.price) / entry.price * 100
 
-            # ML was correct if price went DOWN (rejecting was right)
-            ml_was_correct = price_change_pct <= 0
+            # ML was wrong if the setup gave a usable scalp after the reject,
+            # even if it later faded before the 5-minute shadow label expires.
+            ml_was_correct = price_change_pct <= 0 and max_run_pct < 3.0
+            elite_false_reject = (
+                not ml_was_correct
+                and entry.score >= self.ELITE_FALSE_REJECT_MIN_SCORE
+                and max_run_pct >= self.ELITE_FALSE_REJECT_RUN_PCT
+            )
 
             with self._lock:
                 if ml_was_correct:
                     self._stats.shadow_correct += 1
                 else:
                     self._stats.shadow_wrong += 1
+                    if elite_false_reject:
+                        self._stats.elite_false_rejects += 1
 
-            self._log_shadow_result(entry, current_price, price_change_pct, ml_was_correct)
+            self._log_shadow_result(
+                entry, current_price, price_change_pct, max_run_pct, ml_was_correct,
+            )
 
         # Auto-disable check
         self._check_auto_disable()
@@ -215,6 +240,20 @@ class MLMonitor:
             total_scored = self._stats.total_scored
 
             # Need minimum samples before making decisions
+            if self._stats.elite_false_rejects >= self.ELITE_FALSE_REJECT_DISABLE_COUNT:
+                self._model_enabled = False
+                self._stats.model_disabled = True
+                self._stats.disable_reason = (
+                    "{} elite false ML rejects moved >= {:.0f}% after reject".format(
+                        self._stats.elite_false_rejects,
+                        self.ELITE_FALSE_REJECT_RUN_PCT,
+                    )
+                )
+                logger.warning(
+                    "ML MODEL AUTO-DISABLED: %s", self._stats.disable_reason,
+                )
+                return
+
             if total_scored < self.MIN_SAMPLES_FOR_DISABLE:
                 return
 
@@ -256,7 +295,7 @@ class MLMonitor:
 
     def _log_shadow_result(
         self, entry: ShadowEntry, final_price: float,
-        change_pct: float, ml_correct: bool,
+        change_pct: float, max_run_pct: float, ml_correct: bool,
     ) -> None:
         """Persist shadow result to file."""
         try:
@@ -266,6 +305,8 @@ class MLMonitor:
                 "symbol": entry.symbol,
                 "entry_price": entry.price,
                 "final_price": round(final_price, 4),
+                "max_price": round(entry.max_price, 4),
+                "max_run_pct": round(max_run_pct, 4),
                 "change_pct": round(change_pct, 4),
                 "ml_prob": entry.ml_prob,
                 "score": entry.score,

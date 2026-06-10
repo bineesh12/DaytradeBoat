@@ -12,6 +12,7 @@ Verifies:
 from __future__ import annotations
 
 import threading
+import logging
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Optional
@@ -20,6 +21,50 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from daytrading.models import Bar, Fill, Order, OrderStatus, PortfolioState, Side
+
+
+def test_alpaca_subscription_noise_filter_drops_info_chatter() -> None:
+    from daytrading.data.alpaca_feed import (
+        _AlpacaSubscriptionNoiseFilter,
+        configure_alpaca_stream_logging,
+    )
+
+    filt = _AlpacaSubscriptionNoiseFilter()
+    noisy = logging.LogRecord(
+        "alpaca.data.live.websocket",
+        logging.INFO,
+        __file__,
+        1,
+        "subscribed to trades: ['BATL']",
+        (),
+        None,
+    )
+    warning = logging.LogRecord(
+        "alpaca.data.live.websocket",
+        logging.WARNING,
+        __file__,
+        1,
+        "subscribed to trades failed",
+        (),
+        None,
+    )
+    useful = logging.LogRecord(
+        "alpaca.data.live.websocket",
+        logging.INFO,
+        __file__,
+        1,
+        "starting websocket connection",
+        (),
+        None,
+    )
+
+    assert filt.filter(noisy) is False
+    assert filt.filter(warning) is True
+    assert filt.filter(useful) is True
+
+    configure_alpaca_stream_logging()
+    logger = logging.getLogger("alpaca.data.live.websocket")
+    assert any(isinstance(f, _AlpacaSubscriptionNoiseFilter) for f in logger.filters)
 
 
 # ===================================================================
@@ -497,6 +542,7 @@ class TestAlpacaStreamFeed:
         feed._subscribed_quote_symbols = []
         feed._subscribed_trade_symbols = []
         feed._trade_filter_symbols = set()
+        feed._flush_retry_scheduled = False
         feed._handle_bar = MagicMock()
         feed._handle_quote = MagicMock()
         feed._handle_trade = MagicMock()
@@ -509,6 +555,72 @@ class TestAlpacaStreamFeed:
         assert sorted(feed._subscribed_trade_symbols) == ["IOTR", "NEXR"]
         assert feed._pending_trade_symbols == set()
         assert run_coro.called
+
+    def test_trade_filter_queues_symbols_before_stream_starts(self) -> None:
+        """Initial HOD tick symbols should not be lost before the WS loop starts."""
+        from daytrading.data.alpaca_feed import AlpacaStreamFeed
+
+        feed = AlpacaStreamFeed.__new__(AlpacaStreamFeed)
+        feed._running = False
+        feed._subscribe_all_trades = True
+        feed._sub_lock = threading.Lock()
+        feed._pending_trade_symbols = set()
+        feed._trade_filter_symbols = set()
+
+        feed.set_trade_filter({"FOXX", "MNTS"})
+
+        assert feed._trade_filter_symbols == {"FOXX", "MNTS"}
+        assert feed._pending_trade_symbols == {"FOXX", "MNTS"}
+
+    def test_flush_retries_when_stream_loop_not_ready(self) -> None:
+        """Pending 10s trade subscriptions must retry until the WS loop exists."""
+        from daytrading.data.alpaca_feed import AlpacaStreamFeed
+
+        class _Stream:
+            _loop = None
+
+        feed = AlpacaStreamFeed.__new__(AlpacaStreamFeed)
+        feed._stream = _Stream()
+        feed._running = True
+        feed._pending_trade_symbols = {"FOXX"}
+        feed._schedule_pending_subscription_flush = MagicMock()
+
+        feed.flush_pending_subscriptions()
+
+        assert feed._pending_trade_symbols == {"FOXX"}
+        feed._schedule_pending_subscription_flush.assert_called_once_with()
+
+    def test_start_schedules_pending_subscription_flush(self) -> None:
+        """Queued bar/quote/trade subscriptions should flush after WS startup."""
+        from daytrading.data.alpaca_feed import AlpacaStreamFeed
+
+        feed = AlpacaStreamFeed.__new__(AlpacaStreamFeed)
+        feed._stream = MagicMock()
+        feed._thread = None
+        feed._running = False
+        feed._schedule_pending_subscription_flush = MagicMock()
+
+        with patch("daytrading.data.alpaca_feed.threading.Thread") as thread_cls:
+            thread = MagicMock()
+            thread_cls.return_value = thread
+
+            feed.start(background=True)
+
+        thread.start.assert_called_once_with()
+        feed._schedule_pending_subscription_flush.assert_called_once_with()
+        assert feed._running is True
+
+    def test_add_trade_filter_symbols_merges_with_existing_filter(self) -> None:
+        """Hot symbols can be added to the trade tick stream immediately."""
+        from daytrading.data.alpaca_feed import AlpacaStreamFeed
+
+        feed = AlpacaStreamFeed.__new__(AlpacaStreamFeed)
+        feed._trade_filter_symbols = {"OLD"}
+        feed.set_trade_filter = MagicMock()
+
+        feed.add_trade_filter_symbols(["fofo", "STAK"])
+
+        feed.set_trade_filter.assert_called_once_with({"OLD", "FOFO", "STAK"})
 
 
 # ===================================================================

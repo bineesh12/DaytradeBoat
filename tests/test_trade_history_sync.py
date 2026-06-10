@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -51,6 +51,17 @@ def _runner_with_orders(orders: list[SimpleNamespace]) -> AlpacaRunner:
     return runner
 
 
+def _runner_for_fill_sync(orders: list[SimpleNamespace]) -> AlpacaRunner:
+    runner = _runner_with_orders(orders)
+    runner._pipeline = SimpleNamespace(
+        exit_manager=SimpleNamespace(tracked={}),
+        portfolio=SimpleNamespace(positions={}),
+    )
+    runner._record_trade_exit = lambda *args, **kwargs: None
+    runner._push_positions_from_alpaca = lambda: None
+    return runner
+
+
 def test_sync_trade_history_matches_canceled_buy_with_fill_to_later_sell() -> None:
     ts = datetime.now(timezone.utc).replace(hour=13, minute=30, second=0, microsecond=0)
     # Alpaca returns closed orders newest first; runner reverses to process oldest first.
@@ -86,3 +97,25 @@ def test_sync_trade_history_does_not_report_zero_pnl_for_unmatched_sell() -> Non
     assert exit_trade.pnl is None
     assert runner._hub.winning_trades == 0
     assert runner._hub.losing_trades == 0
+
+
+def test_check_new_fills_ignores_orders_before_current_session(monkeypatch) -> None:
+    now_et = datetime(2026, 6, 3, 5, 0, tzinfo=timezone(timedelta(hours=-4)))
+    yesterday = datetime(2026, 6, 2, 17, 32, tzinfo=timezone.utc)
+    orders = [
+        _order(
+            order_id="old-buy",
+            side="buy",
+            status="filled",
+            qty=100,
+            price=5.00,
+            ts=yesterday,
+        ),
+    ]
+    runner = _runner_for_fill_sync(orders)
+    monkeypatch.setattr(AlpacaRunner, "_now_et", classmethod(lambda cls: now_et))
+
+    runner._check_new_fills()
+
+    assert list(runner._hub.trades) == []
+    assert runner._last_synced_order_ids == {"old-buy"}

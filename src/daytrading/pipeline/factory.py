@@ -12,7 +12,12 @@ from daytrading.classifier.regime import MarketRegimeClassifier
 from daytrading.classifier.router import AdaptiveRouter, StyleConfig
 from daytrading.execution.broker import PaperBroker
 from daytrading.exits.manager import ExitManager
-from daytrading.exits.scaler import ReentryDetector, ReentryConfig
+from daytrading.exits.scaler import (
+    PositionScaler,
+    ReentryDetector,
+    ReentryConfig,
+    ScaleUpConfig,
+)
 from daytrading.pipeline.engine import TradingPipeline
 from daytrading.scanner.scalping.momentum_burst import MomentumBurstScanner
 from daytrading.scanner.scalping.bull_flag import BullFlagScanner
@@ -22,6 +27,12 @@ from daytrading.scanner.scalping.opening_range_breakout import OpeningRangeBreak
 from daytrading.scanner.scalping.hod_reclaim import HODReclaimScanner
 from daytrading.scanner.scalping.pullback_base import PullbackBaseScanner
 from daytrading.scanner.scalping.abc_continuation import ABCContinuationScanner
+from daytrading.scanner.scalping.first_pullback_reclaim import FirstPullbackReclaimScanner
+from daytrading.scanner.scalping.level_breakout_reclaim import LevelBreakoutReclaimScanner
+from daytrading.scanner.scalping.level_breakout_watch import LevelBreakoutWatchScanner
+from daytrading.scanner.scalping.runner_reclaim_continuation import RunnerReclaimContinuationScanner
+from daytrading.scanner.scalping.shallow_stair_continuation import ShallowStairContinuationScanner
+from daytrading.scanner.scalping.early_vwap_reclaim_scout import EarlyVWAPReclaimScoutScanner
 from daytrading.strategy.scalping.momentum_pattern import MomentumPatternVerifier
 from daytrading.models import PortfolioState, TradingStyle
 
@@ -84,7 +95,9 @@ def create_scalping_pipeline(
     if portfolio is None:
         portfolio = PortfolioState(cash=initial_cash)
 
-    # --- Scanners (Warrior Trading: Bull Flag + Flat Top Breakout) ---
+    # --- Scanners ---
+    # All scanners stay active for watch/shadow learning. Only the live
+    # verifier map below can turn a hit into an order candidate.
     momentum_scanner = MomentumBurstScanner(
         min_burst_pct=min_burst_pct,
         burst_period=burst_period,
@@ -125,6 +138,30 @@ def create_scalping_pipeline(
         min_price=min_price,
         max_price=max_price,
     )
+    first_pullback_scanner = FirstPullbackReclaimScanner(
+        min_price=min_price,
+        max_price=max_price,
+    )
+    level_breakout_scanner = LevelBreakoutReclaimScanner(
+        min_price=min_price,
+        max_price=max_price,
+    )
+    level_breakout_watch_scanner = LevelBreakoutWatchScanner(
+        min_price=min_price,
+        max_price=max_price,
+    )
+    runner_reclaim_scanner = RunnerReclaimContinuationScanner(
+        min_price=min_price,
+        max_price=max_price,
+    )
+    shallow_stair_scanner = ShallowStairContinuationScanner(
+        min_price=min_price,
+        max_price=max_price,
+    )
+    early_vwap_reclaim_scanner = EarlyVWAPReclaimScoutScanner(
+        min_price=min_price,
+        max_price=max_price,
+    )
 
     # --- Verifier (Warrior Trading momentum pattern: 2:1 R/R, pattern-based stops) ---
     pattern_verifier = MomentumPatternVerifier(
@@ -153,21 +190,29 @@ def create_scalping_pipeline(
     all_scanners = [
         momentum_scanner, bull_flag_scanner, flat_top_scanner,
         vwap_pullback_scanner, orb_scanner, hod_scanner,
-        pullback_base_scanner, abc_scanner,
+        pullback_base_scanner, abc_scanner, first_pullback_scanner,
+        level_breakout_scanner, level_breakout_watch_scanner,
+        runner_reclaim_scanner,
+        shallow_stair_scanner,
+        early_vwap_reclaim_scanner,
     ]
+
+    live_verifiers = {
+        "vwap_pullback": pattern_verifier,
+        "hod_reclaim": pattern_verifier,
+        "pullback_base": pattern_verifier,
+        "abc_continuation": pattern_verifier,
+        "first_pullback_reclaim": pattern_verifier,
+        "level_breakout_reclaim": pattern_verifier,
+        "level_breakout_watch": pattern_verifier,
+        "runner_reclaim_continuation": pattern_verifier,
+        "shallow_stair_continuation": pattern_verifier,
+        "early_vwap_reclaim_scout": pattern_verifier,
+    }
 
     scalp_config = StyleConfig(
         scanners=all_scanners,
-        verifiers={
-            "momentum_burst": pattern_verifier,
-            "bull_flag": pattern_verifier,
-            "flat_top_breakout": pattern_verifier,
-            "vwap_pullback": pattern_verifier,
-            "opening_range_breakout": pattern_verifier,
-            "hod_reclaim": pattern_verifier,
-            "pullback_base": pattern_verifier,
-            "abc_continuation": pattern_verifier,
-        },
+        verifiers=live_verifiers,
     )
 
     router = AdaptiveRouter(
@@ -178,34 +223,50 @@ def create_scalping_pipeline(
     # --- Broker ---
     broker = PaperBroker(commission_per_share=commission_per_share)
 
-    # --- Re-entry detector DISABLED ---
-    # The logic has bugs (wrong values passed to record_full_exit,
-    # entry_price vs exit_price confusion). Disable until properly fixed.
-    # reentry_detector = ReentryDetector(ReentryConfig(
-    #     enabled=True,
-    #     cooldown_seconds=30.0,
-    #     max_reentries=2,
-    #     reentry_size_pct=0.5,
-    # ))
+    # --- Re-entry detector ---
+    # After a full profitable exit, keep watching the same runner for a
+    # pullback + reclaim. This helps avoid missing VERU-style second legs.
+    reentry_detector = ReentryDetector(ReentryConfig(
+        enabled=True,
+        cooldown_seconds=60.0,
+        max_reentries=2,
+        reentry_size_pct=0.35,
+        min_continuation_cents=5.0,
+        pullback_max_cents=25.0,
+        stop_cents=5.0,
+        trail_cents=3.0,
+        max_hold_seconds=120,
+        require_clean_continuation_profile=True,
+        min_pullback_depth_pct=1.0,
+        max_pullback_depth_pct=10.0,
+        max_base_range_pct=7.0,
+        max_reentry_risk_pct=2.5,
+    ))
+    runner_readd_scaler = PositionScaler(ScaleUpConfig(
+        max_scale_ups=2,
+        size_decay=0.6,
+        min_profit_cents=8.0,
+        pullback_pct=0.8,
+        bounce_pct=0.45,
+        stop_advance_cents=3.0,
+        require_protected_runner=True,
+        require_clean_pullback_profile=True,
+        min_pullback_depth_pct=1.0,
+        max_pullback_depth_pct=10.0,
+        max_base_range_pct=7.0,
+        max_add_risk_pct=2.5,
+    ))
 
     # --- Pipeline ---
     return TradingPipeline(
         scanners=all_scanners,
-        verifiers={
-            "momentum_burst": pattern_verifier,
-            "bull_flag": pattern_verifier,
-            "flat_top_breakout": pattern_verifier,
-            "vwap_pullback": pattern_verifier,
-            "opening_range_breakout": pattern_verifier,
-            "hod_reclaim": pattern_verifier,
-            "pullback_base": pattern_verifier,
-            "abc_continuation": pattern_verifier,
-        },
+        verifiers=live_verifiers,
         broker=broker,
         portfolio=portfolio,
         exit_manager=ExitManager(max_unrealized_loss=pattern_max_dollar_risk),
         router=router,
-        reentry_detector=None,
+        scaler=runner_readd_scaler,
+        reentry_detector=reentry_detector,
         max_positions=max_positions,
         max_position_shares=max_position_shares,
         max_order_shares=max_order_shares,

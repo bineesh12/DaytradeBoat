@@ -153,3 +153,36 @@ class TestBuildFloatPool:
 
         assert "MTEK" in pool
         assert "NOISE" not in pool
+
+    def test_split_sanity_refetch_has_cooldown(self) -> None:
+        class _Checker:
+            def __init__(self) -> None:
+                self.network_calls = 0
+
+            def warm_from_store(self, symbols):
+                return 1, 0
+
+            def get_float_cached(self, symbol):
+                return 600_000_000
+
+            def get_float(self, symbol):
+                self.network_calls += 1
+                return 600_000_000
+
+        checker = _Checker()
+        candidates = [
+            {"symbol": "SPLTCOOL", "price": 20.0, "change_pct": 10.0, "volume": 1_000_000},
+        ]
+
+        AlpacaRunner.build_float_filtered_hod_pool(
+            candidates,
+            checker,
+            split_sanity_cooldown_sec=3600.0,
+        )
+        AlpacaRunner.build_float_filtered_hod_pool(
+            candidates,
+            checker,
+            split_sanity_cooldown_sec=3600.0,
+        )
+
+        assert checker.network_calls == 1

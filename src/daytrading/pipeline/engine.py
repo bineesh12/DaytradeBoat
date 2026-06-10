@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from daytrading.classifier.regime import MarketRegimeClassifier
 from daytrading.classifier.router import AdaptiveRouter, StyleConfig
+from daytrading.analytics.missed_a_plus import MissedAPlusTracker
 from daytrading.data.news_checker import NewsChecker
 from daytrading.execution.broker import Broker, apply_fill
 from daytrading.exits.manager import ExitManager
@@ -28,6 +29,8 @@ from daytrading.exits.scaler import PositionScaler, ReentryDetector
 from daytrading.risk.manager import allow_order
 from daytrading.risk.guards import TradeGuard
 from daytrading.scanner.base import Scanner
+from daytrading.strategy.entry_guard import check_entry_quality
+from daytrading.strategy.entry_policy import EntryDecision, EntryPolicy
 from daytrading.strategy.verifier import StrategyVerifier
 from daytrading.models import (
     Bar,
@@ -48,6 +51,36 @@ from daytrading.models import (
 logger = logging.getLogger(__name__)
 
 
+LIVE_A_PLUS_SCANNERS = frozenset({
+    "vwap_pullback",
+    "abc_continuation",
+    "first_pullback_reclaim",
+    "hod_reclaim",
+    "pullback_base",
+    "level_breakout_reclaim",
+    "runner_reclaim_continuation",
+    "shallow_stair_continuation",
+    "early_vwap_reclaim_scout",
+})
+
+WATCH_ONLY_SCANNERS = frozenset({
+    "momentum_burst",
+    "bull_flag",
+    "flat_top_breakout",
+    "opening_range_breakout",
+    "level_breakout_watch",
+})
+
+
+@dataclass
+class _RejectCooldown:
+    reason: str
+    ts: datetime
+    price: float = 0.0
+    volume: float = 0.0
+    ttl_seconds: float = 60.0
+
+
 @dataclass
 class PipelineResult:
     """Result of one pipeline cycle."""
@@ -65,6 +98,7 @@ class PipelineResult:
     entry_strategies: Dict[str, str] = field(default_factory=dict)
     exit_reasons: Dict[str, str] = field(default_factory=dict)
     deferred_signals: List[TradeSignal] = field(default_factory=list)
+    entry_decisions: List[Dict[str, Any]] = field(default_factory=list)
 
 
 class TradingPipeline:
@@ -106,9 +140,17 @@ class TradingPipeline:
         self._exit_cooldowns: Dict[str, datetime] = {}
         self._cooldown_seconds: int = 300  # 5 min cooldown after exiting a stock
         self._scan_rejections: Dict[str, str] = {}  # symbol -> last rejection reason
+        self._reject_cooldowns: Dict[str, _RejectCooldown] = {}
         self._trade_guard = TradeGuard()
+        self._entry_policy = EntryPolicy(
+            guard=lambda *args, **kwargs: check_entry_quality(*args, **kwargs),
+        )
+        self._missed_a_plus = MissedAPlusTracker()
         self._enable_daily_loser_blacklist = enable_daily_loser_blacklist
-        self._daily_losers: set = set()  # symbols that lost money today — no re-entry
+        self._daily_losers: set = set()  # symbols blocked from re-entry today
+        self._daily_loss_counts: Dict[str, int] = {}
+        self._daily_loser_blacklist_min_loss: float = 10.0
+        self._daily_loser_blacklist_max_losses: int = 2
         self._symbol_entry_counts: Dict[str, int] = {}  # per-symbol entries this session
         self._max_entries_per_symbol: int = 3
         self._daily_pnl: float = 0.0  # running realized P&L for the day
@@ -118,16 +160,77 @@ class TradingPipeline:
         self._bar_aggregator = None   # set by runner for 5m context
         self._require_hod_alert_for_entry: bool = False
         self._hod_active_checker = None  # Callable[[str], bool] set by runner
+        self._hod_entry_bypass_checker = None
+
+    def _append_entry_decision(
+        self,
+        result: PipelineResult,
+        decision: EntryDecision,
+    ) -> None:
+        result.entry_decisions.append(decision.to_payload())
+
+    def _append_entry_reject(
+        self,
+        result: PipelineResult,
+        *,
+        symbol: str,
+        stage: str,
+        reason: str,
+        hit: Optional[ScanResult] = None,
+        signal: Optional[TradeSignal] = None,
+        price: float = 0.0,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if signal is None and hit is not None:
+            signal = TradeSignal(
+                symbol=symbol,
+                action=SignalAction.ENTER_LONG,
+                quantity=0,
+                entry_price=price or self._hit_price_volume(hit)[0],
+                reason=reason,
+                scan_result=hit,
+            )
+        self._append_entry_decision(
+            result,
+            self._entry_policy.decision(
+                symbol=symbol,
+                stage=stage,
+                passed=False,
+                reason=reason,
+                blocked_layer=stage,
+                signal=signal,
+                price=price,
+                metadata=metadata,
+            ),
+        )
 
     def set_hod_entry_gate(
         self,
         checker,
         *,
         require: bool = True,
+        bypass_checker=None,
     ) -> None:
         """Only allow new entries when checker(symbol) is True."""
         self._hod_active_checker = checker
         self._require_hod_alert_for_entry = require
+        self._hod_entry_bypass_checker = bypass_checker
+
+    @staticmethod
+    def _setup_tier(hit: ScanResult) -> str:
+        scanner = hit.scanner_name
+        pattern = str(hit.criteria.get("pattern") or "")
+        if scanner in LIVE_A_PLUS_SCANNERS or pattern in LIVE_A_PLUS_SCANNERS:
+            return "A+ setup"
+        if scanner in WATCH_ONLY_SCANNERS or pattern in WATCH_ONLY_SCANNERS:
+            return "watch only"
+        return "watch only"
+
+    @staticmethod
+    def _watch_only_reason(hit: ScanResult) -> str:
+        return "watch only: {} collecting data, not live A+ setup".format(
+            hit.scanner_name,
+        )
 
     @property
     def portfolio(self) -> PortfolioState:
@@ -149,6 +252,13 @@ class TradingPipeline:
     def scan_rejections(self) -> Dict[str, str]:
         return dict(self._scan_rejections)
 
+    @property
+    def missed_a_plus(self) -> MissedAPlusTracker:
+        return self._missed_a_plus
+
+    def missed_a_plus_report(self, limit: int = 30) -> List[Dict[str, Any]]:
+        return self._missed_a_plus.report(limit=limit)
+
     @staticmethod
     def _get_last_reject(symbol: str, verifier: Any) -> Optional[str]:
         """Try to extract the last rejection reason from verifier logs."""
@@ -158,6 +268,103 @@ class TradingPipeline:
     def set_news_checker(self, checker: NewsChecker) -> None:
         """Attach a news checker for pre-trade sentiment screening."""
         self._news_checker = checker
+
+    @staticmethod
+    def _hit_price_volume(hit: ScanResult) -> tuple[float, float]:
+        price = float(
+            hit.criteria.get("close")
+            or hit.criteria.get("price")
+            or hit.criteria.get("entry_price")
+            or 0.0
+        )
+        volume = float(hit.criteria.get("volume") or 0.0)
+        if hit.bars:
+            latest = hit.bars[-1]
+            price = price or float(latest.close or 0.0)
+            volume = volume or float(latest.volume or 0.0)
+        return price, volume
+
+    @staticmethod
+    def _reject_ttl_seconds(reason: str) -> float:
+        text = reason.lower()
+        if "stale data" in text:
+            return 0.0
+        if "watch only" in text:
+            return 0.0
+        if "unknown pattern: level_breakout_watch" in text:
+            return 0.0
+        if "thin sub-$5 liquidity" in text or "too illiquid" in text:
+            return 180.0
+        if "tape too slow" in text:
+            return 120.0
+        if "below vwap" in text or "not strong above vwap" in text:
+            return 45.0
+        if "price $" in text and "outside range" in text:
+            return 300.0
+        if "not enough movement" in text:
+            return 120.0
+        return 60.0
+
+    @staticmethod
+    def _materially_changed(
+        old_price: float,
+        old_volume: float,
+        new_price: float,
+        new_volume: float,
+    ) -> bool:
+        if old_price > 0 and new_price > 0:
+            if abs(new_price - old_price) / old_price >= 0.01:
+                return True
+        if old_volume > 0 and new_volume > 0:
+            if new_volume >= old_volume * 1.25:
+                return True
+        return False
+
+    @staticmethod
+    def _cooldown_pattern(hit: ScanResult) -> str:
+        pattern = str(hit.criteria.get("pattern") or "").strip()
+        return pattern or hit.scanner_name
+
+    def _cooldown_key(self, hit: ScanResult) -> str:
+        return "{}:{}".format(hit.symbol, self._cooldown_pattern(hit))
+
+    def _reject_cooldown_reason(self, hit: ScanResult, now: datetime) -> Optional[str]:
+        cd = self._reject_cooldowns.get(self._cooldown_key(hit))
+        if cd is None or cd.ttl_seconds <= 0:
+            return None
+        elapsed = (now - cd.ts).total_seconds()
+        if elapsed >= cd.ttl_seconds:
+            return None
+        price, volume = self._hit_price_volume(hit)
+        if self._materially_changed(cd.price, cd.volume, price, volume):
+            return None
+        return "cached reject: {} ({:.0f}s left)".format(
+            cd.reason,
+            max(0.0, cd.ttl_seconds - elapsed),
+        )
+
+    def _record_reject_cooldown(
+        self,
+        hit: ScanResult,
+        reason: str,
+        now: datetime,
+    ) -> None:
+        ttl = self._reject_ttl_seconds(reason)
+        key = self._cooldown_key(hit)
+        if ttl <= 0:
+            self._reject_cooldowns.pop(key, None)
+            return
+        price, volume = self._hit_price_volume(hit)
+        self._reject_cooldowns[key] = _RejectCooldown(
+            reason=reason,
+            ts=now,
+            price=price,
+            volume=volume,
+            ttl_seconds=ttl,
+        )
+
+    def _clear_reject_cooldown(self, hit: ScanResult) -> None:
+        self._reject_cooldowns.pop(self._cooldown_key(hit), None)
 
     def set_cooldown(self, symbol: str) -> None:
         """Record an exit time for cooldown enforcement."""
@@ -176,11 +383,23 @@ class TradingPipeline:
         trade_pnl = (exit_price - entry_price) * quantity
         self._daily_pnl += trade_pnl
         if trade_pnl < 0 and self._enable_daily_loser_blacklist:
-            self._daily_losers.add(symbol)
-            logger.info(
-                "DAILY BLACKLIST %s: lost $%.2f — no re-entry today",
-                symbol, abs(trade_pnl),
-            )
+            loss_amount = abs(trade_pnl)
+            loss_count = self._daily_loss_counts.get(symbol, 0) + 1
+            self._daily_loss_counts[symbol] = loss_count
+            if (
+                loss_amount >= self._daily_loser_blacklist_min_loss
+                or loss_count >= self._daily_loser_blacklist_max_losses
+            ):
+                self._daily_losers.add(symbol)
+                logger.info(
+                    "DAILY BLACKLIST %s: loss #%d, lost $%.2f - no re-entry today",
+                    symbol, loss_count, loss_amount,
+                )
+            else:
+                logger.info(
+                    "DAILY LOSS %s: loss #%d, lost $%.2f - not blacklisted yet",
+                    symbol, loss_count, loss_amount,
+                )
         # Shorter cooldown for profitable exits to allow pullback re-entry
         if trade_pnl > 0:
             self._exit_cooldowns[symbol] = datetime.now(timezone.utc) - timedelta(
@@ -235,6 +454,32 @@ class TradingPipeline:
         hit: Optional[ScanResult] = None,
     ) -> None:
         try:
+            tracker_hit = hit
+            if tracker_hit is None:
+                bars = list(universe.get(symbol, []))
+                if bars:
+                    tracker_hit = ScanResult(
+                        symbol=symbol,
+                        scanner_name=scanner or "unknown",
+                        ts=bars[-1].ts,
+                        score=0.0,
+                        criteria={
+                            "pattern": scanner or "unknown",
+                            "close": fallback_price or bars[-1].close,
+                        },
+                        bars=bars,
+                    )
+            self._missed_a_plus.record_blocked(
+                layer=self._blocked_layer(reason),
+                reason=reason,
+                universe=universe,
+                quotes=quotes,
+                hit=tracker_hit,
+                fallback_price=fallback_price,
+            )
+        except Exception:
+            pass
+        try:
             from daytrading.ml.shadow_collector import log_missed_opportunity
             bars = list(hit.bars) if hit is not None and hit.bars else universe.get(symbol, [])
             quote = self._latest_quote(quotes, symbol)
@@ -256,6 +501,23 @@ class TradingPipeline:
         except Exception:
             pass
 
+    @staticmethod
+    def _blocked_layer(reason: str) -> str:
+        text = str(reason or "").lower()
+        if "ml model" in text or "ml low confidence" in text:
+            return "ml"
+        if "final entry guard" in text or "entry guard" in text or "entry score" in text:
+            return "entry_guard"
+        if "r:r" in text or "risk" in text or "position" in text or "risk cap" in text:
+            return "risk"
+        if "order_" in text or "no bar data" in text:
+            return "order"
+        if "watch only" in text or "did not pass verifier" in text:
+            return "verifier"
+        if "hod momentum" in text or "cooldown" in text or "blacklist" in text:
+            return "risk"
+        return "scanner"
+
     def _log_shadow_pullback(
         self,
         hit: ScanResult,
@@ -264,8 +526,14 @@ class TradingPipeline:
     ) -> None:
         try:
             pattern = str(hit.criteria.get("pattern", ""))
-            if hit.scanner_name not in ("pullback_base", "vwap_pullback", "hod_reclaim", "abc_continuation") and (
-                pattern not in ("pullback_base", "vwap_pullback", "hod_reclaim", "abc_continuation")
+            if hit.scanner_name not in (
+                "pullback_base", "vwap_pullback", "hod_reclaim",
+                "abc_continuation", "early_vwap_reclaim_scout",
+            ) and (
+                pattern not in (
+                    "pullback_base", "vwap_pullback", "hod_reclaim",
+                    "abc_continuation", "early_vwap_reclaim_scout",
+                )
             ):
                 return
             from daytrading.ml.shadow_collector import log_pullback_candidate
@@ -316,6 +584,7 @@ class TradingPipeline:
     ) -> PipelineResult:
         """Run one full cycle: classify → exits → scan → verify → execute."""
         result = PipelineResult()
+        self._missed_a_plus.update_prices(universe, now=now)
 
         if now is None:
             for bars in universe.values():
@@ -335,6 +604,17 @@ class TradingPipeline:
             for sym, brs in universe.items():
                 if len(brs) >= 2:
                     self._exit_manager.update_bar_close(sym, brs[-2].close, brs[-2].open, brs[-2].volume)
+            pre_exit_positions = {
+                sym: {
+                    "side": pos.side,
+                    "quantity": pos.quantity,
+                    "remaining_qty": pos.remaining_qty,
+                    "entry_price": pos.entry_price,
+                    "highest_price": pos.highest_price,
+                    "lowest_price": pos.lowest_price,
+                }
+                for sym, pos in self._exit_manager.tracked.items()
+            }
             exit_signals = self._exit_manager.check_exits(prices, now)
             for exit_sig in exit_signals:
                 exit_order = self._signal_to_order(exit_sig)
@@ -362,6 +642,36 @@ class TradingPipeline:
                         exit_sig.symbol, fill.quantity, fill.price, exit_sig.reason,
                         self._cooldown_seconds, self._daily_pnl,
                     )
+                    if self._reentry is not None:
+                        remaining_after = 0.0
+                        live_tracked = self._exit_manager.tracked.get(exit_sig.symbol)
+                        if live_tracked is not None:
+                            remaining_after = live_tracked.remaining_qty
+                        if remaining_after <= 0:
+                            snapshot = pre_exit_positions.get(exit_sig.symbol, {})
+                            entry_price = float(snapshot.get("entry_price") or entry_px or fill.price)
+                            original_qty = float(
+                                self._original_sizes.get(exit_sig.symbol)
+                                or snapshot.get("quantity")
+                                or fill.quantity
+                            )
+                            self._original_sizes[exit_sig.symbol] = original_qty
+                            self._reentry.record_full_exit(
+                                symbol=exit_sig.symbol,
+                                side=snapshot.get(
+                                    "side",
+                                    Side.BUY if exit_sig.action is SignalAction.EXIT_LONG else Side.SELL,
+                                ),
+                                exit_price=fill.price,
+                                exit_ts=now,
+                                highest_price=max(
+                                    float(snapshot.get("highest_price") or fill.price),
+                                    fill.price,
+                                ),
+                                entry_price=entry_price,
+                            )
+                            if self._scaler:
+                                self._scaler.clear(exit_sig.symbol)
                 else:
                     tracked_pos = self._exit_manager._positions.get(exit_sig.symbol)
                     if tracked_pos and tracked_pos.sold_half and tracked_pos.remaining_qty > 0:
@@ -373,36 +683,57 @@ class TradingPipeline:
                             "ROLLBACK half-sell %s: restored qty=%d, stop=%.4f",
                             exit_sig.symbol, int(tracked_pos.remaining_qty), tracked_pos.stop_loss,
                         )
-
-            # track fully closed positions for re-entry
-            if self._reentry is not None:
-                for exit_sig in exit_signals:
-                    sym = exit_sig.symbol
-                    tracked = self._exit_manager.tracked
-                    if sym not in tracked:
-                        pos_data = self._exit_manager.tracked  # already removed
-                        self._reentry.record_full_exit(
-                            symbol=sym,
-                            side=Side.BUY if exit_sig.action is SignalAction.EXIT_LONG else Side.SELL,
-                            exit_price=exit_sig.entry_price,
-                            exit_ts=now,
-                            highest_price=exit_sig.entry_price,
-                            entry_price=self._original_sizes.get(sym, exit_sig.entry_price),
-                        )
-                        if self._scaler:
-                            self._scaler.clear(sym)
-
         # --- Step 0b: scale-up check on winning positions ---
         if self._scaler is not None and now is not None:
             scale_signals = self._scaler.check_scale_ups(
                 self._exit_manager, prices, universe,
             )
             for scale_sig in scale_signals:
+                final_quality_reject = self._final_entry_quality_reject(
+                    scale_sig, universe=universe, quotes=quotes,
+                    result=result, stage="scale_up_final",
+                )
+                if final_quality_reject:
+                    result.rejected_orders += 1
+                    result.rejection_details.append({
+                        "symbol": scale_sig.symbol,
+                        "reason": "final entry guard: {}".format(final_quality_reject),
+                    })
+                    self._scan_rejections[scale_sig.symbol] = "final entry guard: {}".format(
+                        final_quality_reject,
+                    )
+                    logger.info(
+                        "FINAL ENTRY GUARD REJECT scale-up %s: %s",
+                        scale_sig.symbol, final_quality_reject,
+                    )
+                    continue
                 scale_order = self._signal_to_order(scale_sig)
                 if scale_order is None:
                     continue
                 bar = self._latest_bar(universe, scale_sig.symbol)
                 if bar is None:
+                    continue
+                ok = allow_order(
+                    scale_order, bar, self._portfolio,
+                    max_position_shares=self._max_position_shares,
+                    max_order_shares=self._max_order_shares,
+                )
+                if not ok:
+                    logger.info("Risk check rejected scale-up for %s", scale_sig.symbol)
+                    result.rejected_orders += 1
+                    result.rejection_details.append({
+                        "symbol": scale_sig.symbol,
+                        "reason": "scale_up_position_risk_limit",
+                    })
+                    continue
+                if self._execution_timer is not None:
+                    result.deferred_signals.append(scale_sig)
+                    result.entry_strategies[scale_sig.symbol] = "runner_readd"
+                    logger.info(
+                        "DEFERRED SCALE-UP %s %.0f @ %.4f → waiting for 10s re-add confirmation | %s",
+                        scale_sig.symbol, scale_sig.quantity,
+                        scale_sig.entry_price, scale_sig.reason,
+                    )
                     continue
                 fill, status = self._broker.submit(scale_order, bar, self._portfolio)
                 if status is OrderStatus.FILLED and fill is not None:
@@ -424,11 +755,38 @@ class TradingPipeline:
             for re_sig in reentry_signals:
                 if self._at_position_limit():
                     break
+                final_quality_reject = self._final_entry_quality_reject(
+                    re_sig, universe=universe, quotes=quotes,
+                    result=result, stage="reentry_final",
+                )
+                if final_quality_reject:
+                    result.rejected_orders += 1
+                    result.rejection_details.append({
+                        "symbol": re_sig.symbol,
+                        "reason": "final entry guard: {}".format(final_quality_reject),
+                    })
+                    self._scan_rejections[re_sig.symbol] = "final entry guard: {}".format(
+                        final_quality_reject,
+                    )
+                    logger.info(
+                        "FINAL ENTRY GUARD REJECT re-entry %s: %s",
+                        re_sig.symbol, final_quality_reject,
+                    )
+                    continue
                 re_order = self._signal_to_order(re_sig)
                 if re_order is None:
                     continue
                 bar = self._latest_bar(universe, re_sig.symbol)
                 if bar is None:
+                    continue
+                if self._execution_timer is not None:
+                    result.deferred_signals.append(re_sig)
+                    result.entry_strategies[re_sig.symbol] = "abc_reentry"
+                    logger.info(
+                        "DEFERRED RE-ENTRY %s %.0f @ %.4f → waiting for 10s confirmation | %s",
+                        re_sig.symbol, re_sig.quantity,
+                        re_sig.entry_price, re_sig.reason,
+                    )
                     continue
                 fill, status = self._broker.submit(re_order, bar, self._portfolio)
                 if status is OrderStatus.FILLED and fill is not None:
@@ -491,9 +849,28 @@ class TradingPipeline:
 
                 result.scan_hits.extend(style_hits)
                 for hit in style_hits:
+                    hit.criteria["setup_tier"] = self._setup_tier(hit)
+                    cooldown_reason = self._reject_cooldown_reason(hit, now or datetime.now(timezone.utc))
+                    if cooldown_reason is not None:
+                        self._scan_rejections[hit.symbol] = cooldown_reason
+                        continue
                     self._log_shadow_pullback(hit, universe, quotes)
                     verifier = cfg.verifiers.get(hit.scanner_name)
                     if verifier is None:
+                        reason = self._watch_only_reason(hit)
+                        self._scan_rejections[hit.symbol] = reason
+                        self._append_entry_reject(
+                            result, symbol=hit.symbol, stage="scanner",
+                            reason=reason, hit=hit,
+                        )
+                        self._log_shadow_missed(
+                            symbol=hit.symbol,
+                            reason=reason,
+                            universe=universe,
+                            quotes=quotes,
+                            scanner=hit.scanner_name,
+                            hit=hit,
+                        )
                         continue
                     signal = verifier.verify(hit, self._portfolio)
                     if signal is None:
@@ -501,6 +878,15 @@ class TradingPipeline:
                         if reject is None:
                             reject = self._get_last_reject(hit.symbol, verifier)
                         self._scan_rejections[hit.symbol] = reject or "did not pass verifier"
+                        self._record_reject_cooldown(
+                            hit,
+                            self._scan_rejections[hit.symbol],
+                            now or datetime.now(timezone.utc),
+                        )
+                        self._append_entry_reject(
+                            result, symbol=hit.symbol, stage="verifier",
+                            reason=self._scan_rejections[hit.symbol], hit=hit,
+                        )
                         self._log_shadow_missed(
                             symbol=hit.symbol,
                             reason=self._scan_rejections[hit.symbol],
@@ -512,6 +898,12 @@ class TradingPipeline:
                         continue
                     if signal.action is SignalAction.SKIP:
                         result.skipped.append(signal)
+                        self._append_entry_reject(
+                            result, symbol=signal.symbol, stage="strategy_skip",
+                            reason=signal.reason or "strategy skip",
+                            signal=signal,
+                            price=signal.entry_price,
+                        )
                         self._log_shadow_missed(
                             symbol=signal.symbol,
                             reason=signal.reason or "strategy skip",
@@ -534,7 +926,18 @@ class TradingPipeline:
                             trend_strength=regime.trend_strength,
                         )
                     self._scan_rejections.pop(hit.symbol, None)
+                    self._clear_reject_cooldown(hit)
                     result.signals.append(signal)
+                    self._append_entry_decision(
+                        result,
+                        self._entry_policy.decision(
+                            symbol=signal.symbol,
+                            stage="verifier",
+                            passed=True,
+                            signal=signal,
+                            price=signal.entry_price,
+                        ),
+                    )
         else:
             # no router → run all scanners against full universe (legacy mode)
             for scanner in self._scanners:
@@ -542,14 +945,42 @@ class TradingPipeline:
                 result.scan_hits.extend(hits)
                 logger.info("Scanner %s found %d hits", scanner.name, len(hits))
             for hit in result.scan_hits:
+                hit.criteria["setup_tier"] = self._setup_tier(hit)
+                cooldown_reason = self._reject_cooldown_reason(hit, now or datetime.now(timezone.utc))
+                if cooldown_reason is not None:
+                    self._scan_rejections[hit.symbol] = cooldown_reason
+                    continue
                 self._log_shadow_pullback(hit, universe, quotes)
                 verifier = self._verifiers.get(hit.scanner_name)
                 if verifier is None:
+                    reason = self._watch_only_reason(hit)
+                    self._scan_rejections[hit.symbol] = reason
+                    self._append_entry_reject(
+                        result, symbol=hit.symbol, stage="scanner",
+                        reason=reason, hit=hit,
+                    )
+                    self._log_shadow_missed(
+                        symbol=hit.symbol,
+                        reason=reason,
+                        universe=universe,
+                        quotes=quotes,
+                        scanner=hit.scanner_name,
+                        hit=hit,
+                    )
                     continue
                 signal = verifier.verify(hit, self._portfolio)
                 if signal is None:
                     reject = self._get_last_reject(hit.symbol, verifier)
                     self._scan_rejections[hit.symbol] = reject or "did not pass verifier"
+                    self._record_reject_cooldown(
+                        hit,
+                        self._scan_rejections[hit.symbol],
+                        now or datetime.now(timezone.utc),
+                    )
+                    self._append_entry_reject(
+                        result, symbol=hit.symbol, stage="verifier",
+                        reason=self._scan_rejections[hit.symbol], hit=hit,
+                    )
                     self._log_shadow_missed(
                         symbol=hit.symbol,
                         reason=self._scan_rejections[hit.symbol],
@@ -561,6 +992,12 @@ class TradingPipeline:
                     continue
                 if signal.action is SignalAction.SKIP:
                     result.skipped.append(signal)
+                    self._append_entry_reject(
+                        result, symbol=signal.symbol, stage="strategy_skip",
+                        reason=signal.reason or "strategy skip",
+                        signal=signal,
+                        price=signal.entry_price,
+                    )
                     self._log_shadow_missed(
                         symbol=signal.symbol,
                         reason=signal.reason or "strategy skip",
@@ -571,7 +1008,18 @@ class TradingPipeline:
                     )
                     continue
                 self._scan_rejections.pop(hit.symbol, None)
+                self._clear_reject_cooldown(hit)
                 result.signals.append(signal)
+                self._append_entry_decision(
+                    result,
+                    self._entry_policy.decision(
+                        symbol=signal.symbol,
+                        stage="verifier",
+                        passed=True,
+                        signal=signal,
+                        price=signal.entry_price,
+                    ),
+                )
 
         # --- Step 3 & 4: risk check + execute entries ---
         # Pre-score all entry signals by news sentiment so we prioritize
@@ -614,23 +1062,32 @@ class TradingPipeline:
                     and self._hod_active_checker is not None
                     and not self._hod_active_checker(signal.symbol)
                 ):
-                    logger.info(
-                        "HOD GATE %s: not on HOD momentum board — skip entry",
-                        signal.symbol,
-                    )
-                    result.skipped.append(signal)
-                    self._scan_rejections[signal.symbol] = (
-                        "not on HOD momentum alert board"
-                    )
-                    self._log_shadow_missed(
-                        symbol=signal.symbol,
-                        reason="not on HOD momentum alert board",
-                        universe=universe,
-                        quotes=quotes,
-                        scanner=signal.scan_result.scanner_name if signal.scan_result else "",
-                        fallback_price=signal.entry_price,
-                    )
-                    continue
+                    if (
+                        self._hod_entry_bypass_checker is not None
+                        and self._hod_entry_bypass_checker(signal)
+                    ):
+                        logger.info(
+                            "HOD GATE BYPASS %s: structured hot-watch setup",
+                            signal.symbol,
+                        )
+                    else:
+                        logger.info(
+                            "HOD GATE %s: not on HOD momentum board — skip entry",
+                            signal.symbol,
+                        )
+                        result.skipped.append(signal)
+                        self._scan_rejections[signal.symbol] = (
+                            "not on HOD momentum alert board"
+                        )
+                        self._log_shadow_missed(
+                            symbol=signal.symbol,
+                            reason="not on HOD momentum alert board",
+                            universe=universe,
+                            quotes=quotes,
+                            scanner=signal.scan_result.scanner_name if signal.scan_result else "",
+                            fallback_price=signal.entry_price,
+                        )
+                        continue
 
                 # Circuit breaker: stop all new entries after max daily loss
                 if self._circuit_breaker_tripped:
@@ -749,7 +1206,35 @@ class TradingPipeline:
                     logger.debug(
                         "NEWS NEUTRAL %s: sentiment=%.2f — %s",
                         signal.symbol, news_score, headlines[0],
+	                    )
+
+            if signal.action in (SignalAction.ENTER_LONG, SignalAction.REENTER_LONG, SignalAction.SCALE_UP_LONG):
+                final_quality_reject = self._final_entry_quality_reject(
+                    signal, universe=universe, quotes=quotes,
+                    result=result, stage="final_entry_guard",
+                )
+                if final_quality_reject:
+                    logger.info(
+                        "FINAL ENTRY GUARD REJECT %s: %s",
+                        signal.symbol, final_quality_reject,
                     )
+                    result.rejected_orders += 1
+                    result.rejection_details.append({
+                        "symbol": signal.symbol,
+                        "reason": "final entry guard: {}".format(final_quality_reject),
+                    })
+                    self._scan_rejections[signal.symbol] = "final entry guard: {}".format(
+                        final_quality_reject,
+                    )
+                    self._log_shadow_missed(
+                        symbol=signal.symbol,
+                        reason="final entry guard: {}".format(final_quality_reject),
+                        universe=universe,
+                        quotes=quotes,
+                        scanner=signal.scan_result.scanner_name if signal.scan_result else "",
+                        fallback_price=signal.entry_price,
+                    )
+                    continue
 
             # Risk-reward gate: reject signals worse than 1:2
             # Relax to 1:1.5 for stocks with strong positive news catalysts
@@ -765,6 +1250,15 @@ class TradingPipeline:
                         )
                         result.rejected_orders += 1
                         result.rejection_details.append({"symbol": signal.symbol, "reason": "R:R {:.1f} < {:.1f}".format(reward / risk, min_rr)})
+                        self._append_entry_reject(
+                            result,
+                            symbol=signal.symbol,
+                            stage="risk_reward",
+                            reason="R:R {:.1f} < {:.1f}".format(reward / risk, min_rr),
+                            signal=signal,
+                            price=signal.entry_price,
+                            metadata={"risk": risk, "reward": reward, "min_rr": min_rr},
+                        )
                         self._log_shadow_missed(
                             symbol=signal.symbol,
                             reason="R:R {:.1f} < {:.1f}".format(reward / risk, min_rr),
@@ -787,6 +1281,15 @@ class TradingPipeline:
                                 )
                                 result.rejected_orders += 1
                                 result.rejection_details.append({"symbol": signal.symbol, "reason": "risk_cap ${:.2f}".format(dollar_risk)})
+                                self._append_entry_reject(
+                                    result,
+                                    symbol=signal.symbol,
+                                    stage="risk_cap",
+                                    reason="risk cap",
+                                    signal=signal,
+                                    price=signal.entry_price,
+                                    metadata={"dollar_risk": dollar_risk, "max_dollar_risk": max_dollar_risk},
+                                )
                                 self._log_shadow_missed(
                                     symbol=signal.symbol,
                                     reason="risk cap",
@@ -842,6 +1345,14 @@ class TradingPipeline:
                 logger.warning("No bar data for %s, cannot execute", signal.symbol)
                 result.rejected_orders += 1
                 result.rejection_details.append({"symbol": signal.symbol, "reason": "no_bar_data"})
+                self._append_entry_reject(
+                    result,
+                    symbol=signal.symbol,
+                    stage="order_context",
+                    reason="no bar data",
+                    signal=signal,
+                    price=signal.entry_price,
+                )
                 self._log_shadow_missed(
                     symbol=signal.symbol,
                     reason="no bar data",
@@ -861,6 +1372,22 @@ class TradingPipeline:
                 logger.info("Risk check rejected %s for %s", signal.action.value, signal.symbol)
                 result.rejected_orders += 1
                 result.rejection_details.append({"symbol": signal.symbol, "reason": "position_risk_limit"})
+                self._append_entry_reject(
+                    result,
+                    symbol=signal.symbol,
+                    stage="risk_manager",
+                    reason="position_risk_limit",
+                    signal=signal,
+                    price=signal.entry_price,
+                )
+                self._log_shadow_missed(
+                    symbol=signal.symbol,
+                    reason="position_risk_limit",
+                    universe=universe,
+                    quotes=quotes,
+                    scanner=signal.scan_result.scanner_name if signal.scan_result else "",
+                    fallback_price=signal.entry_price,
+                )
                 continue
 
             # Advanced guards: false breakout, liquidity trap, halt, market panic, spread
@@ -873,10 +1400,20 @@ class TradingPipeline:
                 if not guard_ok:
                     logger.info("GUARD REJECT %s: %s", signal.symbol, guard_reason)
                     result.rejected_orders += 1
-                    result.rejection_details.append({"symbol": signal.symbol, "reason": "guard: {}".format(guard_reason)})
+                    post_guard_reason = "post-guard: {}".format(guard_reason)
+                    result.rejection_details.append({"symbol": signal.symbol, "reason": post_guard_reason})
+                    self._scan_rejections[signal.symbol] = post_guard_reason
+                    self._append_entry_reject(
+                        result,
+                        symbol=signal.symbol,
+                        stage="trade_guard",
+                        reason=post_guard_reason,
+                        signal=signal,
+                        price=signal.entry_price,
+                    )
                     self._log_shadow_missed(
                         symbol=signal.symbol,
-                        reason="guard: {}".format(guard_reason),
+                        reason=post_guard_reason,
                         universe=universe,
                         quotes=quotes,
                         scanner=signal.scan_result.scanner_name if signal.scan_result else "",
@@ -896,6 +1433,16 @@ class TradingPipeline:
                     "DEFERRED %s %s %.0f @ %.4f → waiting for 10s micro-entry | %s",
                     signal.action.value, signal.symbol,
                     signal.quantity, signal.entry_price, signal.reason,
+                )
+                self._append_entry_decision(
+                    result,
+                    self._entry_policy.decision(
+                        symbol=signal.symbol,
+                        stage="deferred_to_timer",
+                        passed=True,
+                        signal=signal,
+                        price=signal.entry_price,
+                    ),
                 )
                 continue
 
@@ -919,12 +1466,70 @@ class TradingPipeline:
                 if now is not None:
                     self._exit_manager.register_from_signal(signal, now, fill_price=fill.price)
                     self._original_sizes[signal.symbol] = signal.quantity
+                self._append_entry_decision(
+                    result,
+                    self._entry_policy.decision(
+                        symbol=signal.symbol,
+                        stage="order",
+                        passed=True,
+                        signal=signal,
+                        price=fill.price,
+                        metadata={"status": status.value},
+                    ),
+                )
             else:
                 logger.info("Order %s for %s: %s", signal.action.value, signal.symbol, status.value)
                 result.rejected_orders += 1
-                result.rejection_details.append({"symbol": signal.symbol, "reason": "order_{}".format(status.value)})
+                reason = "order_{}".format(status.value)
+                result.rejection_details.append({"symbol": signal.symbol, "reason": reason})
+                self._append_entry_reject(
+                    result,
+                    symbol=signal.symbol,
+                    stage="order",
+                    reason=reason,
+                    signal=signal,
+                    price=signal.entry_price,
+                    metadata={"status": status.value},
+                )
+                self._log_shadow_missed(
+                    symbol=signal.symbol,
+                    reason=reason,
+                    universe=universe,
+                    quotes=quotes,
+                    scanner=signal.scan_result.scanner_name if signal.scan_result else "",
+                    fallback_price=signal.entry_price,
+                )
 
         return result
+
+    def _final_entry_quality_reject(
+        self,
+        signal: TradeSignal,
+        *,
+        universe: Dict[str, Sequence[Bar]],
+        quotes: Optional[Dict[str, Sequence[Quote]]] = None,
+        result: Optional[PipelineResult] = None,
+        stage: str = "final_entry_guard",
+    ) -> Optional[str]:
+        """Last shared rule/ML gate before any long entry/add/re-entry can order."""
+        if signal.action not in (
+            SignalAction.ENTER_LONG,
+            SignalAction.REENTER_LONG,
+            SignalAction.SCALE_UP_LONG,
+        ):
+            return None
+        sym_bars = universe.get(signal.symbol) or []
+        sym_quotes = quotes.get(signal.symbol) if quotes else None
+        decision = self._entry_policy.evaluate(
+            signal,
+            bars=sym_bars,
+            quotes=sym_quotes,
+            stage=stage,
+            min_day_change_pct=0.0,
+        )
+        if result is not None:
+            self._append_entry_decision(result, decision)
+        return decision.reject_reason
 
     def _at_position_limit(self) -> bool:
         open_positions = sum(1 for p in self._portfolio.positions.values() if not p.is_flat)

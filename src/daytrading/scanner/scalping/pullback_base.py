@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 from typing import Dict, List, Sequence
 
+from daytrading.indicators.core import vwap
 from daytrading.models import Bar, ScanResult
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,45 @@ class PullbackBaseScanner:
     @property
     def name(self) -> str:
         return "pullback_base"
+
+    @staticmethod
+    def _is_second_chance_vwap_reclaim(bars: List[Bar], session_high: float) -> bool:
+        """Allow deep runner pullbacks only after a fresh VWAP/base reclaim."""
+        if len(bars) < 10 or session_high <= 0:
+            return False
+
+        latest = bars[-1]
+        if latest.close <= latest.open or latest.close <= 0:
+            return False
+
+        vwap_vals = vwap(bars)
+        current_vwap = vwap_vals[-1] if vwap_vals else 0.0
+        if current_vwap <= 0 or latest.close < current_vwap * 1.005:
+            return False
+
+        base = list(bars[-5:-1])
+        if len(base) < 4:
+            return False
+        base_high = max(b.high for b in base)
+        base_low = min(b.low for b in base)
+        if base_low <= 0 or latest.close <= base_high * 1.002:
+            return False
+
+        base_range_pct = (base_high - base_low) / base_low * 100.0
+        if base_range_pct > 9.0:
+            return False
+
+        candle_range = latest.high - latest.low
+        body_ratio = (latest.close - latest.open) / candle_range if candle_range > 0 else 0.0
+        if body_ratio < 0.35:
+            return False
+
+        avg_base_vol = sum(float(b.volume or 0.0) for b in base) / len(base)
+        if avg_base_vol <= 0 or float(latest.volume or 0.0) < avg_base_vol * 1.05:
+            return False
+
+        recent_volume = sum(float(b.volume or 0.0) for b in bars[-3:])
+        return recent_volume >= 75_000
 
     def scan(self, universe: Dict[str, Sequence[Bar]]) -> List[ScanResult]:
         results: List[ScanResult] = []
@@ -86,13 +126,14 @@ class PullbackBaseScanner:
             return None
 
         pullback_pct = (session_high - latest.close) / session_high * 100
+        second_chance_reclaim = self._is_second_chance_vwap_reclaim(bars, session_high)
         if pullback_pct < self._min_pullback_pct:
             logger.info(
                 "PULLBACK_BASE %s: pullback too small %.1f%% (min %.1f%%)",
                 symbol, pullback_pct, self._min_pullback_pct,
             )
             return None
-        if pullback_pct > self._max_pullback_pct:
+        if pullback_pct > self._max_pullback_pct and not second_chance_reclaim:
             logger.info(
                 "PULLBACK_BASE %s: pullback too large %.1f%% (max %.1f%%)",
                 symbol, pullback_pct, self._max_pullback_pct,
@@ -108,8 +149,7 @@ class PullbackBaseScanner:
 
         effective_max_range = self._max_base_range_pct * (1 + day_move_pct / 50)
         effective_max_range = min(effective_max_range, 15.0)
-
-        if base_range_pct > effective_max_range:
+        if base_range_pct > effective_max_range and not second_chance_reclaim:
             logger.info(
                 "PULLBACK_BASE %s: base range too wide %.1f%% (max %.1f%% adj for %.0f%% move), "
                 "base_high=%.2f base_low=%.2f, close=%.2f, HOD=%.2f, pullback=%.1f%%",
@@ -134,7 +174,7 @@ class PullbackBaseScanner:
             return None
 
         session_mid = (session_high + session_open) / 2
-        if latest.close < session_mid:
+        if latest.close < session_mid and not second_chance_reclaim:
             logger.info(
                 "PULLBACK_BASE %s: below session midpoint (%.2f < %.2f)",
                 symbol, latest.close, session_mid,
@@ -143,13 +183,15 @@ class PullbackBaseScanner:
 
         logger.info(
             "PULLBACK_BASE %s: *** HIT *** close=%.2f HOD=%.2f pullback=%.1f%% "
-            "base_range=%.1f%% day_move=%.0f%%",
+            "base_range=%.1f%% day_move=%.0f%%%s",
             symbol, latest.close, session_high, pullback_pct,
             base_range_pct, day_move_pct,
+            " second-chance VWAP reclaim" if second_chance_reclaim else "",
         )
 
         stop_price = base_low - 0.02
         score = day_move_pct * (1 + (self._max_pullback_pct - pullback_pct) / 10)
+        entry_tier = "second_chance_reclaim" if second_chance_reclaim else None
 
         return ScanResult(
             symbol=symbol,
@@ -167,6 +209,13 @@ class PullbackBaseScanner:
                 "stop_price": round(stop_price, 4),
                 "close": latest.close,
                 "volume": latest.volume,
+                **(
+                    {
+                        "entry_tier": entry_tier,
+                        "entry_tier_reason": "deep pullback reclaimed VWAP/base with buyers returning",
+                    }
+                    if entry_tier else {}
+                ),
             },
             bars=[],
         )

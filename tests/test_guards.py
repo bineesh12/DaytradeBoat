@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from daytrading.models import Bar, Quote, SignalAction, Timeframe, TradeSignal
+from daytrading.models import Bar, Quote, ScanResult, SignalAction, Timeframe, TradeSignal
 from daytrading.risk.guards import (
     FalseBreakoutDetector,
     HaltTracker,
@@ -98,6 +98,37 @@ class TestFalseBreakoutDetector:
         result = detector.check(bars)
         assert result is not None
         assert "volume declining" in result
+
+    def test_trade_guard_skips_false_breakout_for_first_pullback_reclaim(self) -> None:
+        bars = [
+            _bar(i, close=5.0, open_=4.99, high=5.01, low=4.98, volume=20_000)
+            for i in range(5)
+        ]
+        bars.append(_bar(5, close=5.05, open_=5.01, high=5.06, low=5.00, volume=10_000))
+        scan_result = ScanResult(
+            symbol="TST",
+            scanner_name="first_pullback_reclaim",
+            ts=TS,
+            score=80.0,
+            criteria={"pattern": "first_pullback_reclaim", "direction": "up"},
+            bars=bars,
+        )
+        signal = TradeSignal(
+            symbol="TST",
+            action=SignalAction.ENTER_LONG,
+            quantity=100,
+            entry_price=5.05,
+            stop_loss=4.95,
+            take_profit=5.25,
+            reason="test signal",
+            scan_result=scan_result,
+        )
+        guard = _guard_with_quote(bid=5.04, ask=5.05)
+
+        ok, reason = guard.check_entry(signal, bars=bars, quotes=[_quote(bid=5.04, ask=5.05)])
+
+        assert ok
+        assert reason is None
 
     def test_allow_high_volume_vwap_reclaim_with_light_breakout_bar(self) -> None:
         """Runner reclaiming VWAP near HOD can continue even if one bar volume is lighter."""

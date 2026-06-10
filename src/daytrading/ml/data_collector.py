@@ -78,6 +78,7 @@ def log_entry_candidate(
             "outcome_pnl": None,
             "outcome_pct": None,
             "outcome_duration_s": None,
+            "outcome_source": None,
         }
 
         _ensure_dir()
@@ -113,17 +114,30 @@ def log_trade_outcome(
         with _lock:
             lines = _CANDIDATES_FILE.read_text().splitlines()
 
-            # Find the most recent passed entry for this symbol without an outcome
+            # Find the most recent passed entry for this symbol.  A shadow label
+            # is only a provisional learning label; real closed-trade P&L must
+            # replace it so training data prefers ground truth over future-price
+            # inference.
             updated = False
             for i in range(len(lines) - 1, -1, -1):
                 try:
                     rec = json.loads(lines[i])
                 except json.JSONDecodeError:
                     continue
-                if rec.get("symbol") == symbol and rec.get("passed") and rec.get("outcome_pnl") is None:
+                if (
+                    rec.get("symbol") == symbol
+                    and rec.get("passed")
+                    and (
+                        rec.get("outcome_pnl") is None
+                        or rec.get("outcome_source") == "shadow_future_price"
+                    )
+                ):
                     rec["outcome_pnl"] = round(pnl_pct, 4)
                     rec["outcome_pct"] = round(pnl_pct, 4)
                     rec["outcome_duration_s"] = duration_s
+                    rec["outcome_source"] = "real_trade"
+                    rec.pop("shadow_label", None)
+                    rec.pop("labeled_at", None)
                     lines[i] = json.dumps(rec)
                     updated = True
                     break
@@ -133,6 +147,88 @@ def log_trade_outcome(
 
     except Exception as exc:
         logger.debug("Outcome backfill error: %s", exc)
+
+
+def update_deferred_entry_outcomes(
+    bar_universe: Dict[str, Sequence[Bar]],
+    *,
+    wait_seconds: float = 180.0,
+    min_move_pct: float = 1.5,
+) -> int:
+    """Label old entry candidates from same-day future price movement.
+
+    Real fills still use ``log_trade_outcome``.  This shadow label gives the
+    entry model more learning data for candidates that passed/rejected but did
+    not become a completed trade.  Rows are only labeled against a latest bar
+    from the same UTC day so old candidates are not accidentally labeled with a
+    later trading day's price.
+    """
+    if not _CANDIDATES_FILE.exists():
+        return 0
+
+    latest: Dict[str, Bar] = {
+        sym: bars[-1]
+        for sym, bars in bar_universe.items()
+        if bars and bars[-1].close > 0
+    }
+    if not latest:
+        return 0
+
+    now = datetime.now(timezone.utc)
+    changed = 0
+    try:
+        _ensure_dir()
+        with _lock:
+            lines = _CANDIDATES_FILE.read_text().splitlines()
+            for i, line in enumerate(lines):
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("outcome_pnl") is not None:
+                    continue
+                # Passed entries may still become real trades.  Do not stamp a
+                # shadow label onto a still-open/unknown real fill; otherwise
+                # log_trade_outcome can lose the ground-truth P&L later.
+                if rec.get("passed"):
+                    continue
+                sym = str(rec.get("symbol") or "")
+                bar = latest.get(sym)
+                if bar is None or bar.ts is None:
+                    continue
+                try:
+                    rec_ts = datetime.fromisoformat(str(rec.get("ts")).replace("Z", "+00:00"))
+                    if rec_ts.tzinfo is None:
+                        rec_ts = rec_ts.replace(tzinfo=timezone.utc)
+                    bar_ts = bar.ts
+                    if bar_ts.tzinfo is None:
+                        bar_ts = bar_ts.replace(tzinfo=timezone.utc)
+                    rec_ts = rec_ts.astimezone(timezone.utc)
+                    bar_ts = bar_ts.astimezone(timezone.utc)
+                except Exception:
+                    continue
+                if rec_ts.date() != bar_ts.date():
+                    continue
+                if (now - rec_ts).total_seconds() < wait_seconds:
+                    continue
+                entry = float(rec.get("price") or 0.0)
+                if entry <= 0:
+                    continue
+                move_pct = (float(bar.close) - entry) / entry * 100.0
+                rec["outcome_pnl"] = round(move_pct, 4)
+                rec["outcome_pct"] = round(move_pct, 4)
+                rec["outcome_duration_s"] = int((bar_ts - rec_ts).total_seconds())
+                rec["outcome_source"] = "shadow_future_price"
+                rec["shadow_label"] = 1 if move_pct >= min_move_pct else 0
+                rec["labeled_at"] = now.isoformat()
+                lines[i] = json.dumps(rec)
+                changed += 1
+            if changed:
+                _CANDIDATES_FILE.write_text("\n".join(lines) + "\n")
+    except Exception as exc:
+        logger.debug("Deferred entry outcome update error: %s", exc)
+        return 0
+    return changed
 
 
 def load_training_data() -> List[dict]:

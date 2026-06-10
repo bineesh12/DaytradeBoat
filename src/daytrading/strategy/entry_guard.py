@@ -4,7 +4,7 @@ Uses a hybrid approach:
   1. Hard rejects: 4 absolute deal-breakers (immediate rejection)
   2. Scoring: 7 weighted conditions scored 0-100
   3. Penalty: S8 volume exhaustion subtracts up to -30 for declining-volume green bars
-  4. Threshold: score >= 60 to trade
+  4. Threshold: score >= 80 to trade
   5. ML model: optional XGBoost probability check (if model file exists)
 
 This allows strong setups (VWAP break + volume) to pass even if
@@ -25,7 +25,13 @@ from daytrading.models import Bar, Quote, Tick
 
 logger = logging.getLogger(__name__)
 
-ENTRY_SCORE_THRESHOLD = 65
+ENTRY_SCORE_THRESHOLD = int(os.getenv("DAYTRADING_ENTRY_SCORE_THRESHOLD", "80"))
+ENTRY_ML_ENABLED = os.getenv("DAYTRADING_ENABLE_ENTRY_ML", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+MIN_TICK_SPREAD = 0.01
 
 # ML Monitor — singleton instance for tracking model performance
 _ml_monitor = None
@@ -38,17 +44,18 @@ except Exception:
 # XGBoost model — loaded once at import time, None if unavailable
 _xgb_model = None
 _XGB_THRESHOLD = 0.30
-_ML_SOFT_PASS_SCORE = 80
 try:
     import xgboost as xgb
     _model_path = os.path.join(
         os.path.dirname(__file__), "..", "..", "..", "data", "models", "entry_model.json",
     )
     _model_path = os.path.normpath(_model_path)
-    if os.path.exists(_model_path):
+    if ENTRY_ML_ENABLED and os.path.exists(_model_path):
         _xgb_model = xgb.Booster()
         _xgb_model.load_model(_model_path)
         logger.info("XGBoost entry model loaded from %s", _model_path)
+    elif not ENTRY_ML_ENABLED:
+        logger.info("XGBoost entry model disabled by DAYTRADING_ENABLE_ENTRY_ML=false")
 except Exception:
     pass
 
@@ -56,6 +63,37 @@ except Exception:
 def get_ml_monitor():
     """Get the global ML monitor instance."""
     return _ml_monitor
+
+
+def is_entry_ml_enabled() -> bool:
+    """Return whether the live XGBoost entry gate is enabled by config."""
+    return ENTRY_ML_ENABLED
+
+
+def is_entry_ml_loaded() -> bool:
+    """Return whether the live XGBoost entry gate loaded a model."""
+    return _xgb_model is not None
+
+
+def tick_aware_spread_ok(
+    spread: float,
+    price: float,
+    pct_limit: float,
+    *,
+    min_tick: float = MIN_TICK_SPREAD,
+) -> bool:
+    """Return true when spread is within pct limit or just one normal tick."""
+    if spread <= 0:
+        return True
+    if price <= 0:
+        return False
+    return spread <= max(price * pct_limit, min_tick) + 1e-6
+
+
+def tick_aware_spread_limit(price: float, pct_limit: float, *, min_tick: float = MIN_TICK_SPREAD) -> float:
+    if price <= 0:
+        return min_tick
+    return max(price * pct_limit, min_tick)
 
 
 def record_rule_rejection(
@@ -116,6 +154,9 @@ def _liquidity_score(
     elif day_volume >= 200_000:
         score += 12
         parts.append("dayVol=12")
+    elif day_volume >= 100_000:
+        score += 8
+        parts.append("dayVol=8")
     else:
         parts.append("dayVol=0")
 
@@ -161,13 +202,13 @@ def _liquidity_score(
         avg_spread_pct = (
             sum((q.ask - q.bid) / price for q in valid_quotes) / len(valid_quotes)
         ) * 100
-        if avg_spread_pct <= 0.15:
+        if tick_aware_spread_ok(avg_spread_pct / 100.0 * price, price, 0.0015):
             score += 15
             parts.append("spread=15")
-        elif avg_spread_pct <= 0.30:
+        elif tick_aware_spread_ok(avg_spread_pct / 100.0 * price, price, 0.0030):
             score += 10
             parts.append("spread=10")
-        elif avg_spread_pct <= 0.50:
+        elif tick_aware_spread_ok(avg_spread_pct / 100.0 * price, price, 0.0050):
             score += 5
             parts.append("spread=5")
         else:
@@ -238,7 +279,7 @@ class ScannerProfile:
 
 LOW_FLOAT_RUNNER = ScannerProfile(
     name="Low Float Runner",
-    min_price=2.0,
+    min_price=1.5,
     max_price=20.0,
     min_day_change_pct=5.0,
     min_bar_volume=10_000,
@@ -273,7 +314,7 @@ def check_entry_quality(
     bars: Sequence[Bar],
     *,
     symbol: str = "",
-    min_price: float = 2.0,
+    min_price: float = 1.5,
     max_price: float = 20.0,
     min_rvol: float = 1.5,
     max_bar_age_seconds: int = 300,
@@ -284,6 +325,9 @@ def check_entry_quality(
     float_shares: Optional[float] = None,
     ticks: Optional[Sequence[Tick]] = None,
     quotes: Optional[Sequence[Quote]] = None,
+    entry_pattern: Optional[str] = None,
+    setup_tier: Optional[str] = None,
+    entry_tier: Optional[str] = None,
 ) -> Optional[str]:
     """Return a rejection reason string, or ``None`` if the setup is OK.
 
@@ -301,6 +345,10 @@ def check_entry_quality(
     price = latest.close
     if price <= 0:
         return _rule_reject("invalid price")
+
+    pattern_context = str(entry_pattern or "")
+    setup_context = str(setup_tier or "").lower()
+    tier_context = str(entry_tier or "").lower()
 
     # --- Split bars into today vs historical ---
     today_bars: Sequence[Bar] = bars
@@ -361,14 +409,80 @@ def check_entry_quality(
         except Exception:
             pass
 
-    # 3. Below VWAP — buying into sellers is always wrong for momentum
+    day_volume, recent_avg_volume, hard_gate_rvol = _recent_volume_stats(today_bars)
+    latest_volume = float(getattr(latest, "volume", 0.0) or 0.0)
+    session_high_context = max((b.high for b in today_bars), default=price)
+    distance_from_hod_context = (
+        (session_high_context - price) / session_high_context
+        if session_high_context > 0 else 1.0
+    )
+    elite_reclaim_context = (
+        (
+            "a+" in setup_context
+            or tier_context in {
+                "a_plus_reclaim_scout",
+                "a_plus_retry_watch",
+                "deep_runner_scout",
+                "level_scout",
+            }
+        )
+        and pattern_context in {
+            "vwap_pullback",
+            "pullback_base",
+            "hod_reclaim",
+            "level_breakout_reclaim",
+            "runner_reclaim_continuation",
+            "shallow_stair_continuation",
+            "early_vwap_reclaim_scout",
+        }
+        and 1.0 <= price <= 20.0
+        and day_volume >= 2_000_000
+        and recent_avg_volume >= 50_000
+        and latest_volume >= 20_000
+    )
+    recent_vwap_context = 0.0
+    recent_reclaim_ok = False
+    recent_bars_context = list(today_bars[-5:])
+    if len(recent_bars_context) >= 3:
+        recent_vwap_vals = vwap(recent_bars_context)
+        recent_vwap_context = recent_vwap_vals[-1] if recent_vwap_vals else 0.0
+        previous_close = recent_bars_context[-2].close if len(recent_bars_context) >= 2 else 0.0
+        local_base_high = max((b.high for b in recent_bars_context[:-1]), default=0.0)
+        recent_reclaim_ok = (
+            recent_vwap_context > 0
+            and price >= recent_vwap_context * 1.003
+            and (
+                latest.close > latest.open
+                or (previous_close > 0 and latest.close >= previous_close * 1.006)
+                or (local_base_high > 0 and latest.close >= local_base_high * 0.995)
+            )
+        )
+
+    # 3. Below VWAP — buying into sellers is usually wrong for momentum.
+    # Reduced-size A+ reclaim scouts can use recent VWAP when the full-session
+    # VWAP is distorted by a huge earlier runner spike.
     last_vwap = 0.0
     if len(today_bars) >= 3:
         vwap_vals = vwap(today_bars)
         last_vwap = vwap_vals[-1] if vwap_vals else 0.0
         if not math.isnan(last_vwap) and last_vwap > 0:
             if price < last_vwap * 0.995:
-                return _rule_reject("below VWAP ({:.2f} < {:.2f})".format(price, last_vwap))
+                elite_recent_vwap_ok = (
+                    elite_reclaim_context
+                    and recent_reclaim_ok
+                    and distance_from_hod_context <= 0.55
+                )
+                if not elite_recent_vwap_ok:
+                    return _rule_reject("below VWAP ({:.2f} < {:.2f})".format(price, last_vwap))
+                logger.info(
+                    "ENTRY GUARD %s: A+ reclaim using recent VWAP %.2f "
+                    "over session VWAP %.2f pattern=%s tier=%s",
+                    symbol,
+                    recent_vwap_context,
+                    last_vwap,
+                    pattern_context,
+                    tier_context,
+                )
 
     # 4. Dead cat bounce — price crashed too far from session HOD
     if len(today_bars) >= 5:
@@ -376,40 +490,75 @@ def check_entry_quality(
         session_open_price = today_bars[0].open
         if today_high > 0 and session_open_price > 0:
             drop_from_high = (today_high - price) / today_high
-            if drop_from_high > 0.20:
+            elite_deep_reclaim_ok = (
+                elite_reclaim_context
+                and drop_from_high <= 0.55
+                and recent_reclaim_ok
+            )
+            if drop_from_high > 0.20 and not elite_deep_reclaim_ok:
                 return _rule_reject(
                     "dead cat bounce: price {:.2f} is {:.0f}% below HOD {:.2f}".format(
                         price, drop_from_high * 100, today_high)
                 )
-
-    # 5. Minimum upward movement — avoid flat names with no momentum edge
-    if len(today_bars) >= 3:
-        session_open_price = today_bars[0].open
-        if session_open_price > 0:
-            day_change_pct_hard = ((price - session_open_price) / session_open_price) * 100
-            if day_change_pct_hard < min_day_change_pct:
-                return _rule_reject(
-                    "not enough movement: day change {:.1f}% (need {:.1f}%+)".format(
-                        day_change_pct_hard, min_day_change_pct)
+            if drop_from_high > 0.20 and elite_deep_reclaim_ok:
+                logger.info(
+                    "ENTRY GUARD %s: A+ reclaim dead-cat exception %.0f%% below HOD "
+                    "pattern=%s tier=%s",
+                    symbol,
+                    drop_from_high * 100,
+                    pattern_context,
+                    tier_context,
                 )
-
-    # 6. Minimum day volume — low-liquidity stocks produce unreliable breakouts
-    day_volume = sum(b.volume for b in today_bars)
-    _, recent_avg_volume, hard_gate_rvol = _recent_volume_stats(today_bars)
     daily_rvol = (
         day_volume / float(avg_daily_volume)
         if avg_daily_volume and avg_daily_volume > 0
         else 0.0
     )
+    effective_hard_gate_rvol = max(daily_rvol, hard_gate_rvol)
+
+    # 5. Minimum upward movement — avoid flat names with no momentum edge.
+    # Exception: huge low-float premarket gappers can base/pull back while the
+    # session-change number is only 3-5%. Let those reach scoring/ML when
+    # liquidity and relative volume are already exceptional.
+    if len(today_bars) >= 3:
+        session_open_price = today_bars[0].open
+        if session_open_price > 0:
+            day_change_pct_hard = ((price - session_open_price) / session_open_price) * 100
+            hot_low_float_runner = (
+                day_change_pct_hard >= 3.0
+                and price < 10.0
+                and day_volume >= 2_000_000
+                and recent_avg_volume >= 75_000
+                and effective_hard_gate_rvol >= 3.0
+                and (float_shares is None or float_shares <= 10_000_000)
+            )
+            if day_change_pct_hard < min_day_change_pct and not hot_low_float_runner:
+                return _rule_reject(
+                    "not enough movement: day change {:.1f}% (need {:.1f}%+)".format(
+                        day_change_pct_hard, min_day_change_pct)
+                )
+            if day_change_pct_hard < min_day_change_pct and hot_low_float_runner:
+                logger.info(
+                    "ENTRY GUARD %s: hot runner movement exception day_change=%.1f%% "
+                    "vol=%.0f recent=%.0f rvol=%.1fx float=%s",
+                    symbol,
+                    day_change_pct_hard,
+                    day_volume,
+                    recent_avg_volume,
+                    effective_hard_gate_rvol,
+                    "{:.0f}".format(float_shares) if float_shares is not None else "unknown",
+                )
+
+    # 6. Minimum day volume — low-liquidity stocks produce unreliable breakouts
     sub5_has_relative_momentum = (
         price < 5.0
         and day_volume >= 200_000
         and recent_avg_volume >= 20_000
         and max(daily_rvol, hard_gate_rvol) >= max(min_rvol, 1.8)
     )
-    if day_volume < 200_000:
+    if day_volume < 100_000:
         return _rule_reject(
-            "low day volume {:.0f} for ${:.2f} stock (need 200K+)".format(day_volume, price)
+            "low day volume {:.0f} for ${:.2f} stock (need 100K+)".format(day_volume, price)
         )
     if price < 5.0 and day_volume < 500_000 and not sub5_has_relative_momentum:
         return _rule_reject(
@@ -426,14 +575,89 @@ def check_entry_quality(
             "low day volume {:.0f} for ${:.2f} stock (need 500K+)".format(day_volume, price)
         )
 
-    # 7. Spread filter — wide spread means illiquid stock, bad fills
+    # Day volume can be stale comfort. For scalps, the current entry candle
+    # still needs live participation or fills/slippage become unreliable.
+    if price >= 5.0 and latest_volume < 20_000 and recent_avg_volume < 25_000:
+        return _rule_reject(
+            "weak active tape {:.0f} latest volume, {:.0f} recent avg (need 20K latest or 25K avg)".format(
+                latest_volume,
+                recent_avg_volume,
+            )
+        )
+
+    # 7. Spread filter — wide spread means illiquid stock, bad fills.
+    # Elite A+ runner continuation setups may still be executable with a
+    # slightly wider spread, but they must continue through score + ML below.
     if quotes and len(quotes) >= 3:
         recent_quotes = list(quotes[-5:])
-        avg_spread = sum(q.ask - q.bid for q in recent_quotes if q.ask > q.bid > 0) / len(recent_quotes)
-        if price > 0 and avg_spread / price > 0.005:
+        valid_spreads = [q.ask - q.bid for q in recent_quotes if q.ask > q.bid > 0]
+        avg_spread = sum(valid_spreads) / len(valid_spreads) if valid_spreads else 0.0
+        avg_spread_pct = avg_spread / price if price > 0 else 1.0
+        runner_patterns = {
+            "abc_continuation",
+            "vwap_pullback",
+            "pullback_base",
+            "level_breakout_reclaim",
+            "runner_reclaim_continuation",
+            "shallow_stair_continuation",
+            "early_vwap_reclaim_scout",
+        }
+        pattern = pattern_context
+        tier = setup_context
+        session_high = max((b.high for b in today_bars), default=price)
+        distance_from_hod = (
+            (session_high - price) / session_high if session_high > 0 else 1.0
+        )
+        elite_spread_ceiling = 0.010 if pattern == "shallow_stair_continuation" else 0.008
+        if tier_context in {"level_scout", "a_plus_reclaim_scout", "a_plus_retry_watch"}:
+            elite_spread_ceiling = max(elite_spread_ceiling, 0.012)
+        elite_hod_distance_ceiling = 0.15 if pattern == "shallow_stair_continuation" else 0.12
+        elite_day_volume_floor = 3_000_000 if pattern == "shallow_stair_continuation" else 2_000_000
+        elite_float_ceiling = 10_000_000 if pattern == "shallow_stair_continuation" else 20_000_000
+        elite_runner_spread_ok = (
+            pattern in runner_patterns
+            and (
+                "a+" in tier
+                or pattern in {
+                    "runner_reclaim_continuation",
+                    "shallow_stair_continuation",
+                    "early_vwap_reclaim_scout",
+                }
+                or tier_context in {
+                    "a_plus_reclaim_scout",
+                    "a_plus_retry_watch",
+                    "deep_runner_scout",
+                    "level_scout",
+                }
+            )
+            and 0.005 < avg_spread_pct <= elite_spread_ceiling
+            and 1.5 <= price <= 20.0
+            and day_volume >= elite_day_volume_floor
+            and recent_avg_volume >= 75_000
+            and latest_volume >= 50_000
+            and distance_from_hod <= elite_hod_distance_ceiling
+            and (float_shares is None or float_shares <= elite_float_ceiling)
+        )
+        if (
+            price > 0
+            and not tick_aware_spread_ok(avg_spread, price, 0.005)
+            and not elite_runner_spread_ok
+        ):
             return _rule_reject(
                 "spread too wide ({:.2f}c = {:.2f}% of ${:.2f})".format(
-                    avg_spread * 100, (avg_spread / price) * 100, price)
+                    avg_spread * 100, avg_spread_pct * 100, price)
+            )
+        if elite_runner_spread_ok:
+            logger.info(
+                "ENTRY GUARD %s: elite runner spread exception %.2fc %.2f%% "
+                "pattern=%s vol=%.0f recent=%.0f latest=%.0f",
+                symbol,
+                avg_spread * 100,
+                avg_spread_pct * 100,
+                pattern,
+                day_volume,
+                recent_avg_volume,
+                latest_volume,
             )
 
     # 8. Full liquidity score — avoid weak chop even when simple volume passes
@@ -453,14 +677,51 @@ def check_entry_quality(
                 liquidity_score, liquidity_parts)
         )
 
+    elite_sub2_reclaim = False
+
     # 9. Tape confirmation — sellers dominating means breakout is failing
     if ticks and len(ticks) >= 20:
         from daytrading.indicators.scalping import order_flow_imbalance
         imb_values = order_flow_imbalance(list(ticks), window=min(30, len(ticks)))
         current_imb = imb_values[-1] if imb_values else 0.0
         if current_imb <= -0.3:
-            return _rule_reject(
-                "tape shows selling pressure (imbalance={:.2f}, need >-0.3)".format(current_imb)
+            pattern = str(entry_pattern or "")
+            tier = str(setup_tier or "").lower()
+            session_high = max((b.high for b in today_bars), default=price)
+            distance_from_hod = (
+                (session_high - price) / session_high if session_high > 0 else 1.0
+            )
+            elite_sub2_reclaim = (
+                1.5 <= price < 2.0
+                and pattern in {
+                    "abc_continuation",
+                    "vwap_pullback",
+                    "pullback_base",
+                    "hod_reclaim",
+                }
+                and "a+" in tier
+                and current_imb > -0.60
+                and day_volume >= 2_000_000
+                and recent_avg_volume >= 50_000
+                and latest_volume >= 25_000
+                and last_vwap > 0
+                and price >= last_vwap * 1.02
+                and distance_from_hod <= 0.12
+                and (float_shares is None or float_shares <= 10_000_000)
+            )
+            if not elite_sub2_reclaim:
+                return _rule_reject(
+                    "tape shows selling pressure (imbalance={:.2f}, need >-0.3)".format(current_imb)
+                )
+            logger.info(
+                "ENTRY GUARD %s: elite sub-$2 reclaim tape exception imbalance=%.2f "
+                "pattern=%s price=%.2f vol=%.0f recent=%.0f",
+                symbol,
+                current_imb,
+                pattern,
+                price,
+                day_volume,
+                recent_avg_volume,
             )
 
     # =================================================================
@@ -654,13 +915,9 @@ def check_entry_quality(
 
     # =================================================================
     # FINAL DECISION
-    # =================================================================
-
-    # =================================================================
-    # FINAL DECISION
-    # Score is computed for data collection and ML training, but does NOT
-    # block entries. Only ML (when trained) can reject based on quality.
-    # Safety checks above (stale, VWAP, spread, tape) still block.
+    # Rule score and ML are both live gates. Every buy path that reaches
+    # check_entry_quality must clear this rule score, and when ML is loaded
+    # it must clear ML too. No hot-watch/HOD/timed-entry soft pass.
     # =================================================================
 
     # Compute values needed for data collection
@@ -693,35 +950,41 @@ def check_entry_quality(
             dmat = xgb.DMatrix([features])
             ml_prob_val = float(_xgb_model.predict(dmat)[0])
             if ml_prob_val < _XGB_THRESHOLD:
-                if score >= _ML_SOFT_PASS_SCORE:
-                    logger.info(
-                        "ENTRY GUARD ML SOFT PASS %s: prob=%.0f%% < %.0f%% but rule score=%d >= %d",
-                        symbol, ml_prob_val * 100, _XGB_THRESHOLD * 100,
-                        score, _ML_SOFT_PASS_SCORE,
-                    )
-                    if _ml_monitor:
-                        try:
-                            _ml_monitor.record_ml_rejection(
-                                symbol, price, ml_prob_val, score, counted=False,
-                            )
-                        except TypeError:
-                            _ml_monitor.record_ml_rejection(symbol, price, ml_prob_val, score)
-                else:
-                    logger.info("ENTRY GUARD ML REJECT %s: prob=%.0f%% < %.0f%% [score=%d]",
-                                symbol, ml_prob_val * 100, _XGB_THRESHOLD * 100, score)
-                    if _ml_monitor:
-                        _ml_monitor.record_ml_rejection(symbol, price, ml_prob_val, score)
-                    _log_candidate(symbol, price, score, False,
-                                   "ML low confidence ({:.0f}%)".format(ml_prob_val * 100),
-                                   ml_prob_val, ", ".join(breakdown),
-                                   float_shares, today_bars, bar_rvol,
-                                   _session_high, _session_open, _prior_close_est)
-                    return "ML model low confidence ({:.0f}%, need {:.0f}%)".format(
-                        ml_prob_val * 100, _XGB_THRESHOLD * 100)
+                logger.info("ENTRY GUARD ML REJECT %s: prob=%.0f%% < %.0f%% [score=%d]",
+                            symbol, ml_prob_val * 100, _XGB_THRESHOLD * 100, score)
+                if _ml_monitor:
+                    _ml_monitor.record_ml_rejection(symbol, price, ml_prob_val, score)
+                _log_candidate(symbol, price, score, False,
+                               "ML low confidence ({:.0f}%)".format(ml_prob_val * 100),
+                               ml_prob_val, ", ".join(breakdown),
+                               float_shares, today_bars, bar_rvol,
+                               _session_high, _session_open, _prior_close_est)
+                return "ML model low confidence ({:.0f}%, need {:.0f}%)".format(
+                    ml_prob_val * 100, _XGB_THRESHOLD * 100)
         except Exception as exc:
             logger.debug("ML scoring skipped for %s: %s", symbol, exc)
 
-    # PASS — log score for data collection (score no longer blocks)
+    elite_sub2_score_ok = elite_sub2_reclaim and score >= 50
+    if score < ENTRY_SCORE_THRESHOLD and not elite_sub2_score_ok:
+        reason = "entry score too low ({}/100, need {}+) [{}]".format(
+            score, ENTRY_SCORE_THRESHOLD, ", ".join(breakdown),
+        )
+        logger.info("ENTRY GUARD SCORE REJECT %s: %s [%s]",
+                    symbol, reason, ", ".join(breakdown))
+        record_rule_rejection(symbol=symbol, reason=reason)
+        _log_candidate(symbol, price, score, False, reason, ml_prob_val,
+                       ", ".join(breakdown), float_shares, today_bars, bar_rvol,
+                       _session_high, _session_open, _prior_close_est)
+        return reason
+    if elite_sub2_score_ok:
+        logger.info(
+            "ENTRY GUARD %s: elite sub-$2 reclaim score exception %d/%d",
+            symbol,
+            score,
+            ENTRY_SCORE_THRESHOLD,
+        )
+
+    # PASS — log score for data collection after all live gates clear.
     if _ml_monitor:
         _ml_monitor.record_entry_passed()
 

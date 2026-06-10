@@ -205,6 +205,7 @@ class AlpacaBroker:
             if status_val == "filled":
                 fill = self._fill_from_alpaca_order(alpaca_order, original)
                 if fill:
+                    self._invalidate_position_cache()
                     logger.info(
                         "ORDER FILLED %s %s %.0f @ %.4f",
                         original.side.value, original.symbol, fill.quantity, fill.price,
@@ -215,6 +216,7 @@ class AlpacaBroker:
             if status_val in ("canceled", "cancelled", "expired", "rejected"):
                 fill = self._fill_from_alpaca_order(alpaca_order, original)
                 if fill:
+                    self._invalidate_position_cache()
                     logger.info(
                         "ORDER %s WITH FILL %s %s %.0f @ %.4f",
                         status_val.upper(), original.side.value, original.symbol,
@@ -294,6 +296,7 @@ class AlpacaBroker:
             time.sleep(self._poll_interval)
 
         if last_fill:
+            self._invalidate_position_cache()
             logger.info(
                 "PARTIAL FILL %s %s %.0f of %.0f @ %.4f (cancel confirmed/late fill)",
                 original.side.value, original.symbol,

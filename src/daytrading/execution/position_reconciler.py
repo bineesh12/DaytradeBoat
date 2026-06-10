@@ -43,6 +43,7 @@ class ReconcileResult:
     confirmed: list = field(default_factory=list)
     closed: list = field(default_factory=list)
     still_pending: list = field(default_factory=list)
+    accidental_shorts: list = field(default_factory=list)
 
 
 class PositionReconciler:
@@ -113,7 +114,36 @@ class PositionReconciler:
         for sym, data in broker_positions.items():
             qty = float(data.get("qty", 0))
             avg = float(data.get("avg_entry", 0))
-            if qty <= 0:
+            if qty < 0:
+                result.accidental_shorts.append(sym)
+                short_qty = abs(qty)
+                led = self.ledger(sym)
+                led.pending_broker_since = None
+                led.broker_miss_count = 0
+                led.last_seen_on_broker = now
+
+                pos = portfolio.positions.get(sym)
+                if pos is None:
+                    portfolio.positions[sym] = Position(
+                        symbol=sym, quantity=qty, avg_price=avg, entry_ts=now,
+                    )
+                else:
+                    pos.quantity = qty
+                    pos.avg_price = avg
+                tracked = exit_manager.tracked.get(sym)
+                if tracked is None or tracked.side is not Side.SELL:
+                    self._adopt_unexpected_short(sym, short_qty, avg, now, exit_manager)
+                    tracked_syms.add(sym)
+                else:
+                    tracked.quantity = short_qty
+                    tracked.remaining_qty = short_qty
+                    tracked.entry_price = avg
+                logger.warning(
+                    "RECONCILE detected unexpected short %s %.0f @ %.4f",
+                    sym, qty, avg,
+                )
+                continue
+            if qty == 0:
                 continue
 
             led = self.ledger(sym)
@@ -203,7 +233,9 @@ class PositionReconciler:
     ) -> None:
         """Broker has a position the bot is not monitoring — adopt with tight scalp defaults.
 
-        Uses 10-tick stop, no fixed target (candle-based exits + trailing stop decide exit).
+        Rebuild the normal 1:1 target from the fallback 10-tick risk. This can
+        happen briefly around fresh fills, so disabling the target would turn a
+        valid scalp into a runner and skip the first profit-taking exit.
         """
         TICK = 0.01
         STOP_TICKS = 10
@@ -221,9 +253,44 @@ class PositionReconciler:
             trend_strength=0.7,
             reason="adopted from broker",
         )
-        pos.first_target_price = 0  # disable half-sell; candle exits + trailing stop only
         exit_manager.track(pos)
         logger.warning(
-            "RECONCILE adopted orphan %s %.0f @ %.4f (stop=%.4f, 10-tick trail, no target)",
+            "RECONCILE adopted orphan %s %.0f @ %.4f (stop=%.4f, target=%.4f)",
+            symbol, qty, avg, stop, pos.first_target_price,
+        )
+
+    @staticmethod
+    def _adopt_unexpected_short(
+        symbol: str,
+        qty: float,
+        avg: float,
+        now: datetime,
+        exit_manager: ExitManager,
+    ) -> None:
+        """Track an unexpected broker short with a tight cover stop.
+
+        The live runner also tries to flatten accidental shorts immediately.
+        This software tracker is a second line of defense if that cover order
+        cannot be submitted/fills fail.
+        """
+        TICK = 0.01
+        STOP_TICKS = 10
+        stop = round(avg + STOP_TICKS * TICK, 4)
+
+        pos = TrackedPosition(
+            symbol=symbol,
+            side=Side.SELL,
+            quantity=qty,
+            remaining_qty=qty,
+            entry_price=avg,
+            entry_ts=now,
+            stop_loss=stop,
+            risk_per_share=STOP_TICKS * TICK,
+            trend_strength=0.0,
+            reason="unexpected broker short",
+        )
+        exit_manager.track(pos)
+        logger.error(
+            "RECONCILE tracking unexpected short %s %.0f @ %.4f (cover_stop=%.4f)",
             symbol, qty, avg, stop,
         )

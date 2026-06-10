@@ -45,6 +45,8 @@ class WatchlistScanner:
 
     @staticmethod
     def _is_probable_warrant_symbol(symbol: str) -> bool:
+        if "." in symbol:
+            return True
         # Common warrant symbols are usually longer root tickers ending in W.
         # Short real tickers like WNW should stay in the scan universe.
         return len(symbol) >= 4 and symbol.endswith("W")
@@ -291,26 +293,31 @@ class WatchlistScanner:
         if bar is None or prev is None:
             return None
 
-        # During pre-market, daily_bar is stale — use latest_trade for real price
+        # During pre-market, daily_bar is yesterday's full-session bar in
+        # Alpaca snapshots. Use latest trade for price and daily_bar.close as
+        # the true prior close; previous_daily_bar can be two sessions old.
         if self._is_premarket:
             latest = getattr(snap, "latest_trade", None)
             price = float(latest.price) if latest else float(bar.close)
+            prev_close = float(bar.close)
         else:
             price = float(bar.close)
+            prev_close = float(prev.close)
 
         if price < self._min_price or price > self._max_price:
             return None
 
-        prev_close = float(prev.close)
         if prev_close <= 0:
             return None
 
         volume = float(bar.volume)
-        # During pre-market, daily_bar.volume is stale (yesterday's).
-        # Use minute_bar.volume which reflects actual real-time activity.
+        # During pre-market, daily_bar.volume is yesterday's full-session
+        # volume. Only use current minute volume here; HOD/session scanners
+        # supply full premarket volume later from real session bars.
         if self._is_premarket:
+            volume = 0.0
             mbar = getattr(snap, "minute_bar", None)
-            if mbar is not None and mbar.volume > volume:
+            if mbar is not None:
                 volume = float(mbar.volume)
         effective_min_vol = (
             self._premarket_min_volume if self._is_premarket else self._min_volume

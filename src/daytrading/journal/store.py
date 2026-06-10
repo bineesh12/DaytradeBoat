@@ -7,15 +7,19 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import sqlite3
 import shutil
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence
 
 from daytrading.models import Bar
+
+SQLITE_BUSY_TIMEOUT_MS = 30000
+logger = logging.getLogger(__name__)
 
 
 def _utc_now() -> datetime:
@@ -38,6 +42,28 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _env_set(name: str, default: str = "") -> set:
+    raw = os.environ.get(name, default)
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
 class TradingJournal:
     """SQLite-backed journal for strategy learning and replay."""
 
@@ -46,8 +72,17 @@ class TradingJournal:
         base_dir: Optional[str] = None,
         screenshot_dir: Optional[str] = None,
         db_path: Optional[str] = None,
+        *,
+        record_candle_snapshots: Optional[bool] = None,
+        retention_days: Optional[int] = None,
+        prune_on_start: Optional[bool] = None,
+        daily_prune_enabled: Optional[bool] = None,
+        vacuum_on_prune: Optional[bool] = None,
+        async_prune: Optional[bool] = None,
+        skipped_event_types: Optional[Sequence[str]] = None,
     ) -> None:
         root = base_dir or os.environ.get("DAYTRADING_JOURNAL_DIR", "data/journal")
+        use_runtime_env = base_dir is None and db_path is None
         self._base_dir = os.path.abspath(root)
         self._event_dir = os.path.join(self._base_dir, "events")  # legacy mirror (optional)
         self._shot_dir = os.path.abspath(
@@ -56,10 +91,68 @@ class TradingJournal:
         self._db_path = os.path.abspath(db_path or os.environ.get("DAYTRADING_JOURNAL_DB", os.path.join(self._base_dir, "journal.db")))
         os.makedirs(self._event_dir, exist_ok=True)
         os.makedirs(self._shot_dir, exist_ok=True)
+        self._record_candle_snapshots = (
+            _env_bool("DAYTRADING_JOURNAL_CANDLE_SNAPSHOTS", False)
+            if use_runtime_env and record_candle_snapshots is None
+            else bool(record_candle_snapshots)
+            if record_candle_snapshots is not None
+            else False
+        )
+        self._retention_days = (
+            _env_int("DAYTRADING_JOURNAL_RETENTION_DAYS", 5)
+            if use_runtime_env and retention_days is None
+            else int(retention_days)
+            if retention_days is not None
+            else 5
+        )
+        self._prune_on_start = (
+            _env_bool("DAYTRADING_JOURNAL_PRUNE_ON_START", False)
+            if use_runtime_env and prune_on_start is None
+            else bool(prune_on_start)
+            if prune_on_start is not None
+            else False
+        )
+        self._daily_prune_enabled = (
+            _env_bool("DAYTRADING_JOURNAL_DAILY_PRUNE_ENABLED", False)
+            if use_runtime_env and daily_prune_enabled is None
+            else bool(daily_prune_enabled)
+            if daily_prune_enabled is not None
+            else False
+        )
+        self._vacuum_on_prune = (
+            _env_bool("DAYTRADING_JOURNAL_VACUUM_ON_PRUNE", False)
+            if use_runtime_env and vacuum_on_prune is None
+            else bool(vacuum_on_prune)
+            if vacuum_on_prune is not None
+            else False
+        )
+        self._async_prune = (
+            _env_bool("DAYTRADING_JOURNAL_ASYNC_PRUNE", True)
+            if use_runtime_env and async_prune is None
+            else bool(async_prune)
+            if async_prune is not None
+            else True
+        )
+        self._skipped_event_types = (
+            _env_set("DAYTRADING_JOURNAL_SKIP_EVENT_TYPES")
+            if use_runtime_env and skipped_event_types is None
+            else {str(item).strip() for item in skipped_event_types if str(item).strip()}
+            if skipped_event_types is not None
+            else set()
+        )
+        self._last_prune_day: Optional[str] = None
+        self._prune_in_progress = False
         self._lock = threading.Lock()
-        self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
+        self._conn = sqlite3.connect(
+            self._db_path,
+            check_same_thread=False,
+            timeout=SQLITE_BUSY_TIMEOUT_MS / 1000,
+        )
+        self._configure_connection(self._conn)
         self._conn.row_factory = sqlite3.Row
         self._init_db()
+        if self._prune_on_start:
+            self.prune(retention_days=self._retention_days, vacuum=self._vacuum_on_prune)
 
     @property
     def base_dir(self) -> str:
@@ -68,6 +161,12 @@ class TradingJournal:
     @property
     def db_path(self) -> str:
         return self._db_path
+
+    @staticmethod
+    def _configure_connection(conn: sqlite3.Connection) -> None:
+        conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
 
     def _init_db(self) -> None:
         with self._lock:
@@ -186,7 +285,7 @@ class TradingJournal:
                     FROM events
                     WHERE type IN (
                         'cycle','classification','scan_hit','signal',
-                        'trade_fill','trade_exit','mistake',
+                        'trade_fill','trade_exit','mistake','entry_decision',
                         'market_context','market_regime','screenshot'
                     );
                 """
@@ -379,6 +478,8 @@ class TradingJournal:
         row = cur.fetchone()
         if row and row[0] == "table":
             cur.execute("DROP TABLE replay_events")
+        elif row and row[0] == "view":
+            cur.execute("DROP VIEW replay_events")
 
     def _insert_specialized(self, event_id: int, event_type: str, ts_iso: str, payload: Dict[str, Any]) -> None:
         cur = self._conn.cursor()
@@ -485,7 +586,7 @@ class TradingJournal:
                 ),
             )
 
-        bars = payload.get("candle_snapshot")
+        bars = payload.get("candle_snapshot") if self._record_candle_snapshots else None
         if isinstance(bars, list) and bars:
             cur.execute(
                 """
@@ -501,12 +602,19 @@ class TradingJournal:
             )
 
     def record(self, event_type: str, payload: Dict[str, Any], ts: Optional[datetime] = None) -> None:
+        if event_type in self._skipped_event_types:
+            self._maybe_prune_daily()
+            return
         t = ts or _utc_now()
+        payload_for_storage = _json_safe(payload)
+        if not self._record_candle_snapshots and isinstance(payload_for_storage, dict):
+            payload_for_storage = dict(payload_for_storage)
+            payload_for_storage.pop("candle_snapshot", None)
         event = {
             "ts": t.isoformat(),
             "day": _day_key(t),
             "type": event_type,
-            "payload": _json_safe(payload),
+            "payload": payload_for_storage,
         }
         payload_json = json.dumps(event["payload"], separators=(",", ":"), ensure_ascii=True)
         line = json.dumps(event, separators=(",", ":"), ensure_ascii=True)  # legacy mirror
@@ -523,6 +631,7 @@ class TradingJournal:
             # Keep JSONL mirror so old tools/scripts keep working.
             with open(path, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
+        self._maybe_prune_daily()
 
     def candle_snapshot(self, bars: Sequence[Bar], limit: int = 30) -> List[Dict[str, Any]]:
         recent = list(bars[-limit:]) if bars else []
@@ -611,6 +720,7 @@ class TradingJournal:
             "trade_fill",
             "trade_exit",
             "mistake",
+            "entry_decision",
             "market_context",
             "market_regime",
             "screenshot",
@@ -652,6 +762,112 @@ class TradingJournal:
             except Exception:
                 continue
         return frames
+
+    def prune(self, *, retention_days: Optional[int] = None, vacuum: bool = False) -> int:
+        """Delete old journal rows and optional legacy JSONL mirrors.
+
+        Retention is day-based and keeps today plus the previous N-1 days.
+        VACUUM is intentionally opt-in because it can be slow on large live DBs.
+        """
+        days = self._retention_days if retention_days is None else int(retention_days)
+        if days <= 0:
+            return 0
+        cutoff = (_utc_now() - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+        deleted = 0
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute("SELECT id FROM events WHERE day < ?", (cutoff,))
+            old_event_ids = [int(row[0]) for row in cur.fetchall()]
+            if old_event_ids:
+                for table in (
+                    "trades",
+                    "market_context",
+                    "classifications",
+                    "mistakes",
+                    "market_regime",
+                    "screenshots",
+                    "candle_snapshots",
+                ):
+                    for chunk in self._chunks(old_event_ids, 500):
+                        placeholders = ",".join("?" for _ in chunk)
+                        cur.execute(
+                            f"DELETE FROM {table} WHERE event_id IN ({placeholders})",
+                            chunk,
+                        )
+                cur.execute("DELETE FROM events WHERE day < ?", (cutoff,))
+                deleted = int(cur.rowcount or 0)
+            self._conn.commit()
+            try:
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception:
+                pass
+
+        self._prune_legacy_event_files(cutoff)
+        if vacuum and deleted:
+            with self._lock:
+                self._conn.execute("VACUUM")
+        self._last_prune_day = _day_key()
+        return deleted
+
+    @staticmethod
+    def _chunks(values: List[int], size: int) -> List[List[int]]:
+        return [values[i:i + size] for i in range(0, len(values), size)]
+
+    def _maybe_prune_daily(self) -> None:
+        if not self._daily_prune_enabled:
+            return
+        current_day = _day_key()
+        retention_days = int(self._retention_days or 0)
+        if (
+            retention_days <= 0
+            or self._last_prune_day == current_day
+            or self._prune_in_progress
+        ):
+            return
+        if self._async_prune:
+            self._last_prune_day = current_day
+            self._prune_in_progress = True
+            thread = threading.Thread(
+                target=self._run_daily_prune,
+                daemon=True,
+                name="journal-prune",
+            )
+            thread.start()
+            return
+        try:
+            self.prune(retention_days=retention_days, vacuum=False)
+        except Exception as exc:
+            logger.warning("Journal daily prune failed: %s", exc)
+
+    def _run_daily_prune(self) -> None:
+        try:
+            deleted = self.prune(
+                retention_days=int(self._retention_days or 0),
+                vacuum=False,
+            )
+            if deleted:
+                logger.info("Journal daily prune removed %d old events", deleted)
+        except Exception as exc:
+            logger.warning("Journal daily prune failed: %s", exc)
+            self._last_prune_day = None
+        finally:
+            self._prune_in_progress = False
+
+    def _prune_legacy_event_files(self, cutoff_day: str) -> None:
+        try:
+            names = os.listdir(self._event_dir)
+        except Exception:
+            return
+        for name in names:
+            if not name.endswith(".jsonl"):
+                continue
+            day = name[:-6]
+            if day >= cutoff_day:
+                continue
+            try:
+                os.remove(os.path.join(self._event_dir, name))
+            except Exception:
+                pass
 
     def close(self) -> None:
         """Flush WAL and close the SQLite connection cleanly."""

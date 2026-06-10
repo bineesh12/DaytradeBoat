@@ -34,7 +34,7 @@ class TestNightlyAnalystRun:
             "quantity": 100,
             "price": 5.0,
             "trade_type": "entry",
-            "strategy": "bull_flag",
+            "strategy": "vwap_pullback",
         }, ts=datetime.fromisoformat(ts_entry))
         journal.record("trade_exit", {
             "symbol": "WIN",
@@ -45,7 +45,7 @@ class TestNightlyAnalystRun:
             "pnl": 20.0,
             "trade_type": "exit",
             "reason": "take_profit",
-            "strategy": "bull_flag",
+            "strategy": "vwap_pullback",
         }, ts=datetime.fromisoformat(ts_exit))
         journal.record("trade_fill", {
             "symbol": "LOSS",
@@ -53,7 +53,7 @@ class TestNightlyAnalystRun:
             "quantity": 100,
             "price": 3.0,
             "trade_type": "entry",
-            "strategy": "momentum_burst",
+            "strategy": "pullback_base",
         }, ts=datetime.fromisoformat(ts_entry))
         journal.record("trade_exit", {
             "symbol": "LOSS",
@@ -64,7 +64,7 @@ class TestNightlyAnalystRun:
             "pnl": -10.0,
             "trade_type": "exit",
             "reason": "stop_loss",
-            "strategy": "momentum_burst",
+            "strategy": "pullback_base",
         }, ts=datetime.fromisoformat(ts_exit))
 
     def _write_jsonl(self, path, rows) -> None:
@@ -78,6 +78,7 @@ class TestNightlyAnalystRun:
             {
                 "ts": f"{day}T14:31:00+00:00",
                 "symbol": "OLOX",
+                "scanner": "vwap_pullback",
                 "reason": "guard rejected: extended",
                 "label": 1,
                 "future_return_pct": 3.2,
@@ -85,6 +86,7 @@ class TestNightlyAnalystRun:
             {
                 "ts": f"{day}T14:34:00+00:00",
                 "symbol": "STG",
+                "scanner": "hod_reclaim",
                 "reason": "cooldown",
                 "label": 0,
                 "future_return_pct": -0.4,
@@ -103,12 +105,14 @@ class TestNightlyAnalystRun:
             {
                 "ts": f"{day}T14:36:00+00:00",
                 "symbol": "HOLD",
+                "entry_pattern": "vwap_pullback",
                 "label": 1,
                 "future_return_pct": 0.7,
             },
             {
                 "ts": f"{day}T14:37:00+00:00",
                 "symbol": "SELL",
+                "entry_pattern": "pullback_base",
                 "label": 0,
                 "future_return_pct": -0.8,
             },
@@ -208,6 +212,24 @@ class TestNightlyAnalystRun:
         report = analyst.run("2026-05-15")
         assert report["status"] == "no_trades"
 
+    def test_no_trades_with_ml_rows_writes_ml_only_report(self, tmp_path) -> None:
+        journal = TradingJournal(base_dir=str(tmp_path / "journal"))
+        report_dir = tmp_path / "reports"
+        ml_dir = tmp_path / "ml"
+        self._seed_ml_learning_rows(ml_dir, "2026-05-15")
+        analyst = NightlyAnalyst(
+            db_path=journal.db_path,
+            report_dir=str(report_dir),
+            ml_dir=str(ml_dir),
+        )
+
+        report = analyst.run("2026-05-15")
+
+        assert report["status"] == "ml_only"
+        assert report["summary"]["total_entries"] == 0
+        assert report["ml_learning"]["total_rows"] > 0
+        assert (report_dir / "2026-05-15.json").exists()
+
     def test_full_report_shape_and_files(self, tmp_path) -> None:
         journal = TradingJournal(base_dir=str(tmp_path / "journal"))
         report_dir_path = tmp_path / "reports"
@@ -233,8 +255,17 @@ class TestNightlyAnalystRun:
         assert report["summary"]["total_pnl"] == pytest.approx(10.0)
 
         patterns = {p["pattern"]: p for p in report["pattern_analysis"]}
-        assert patterns["bull_flag"]["total_pnl"] == pytest.approx(20.0)
-        assert patterns["momentum_burst"]["total_pnl"] == pytest.approx(-10.0)
+        assert patterns["vwap_pullback"]["total_pnl"] == pytest.approx(20.0)
+        assert patterns["pullback_base"]["total_pnl"] == pytest.approx(-10.0)
+
+        setups = {s["setup"]: s for s in report["setup_performance"]}
+        assert setups["vwap_pullback"]["trades"] == 1
+        assert setups["vwap_pullback"]["total_pnl"] == pytest.approx(20.0)
+        assert setups["vwap_pullback"]["missed_went_up"] == 1
+        assert setups["vwap_pullback"]["pullback_worked"] == 1
+        assert setups["vwap_pullback"]["exit_hold_helped"] == 1
+        assert setups["pullback_base"]["trades"] == 1
+        assert setups["pullback_base"]["losses"] == 1
 
         ml = report["ml_learning"]
         assert ml["total_rows"] == 12
@@ -277,5 +308,108 @@ class TestNightlyAnalystRun:
             assert "Trading Report" in markdown
             assert "ML Learning Report" in markdown
             assert "ML Progress" in markdown
+            assert "Live Setup Scorecard" in markdown
             assert "Best missed setup: OLOX" in markdown
             assert "missed_opportunity" in markdown
+
+    def test_realized_trade_details_pair_same_symbol_exits_fifo(self, tmp_path) -> None:
+        analyst = NightlyAnalyst(db_path=str(tmp_path / "missing.db"))
+        trades = [
+            {
+                "symbol": "VERU",
+                "side": "buy",
+                "trade_type": "entry",
+                "strategy": "vwap_pullback",
+                "quantity": 100,
+                "entry_price": 4.00,
+                "exit_price": None,
+                "pnl": None,
+                "reason": None,
+                "ts": "2026-06-05T14:00:00+00:00",
+            },
+            {
+                "symbol": "VERU",
+                "side": "sell",
+                "trade_type": "exit",
+                "strategy": "vwap_pullback",
+                "quantity": 50,
+                "entry_price": 4.00,
+                "exit_price": 4.40,
+                "pnl": 20.0,
+                "reason": "take_profit",
+                "ts": "2026-06-05T14:03:00+00:00",
+            },
+            {
+                "symbol": "VERU",
+                "side": "buy",
+                "trade_type": "scale_up",
+                "strategy": "runner_readd",
+                "quantity": 50,
+                "entry_price": 4.30,
+                "exit_price": None,
+                "pnl": None,
+                "reason": None,
+                "ts": "2026-06-05T14:05:00+00:00",
+            },
+            {
+                "symbol": "VERU",
+                "side": "sell",
+                "trade_type": "exit",
+                "strategy": "runner_readd",
+                "quantity": 100,
+                "entry_price": 4.15,
+                "exit_price": 4.10,
+                "pnl": -5.0,
+                "reason": "stop_loss",
+                "ts": "2026-06-05T14:08:00+00:00",
+            },
+        ]
+
+        details = analyst._build_realized_trade_details(trades)
+
+        assert len(details) == 2
+        assert details[0]["entry_price"] == pytest.approx(4.00)
+        assert details[0]["hold_seconds"] == pytest.approx(180.0)
+        assert details[1]["entry_price"] == pytest.approx(4.15)
+        assert details[1]["hold_seconds"] == pytest.approx(480.0)
+        assert all(d["hold_seconds"] >= 0 for d in details)
+
+    def test_markdown_uses_realized_trade_details_without_problem_payload(self, tmp_path) -> None:
+        analyst = NightlyAnalyst(db_path=str(tmp_path / "missing.db"))
+        markdown = analyst._render_markdown({
+            "day": "2026-06-05",
+            "summary": {
+                "total_entries": 1,
+                "total_exits": 1,
+                "total_pnl": 10.0,
+                "win_count": 1,
+                "loss_count": 0,
+                "win_rate": 100.0,
+                "avg_winner": 10.0,
+                "avg_loser": 0.0,
+                "largest_winner": 10.0,
+                "largest_loser": 0.0,
+                "profit_factor": float("inf"),
+                "symbols_traded": ["BGMS"],
+            },
+            "realized_trade_details": [{
+                "symbol": "BGMS",
+                "entry_price": 2.98,
+                "exit_price": 3.12,
+                "pnl": 10.0,
+                "hold_seconds": 90.0,
+                "reason": "take_profit",
+                "strategy": "level_breakout_reclaim",
+            }],
+            "problems": [],
+            "pattern_analysis": [],
+            "setup_performance": [],
+            "exit_analysis": [],
+            "time_analysis": {},
+            "rejection_analysis": {},
+            "ml_learning": {},
+        })
+
+        assert "Every Trade Today" in markdown
+        assert "BGMS" in markdown
+        assert "$2.98" in markdown

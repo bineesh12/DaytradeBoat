@@ -436,7 +436,12 @@ class TradeGuard:
                 pattern = signal.scan_result.criteria.get("pattern", "")
                 if not pattern and signal.scan_result.scanner_name == "momentum_burst":
                     pattern = "momentum_burst"
-            pullback_patterns = ("vwap_pullback", "pullback_base", "hod_reclaim")
+            pullback_patterns = (
+                "vwap_pullback",
+                "pullback_base",
+                "hod_reclaim",
+                "first_pullback_reclaim",
+            )
             if pattern not in pullback_patterns:
                 reason = self.false_breakout.check(bars, symbol=signal.symbol)
                 if reason:

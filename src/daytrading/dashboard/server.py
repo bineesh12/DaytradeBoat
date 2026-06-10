@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from flask import Flask, Response, jsonify, render_template_string, request
+from werkzeug.exceptions import BadRequest
 
 from daytrading.dashboard.hub import DashboardHub
 
@@ -28,13 +29,33 @@ def create_app(hub: DashboardHub) -> Flask:
     _hub = hub
 
     app = Flask(__name__)
+    analytics_generation_lock = threading.Lock()
     app.config["PROPAGATE_EXCEPTIONS"] = True
 
     @app.after_request
     def add_no_cache(response):
-        if response.content_type and "text/html" in response.content_type:
+        if (
+            response.content_type
+            and ("text/html" in response.content_type or request.path.startswith("/api/"))
+        ):
             response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
         return response
+
+    @app.errorhandler(BadRequest)
+    def handle_bad_request(exc):
+        logger.warning(
+            "Dashboard bad request on %s %s: %s",
+            request.method,
+            request.path,
+            getattr(exc, "description", str(exc)),
+        )
+        return jsonify({
+            "ok": False,
+            "error": "bad request",
+            "path": request.path,
+        }), 400
 
     @app.route("/")
     def index():
@@ -57,16 +78,34 @@ def create_app(hub: DashboardHub) -> Flask:
     def ml_stats():
         """Return ML model monitoring stats."""
         try:
-            from daytrading.strategy.entry_guard import get_ml_monitor
+            from daytrading.strategy.entry_guard import (
+                get_ml_monitor,
+                is_entry_ml_enabled,
+                is_entry_ml_loaded,
+            )
             monitor = get_ml_monitor()
             if monitor is None:
                 return jsonify({"enabled": False, "reason": "no monitor"})
             stats = monitor.stats.to_dict()
-            stats["model_loaded"] = True
-            stats["model_active"] = monitor.is_model_enabled
+            model_enabled = is_entry_ml_enabled()
+            model_loaded = is_entry_ml_loaded()
+            stats["model_enabled"] = model_enabled
+            stats["model_loaded"] = model_loaded
+            stats["model_active"] = model_enabled and model_loaded and monitor.is_model_enabled
+            if not model_enabled:
+                stats["disable_reason"] = stats.get("disable_reason") or "disabled by config"
             return jsonify(stats)
         except Exception as exc:
             return jsonify({"enabled": False, "reason": str(exc)})
+
+    @app.route("/api/missed-a-plus")
+    def missed_a_plus():
+        """Return blocked A+ setups with later outcome labels."""
+        return jsonify({
+            "ok": True,
+            "rows": list(getattr(_hub, "missed_a_plus", [])),
+            "loaded_at": datetime.now(timezone.utc).isoformat(),
+        })
 
     @app.route("/api/analytics-report")
     def analytics_report():
@@ -79,22 +118,46 @@ def create_app(hub: DashboardHub) -> Flask:
                     report_dir = os.path.join(os.path.dirname(base_dir), "reports")
             report_dir = report_dir or os.environ.get("DAYTRADING_REPORT_DIR", "data/reports")
             report_dir = os.path.abspath(report_dir)
-            if not os.path.isdir(report_dir):
-                return jsonify({
-                    "ok": True,
-                    "report": None,
-                    "message": "No nightly analytics report directory yet",
-                })
-
             requested_day = request.args.get("day")
+            explicit_day = bool(requested_day)
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            has_journal_db = bool(getattr(getattr(_hub, "journal", None), "db_path", None))
+
+            if not os.path.isdir(report_dir):
+                os.makedirs(report_dir, exist_ok=True)
+
             candidates = []
             for name in os.listdir(report_dir):
                 if not name.endswith(".json"):
                     continue
                 day = name[:-5]
-                if requested_day and day != requested_day:
+                if explicit_day and day != requested_day:
                     continue
                 candidates.append((day, os.path.join(report_dir, name)))
+            if not candidates:
+                generation_day = requested_day if explicit_day else today
+                if generation_day and has_journal_db:
+                    try:
+                        if not analytics_generation_lock.acquire(blocking=False):
+                            return jsonify({
+                                "ok": True,
+                                "report": None,
+                                "message": f"Analytics report for {generation_day} is generating",
+                            })
+                        from daytrading.analyst.collector import NightlyAnalyst
+                        try:
+                            analyst = NightlyAnalyst(
+                                db_path=_hub.journal.db_path,
+                                report_dir=report_dir,
+                            )
+                            generated = analyst.run(generation_day)
+                            if generated.get("status") not in ("no_trades", "holiday"):
+                                path = os.path.join(report_dir, f"{generation_day}.json")
+                                candidates.append((generation_day, path))
+                        finally:
+                            analytics_generation_lock.release()
+                    except Exception as exc:
+                        logger.debug("On-demand analytics report generation skipped: %s", exc)
             if not candidates:
                 msg = "No nightly analytics report found"
                 if requested_day:
@@ -104,17 +167,19 @@ def create_app(hub: DashboardHub) -> Flask:
             day, path = sorted(candidates, reverse=True)[0]
             with open(path) as f:
                 report = json.load(f)
-            if getattr(_hub, "journal", None):
+            if explicit_day and getattr(_hub, "journal", None):
                 try:
                     from daytrading.analyst.collector import NightlyAnalyst
                     analyst = NightlyAnalyst(
                         db_path=_hub.journal.db_path,
                         report_dir=report_dir,
                     )
-                    # Refresh ML sections from current JSONL/model files so older reports
-                    # still show previously collected ML data after dashboard upgrades.
+                    # Keep the normal dashboard load fast. Only explicit day requests
+                    # refresh ML sections because those can scan large JSONL/model files.
                     report["ml_learning"] = analyst._analyze_ml_learning(day)
                     report["ml_progress"] = analyst._analyze_ml_progress(day)
+                    if "setup_performance" not in report:
+                        report["setup_performance"] = analyst._analyze_setup_performance(day, [])
                 except Exception as exc:
                     logger.debug("Analytics report ML refresh skipped: %s", exc)
             return jsonify({
@@ -533,9 +598,9 @@ tr:hover { background:var(--surface2); }
 
   <div class="grid grid-2" style="margin-top:16px">
     <div class="card">
-      <div class="card-header"><h3>Latest Scanner Hits</h3><span class="badge pill-blue" id="ov-scan-count2">0</span></div>
+      <div class="card-header"><h3>Entry Checks</h3><span class="badge pill-blue" id="ov-scan-count2">0</span></div>
       <div id="ov-scanner-wrap">
-        <div class="empty"><div class="icon">&#128269;</div>No scanner hits yet</div>
+        <div class="empty"><div class="icon">&#128269;</div>No entry checks yet</div>
       </div>
     </div>
     <div class="card">
@@ -568,17 +633,29 @@ tr:hover { background:var(--surface2); }
     <div class="card stat-card">
       <div class="stat-label">Trading Watchlist</div>
       <div class="stat-value text-blue" id="trading-watchlist-count">0</div>
-      <div class="stat-sub">Active trade symbols</div>
+      <div class="stat-sub">HOD + Hot Watch symbols</div>
     </div>
   </div>
 
   <div class="card" style="margin-bottom:16px">
     <div class="card-header">
       <h3>Trading Watchlist</h3>
-      <span style="font-size:11px;color:var(--text2)">HOD trade names only — SPY is pinned for market panic, not HOD alerts</span>
+      <span style="font-size:11px;color:var(--text2)">Active scan universe from HOD alerts and Hot Watch — SPY is pinned for market panic</span>
     </div>
     <div id="trading-watchlist-wrap">
       <div class="empty"><div class="icon">&#128203;</div>No symbols on watchlist yet</div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-header">
+      <h3>Hot Watch</h3>
+      <span style="font-size:11px;color:var(--text2)">Early fast-scan movers waiting for clean pullback or breakout</span>
+      <span class="badge pill-yellow" id="hot-watch-count">0</span>
+    </div>
+    <div id="candidate-worker-status" style="font-size:12px;color:var(--text2);margin-bottom:10px"></div>
+    <div id="hot-watch-wrap">
+      <div class="empty"><div class="icon">&#128293;</div>No hot-watch movers yet</div>
     </div>
   </div>
 
@@ -659,6 +736,15 @@ tr:hover { background:var(--surface2); }
     <div class="card stat-card">
       <div class="stat-label">Expectancy</div>
       <div class="stat-value" id="an-expect">$0.00</div>
+    </div>
+  </div>
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-header">
+      <h3>Missed A+ Setups</h3>
+      <span style="font-size:11px;color:var(--text2)">Blocked elite setups labeled by later price action</span>
+    </div>
+    <div id="missed-a-plus-wrap">
+      <div class="empty"><div class="icon">&#128269;</div>No blocked A+ setups labeled yet</div>
     </div>
   </div>
   <div class="grid grid-2" style="margin-bottom:16px">
@@ -780,7 +866,9 @@ let state = {
   stats: {}, account: {}, positions: {}, symbols: {},
   recent_trades: [], recent_scans: [], pnl_history: [],
   market_open: false, stream_connected: false,
-  watchlist_scan: [], rt_movers: [], hod_momentum_alerts: [], trading_watchlist: [],
+  watchlist_scan: [], rt_movers: [], hod_momentum_alerts: [], hot_watch: [], trading_watchlist: [],
+  missed_a_plus: [],
+  candidate_hydration: {},
   watchlist_pinned: ['SPY'],
   hod_momentum_filter: 'all', rt_new_total: 0,
   news: {}, journal: {events: [], loaded: false, error: null, last_update: null},
@@ -813,6 +901,14 @@ function fmtPnl(v) {
 function chartLink(sym) {
   let url = 'https://www.tradingview.com/chart/?symbol=' + encodeURIComponent(sym);
   return '<a href="' + url + '" target="_blank" rel="noopener" style="text-decoration:none" title="Open chart for ' + sym + '"><strong>' + sym + '</strong> <span style="font-size:11px;opacity:0.6">&#128200;</span></a>';
+}
+function fmtCompact(v) {
+  let n = Number(v || 0);
+  let abs = Math.abs(n);
+  if (abs >= 1000000000) return (n / 1000000000).toFixed(abs >= 10000000000 ? 0 : 1) + 'B';
+  if (abs >= 1000000) return (n / 1000000).toFixed(abs >= 10000000 ? 0 : 1) + 'M';
+  if (abs >= 1000) return (n / 1000).toFixed(abs >= 10000 ? 0 : 1) + 'K';
+  return n.toFixed(0);
 }
 function confBar(pct) {
   let color = pct >= 60 ? 'var(--green)' : pct >= 40 ? 'var(--yellow)' : 'var(--red)';
@@ -881,28 +977,108 @@ function renderOverviewScanner() {
   if (countEl) countEl.textContent = scans.length;
 
   if (scans.length === 0) {
-    wrap.innerHTML = '<div class="empty"><div class="icon">&#128269;</div>No scanner hits yet</div>';
+    wrap.innerHTML = '<div class="empty"><div class="icon">&#128269;</div>No entry checks yet</div>';
     return;
   }
-  let html = '<table><tr><th>Time</th><th>Symbol</th><th>Price</th><th>Scanner</th><th>Score</th><th>Status</th></tr>';
+  let html = '<table><tr><th>Time</th><th>Symbol</th><th>Price</th><th>Pattern</th><th>Tier</th><th>Score</th><th>Entry Check</th></tr>';
   scans.forEach(h => {
     let status = '';
     if (h.verified) {
-      status = '<span class="pill pill-green">SIGNAL</span>';
+      status = '<span class="pill pill-green">A+ SIGNAL</span>';
     } else if (h.action_taken) {
-      status = '<span style="color:var(--red);font-size:11px">\u2718 '+h.action_taken+'</span>';
+      status = renderHumanScanStatus(h.action_taken);
     } else {
       status = '<span style="color:var(--text2);font-size:11px">pending</span>';
     }
     html += '<tr><td style="color:var(--text2)">'+shortTime(h.time)+'</td>';
-    html += '<td><strong>'+h.symbol+'</strong></td>';
+    html += '<td>'+chartLink(h.symbol)+'</td>';
     html += '<td>$'+(h.price||0).toFixed(2)+'</td>';
     html += '<td><span class="pill pill-blue">'+h.scanner_name+'</span></td>';
+    html += '<td>'+renderSetupTier(h)+'</td>';
     html += '<td>'+h.score.toFixed(2)+'</td>';
     html += '<td>'+status+'</td></tr>';
   });
   html += '</table>';
   wrap.innerHTML = html;
+}
+
+const A_PLUS_SCANNERS = new Set([
+  'vwap_pullback',
+  'abc_continuation',
+  'first_pullback_reclaim',
+  'hod_reclaim',
+  'pullback_base',
+  'runner_readd'
+]);
+
+function setupTier(hit) {
+  let explicit = hit && hit.criteria ? String(hit.criteria.setup_tier || '').toLowerCase() : '';
+  if (explicit.includes('a+')) return 'A+';
+  if (explicit.includes('watch')) return 'Watch';
+  return A_PLUS_SCANNERS.has(hit.scanner_name) ? 'A+' : 'Watch';
+}
+
+function renderSetupTier(hit) {
+  let tier = setupTier(hit);
+  let cls = tier === 'A+' ? 'pill-green' : 'pill-yellow';
+  let title = tier === 'A+'
+    ? 'Live A+ setup: can continue to guard, ML, 10-second confirmation, and risk checks'
+    : 'Watch only: monitored for learning/watchlist, not a live trade setup by itself';
+  return '<span class="pill '+cls+'" title="'+escapeHtml(title)+'">'+tier+'</span>';
+}
+
+function humanScanStatus(reason) {
+  let raw = String(reason || '');
+  let r = raw.toLowerCase();
+  let label = 'Rule rejected';
+  let cls = 'pill-red';
+
+  if (r.includes('stale data')) {
+    label = r.includes('halt') ? 'Halt/data issue' : 'Data issue';
+  } else if (r.includes('watch only')) {
+    label = 'Watch only';
+    cls = 'pill-yellow';
+  } else if (r.includes('tape too slow') || r.includes('recent volume')) {
+    label = 'Weak tape';
+  } else if (r.includes('thin sub-$5 liquidity') || r.includes('liquidity')) {
+    label = 'Thin liquidity';
+  } else if (r.includes('not enough movement') || r.includes('movement too small')) {
+    label = 'Not enough movement';
+  } else if (r.includes('outside range') || r.includes('price band')) {
+    label = 'Outside price range';
+  } else if (r.includes('late pullback not strong above vwap')) {
+    let m = raw.match(/VWAP\\s+([0-9.]+)%/i);
+    let pct = m ? Number(m[1]) : 0;
+    if (pct >= 0.7) {
+      label = 'Borderline VWAP';
+      cls = 'pill-yellow';
+    } else {
+      label = 'Weak VWAP';
+    }
+  } else if (r.includes('below vwap')) {
+    label = 'Below VWAP';
+  } else if (r.includes('spread')) {
+    label = 'Wide spread';
+  } else if (r.includes('cooldown')) {
+    label = 'Cooldown';
+    cls = 'pill-yellow';
+  } else if (r.includes('hod momentum') || r.includes('hod board')) {
+    label = 'Waiting for HOD';
+    cls = 'pill-yellow';
+  } else if (r.includes('ml')) {
+    label = 'ML rejected';
+  } else if (r.includes('risk') || r.includes('r:r')) {
+    label = 'Risk rejected';
+  } else if (r.includes('negative news')) {
+    label = 'Bad news';
+  }
+
+  return { label, cls, raw };
+}
+
+function renderHumanScanStatus(reason) {
+  let s = humanScanStatus(reason);
+  return '<span class="pill '+s.cls+'" title="'+escapeHtml(s.raw)+'">\u2718 '+escapeHtml(s.label)+'</span>';
 }
 
 function renderPositionsCompact() {
@@ -959,17 +1135,41 @@ function renderScanner() {
   let scanSignals = document.getElementById('scan-signals');
   if (scanTotal) scanTotal.textContent = s.total_scan_hits||0;
   if (scanSignals) scanSignals.textContent = s.total_signals||0;
+  renderCandidateWorker();
   renderTradingWatchlist();
+  renderHotWatch();
   renderHodMomentumScanner();
+}
+
+function renderCandidateWorker() {
+  let el = document.getElementById('candidate-worker-status');
+  if (!el) return;
+  let c = state.candidate_hydration || {};
+  let paused = c.paused_for_entry ? '<span class="pill pill-yellow">ENTRY TIMER PRIORITY</span>' : '<span class="pill pill-green">READY</span>';
+  el.innerHTML = 'Candidate Worker ' + paused
+    + ' &middot; pending ' + (c.pending || 0)
+    + ' &middot; batches ' + (c.batches || 0)
+    + ' &middot; hydrated ' + (c.hydrated || 0)
+    + ' &middot; skipped fresh ' + (c.skipped_fresh || 0)
+    + ' &middot; dropped ' + (c.dropped || 0);
 }
 
 function renderTradingWatchlist() {
   let wrap = document.getElementById('trading-watchlist-wrap');
   if (!wrap) return;
-  let syms = (state.trading_watchlist || []).slice();
+  let hotSyms = (state.hot_watch || [])
+    .map(h => String(h.symbol || '').trim().toUpperCase())
+    .filter(Boolean);
+  let syms = (state.trading_watchlist || [])
+    .map(s => String(s || '').trim().toUpperCase())
+    .filter(Boolean);
+  hotSyms.forEach(sym => {
+    if (!syms.includes(sym)) syms.push(sym);
+  });
   let countEl = document.getElementById('trading-watchlist-count');
 
   if (syms.length === 0) {
+    if (countEl) countEl.textContent = '0';
     wrap.innerHTML = '<div class="empty"><div class="icon">&#128203;</div>No symbols on watchlist yet</div>';
     return;
   }
@@ -984,20 +1184,90 @@ function renderTradingWatchlist() {
   if (countEl) countEl.textContent = tradeSyms.length;
 
   if (tradeSyms.length === 0) {
-    wrap.innerHTML = '<div class="empty"><div class="icon">&#128203;</div>Waiting for HOD alerts to add trade symbols...</div>';
+    wrap.innerHTML = '<div class="empty"><div class="icon">&#128203;</div>Waiting for HOD alerts or Hot Watch movers...</div>';
     return;
   }
 
-  let html = '<table><tr><th>Symbol</th><th>HOD Alert</th><th>Latest</th></tr>';
+  let hotBySym = {};
+  (state.hot_watch || []).forEach(h => { hotBySym[h.symbol] = h; });
+  let html = '<table><tr><th>Symbol</th><th>Source</th><th>Latest</th></tr>';
   tradeSyms.forEach(sym => {
     let a = alertBySym[sym];
+    let h = hotBySym[sym];
     let onBoard = a
       ? '<span class="pill pill-green">YES</span>'
-      : '<span class="pill pill-yellow">waiting</span>';
+      : (h ? hotWatchModePill(h.mode) : '<span class="pill pill-yellow">waiting</span>');
     let alertCell = a
       ? '<span class="hod-alert-name">' + escapeHtml(a.alert_name) + '</span> @ $' + (a.price||0).toFixed(2)
-      : '<span style="color:var(--text2);font-size:11px">TTL active — no new alert yet</span>';
+      : (h ? '<span style="color:var(--text2);font-size:11px">Hot Watch session ' + (h.change_pct||0).toFixed(1) + '% · now ' + hotWatchNowText(h) + ' · vol ' + fmtCompact(h.volume||0) + '</span>'
+           : '<span style="color:var(--text2);font-size:11px">TTL active — no new alert yet</span>');
     html += '<tr><td>' + chartLink(sym) + '</td><td>' + onBoard + '</td><td>' + alertCell + '</td></tr>';
+  });
+  html += '</table>';
+  wrap.innerHTML = html;
+}
+
+function hotWatchModePill(mode) {
+  let map = {
+    runner_watch: {label: 'Runner', cls: 'pill-green'},
+    strong_watch: {label: 'Strong', cls: 'pill-blue'},
+    watch: {label: 'Watch', cls: 'pill-yellow'}
+  };
+  let m = map[mode] || {label: mode || 'Watch', cls: 'pill-yellow'};
+  return '<span class="pill '+m.cls+'">'+escapeHtml(m.label)+'</span>';
+}
+
+function hotWatchNowText(row) {
+  let pull = Number(row.pullback_from_high_pct);
+  let short = Number(row.short_change_pct);
+  if (Number.isFinite(pull) && pull < -0.1) {
+    return pull.toFixed(1) + '% from high';
+  }
+  if (Number.isFinite(short)) {
+    return (short >= 0 ? '+' : '') + short.toFixed(1) + '% short-term';
+  }
+  return 'checking';
+}
+
+function hotWatchNowClass(row) {
+  let pull = Number(row.pullback_from_high_pct);
+  let short = Number(row.short_change_pct);
+  if (Number.isFinite(pull) && pull <= -2.0) return 'text-red';
+  if (Number.isFinite(short)) return short >= 0 ? 'text-green' : 'text-red';
+  return '';
+}
+
+function renderHotWatch() {
+  let wrap = document.getElementById('hot-watch-wrap');
+  if (!wrap) return;
+  let rows = (state.hot_watch || []).slice();
+  let countEl = document.getElementById('hot-watch-count');
+  if (countEl) countEl.textContent = rows.length;
+
+  if (rows.length === 0) {
+    wrap.innerHTML = '<div class="empty"><div class="icon">&#128293;</div>No hot-watch movers yet</div>';
+    return;
+  }
+
+  let html = '<table><tr><th>Symbol</th><th>Mode</th><th>Time Left</th><th>Price</th><th>Session</th><th>Now</th><th>Volume</th><th>Score</th><th>Why</th></tr>';
+  rows.forEach(r => {
+    let remaining = Math.max(0, Number(r.remaining_seconds || 0));
+    let mins = Math.ceil(remaining / 60);
+    let chg = Number(r.change_pct || r.abs_change_pct || 0);
+    let volume = Number(r.volume || 0);
+    let score = Number(r.score || 0);
+    let price = Number(r.price || 0);
+    html += '<tr>';
+    html += '<td>' + chartLink(r.symbol) + '</td>';
+    html += '<td>' + hotWatchModePill(r.mode) + '</td>';
+    html += '<td>' + mins + 'm</td>';
+    html += '<td><strong>$' + price.toFixed(2) + '</strong></td>';
+    html += '<td class="' + (chg >= 0 ? 'text-green' : 'text-red') + '">' + (chg >= 0 ? '+' : '') + chg.toFixed(1) + '%</td>';
+    html += '<td class="' + hotWatchNowClass(r) + '">' + escapeHtml(hotWatchNowText(r)) + '</td>';
+    html += '<td>' + volume.toLocaleString() + '</td>';
+    html += '<td>' + score.toFixed(2) + '</td>';
+    html += '<td style="color:var(--text2);font-size:11px">' + escapeHtml(r.reason || '') + '</td>';
+    html += '</tr>';
   });
   html += '</table>';
   wrap.innerHTML = html;
@@ -1034,7 +1304,7 @@ function renderHodMomentumScanner() {
     if (a.verified) {
       status = '<span class="pill pill-green">SIGNAL</span>';
     } else if (a.reject_reason) {
-      status = '<span style="color:var(--red);font-size:10px" title="'+escapeHtml(a.reject_reason)+'">REJECT</span>';
+      status = renderHumanScanStatus(a.reject_reason);
     } else {
       status = '<span class="pill pill-yellow">ALERT</span>';
     }
@@ -1157,9 +1427,74 @@ function renderLogs() {
   logs.slice(-200).forEach(addLogLine);
 }
 
+function pushLogLine(msg) {
+  if (!msg || !msg.message) return;
+  state.logs = state.logs || [];
+  let key = (msg.ts || '') + '|' + msg.message;
+  if (state.logs.some(l => ((l.ts || '') + '|' + l.message) === key)) return;
+  state.logs.push(msg);
+  if (state.logs.length > 300) state.logs = state.logs.slice(-300);
+  addLogLine(msg);
+}
+
+function replayEventToLog(ev) {
+  if (!ev) return null;
+  let p = ev.payload || {};
+  let ts = ev.ts || p.ts || new Date().toISOString();
+  if (ev.type === 'cycle') {
+    return {
+      level: 'INFO',
+      ts: ts,
+      message: 'CYCLE #' + (p.cycle || '') + ' scanned=' + (p.symbols_scanned || 0)
+        + ' hits=' + (p.scan_hits || 0) + ' signals=' + (p.signals || 0)
+        + ' fills=' + (p.fills || 0),
+    };
+  }
+  if (ev.type === 'scan_hit') {
+    return {
+      level: 'INFO',
+      ts: ts,
+      message: 'SCAN HIT ' + (p.symbol || '') + ' ' + (p.scanner_name || p.pattern || '')
+        + (p.price ? ' @ $' + p.price : ''),
+    };
+  }
+  if (ev.type === 'signal') {
+    return {
+      level: 'INFO',
+      ts: ts,
+      message: 'SIGNAL ' + (p.symbol || '') + ' ' + (p.action || '')
+        + (p.reason ? ' — ' + p.reason : ''),
+    };
+  }
+  if (ev.type === 'trade_fill' || ev.type === 'trade_exit') {
+    return {
+      level: ev.type === 'trade_exit' && Number(p.pnl || 0) < 0 ? 'WARNING' : 'INFO',
+      ts: ts,
+      message: ev.type.toUpperCase().replace('_', ' ') + ' ' + (p.symbol || '')
+        + (p.price ? ' @ $' + p.price : '') + (p.pnl != null ? ' P&L ' + fmtPnl(p.pnl) : ''),
+    };
+  }
+  if (ev.type === 'mistake') {
+    return {
+      level: 'WARNING',
+      ts: ts,
+      message: 'MISTAKE ' + (p.symbol || '') + ': ' + (p.reason || p.kind || ''),
+    };
+  }
+  if (ev.type === 'market_regime') {
+    return {
+      level: 'INFO',
+      ts: ts,
+      message: 'MARKET ' + (p.phase || '') + (p.regime_label ? ' — ' + p.regime_label : ''),
+    };
+  }
+  return null;
+}
+
 function renderNews() {
   let wrap = document.getElementById('news-wrap');
   let countEl = document.getElementById('news-count');
+  if (!wrap) return;
   let newsItems = Object.values(state.news || {});
   if (countEl) countEl.textContent = newsItems.length;
 
@@ -1184,6 +1519,7 @@ function renderNews() {
 }
 
 function renderAnalytics() {
+  renderMissedAPlus();
   let exits = (state.recent_trades||[]).filter(t => t.trade_type === 'exit' && t.pnl != null);
   if (exits.length === 0) {
     renderMLReport();
@@ -1306,6 +1642,33 @@ function renderAnalytics() {
   renderAI();
 }
 
+function renderMissedAPlus() {
+  let wrap = document.getElementById('missed-a-plus-wrap');
+  if (!wrap) return;
+  let rows = (state.missed_a_plus || []).slice(0, 30);
+  if (!rows.length) {
+    wrap.innerHTML = '<div class="empty"><div class="icon">&#128269;</div>No blocked A+ setups labeled yet</div>';
+    return;
+  }
+  let html = '<table><tr><th>Symbol</th><th>Pattern</th><th>Blocked At</th><th>Reason</th><th>Move After</th><th>Correct?</th><th>Fix</th></tr>';
+  rows.forEach(r => {
+    let move = Number(r.move_after_pct || 0);
+    let cls = move >= 3 ? 'text-green' : (Number(r.dump_after_pct || 0) <= -3 ? 'text-red' : '');
+    let correct = r.correct === true ? '<span class="text-green">Yes</span>' : (r.correct === false ? '<span class="text-red">No</span>' : '<span class="text-yellow">Pending</span>');
+    html += '<tr>';
+    html += '<td><strong>' + escapeHtml(r.symbol || '') + '</strong></td>';
+    html += '<td><span class="pill pill-blue">' + escapeHtml(r.pattern || r.scanner || '') + '</span><div style="font-size:10px;color:var(--text2)">' + escapeHtml(r.blocked_layer || '') + '</div></td>';
+    html += '<td>' + shortTime(r.blocked_at) + '</td>';
+    html += '<td style="max-width:360px;white-space:normal">' + escapeHtml(r.reason || '') + '</td>';
+    html += '<td class="' + cls + '">' + move.toFixed(1) + '%</td>';
+    html += '<td>' + correct + '</td>';
+    html += '<td style="max-width:320px;white-space:normal">' + escapeHtml(r.suggested_fix || '') + '</td>';
+    html += '</tr>';
+  });
+  html += '</table>';
+  wrap.innerHTML = html;
+}
+
 function pctText(v) {
   if (v === null || v === undefined || isNaN(Number(v))) return 'n/a';
   return Number(v).toFixed(1).replace(/\.0$/, '') + '%';
@@ -1363,6 +1726,26 @@ function renderMLReport() {
     html += '<div style="margin-top:10px;font-size:12px;color:var(--text2)">';
     notes.forEach(n => { html += '<div style="margin-top:4px">' + n + '</div>'; });
     html += '</div>';
+  }
+
+  let setups = report.setup_performance || [];
+  if (setups.length) {
+    html += '<div style="margin-top:14px;font-size:13px;font-weight:700">Live Setup Scorecard</div>';
+    html += '<table style="margin-top:6px"><tr><th>Setup</th><th>Trades</th><th>Win</th><th>P&L</th><th>Pullbacks</th><th>Missed</th><th>Exit</th></tr>';
+    setups.forEach(row => {
+      let pnl = Number(row.total_pnl || 0);
+      let pnlCls = pnl >= 0 ? 'text-green' : 'text-red';
+      html += '<tr>';
+      html += '<td><strong>' + escapeHtml(row.label || row.setup || '') + '</strong></td>';
+      html += '<td>' + (row.trades || 0) + '</td>';
+      html += '<td>' + pctText(row.win_rate) + '</td>';
+      html += '<td><span class="' + pnlCls + '">$' + (pnl >= 0 ? '+' : '') + pnl.toFixed(2) + '</span></td>';
+      html += '<td>' + (row.pullback_worked || 0) + '/' + (row.pullback_labeled || 0) + ' (' + pctText(row.pullback_rate) + ')</td>';
+      html += '<td>' + (row.missed_went_up || 0) + '/' + (row.missed_labeled || 0) + ' (' + pctText(row.missed_rate) + ')</td>';
+      html += '<td>' + (row.exit_hold_helped || 0) + '/' + (row.exit_labeled || 0) + ' (' + pctText(row.exit_hold_helped_rate) + ')</td>';
+      html += '</tr>';
+    });
+    html += '</table>';
   }
   learningWrap.innerHTML = html;
 
@@ -1537,8 +1920,7 @@ function loadJournal(force) {
   let jr = state.journal || {};
   let now = Date.now();
   if (!force && jr.last_fetch_ms && (now - jr.last_fetch_ms) < 10000) return;
-  fetch('/api/replay?limit=300')
-    .then(r => r.json())
+  fetchJsonWithRetry('/api/replay?limit=300')
     .then(data => {
       if (!data.ok) throw new Error(data.error || 'failed to load journal');
       state.journal = {
@@ -1548,6 +1930,10 @@ function loadJournal(force) {
         last_update: new Date().toISOString(),
         last_fetch_ms: Date.now()
       };
+      (state.journal.events || []).slice(-80).forEach(ev => {
+        let log = replayEventToLog(ev);
+        if (log) pushLogLine(log);
+      });
       renderJournal();
     })
     .catch(err => {
@@ -1566,8 +1952,8 @@ function loadMLReport(force) {
   let current = state.ml_report || {};
   let now = Date.now();
   if (!force && current.last_fetch_ms && (now - current.last_fetch_ms) < 30000) return;
-  fetch('/api/analytics-report')
-    .then(r => r.json())
+  let url = '/api/analytics-report' + (force ? ('?_=' + now) : '');
+  fetchJsonWithRetry(url)
     .then(data => {
       if (!data.ok) throw new Error(data.error || 'failed to load analytics report');
       state.ml_report = {
@@ -1632,6 +2018,34 @@ function updateStatus() {
   updateTradeControls();
 }
 
+function currentCycleCount() {
+  return Number((state.stats && state.stats.cycle_count) || 0) || 0;
+}
+
+function setCycleCountMonotonic(value) {
+  let next = Number(value || 0) || 0;
+  state.stats = state.stats || {};
+  state.stats.cycle_count = Math.max(currentCycleCount(), next);
+}
+
+function fetchJsonWithRetry(url, options, attempts) {
+  let tries = attempts || 3;
+  function once(left) {
+    return fetch(url, options || {}).then(r => {
+      if (!r.ok) {
+        return r.text().then(text => {
+          throw new Error('HTTP ' + r.status + ' ' + (text || r.statusText));
+        });
+      }
+      return r.json();
+    }).catch(err => {
+      if (left <= 1) throw err;
+      return new Promise(resolve => setTimeout(resolve, 500)).then(() => once(left - 1));
+    });
+  }
+  return once(tries);
+}
+
 function flashScanner() {
   let dot = document.getElementById('dot-scanner');
   let label = document.getElementById('scanner-label');
@@ -1645,6 +2059,7 @@ function flashScanner() {
 
 function addLogLine(msg) {
   let panel = document.getElementById('log-panel');
+  if (!panel || !msg) return;
   if (panel.querySelector('.empty')) panel.innerHTML = '';
   let cls = '';
   if (msg.level === 'WARNING') cls = ' warn';
@@ -1668,18 +2083,29 @@ function dedupeScans(scans) {
 function applySnapshot(data) {
   let savedJournal = state.journal;
   let savedMLReport = state.ml_report;
+  let savedLogs = state.logs || [];
+  let savedCycle = currentCycleCount();
+  let savedBotStart = state.bot_start_time || null;
+  let incomingBotStart = data.bot_start_time || null;
+  let sameBotRun = !savedBotStart || !incomingBotStart || savedBotStart === incomingBotStart;
+  let incomingCycle = Number((data.stats && data.stats.cycle_count) || 0) || 0;
     state = data;
   state.journal = savedJournal || {events: [], loaded: false, error: null, last_update: null};
   state.ml_report = savedMLReport || {report: null, loaded: false, error: null, message: null, last_update: null};
+  state.stats = state.stats || {};
+  state.stats.cycle_count = sameBotRun ? Math.max(savedCycle, incomingCycle) : incomingCycle;
   state.trading_paused = data.trading_paused === true;
     state.recent_scans = dedupeScans(state.recent_scans || []);
-    state.rt_movers = data.rt_movers || [];
+  state.rt_movers = data.rt_movers || [];
   state.hod_momentum_alerts = data.hod_momentum_alerts || [];
+  state.hot_watch = data.hot_watch || [];
+  state.missed_a_plus = data.missed_a_plus || [];
   state.trading_watchlist = data.trading_watchlist || [];
+  state.candidate_hydration = data.candidate_hydration || {};
   state.watchlist_pinned = data.watchlist_pinned || ['SPY'];
     state.rt_new_total = 0;
     state.news = data.news || {};
-  state.logs = data.logs || [];
+  state.logs = data.logs || savedLogs;
   renderAll();
   updateTradeControls();
   loadJournal(true);
@@ -1712,6 +2138,12 @@ es.onmessage = function(e) {
     case 'trade':
       state.recent_trades.push(msg.data);
       state.stats.total_trades = (state.stats.total_trades||0) + (msg.data.trade_type==='entry'?1:0);
+      pushLogLine({
+        level: 'INFO',
+        ts: msg.data.ts || new Date().toISOString(),
+        message: 'TRADE ' + (msg.data.symbol || '') + ' ' + (msg.data.trade_type || '')
+          + (msg.data.price ? ' @ $' + msg.data.price : ''),
+      });
       renderOverview();
       renderTrades();
       break;
@@ -1724,6 +2156,12 @@ es.onmessage = function(e) {
         let total = (state.stats.winning_trades||0) + (state.stats.losing_trades||0);
         state.stats.win_rate = total > 0 ? ((state.stats.winning_trades/total)*100).toFixed(1) : 0;
       }
+      pushLogLine({
+        level: Number(msg.data.pnl || 0) < 0 ? 'WARNING' : 'INFO',
+        ts: msg.data.ts || new Date().toISOString(),
+        message: 'EXIT ' + (msg.data.symbol || '') + (msg.data.exit_price ? ' @ $' + msg.data.exit_price : '')
+          + (msg.data.pnl != null ? ' P&L ' + fmtPnl(msg.data.pnl) : ''),
+      });
       renderOverview();
       renderTrades();
       break;
@@ -1745,6 +2183,28 @@ es.onmessage = function(e) {
       state.watchlist_pinned = msg.data.pinned || state.watchlist_pinned || ['SPY'];
       renderTradingWatchlist();
       break;
+    case 'hot_watch':
+      state.hot_watch = msg.data.symbols || [];
+      renderHotWatch();
+      renderTradingWatchlist();
+      break;
+    case 'candidate_hydration':
+      state.candidate_hydration = msg.data || {};
+      renderCandidateWorker();
+      break;
+    case 'missed_a_plus':
+      state.missed_a_plus = msg.data.rows || [];
+      if (state.missed_a_plus.length > 0) {
+        let row = state.missed_a_plus[0];
+        pushLogLine({
+          level: 'WARNING',
+          ts: row.blocked_at || new Date().toISOString(),
+          message: 'MISSED A+ ' + row.symbol + ' ' + row.pattern + ': ' + row.reason
+            + (row.move_after_pct != null ? ' move +' + Number(row.move_after_pct).toFixed(1) + '%' : ''),
+        });
+      }
+      renderAnalytics();
+      break;
     case 'scan_hit':
       // Replace existing entry for same symbol+scanner, keep only latest
       let idx = state.recent_scans.findIndex(s => s.symbol === msg.data.symbol && s.scanner_name === msg.data.scanner_name);
@@ -1754,6 +2214,12 @@ es.onmessage = function(e) {
         state.stats.total_scan_hits = (state.stats.total_scan_hits||0) + 1;
       }
       state.recent_scans.push(msg.data);
+      pushLogLine({
+        level: 'INFO',
+        ts: msg.data.ts || new Date().toISOString(),
+        message: 'SCAN HIT ' + (msg.data.symbol || '') + ' ' + (msg.data.scanner_name || msg.data.pattern || '')
+          + (msg.data.price ? ' @ $' + msg.data.price : ''),
+      });
       renderScanner();
       renderOverview();
       break;
@@ -1763,13 +2229,26 @@ es.onmessage = function(e) {
       renderPositionsCompact();
       break;
     case 'cycle':
-      state.stats.cycle_count = msg.data.cycle;
+      setCycleCountMonotonic(msg.data.cycle);
+      pushLogLine({
+        level: 'INFO',
+        ts: msg.data.ts || new Date().toISOString(),
+        message: 'CYCLE #' + (msg.data.cycle || '') + ' scanned=' + (msg.data.symbols_scanned || 0)
+          + ' hits=' + (msg.data.scan_hits || 0) + ' signals=' + (msg.data.signals || 0)
+          + ' fills=' + (msg.data.fills || 0),
+      });
       updateStatus();
       break;
     case 'market_status':
       state.market_open = msg.data.market_open;
       state.stream_connected = msg.data.stream_connected;
       if (msg.data.market_phase) state.market_phase = msg.data.market_phase;
+      pushLogLine({
+        level: 'INFO',
+        ts: new Date().toISOString(),
+        message: 'MARKET ' + (state.market_phase || '') + ' stream='
+          + (state.stream_connected ? 'connected' : 'off'),
+      });
       updateStatus();
       break;
     case 'watchlist_scan':
@@ -1780,9 +2259,9 @@ es.onmessage = function(e) {
       state.news[msg.data.symbol] = msg.data;
       renderNews();
       if (msg.data.sentiment === 'positive') {
-        addLogLine({level:'INFO', ts: msg.data.ts, message: 'NEWS BOOST ' + msg.data.symbol + ': +' + msg.data.score.toFixed(1) + ' — ' + (msg.data.headlines[0]||'positive news')});
+        pushLogLine({level:'INFO', ts: msg.data.ts, message: 'NEWS BOOST ' + msg.data.symbol + ': +' + msg.data.score.toFixed(1) + ' — ' + (msg.data.headlines[0]||'positive news')});
       } else if (msg.data.sentiment === 'negative') {
-        addLogLine({level:'WARNING', ts: msg.data.ts, message: 'NEWS BLOCK ' + msg.data.symbol + ': ' + msg.data.score.toFixed(1) + ' — ' + (msg.data.headlines[0]||'negative news')});
+        pushLogLine({level:'WARNING', ts: msg.data.ts, message: 'NEWS BLOCK ' + msg.data.symbol + ': ' + msg.data.score.toFixed(1) + ' — ' + (msg.data.headlines[0]||'negative news')});
       }
       break;
     case 'rt_movers':
@@ -1792,7 +2271,7 @@ es.onmessage = function(e) {
       renderMovers();
       // Flash new symbols in log
       if (msg.data.new_symbols && msg.data.new_symbols.length > 0) {
-        addLogLine({level:'INFO', ts: msg.data.scan_time, message: 'NEW MOVERS: ' + msg.data.new_symbols.join(', ')});
+        pushLogLine({level:'INFO', ts: msg.data.scan_time, message: 'NEW MOVERS: ' + msg.data.new_symbols.join(', ')});
       }
       break;
     case 'ai_update':
@@ -1807,11 +2286,11 @@ es.onmessage = function(e) {
       if (msg.data.force_closed) {
         state.positions = {};
         renderOverview();
-        addLogLine({level:'WARNING', ts: new Date().toISOString(), message: 'ALL POSITIONS FORCE CLOSED via dashboard'});
+        pushLogLine({level:'WARNING', ts: new Date().toISOString(), message: 'ALL POSITIONS FORCE CLOSED via dashboard'});
       }
       break;
     case 'log':
-      addLogLine(msg.data);
+      pushLogLine(msg.data);
       break;
   }
 };
@@ -1824,28 +2303,37 @@ es.onerror = function() {
 connectSSE();
 
 // Hydrate immediately from REST (fallback if SSE is slow or blocked)
-fetch('/api/snapshot').then(r=>r.json()).then(data => {
+fetchJsonWithRetry('/api/snapshot').then(data => {
   if (data && data.market_phase) applySnapshot(data);
   }).catch(()=>{});
 loadMLReport(true);
 
 // Keep pause/resume controls truthful even if an SSE event is missed.
 function syncTradingControlState() {
-  fetch('/api/snapshot').then(r=>r.json()).then(data => {
+  fetchJsonWithRetry('/api/snapshot').then(data => {
     if (!data) return;
+    let savedBotStart = state.bot_start_time || null;
+    let incomingBotStart = data.bot_start_time || null;
+    let sameBotRun = !savedBotStart || !incomingBotStart || savedBotStart === incomingBotStart;
     state.trading_paused = data.trading_paused === true;
     state.market_open = data.market_open;
     state.stream_connected = data.stream_connected;
+    if (incomingBotStart) state.bot_start_time = incomingBotStart;
     if (data.market_phase) state.market_phase = data.market_phase;
-    if (data.stats) state.stats = Object.assign(state.stats || {}, data.stats);
+    if (data.stats) {
+      let savedCycle = currentCycleCount();
+      state.stats = Object.assign(state.stats || {}, data.stats);
+      let incomingCycle = Number(data.stats.cycle_count || 0) || 0;
+      state.stats.cycle_count = sameBotRun ? Math.max(savedCycle, incomingCycle) : incomingCycle;
+    }
     updateStatus();
   }).catch(()=>{});
 }
-setInterval(syncTradingControlState, 5000);
+setInterval(syncTradingControlState, 10000);
 
 // ML Stats polling (every 30s)
 function fetchMLStats() {
-  fetch('/api/ml-stats').then(r=>r.json()).then(data => {
+  fetchJsonWithRetry('/api/ml-stats').then(data => {
     let wrap = document.getElementById('ml-stats-wrap');
     let badge = document.getElementById('ml-status-badge');
     if (!data || data.enabled === false) {
@@ -1858,7 +2346,7 @@ function fetchMLStats() {
     badge.className = 'badge ' + (data.model_active ? 'pill-green' : 'pill-red');
     let html = '<div style="padding:12px;font-size:13px;">';
     html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px;">';
-    html += '<div><span style="color:var(--text2)">Passed:</span> <b style="color:var(--green)">' + data.entries_passed + '</b></div>';
+    html += '<div><span style="color:var(--text2)">ML/Quality Passed:</span> <b style="color:var(--green)">' + data.entries_passed + '</b></div>';
     html += '<div><span style="color:var(--text2)">ML Rejected:</span> <b style="color:var(--red)">' + data.entries_rejected_by_ml + '</b></div>';
     html += '<div><span style="color:var(--text2)">Rule Rejected:</span> <b style="color:var(--yellow)">' + (data.entries_rejected_by_rules || 0) + '</b></div>';
     html += '<div><span style="color:var(--text2)">Reject Rate:</span> <b>' + data.rejection_rate_pct + '%</b></div>';
@@ -1891,7 +2379,7 @@ function updateTradeControls() {
 
 document.getElementById('btn-stop').addEventListener('click', function() {
   if (!confirm('Stop trading? No new entries will be placed.')) return;
-  fetch('/api/pause', {method:'POST'}).then(r=>r.json()).then(data => {
+  fetchJsonWithRetry('/api/pause', {method:'POST'}).then(data => {
     if (data.ok) {
       state.trading_paused = true;
       updateTradeControls();
@@ -1901,7 +2389,7 @@ document.getElementById('btn-stop').addEventListener('click', function() {
 });
 
 document.getElementById('btn-start').addEventListener('click', function() {
-  fetch('/api/resume', {method:'POST'}).then(r=>r.json()).then(data => {
+  fetchJsonWithRetry('/api/resume', {method:'POST'}).then(data => {
     if (data.ok) {
       state.trading_paused = false;
       updateTradeControls();
@@ -1915,7 +2403,7 @@ document.getElementById('btn-force-close').addEventListener('click', function() 
   let btn = document.getElementById('btn-force-close');
   btn.disabled = true;
   addLogLine({level:'WARNING', ts: new Date().toISOString(), message: 'EMERGENCY CLOSE requested'});
-  fetch('/api/force-close', {method:'POST'}).then(r=>r.json()).then(data => {
+  fetchJsonWithRetry('/api/force-close', {method:'POST'}).then(data => {
     if (data.flat) {
       state.trading_paused = true;
       updateTradeControls();
