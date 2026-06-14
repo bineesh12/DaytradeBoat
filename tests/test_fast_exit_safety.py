@@ -433,6 +433,54 @@ def test_breakout_scalp_reject_does_not_reference_missing_status() -> None:
     assert not runner._pending_breakout_scalps
 
 
+def test_breakout_scalp_honors_spread_size_factor_before_submit() -> None:
+    runner = object.__new__(AlpacaRunner)
+    runner._pending_breakout_scalps = deque([("HOT", 5.0, time.time())])
+    runner._breakout_scalp_active = False
+    runner._breakout_scalp_cooldown = {}
+    runner._quick_scalp_spread_size_factors = {"HOT": 0.35}
+    runner._pipeline = SimpleNamespace(
+        portfolio=PortfolioState(cash=10_000),
+        _symbol_entry_counts={},
+        _max_entries_per_symbol=2,
+        _exit_cooldowns={},
+        _cooldown_seconds=0,
+    )
+    now = datetime.now(timezone.utc)
+    runner._bar_buffer = {
+        "HOT": deque([
+            Bar(symbol="HOT", open=4.80, high=5.00, low=4.75, close=4.90, volume=300_000, ts=now),
+            Bar(symbol="HOT", open=4.90, high=5.20, low=4.85, close=5.10, volume=350_000, ts=now),
+            Bar(symbol="HOT", open=5.10, high=5.35, low=5.05, close=5.30, volume=400_000, ts=now),
+        ])
+    }
+    submitted = []
+
+    def submit(order, bar, portfolio):
+        submitted.append(order)
+        return Fill("HOT", Side.BUY, order.quantity, order.limit_price or bar.close, now), OrderStatus.FILLED
+
+    runner._new_entries_blocked = lambda *args, **kwargs: False
+    runner._quick_scalp_hod_alert_reject = lambda symbol: None
+    runner._quick_scalp_recent_normal_reject = lambda symbol, **kwargs: None
+    runner._check_quick_scalp_entry = lambda symbol, bars: None
+    runner._quick_scalp_shared_quality_reject = lambda symbol, bars: None
+    runner._quick_scalp_10s_reject = lambda symbol: None
+    runner._quick_scalp_tick_rr = lambda symbol, bars, alert_price: (5.30, 5.20, 5.43, "test")
+    runner._broker = SimpleNamespace(submit=submit)
+    runner._on_position_opened = lambda *args, **kwargs: None
+    runner._hub = SimpleNamespace(on_fill=lambda *args, **kwargs: None, add_log=lambda *args, **kwargs: None)
+    runner._journal = SimpleNamespace(record=lambda *args, **kwargs: None)
+    runner._market_phase = lambda: "OPEN"
+    runner._seed_recent_order_ids = lambda: None
+
+    runner._process_breakout_scalps()
+
+    assert submitted
+    assert submitted[0].quantity == 175
+    assert not runner._quick_scalp_spread_size_factors
+
+
 def test_paused_runner_blocks_timed_entries() -> None:
     runner = object.__new__(AlpacaRunner)
     runner._hub = SimpleNamespace(trading_paused=True)

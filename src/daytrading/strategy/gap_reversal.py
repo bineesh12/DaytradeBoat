@@ -9,6 +9,7 @@ Works with: PremarketGapScanner
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Optional
 
 from daytrading.indicators.core import atr, rsi
@@ -42,6 +43,8 @@ class GapReversalVerifier:
         self,
         scan_result: ScanResult,
         portfolio: PortfolioState,
+        *,
+        now: Optional[datetime] = None,
     ) -> Optional[TradeSignal]:
         bars = scan_result.bars
         if len(bars) < 3:
@@ -68,7 +71,7 @@ class GapReversalVerifier:
         if gap_pct > 0 and current_rsi < self._max_rsi:
             # gap up but RSI not overheated — buy the dip if price faded from open
             if latest.close < latest.open:
-                reject = check_entry_quality(bars, symbol=scan_result.symbol)
+                reject = check_entry_quality(bars, symbol=scan_result.symbol, now=now)
                 if reject is not None:
                     return None
                 stop = latest.close - current_atr * self._risk_atr_mult

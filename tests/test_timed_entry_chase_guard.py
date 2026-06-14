@@ -111,6 +111,23 @@ class _Journal:
         self.records.append((event_type, payload, ts))
 
 
+class _FloatChecker:
+    def __init__(self, cached=None, fetched=None) -> None:
+        self.cached = cached
+        self.fetched = fetched
+        self.cached_calls = 0
+        self.fetch_calls = 0
+        self._avg_vol_cache = {}
+
+    def get_float_cached(self, symbol: str):
+        self.cached_calls += 1
+        return self.cached
+
+    def get_float(self, symbol: str):
+        self.fetch_calls += 1
+        return self.fetched
+
+
 def _policy_runner() -> AlpacaRunner:
     runner = _runner(5.0)
     runner._entry_policy = EntryPolicy()
@@ -164,6 +181,61 @@ def test_shared_entry_quality_records_structured_decision(monkeypatch) -> None:
     assert payload["passed"] is False
 
 
+def test_shared_entry_quality_uses_cached_or_stored_float_without_network(monkeypatch) -> None:
+    monkeypatch.setattr("daytrading.strategy.entry_guard.ENTRY_MAX_FLOAT_SHARES", 20_000_000)
+    monkeypatch.setattr("daytrading.strategy.entry_guard._xgb_model", None)
+    runner = _policy_runner()
+    runner._float_checker = _FloatChecker(cached=120_000_000, fetched=5_000_000)
+    now = datetime.now(timezone.utc)
+    bars = [
+        Bar(
+            symbol="SPCE",
+            ts=now,
+            open=4.8 + i * 0.01,
+            high=5.05,
+            low=4.75 + i * 0.01,
+            close=4.9 + i * 0.01,
+            volume=100_000,
+            timeframe=Timeframe.MIN_1,
+        )
+        for i in range(25)
+    ]
+    bars[-1] = Bar(
+        symbol="SPCE",
+        ts=now,
+        open=5.00,
+        high=5.04,
+        low=4.98,
+        close=5.02,
+        volume=250_000,
+        timeframe=Timeframe.MIN_1,
+    )
+    runner._quote_buffer = {
+        "SPCE": [
+            Quote(symbol="SPCE", ts=now, bid=5.01, ask=5.02, bid_size=2000, ask_size=2000)
+            for _ in range(3)
+        ]
+    }
+    signal = _signal(symbol="SPCE", price=5.02)
+    signal.scan_result.criteria.update({
+        "pattern": "first_pullback_reclaim",
+        "setup_tier": "A+ setup",
+    })
+
+    reason = runner._shared_entry_quality_reject(
+        "SPCE",
+        bars,
+        signal=signal,
+        stage="timed_entry_final_guard",
+        source="timed_entry",
+    )
+
+    assert runner._float_checker.cached_calls == 1
+    assert runner._float_checker.fetch_calls == 0
+    assert reason is not None
+    assert "float too large" in reason.lower()
+
+
 def test_timed_entry_chase_guard_allows_one_tick_sub_two_spread() -> None:
     runner = _runner(1.66)
     now = datetime.now(timezone.utc)
@@ -177,6 +249,44 @@ def test_timed_entry_chase_guard_allows_one_tick_sub_two_spread() -> None:
     reason = runner._timed_entry_chase_reject(_signal(symbol="BATL", price=1.66), _bar(symbol="BATL", close=1.66))
 
     assert reason is None
+
+
+def test_timed_entry_chase_guard_uses_opportunity_scaled_spread_policy() -> None:
+    runner = _runner(2.13)
+    now = datetime.now(timezone.utc)
+    runner._quote_buffer = {
+        "RGNT": [
+            Quote(symbol="RGNT", ts=now, bid=2.121, ask=2.139, bid_size=1500, ask_size=1400)
+            for _ in range(3)
+        ]
+    }
+    runner._bar_buffer = {
+        "RGNT": [
+            Bar(
+                symbol="RGNT",
+                ts=now,
+                open=1.95 + i * 0.01,
+                high=2.14,
+                low=1.93 + i * 0.01,
+                close=2.00 + i * 0.0068,
+                volume=90_000,
+                timeframe=Timeframe.MIN_1,
+            )
+            for i in range(20)
+        ]
+    }
+    signal = _signal(symbol="RGNT", price=2.13)
+    signal.scan_result.criteria.update({
+        "pattern": "first_pullback_reclaim",
+        "setup_tier": "A+ setup",
+        "entry_tier": "a_plus_reclaim_scout",
+    })
+
+    reason = runner._timed_entry_chase_reject(signal, _bar(symbol="RGNT", close=2.13))
+
+    assert reason is None
+    assert signal.scan_result.criteria["spread_exception"] == "opportunity_scaled"
+    assert signal.scan_result.criteria["spread_size_factor"] < 1.0
 
 
 def test_timed_entry_chase_guard_uses_queued_base_not_late_signal_price() -> None:

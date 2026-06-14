@@ -14,7 +14,14 @@ TS = datetime(2026, 5, 29, 13, 30, tzinfo=timezone.utc)
 class _QuickScalpRunner:
     _check_quick_scalp_entry = AlpacaRunner._check_quick_scalp_entry
     _quick_scalp_recent_normal_reject = AlpacaRunner._quick_scalp_recent_normal_reject
+    _quick_scalp_has_tradeable_hod_alert = AlpacaRunner._quick_scalp_has_tradeable_hod_alert
+    _quick_scalp_can_ignore_recent_shape_reject = staticmethod(
+        AlpacaRunner._quick_scalp_can_ignore_recent_shape_reject
+    )
     _quick_scalp_hod_alert_reject = AlpacaRunner._quick_scalp_hod_alert_reject
+    _momentum_breakout_tape_is_smooth = AlpacaRunner._momentum_breakout_tape_is_smooth
+    _momentum_breakout_consume = AlpacaRunner._momentum_breakout_consume
+    _quick_scalp_shared_quality_reject = AlpacaRunner._quick_scalp_shared_quality_reject
     _shared_entry_quality_reject = AlpacaRunner._shared_entry_quality_reject
     _quick_scalp_10s_reject = AlpacaRunner._quick_scalp_10s_reject
     _quick_scalp_tick_rr = AlpacaRunner._quick_scalp_tick_rr
@@ -185,6 +192,61 @@ def test_quick_scalp_respects_recent_hard_entry_guard_reject() -> None:
     assert reject == "recent normal entry reject: spread too wide (3.00c = 0.69% of $4.35)"
 
 
+def test_quick_scalp_ignores_stale_late_hod_reject_for_fresh_hod_alert() -> None:
+    runner = _QuickScalpRunner()
+    runner._pipeline = SimpleNamespace(
+        scan_rejections={
+            "CUPR": (
+                "cached reject: late pullback too far from HOD 17.1% "
+                "(max 12.0%; watching for fresh reclaim) (21s left)"
+            ),
+        }
+    )
+    runner._hod_alert_store = SimpleNamespace(
+        snapshot=lambda: [{
+            "symbol": "CUPR",
+            "reject_reason": None,
+            "price": 5.09,
+            "day_volume": 22_000_000,
+            "rel_vol": 1.3,
+            "bar_rvol": 1.3,
+        }]
+    )
+
+    reject = runner._quick_scalp_recent_normal_reject(
+        "CUPR",
+        allow_fresh_hod_breakout=True,
+    )
+
+    assert reject is None
+
+
+def test_quick_scalp_still_respects_recent_spread_reject_on_hod_alert() -> None:
+    runner = _QuickScalpRunner()
+    runner._pipeline = SimpleNamespace(
+        scan_rejections={
+            "CUPR": "spread too wide (6.40c = 1.34% of $4.78)",
+        }
+    )
+    runner._hod_alert_store = SimpleNamespace(
+        snapshot=lambda: [{
+            "symbol": "CUPR",
+            "reject_reason": None,
+            "price": 5.09,
+            "day_volume": 22_000_000,
+            "rel_vol": 1.3,
+            "bar_rvol": 1.3,
+        }]
+    )
+
+    reject = runner._quick_scalp_recent_normal_reject(
+        "CUPR",
+        allow_fresh_hod_breakout=True,
+    )
+
+    assert reject == "recent normal entry reject: spread too wide (6.40c = 1.34% of $4.78)"
+
+
 def test_quick_scalp_rejects_watch_only_hod_alert() -> None:
     runner = _QuickScalpRunner()
     runner._hod_alert_store = SimpleNamespace(
@@ -353,3 +415,120 @@ def test_quick_scalp_tick_rr_uses_tactical_risk_for_hod_scalp() -> None:
     assert stop < price < target
     assert (price - stop) / price <= 0.04
     assert "risk=" in note
+
+
+def test_momentum_breakout_off_rejects_low_rvol() -> None:
+    runner = _QuickScalpRunner()
+    runner._hod_alert_store = SimpleNamespace(
+        snapshot=lambda: [{"symbol": "VSME", "rel_vol": 0.7, "bar_rvol": 0.5, "day_volume": 19_000_000}]
+    )
+    # mode OFF (default): low rvol still rejected
+    r = runner._quick_scalp_hod_alert_reject("VSME")
+    assert r is not None and "RVOL too weak" in r
+
+
+def _smooth_bars(sym: str, close: float = 2.20) -> list:
+    # ~1.4% per-bar range — tight tape where a stop holds
+    return [
+        Bar(symbol=sym, ts=TS, open=close - 0.005, high=close + 0.015,
+            low=close - 0.015, close=close, volume=300_000)
+        for _ in range(6)
+    ]
+
+
+def _gappy_bars(sym: str, close: float = 2.20) -> list:
+    # ~13% per-bar range — violent tape where a stop slips (VSME-style)
+    return [
+        Bar(symbol=sym, ts=TS, open=close - 0.10, high=close + 0.15,
+            low=close - 0.15, close=close, volume=600_000)
+        for _ in range(6)
+    ]
+
+
+def _momentum_runner(bars: list, sym: str) -> _QuickScalpRunner:
+    runner = _QuickScalpRunner()
+    runner._momentum_breakout_enabled = True
+    runner._momentum_breakout_min_rvol = 0.4
+    runner._momentum_breakout_min_day_volume = 5_000_000
+    runner._momentum_breakout_max_bar_range_pct = 3.0
+    runner._momentum_breakout_score_floor = 72.0
+    runner._momentum_breakout_armed = {}
+    runner._bar_buffer = {sym: deque(bars)}
+    return runner
+
+
+def test_momentum_breakout_allows_high_vol_breakout_on_smooth_tape() -> None:
+    runner = _momentum_runner(_smooth_bars("RUNR"), "RUNR")
+    runner._hod_alert_store = SimpleNamespace(
+        snapshot=lambda: [{"symbol": "RUNR", "rel_vol": 0.7, "bar_rvol": 0.5, "day_volume": 19_000_000}]
+    )
+    # high abs volume + faded rvol + SMOOTH tape -> allowed
+    assert runner._quick_scalp_hod_alert_reject("RUNR") is None
+    # ...and the entry is armed for tagging, consumable exactly once
+    assert runner._momentum_breakout_consume("RUNR") is True
+    assert runner._momentum_breakout_consume("RUNR") is False
+
+
+def test_momentum_breakout_consume_false_when_not_armed() -> None:
+    runner = _momentum_runner(_smooth_bars("RUNR"), "RUNR")
+    assert runner._momentum_breakout_consume("RUNR") is False
+
+
+def test_momentum_breakout_rejects_high_vol_breakout_on_gappy_tape() -> None:
+    runner = _momentum_runner(_gappy_bars("VSME"), "VSME")
+    runner._hod_alert_store = SimpleNamespace(
+        snapshot=lambda: [{"symbol": "VSME", "rel_vol": 0.7, "bar_rvol": 0.5, "day_volume": 19_000_000}]
+    )
+    # same high abs volume, but GAPPY tape (stops slip) -> still rejected (VSME)
+    r = runner._quick_scalp_hod_alert_reject("VSME")
+    assert r is not None and "RVOL too weak" in r
+
+
+def test_momentum_breakout_on_still_rejects_dead_tape() -> None:
+    runner = _momentum_runner(_smooth_bars("DEAD"), "DEAD")
+    runner._hod_alert_store = SimpleNamespace(
+        snapshot=lambda: [{"symbol": "DEAD", "rel_vol": 0.7, "bar_rvol": 0.5, "day_volume": 800_000}]
+    )
+    # low absolute volume (dead tape) -> still rejected even if smooth
+    r = runner._quick_scalp_hod_alert_reject("DEAD")
+    assert r is not None and "RVOL too weak" in r
+
+
+def test_momentum_breakout_score_floor_allows_sub80_on_smooth_tape() -> None:
+    runner = _momentum_runner(_smooth_bars("RUNR"), "RUNR")
+    runner._shared_entry_quality_reject = (
+        lambda *a, **k: "entry score too low (75/100, need 80+) [day+78%=20]"
+    )
+    # score 75 >= floor 72 + smooth tape -> override allows it
+    assert runner._quick_scalp_shared_quality_reject("RUNR", []) is None
+
+
+def test_momentum_breakout_score_floor_keeps_reject_on_gappy_tape() -> None:
+    runner = _momentum_runner(_gappy_bars("VSME"), "VSME")
+    runner._shared_entry_quality_reject = (
+        lambda *a, **k: "entry score too low (75/100, need 80+) [day+78%=20]"
+    )
+    # score 75 but GAPPY tape -> override does NOT apply, reject stands
+    r = runner._quick_scalp_shared_quality_reject("VSME", [])
+    assert r is not None and "entry score too low" in r
+
+
+def test_momentum_breakout_score_floor_keeps_reject_below_floor() -> None:
+    runner = _momentum_runner(_smooth_bars("RUNR"), "RUNR")
+    runner._shared_entry_quality_reject = (
+        lambda *a, **k: "entry score too low (68/100, need 80+) [day+78%=20]"
+    )
+    # score 68 < floor 72 -> reject stands even on smooth tape
+    r = runner._quick_scalp_shared_quality_reject("RUNR", [])
+    assert r is not None and "entry score too low" in r
+
+
+def test_momentum_breakout_score_floor_off_keeps_reject() -> None:
+    runner = _momentum_runner(_smooth_bars("RUNR"), "RUNR")
+    runner._momentum_breakout_enabled = False
+    runner._shared_entry_quality_reject = (
+        lambda *a, **k: "entry score too low (75/100, need 80+) [day+78%=20]"
+    )
+    # mode OFF -> no override
+    r = runner._quick_scalp_shared_quality_reject("RUNR", [])
+    assert r is not None and "entry score too low" in r

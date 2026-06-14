@@ -22,6 +22,7 @@ Exit Indicators (Warrior Trading Momentum Strategy):
 from __future__ import annotations
 
 import logging
+import statistics
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
@@ -118,6 +119,25 @@ class TrackedPosition:
     _recent_prices: List[float] = field(default_factory=list)
     _max_recent: int = 10
 
+    # Recent per-bar range % (high-low)/close, for the volatility-adaptive runner
+    # trail. A wider-swinging name earns a wider trail so normal noise does not
+    # stop it; a smooth name trails tight.
+    _recent_ranges: List[float] = field(default_factory=list)
+    _max_ranges: int = 10
+
+    def record_bar_range(self, range_pct: float) -> None:
+        if range_pct <= 0:
+            return
+        self._recent_ranges.append(float(range_pct))
+        if len(self._recent_ranges) > self._max_ranges:
+            self._recent_ranges.pop(0)
+
+    def recent_range_pct(self) -> float:
+        """Median recent per-bar range as a fraction (e.g. 0.027 = 2.7%)."""
+        if not self._recent_ranges:
+            return 0.0
+        return statistics.median(self._recent_ranges)
+
     def __post_init__(self) -> None:
         self.remaining_qty = self.remaining_qty or self.quantity
         self.highest_price = self.entry_price
@@ -174,21 +194,57 @@ class ExitManager:
     The stop ratchets up every time price gains another 10 ticks.
     """
 
-    def __init__(self, *, max_unrealized_loss: float = 50.0) -> None:
+    def __init__(
+        self,
+        *,
+        max_unrealized_loss: float = 50.0,
+        runner_trail_pct: float = RUNNER_TRAIL_PCT,
+        runner_min_confirm_pct: float = RUNNER_MIN_CONFIRM_PCT,
+        runner_trail_adaptive: bool = False,
+        runner_trail_atr_mult: float = 2.5,
+        runner_trail_cap: float = 0.10,
+    ) -> None:
         self._positions: Dict[str, TrackedPosition] = {}
         self._max_unrealized_loss = max_unrealized_loss
+        # How wide the back half of a confirmed runner trails behind the high, and
+        # how far it must run past the partial before it earns that wider trail.
+        # Tunable: a wider trail rides continuation runners (CUPR) further but
+        # gives back more on top-and-fade names (EDHL). Default stays tight.
+        self._runner_trail_pct = max(0.0, float(runner_trail_pct))
+        self._runner_min_confirm_pct = max(0.0, float(runner_min_confirm_pct))
+        # Adaptive trail: scale the trail to the name's own recent volatility, so
+        # a wide-swinging runner (CUPR) breathes while a smooth one (EDHL) trails
+        # tight. trail = clamp(atr_mult * median recent bar range, _pct floor, cap).
+        # Off by default -> flat _runner_trail_pct (current behavior).
+        self._runner_trail_adaptive = bool(runner_trail_adaptive)
+        self._runner_trail_atr_mult = max(0.0, float(runner_trail_atr_mult))
+        self._runner_trail_cap = max(0.0, float(runner_trail_cap))
+
+    def _runner_trail_for(self, pos: "TrackedPosition") -> float:
+        """Trail width for a confirmed runner: flat, or volatility-adaptive."""
+        if not self._runner_trail_adaptive:
+            return pos.runner_trail_pct
+        vol = pos.recent_range_pct()
+        if vol <= 0:
+            return pos.runner_trail_pct
+        adaptive = self._runner_trail_atr_mult * vol
+        return min(self._runner_trail_cap, max(self._runner_trail_pct, adaptive))
 
     @property
     def tracked(self) -> Dict[str, TrackedPosition]:
         return dict(self._positions)
 
     def track(self, pos: TrackedPosition) -> None:
+        entry_time = pos.entry_ts or datetime.now(timezone.utc)
+        if entry_time.tzinfo is None:
+            entry_time = entry_time.replace(tzinfo=timezone.utc)
+        pos.entry_ts = entry_time
         if pos.entry_time is None:
-            pos.entry_time = datetime.now(timezone.utc)
+            pos.entry_time = entry_time
         # Initialize range tracking from entry
         pos._range_high = pos.entry_price
         pos._range_low = pos.entry_price
-        pos._range_start_ts = datetime.now(timezone.utc)
+        pos._range_start_ts = entry_time
         self._positions[pos.symbol] = pos
         target = pos.first_target_price if pos.first_target_price > 0 else pos.entry_price + 0.20
         logger.info(
@@ -200,7 +256,15 @@ class ExitManager:
     def untrack(self, symbol: str) -> None:
         self._positions.pop(symbol, None)
 
-    def update_bar_close(self, symbol: str, close_price: float, open_price: float = 0.0, volume: int = 0) -> None:
+    def update_bar_close(
+        self,
+        symbol: str,
+        close_price: float,
+        open_price: float = 0.0,
+        volume: int = 0,
+        high_price: float = 0.0,
+        low_price: float = 0.0,
+    ) -> None:
         """Called when a new 1-min bar closes. Updates red candle + volume tracking."""
         pos = self._positions.get(symbol)
         if pos is not None:
@@ -212,6 +276,13 @@ class ExitManager:
             pos.prev_bar_volume = pos.last_bar_volume
             pos.last_bar_volume = volume
             pos.last_bar_close = close_price
+            # Volatility sample for the adaptive runner trail: true range when
+            # high/low are supplied, else fall back to the candle body.
+            if close_price > 0:
+                if high_price > 0 and low_price > 0 and high_price >= low_price:
+                    pos.record_bar_range((high_price - low_price) / close_price)
+                elif open_price > 0:
+                    pos.record_bar_range(abs(close_price - open_price) / close_price)
 
             # Track green bars with declining volume (exhaustion detection)
             is_green = close_price > open_price if open_price > 0 else close_price > pos.prev_bar_open
@@ -330,6 +401,10 @@ class ExitManager:
         now: datetime,
     ) -> List[TradeSignal]:
         """Check all tracked positions for stop loss or step-up."""
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        else:
+            now = now.astimezone(timezone.utc)
         exits: List[TradeSignal] = []
 
         for symbol, pos in list(self._positions.items()):
@@ -556,6 +631,20 @@ class ExitManager:
                     trail_stop = round(pos.lowest_price + trail_offset, 4)
                     if trail_stop < (pos.stop_loss or float("inf")):
                         pos.stop_loss = trail_stop
+        elif pos.runner_confirmed and pos.runner_trail_pct > 0:
+            # Post-half on a CONFIRMED runner: trail behind the high so a normal
+            # pullback does not shake us out of the move. Width is flat or, when
+            # adaptive is on, scaled to the name's own recent volatility. The stop
+            # only ever ratchets up, never down.
+            trail = self._runner_trail_for(pos)
+            if is_long:
+                trail_stop = round(pos.highest_price * (1 - trail), 4)
+                if trail_stop > (pos.stop_loss or 0):
+                    pos.stop_loss = trail_stop
+            else:
+                trail_stop = round(pos.lowest_price * (1 + trail), 4)
+                if trail_stop < (pos.stop_loss or float("inf")):
+                    pos.stop_loss = trail_stop
         else:
             # Post-half: step up in 4% increments of entry price to let winner run
             step_amount = pos.entry_price * STEP_PCT_AFTER_HALF
@@ -772,15 +861,14 @@ class ExitManager:
             volume = 0.0
         return day_change >= 20.0 and volume >= 1_000_000
 
-    @staticmethod
-    def _maybe_confirm_runner(pos: TrackedPosition, price: float) -> None:
+    def _maybe_confirm_runner(self, pos: TrackedPosition, price: float) -> None:
         if not pos.runner_candidate or pos.runner_confirmed or pos.entry_price <= 0:
             return
         max_run_pct = (max(pos.highest_price, price) - pos.entry_price) / pos.entry_price
-        if max_run_pct < RUNNER_MIN_CONFIRM_PCT:
+        if max_run_pct < self._runner_min_confirm_pct:
             return
         pos.runner_confirmed = True
-        pos.runner_trail_pct = RUNNER_TRAIL_PCT
+        pos.runner_trail_pct = self._runner_trail_pct
         logger.info(
             "RUNNER CONFIRMED %s | first partial paid, max run %.1f%% — "
             "back half uses %.1f%% trail",

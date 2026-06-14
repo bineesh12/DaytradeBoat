@@ -27,6 +27,10 @@ class EarlyVWAPReclaimScoutScanner:
         max_distance_from_hod_pct: float = 12.0,
         max_reclaim_risk_pct: float = 9.0,
         min_latest_volume: float = 25_000,
+        min_recent_volume: float = 90_000,
+        min_active_recent_bars: int = 2,
+        active_bar_volume: float = 20_000,
+        max_single_bar_volume_share: float = 0.70,
     ) -> None:
         self._min_price = min_price
         self._max_price = max_price
@@ -37,6 +41,10 @@ class EarlyVWAPReclaimScoutScanner:
         self._max_distance_from_hod_pct = max_distance_from_hod_pct
         self._max_reclaim_risk_pct = max_reclaim_risk_pct
         self._min_latest_volume = min_latest_volume
+        self._min_recent_volume = min_recent_volume
+        self._min_active_recent_bars = min_active_recent_bars
+        self._active_bar_volume = active_bar_volume
+        self._max_single_bar_volume_share = max_single_bar_volume_share
 
     @property
     def name(self) -> str:
@@ -69,6 +77,23 @@ class EarlyVWAPReclaimScoutScanner:
         if latest.close <= latest.open:
             return None
         if latest.volume < self._min_latest_volume:
+            return None
+        recent_activity = list(bars[-4:])
+        recent_volume = sum(float(b.volume or 0.0) for b in recent_activity)
+        active_recent_bars = sum(
+            1 for b in recent_activity
+            if float(b.volume or 0.0) >= self._active_bar_volume
+        )
+        max_recent_volume = max((float(b.volume or 0.0) for b in recent_activity), default=0.0)
+        max_recent_volume_share = (
+            max_recent_volume / recent_volume
+            if recent_volume > 0 else 1.0
+        )
+        if recent_volume < self._min_recent_volume:
+            return None
+        if active_recent_bars < self._min_active_recent_bars:
+            return None
+        if max_recent_volume_share > self._max_single_bar_volume_share:
             return None
 
         session = list(session_bars or bars)
@@ -183,6 +208,9 @@ class EarlyVWAPReclaimScoutScanner:
                 "distance_from_hod_pct": round(distance_from_hod_pct, 2),
                 "risk_to_reclaim_low_pct": round(risk_to_reclaim_low_pct, 2),
                 "volume_surge": round(volume_surge, 2),
+                "recent_volume": round(recent_volume, 0),
+                "active_recent_bars": active_recent_bars,
+                "max_recent_volume_share": round(max_recent_volume_share, 2),
                 "stop_price": round(max(reclaim_low - 0.02, current_vwap * 0.97), 4),
                 "close": latest.close,
                 "volume": latest.volume,

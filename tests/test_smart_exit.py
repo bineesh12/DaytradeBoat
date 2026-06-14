@@ -315,3 +315,68 @@ class TestVolumeExhaustionExit:
         # Only 1 qualifying bar since reset
         exits = em.check_exits({"ABC": 5.18}, _ts(130))
         assert len(exits) == 0
+
+
+class TestConfigurableRunnerTrail:
+    def _confirmed_runner(self, em: ExitManager, peak: float) -> TrackedPosition:
+        pos = _long_pos(entry=5.00, stop=4.90, qty=100)
+        pos.sold_half = True
+        pos.breakeven_locked = True
+        pos.stop_loss = 5.00  # breakeven after the partial
+        pos.runner_candidate = True
+        em._positions[pos.symbol] = pos
+        em._maybe_confirm_runner(pos, peak)  # +10% run confirms the runner
+        return pos
+
+    def test_confirm_uses_configured_trail_pct(self) -> None:
+        em = ExitManager(runner_trail_pct=0.08, runner_min_confirm_pct=0.02)
+        pos = self._confirmed_runner(em, 5.50)
+        assert pos.runner_confirmed is True
+        assert pos.runner_trail_pct == pytest.approx(0.08)
+
+    def test_wider_trail_holds_where_tight_trail_stops(self) -> None:
+        # Same 4.5% pullback from a $5.50 high: a 3% trail stops, an 8% trail holds.
+        def run(trail: float) -> int:
+            em = ExitManager(runner_trail_pct=trail)
+            self._confirmed_runner(em, 5.50)
+            em.check_exits({"ABC": 5.50}, _ts(10))   # set high + trail stop
+            return len(em.check_exits({"ABC": 5.25}, _ts(15)))
+
+        assert run(0.03) == 1   # 5.25 <= 5.335 trail stop → exits
+        assert run(0.08) == 0   # 5.25 > 5.06 trail stop → rides
+
+
+class TestAdaptiveRunnerTrail:
+    def test_flat_when_adaptive_off(self) -> None:
+        em = ExitManager(runner_trail_pct=0.03, runner_trail_adaptive=False)
+        pos = _long_pos()
+        pos.runner_trail_pct = 0.03
+        for r in (0.05, 0.06, 0.05):  # high vol ignored when adaptive off
+            pos.record_bar_range(r)
+        assert em._runner_trail_for(pos) == pytest.approx(0.03)
+
+    def test_adaptive_scales_with_volatility_and_clamps(self) -> None:
+        em = ExitManager(
+            runner_trail_pct=0.03, runner_trail_adaptive=True,
+            runner_trail_atr_mult=2.5, runner_trail_cap=0.10,
+        )
+        smooth = _long_pos(symbol="SMOOTH")
+        for _ in range(5):
+            smooth.record_bar_range(0.014)  # 1.4% bars -> 3.5%
+        assert em._runner_trail_for(smooth) == pytest.approx(0.035)
+
+        wide = _long_pos(symbol="WIDE")
+        for _ in range(5):
+            wide.record_bar_range(0.027)    # 2.7% bars -> 6.75%
+        assert em._runner_trail_for(wide) == pytest.approx(0.0675)
+
+        floored = _long_pos(symbol="FLOOR")
+        floored.runner_trail_pct = 0.03
+        for _ in range(5):
+            floored.record_bar_range(0.005)  # 0.5% -> 1.25%, below floor
+        assert em._runner_trail_for(floored) == pytest.approx(0.03)
+
+        crazy = _long_pos(symbol="CRAZY")
+        for _ in range(5):
+            crazy.record_bar_range(0.10)     # 10% -> 25%, above cap
+        assert em._runner_trail_for(crazy) == pytest.approx(0.10)

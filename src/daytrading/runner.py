@@ -23,7 +23,7 @@ import time
 from collections import defaultdict, deque, namedtuple
 from datetime import datetime, timezone, timedelta
 from threading import Event, Lock, Thread
-from typing import Dict, List, Optional, Sequence, Set
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 from daytrading.config import Settings
 from daytrading.market_calendar import ET, is_us_trading_day, now_et
@@ -42,11 +42,16 @@ from daytrading.execution.position_reconciler import PositionReconciler
 from daytrading.exits.manager import ExitManager
 from daytrading.exits.scaler import PositionScaler, ReentryDetector
 from daytrading.exits.tape_pressure import TapePressureExit
+from daytrading.indicators.core import vwap
 from daytrading.journal.store import TradingJournal
 from daytrading.pipeline.engine import PipelineResult, TradingPipeline
 from daytrading.pipeline.factory import create_scalping_pipeline
 from daytrading.models import Bar, Fill, Order, OrderStatus, PortfolioState, Position, Quote, ScanResult, Side, SignalAction, Tick, TradeSignal
-from daytrading.strategy.entry_guard import check_entry_quality, tick_aware_spread_ok
+from daytrading.strategy.entry_guard import (
+    assess_opportunity_scaled_spread,
+    check_entry_quality,
+    tick_aware_spread_ok,
+)
 from daytrading.strategy.entry_policy import EntryDecision, EntryPolicy
 
 logger = logging.getLogger(__name__)
@@ -214,6 +219,14 @@ class AlpacaRunner:
         # symbol -> (anchor_price, last_seen_monotonic)
         self._timed_entry_anchor: Dict[str, tuple] = {}
         self._timed_entry_anchor_ttl_sec = 300.0
+        self._momentum_breakout_enabled = False
+        self._momentum_breakout_min_rvol = 0.4
+        self._momentum_breakout_min_day_volume = 5_000_000.0
+        self._momentum_breakout_max_bar_range_pct = 3.0
+        self._momentum_breakout_score_floor = 72.0
+        # symbol -> monotonic time when the experimental breakout bypass fired,
+        # so the resulting entry can be tagged for isolated scorecard measurement
+        self._momentum_breakout_armed: Dict[str, float] = {}
         self._trade_analyzer = None
         self._analysis_interval = 10  # run analysis every N cycles
         self._reconciler = PositionReconciler()
@@ -290,6 +303,9 @@ class AlpacaRunner:
         self._hot_watch_min_day_volume = 200_000
         self._hot_watch_sub5_min_day_volume = 500_000
         self._hot_watch_min_score = 0.30
+        self._hot_watch_setup_refresh_enabled = True
+        self._hot_watch_setup_refresh_max_pullback_pct = 4.0
+        self._hot_watch_setup_refresh_min_recent_volume = 100_000.0
 
         # Watchlist bar refresh — keep 1m bars fresh for pattern scanners
         self._last_watchlist_bar_refresh: float = 0.0
@@ -299,6 +315,7 @@ class AlpacaRunner:
         self._pending_breakout_scalps: deque = deque(maxlen=10)
         self._breakout_scalp_cooldown: Dict[str, float] = {}
         self._breakout_scalp_active: bool = False  # True if we have an open breakout scalp
+        self._quick_scalp_spread_size_factors: Dict[str, float] = {}
         self._hod_seed_max_per_minute = 30
         self._hod_seed_minute_start = time.time()
         self._hod_seed_processed_this_minute = 0
@@ -382,6 +399,17 @@ class AlpacaRunner:
             commission_per_share=cfg.commission_per_share,
             min_price=cfg.min_price,
             max_price=cfg.max_price,
+            late_pullback_max_hod_pct=cfg.strategy.late_pullback_max_hod_pct,
+            late_pullback_max_hod_other_pct=cfg.strategy.late_pullback_max_hod_other_pct,
+            fresh_vwap_reclaim_scout_enabled=cfg.strategy.fresh_vwap_reclaim_scout_enabled,
+            fresh_vwap_reclaim_scout_max_float=cfg.strategy.fresh_vwap_reclaim_scout_max_float,
+            level_breakout_scout_enabled=cfg.strategy.level_breakout_scout_enabled,
+            level_breakout_scout_min_session_move_pct=cfg.strategy.level_breakout_scout_min_session_move_pct,
+            runner_trail_pct=cfg.strategy.runner_trail_pct,
+            runner_min_confirm_pct=cfg.strategy.runner_min_confirm_pct,
+            runner_trail_adaptive=cfg.strategy.runner_trail_adaptive,
+            runner_trail_atr_mult=cfg.strategy.runner_trail_atr_mult,
+            runner_trail_cap=cfg.strategy.runner_trail_cap,
             max_positions=cfg.max_positions,
             max_position_shares=cfg.max_position_shares,
             max_order_shares=cfg.max_order_shares,
@@ -396,6 +424,16 @@ class AlpacaRunner:
             logger.info("Daily loser blacklist: ON")
         else:
             logger.info("Daily loser blacklist: OFF (testing mode — re-entry allowed after losses)")
+        pipeline.configure_missed_a_plus_chase_guard(
+            window_sec=cfg.strategy.missed_a_plus_chase_window_sec,
+            pct_sub5=cfg.strategy.missed_a_plus_chase_pct_sub5,
+            pct_5plus=cfg.strategy.missed_a_plus_chase_pct_5plus,
+        )
+        pipeline.configure_entry_chase_guard(
+            pct_low=cfg.strategy.entry_chase_pct_low,
+            pct_high=cfg.strategy.entry_chase_pct_high,
+            price_tier=cfg.strategy.entry_chase_price_tier,
+        )
 
         # replace the PaperBroker in the pipeline with the real AlpacaBroker
         pipeline._broker = broker  # type: ignore[assignment]
@@ -491,7 +529,18 @@ class AlpacaRunner:
         runner._hot_watch_min_day_volume = cfg.hot_watch_min_day_volume
         runner._hot_watch_sub5_min_day_volume = cfg.hot_watch_sub5_min_day_volume
         runner._hot_watch_min_score = cfg.hot_watch_min_score
+        runner._hot_watch_setup_refresh_enabled = cfg.strategy.hot_watch_setup_refresh_enabled
+        runner._hot_watch_setup_refresh_max_pullback_pct = cfg.strategy.hot_watch_setup_refresh_max_pullback_pct
+        runner._hot_watch_setup_refresh_min_recent_volume = cfg.strategy.hot_watch_setup_refresh_min_recent_volume
         runner._timed_entry_anchor_ttl_sec = cfg.strategy.timed_entry_anchor_ttl_sec
+        runner._momentum_breakout_enabled = bool(cfg.strategy.momentum_breakout_enabled)
+        runner._momentum_breakout_min_rvol = float(cfg.strategy.momentum_breakout_min_rvol)
+        runner._momentum_breakout_min_day_volume = float(cfg.strategy.momentum_breakout_min_day_volume)
+        runner._momentum_breakout_max_bar_range_pct = float(cfg.strategy.momentum_breakout_max_bar_range_pct)
+        runner._momentum_breakout_score_floor = float(cfg.strategy.momentum_breakout_score_floor)
+        runner._exec_timer._tick_entry_enabled = bool(cfg.strategy.tick_entry_enabled)
+        runner._exec_timer._tick_entry_confirm_count = max(1, int(cfg.strategy.tick_entry_confirm_count))
+        runner._exec_timer._tick_entry_max_above_anchor = float(cfg.strategy.tick_entry_max_above_anchor)
         runner._fast_scan_process_max = max(1, cfg.fast_scan_process_max)
         _ensure_market_data_service(runner).configure(
             candidate_queue_max=max(1, cfg.candidate_hydrate_queue_max),
@@ -1309,6 +1358,22 @@ class AlpacaRunner:
                 continue
             ttl_minutes = float(meta.get("ttl_minutes", self._hot_watch_ttl_minutes))
             if (now - added_at).total_seconds() >= ttl_minutes * 60:
+                refresh_reason = self._hot_watch_setup_refresh_reason(sym)
+                if refresh_reason is not None:
+                    meta["added_at"] = now
+                    meta["last_seen"] = now
+                    meta["reason"] = refresh_reason
+                    service.hot_watch_set(sym, meta)
+                    changed = True
+                    self._journal.record("hot_watch", {
+                        "symbol": sym,
+                        "stage": "setup_refresh",
+                        "reason": refresh_reason,
+                        "age_seconds": round((now - added_at).total_seconds(), 1),
+                        "mode": meta.get("mode", "watch"),
+                        "ttl_minutes": ttl_minutes,
+                    })
+                    continue
                 service.hot_watch_delete(sym)
                 changed = True
                 self._journal.record("hot_watch", {
@@ -1322,6 +1387,43 @@ class AlpacaRunner:
         if changed:
             self._publish_hot_watch()
             self._publish_trading_watchlist()
+
+    def _hot_watch_setup_refresh_reason(self, symbol: str) -> Optional[str]:
+        """Keep watched symbols alive while they are basing near HOD.
+
+        A mover often becomes tradeable only after it stops extending and builds
+        a tight base. Do not expire it during that setup if volume is still
+        active, price is near session high, and VWAP support is intact.
+        """
+        if not getattr(self, "_hot_watch_setup_refresh_enabled", True):
+            return None
+        bars = list(self._bar_buffer.get(symbol, []))
+        if len(bars) < 6:
+            return None
+        latest = bars[-1]
+        price = float(getattr(latest, "close", 0.0) or 0.0)
+        if price <= 0:
+            return None
+        session_high = max(float(getattr(b, "high", 0.0) or 0.0) for b in bars)
+        if session_high <= 0:
+            return None
+        pullback_pct = (session_high - price) / session_high * 100.0
+        if pullback_pct > float(self._hot_watch_setup_refresh_max_pullback_pct):
+            return None
+
+        recent = bars[-3:]
+        recent_volume = sum(float(getattr(b, "volume", 0.0) or 0.0) for b in recent)
+        if recent_volume < float(self._hot_watch_setup_refresh_min_recent_volume):
+            return None
+
+        vwap_vals = vwap(bars)
+        current_vwap = vwap_vals[-1] if vwap_vals else 0.0
+        if current_vwap > 0 and price < current_vwap * 0.995:
+            return None
+
+        return (
+            "setup refresh: holding {:.1f}% below HOD with {:.0f} recent volume"
+        ).format(pullback_pct, recent_volume)
 
     def _hot_watch_snapshot(self) -> List[dict]:
         now = datetime.now(timezone.utc)
@@ -1437,7 +1539,8 @@ class AlpacaRunner:
             return "price outside hot-watch band"
 
         change = abs(float(mover.get("abs_change_pct", mover.get("change_pct", 0.0)) or 0.0))
-        if change < self._hot_watch_min_change_pct:
+        early_level_scout = self._hot_watch_level_breakout_scout_candidate(mover)
+        if change < self._hot_watch_min_change_pct and not early_level_scout:
             return "change {:.1f}% < {:.1f}%".format(
                 change, self._hot_watch_min_change_pct,
             )
@@ -1451,11 +1554,11 @@ class AlpacaRunner:
             # open so stale prior-day volume cannot create fake hot movers.
             # Treat this as tape volume, not full day volume.
             min_volume = 50_000 if price < 5.0 else 40_000
-        if volume < min_volume:
+        if volume < min_volume and not early_level_scout:
             return "volume {:.0f} < {:.0f}".format(volume, min_volume)
 
         score = float(mover.get("score", 0.0) or 0.0)
-        if score < self._hot_watch_min_score:
+        if score < self._hot_watch_min_score and not early_level_scout:
             return "score {:.2f} < {:.2f}".format(score, self._hot_watch_min_score)
 
         if flt is not None and flt > self._hod_max_float:
@@ -1464,6 +1567,28 @@ class AlpacaRunner:
             )
 
         return None
+
+    def _hot_watch_level_breakout_scout_candidate(self, mover: Dict) -> bool:
+        """Hydrate smooth/liquid early level-break candidates before +5%.
+
+        Snapshot data cannot prove the chart pattern yet, but high day volume,
+        decent score, and a 3%+ move are enough to start bar/tick tracking. The
+        actual order still needs the level_breakout_scout scanner, verifier,
+        final guard, timer, spread, and anti-chase checks.
+        """
+        try:
+            price = float(mover.get("price", 0.0) or 0.0)
+            change = abs(float(mover.get("abs_change_pct", mover.get("change_pct", 0.0)) or 0.0))
+            volume = float(mover.get("volume", 0.0) or 0.0)
+            score = float(mover.get("score", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return False
+        if not (self._hod_sub2_min_price <= price <= self._hod_max_price):
+            return False
+        min_change = 3.0
+        min_volume = 5_000_000.0 if price >= 5.0 else 2_000_000.0
+        min_score = max(self._hot_watch_min_score, 0.40)
+        return change >= min_change and volume >= min_volume and score >= min_score
 
     def _hot_watch_mode(self, mover: Dict) -> tuple[str, float]:
         """Return watch mode and TTL from current mover strength."""
@@ -3358,6 +3483,13 @@ class AlpacaRunner:
                         buf = deque(maxlen=self._max_ticks_per_symbol)
                         self._tick_buffer[tick.symbol] = buf
                     buf.append(tick)
+                    # Tick-based early entry: catch fast movers near the base before a
+                    # 10s bar can confirm. Gated on symbols with a pending timed entry
+                    # (small set). The chase/spread guards still run at the execute path.
+                    if tick.symbol in self._exec_timer.pending_symbols:
+                        ready_sig = self._exec_timer.on_tick(tick)
+                        if ready_sig is not None:
+                            self._execute_timed_signal(ready_sig)
 
                     # Tick-level trailing stop for open positions (post-half only)
                     tracked_pos = self._pipeline.exit_manager._positions.get(tick.symbol)
@@ -4077,8 +4209,28 @@ class AlpacaRunner:
                 universe, now=datetime.now(timezone.utc),
             )
             self._hub.on_missed_a_plus(self._pipeline.missed_a_plus_report())
+            self._hub.on_scanner_near_miss(self._pipeline.scanner_near_miss_summary())
         except Exception:
             pass
+
+    @staticmethod
+    def _is_watch_only_decision(decision: Any) -> bool:
+        """True for shadow-scanner 'collecting data, not live A+' monitoring rows.
+
+        These are not real entry attempts and are excluded from the funnel.
+        """
+        if isinstance(decision, dict):
+            text = "{} {} {}".format(
+                decision.get("reason") or "",
+                decision.get("blocked_layer") or "",
+                decision.get("setup_tier") or "",
+            ).lower()
+        else:
+            text = "{} {}".format(
+                getattr(decision, "reason", "") or "",
+                getattr(decision, "blocked_layer", "") or "",
+            ).lower()
+        return "watch only" in text or "collecting data" in text
 
     def _record_entry_decision(
         self,
@@ -4244,9 +4396,51 @@ class AlpacaRunner:
             avg_mid = sum((q.ask + q.bid) / 2.0 for q in recent_quotes) / len(recent_quotes)
             avg_spread_pct = avg_spread / avg_mid * 100.0 if avg_mid > 0 else 0.0
             max_spread = 0.9 if live < 5.0 else 0.6
-            if not tick_aware_spread_ok(avg_spread, avg_mid or live, max_spread / 100.0):
-                return "spread widened to {:.2f}% ({:.2f}c, max {:.1f}% or 1 tick)".format(
-                    avg_spread_pct, avg_spread * 100.0, max_spread)
+            criteria = hit.criteria if hit is not None else {}
+            avg_depth = sum(min(q.bid_size, q.ask_size) for q in recent_quotes) / len(recent_quotes)
+            day_volume = 0.0
+            recent_avg_volume = 0.0
+            latest_volume = float(getattr(fallback_bar, "volume", 0.0) or 0.0)
+            try:
+                bars = list(self._bar_buffer.get(signal.symbol, []))
+            except Exception:
+                bars = []
+            if bars:
+                day_volume = float(sum(getattr(b, "volume", 0.0) or 0.0 for b in bars))
+                recent = bars[-5:]
+                recent_avg_volume = (
+                    float(sum(getattr(b, "volume", 0.0) or 0.0 for b in recent)) / len(recent)
+                    if recent else 0.0
+                )
+                latest_volume = float(getattr(bars[-1], "volume", 0.0) or latest_volume)
+            session_high = max((float(getattr(b, "high", 0.0) or 0.0) for b in bars), default=live)
+            distance_from_hod = (session_high - live) / session_high if session_high > 0 else 1.0
+            spread_decision = assess_opportunity_scaled_spread(
+                price=avg_mid or live,
+                spread=avg_spread,
+                pattern=pattern,
+                setup_tier=str(criteria.get("setup_tier") or ""),
+                entry_tier=str(criteria.get("entry_tier") or ""),
+                day_volume=day_volume,
+                recent_avg_volume=recent_avg_volume,
+                latest_volume=latest_volume,
+                distance_from_hod=distance_from_hod,
+                quote_depth=avg_depth,
+                normal_pct_limit=0.005,
+                setup_score=float(getattr(hit, "score", 0.0) or 0.0) if hit is not None else 0.0,
+            )
+            if not spread_decision.ok:
+                return "spread {:.2f}% ({:.2f}c) rejected: {}".format(
+                    avg_spread_pct, avg_spread * 100.0,
+                    spread_decision.reason or "too wide")
+            if spread_decision.exception and hit is not None:
+                current_factor = float(criteria.get("size_factor") or 1.0)
+                criteria["size_factor"] = round(min(current_factor, spread_decision.size_factor), 2)
+                spread_mode = spread_decision.mode or "opportunity_scaled"
+                criteria["spread_exception"] = spread_mode
+                criteria["spread_size_factor"] = round(spread_decision.size_factor, 2)
+                if spread_mode == "elite_wide_spread":
+                    criteria["entry_mode"] = "elite_wide_spread"
 
         if (
             is_hot
@@ -4433,10 +4627,7 @@ class AlpacaRunner:
         avg_daily_volume = None
         float_checker = getattr(self, "_float_checker", None)
         if float_checker is not None:
-            try:
-                float_shares = float_checker.get_float_cached(symbol)
-            except Exception:
-                float_shares = None
+            float_shares = self._resolve_entry_float_shares(float_checker, symbol)
             try:
                 avg_cache = getattr(float_checker, "_avg_vol_cache", None)
                 if isinstance(avg_cache, dict):
@@ -4473,6 +4664,21 @@ class AlpacaRunner:
             ticks=list(self._tick_buffer.get(symbol, [])),
             quotes=list(self._quote_buffer.get(symbol, [])),
         )
+
+    @staticmethod
+    def _resolve_entry_float_shares(float_checker: object, symbol: str) -> Optional[float]:
+        """Resolve float for final entry guard without network latency.
+
+        FloatChecker.get_float_cached() checks memory and the SQLite FloatStore,
+        but deliberately avoids Yahoo/network fetches on the hot submit path.
+        """
+        cached = getattr(float_checker, "get_float_cached", None)
+        if callable(cached):
+            try:
+                return cached(symbol)
+            except Exception:
+                logger.debug("Cached float lookup failed for %s before entry guard", symbol)
+        return None
 
     def _execute_timed_scale_up(self, signal: TradeSignal) -> None:
         """Execute a protected-runner re-add released by the 10s timer."""
@@ -4552,10 +4758,18 @@ class AlpacaRunner:
                 volume=fallback_bar.volume,
                 ts=datetime.now(timezone.utc),
             )
+            try:
+                criteria = signal.scan_result.criteria if signal.scan_result is not None else {}
+                spread_size_factor = float(criteria.get("spread_size_factor") or 1.0)
+            except (AttributeError, TypeError, ValueError):
+                spread_size_factor = 1.0
+            quantity = signal.quantity
+            if 0 < spread_size_factor < 1.0 and quantity > 1:
+                quantity = float(max(1, int(float(quantity) * spread_size_factor)))
             retry_order = Order(
                 symbol=signal.symbol,
                 side=Side.BUY,
-                quantity=signal.quantity,
+                quantity=quantity,
                 limit_price=live,
             )
             quality_reject = self._shared_entry_quality_reject(
@@ -4571,7 +4785,7 @@ class AlpacaRunner:
                 return None, first_status
             logger.info(
                 "TIMED ENTRY hot retry %s %.0f @ %.4f (signal %.4f, cap %.1f%%)",
-                signal.symbol, signal.quantity, live, original, max_chase_pct * 100,
+                signal.symbol, quantity, live, original, max_chase_pct * 100,
             )
             fill, status = self._broker.submit(retry_order, retry_bar, self._pipeline.portfolio)
             try:
@@ -4661,7 +4875,10 @@ class AlpacaRunner:
                 )
                 continue
 
-            recent_reject = self._quick_scalp_recent_normal_reject(sym)
+            recent_reject = self._quick_scalp_recent_normal_reject(
+                sym,
+                allow_fresh_hod_breakout=True,
+            )
             if recent_reject is not None:
                 logger.info("BREAKOUT SCALP reject %s: %s", sym, recent_reject)
                 probe_signal = self._quick_scalp_probe_signal(sym, alert_price, "breakout_scalp")
@@ -4723,6 +4940,24 @@ class AlpacaRunner:
             max_dollar_risk = 50.0
             quantity = int(max_dollar_risk / risk_per_share) if risk_per_share > 0 else 0
             quantity = max(1, min(quantity, 750))
+            spread_size_factor = float(
+                getattr(self, "_quick_scalp_spread_size_factors", {}).pop(sym, 1.0)
+            )
+            if 0 < spread_size_factor < 1.0 and quantity > 1:
+                original_quantity = quantity
+                quantity = max(1, int(quantity * spread_size_factor))
+                logger.info(
+                    "BREAKOUT SCALP %s size down %d → %d for opportunity-scaled spread",
+                    sym,
+                    original_quantity,
+                    quantity,
+                )
+
+            # Tag entries that the experimental momentum-breakout bypass allowed,
+            # so the scorecard can measure that mode's standalone expectancy.
+            mb_armed = self._momentum_breakout_consume(sym)
+            scanner_name = "breakout_scalp_momentum" if mb_armed else "breakout_scalp"
+            fill_strategy = scanner_name
 
             signal = TradeSignal(
                 symbol=sym,
@@ -4735,9 +4970,20 @@ class AlpacaRunner:
                 reason="Quick Momentum Scalp {} ${:.2f}, stop=${:.2f}, target=${:.2f} ({})".format(
                     sym, price, stop_price, target_price, rr_note),
                 scan_result=ScanResult(
-                    symbol=sym, scanner_name="breakout_scalp",
+                    symbol=sym, scanner_name=scanner_name,
                     ts=datetime.now(timezone.utc), score=0.0,
-                    criteria={"pattern": "breakout_scalp", "direction": "up"},
+                    criteria={
+                        "pattern": "breakout_scalp",
+                        "direction": "up",
+                        **({"entry_mode": "momentum_breakout"} if mb_armed else {}),
+                        **(
+                            {
+                                "spread_exception": "opportunity_scaled",
+                                "spread_size_factor": round(spread_size_factor, 2),
+                            }
+                            if 0 < spread_size_factor < 1.0 else {}
+                        ),
+                    },
                 ),
                 trend_strength=0.8,
             )
@@ -4761,7 +5007,7 @@ class AlpacaRunner:
             if fill:
                 apply_fill(self._pipeline.portfolio, fill)
                 self._on_position_opened(
-                    signal, fill, strategy="breakout_scalp",
+                    signal, fill, strategy=fill_strategy,
                     execution_method="instant_breakout",
                 )
                 self._breakout_scalp_active = True
@@ -4771,7 +5017,7 @@ class AlpacaRunner:
                     "QUICK SCALP ENTRY %s %.0f @ $%.4f stop=$%.2f target=$%.2f %s",
                     sym, fill.quantity, fill.price, stop_price, target_price, rr_note,
                 )
-                self._hub.on_fill(fill, "entry")
+                self._hub.on_fill(fill, "entry", strategy=fill_strategy)
                 self._hub.add_log(
                     "INFO",
                     "QUICK SCALP {} {:.0f} @ ${:.2f}".format(sym, fill.quantity, fill.price),
@@ -4783,7 +5029,7 @@ class AlpacaRunner:
                     "price": fill.price,
                     "ts": fill.ts,
                     "trade_type": "entry",
-                    "strategy": "breakout_scalp",
+                    "strategy": fill_strategy,
                     "execution_method": "instant_breakout",
                     "market_context": {"phase": self._market_phase()},
                 }, ts=fill.ts)
@@ -4860,6 +5106,34 @@ class AlpacaRunner:
             return None
         active_rvol = max(rel_vol, bar_rvol)
         if active_rvol > 0 and active_rvol < 1.0:
+            # EXPERIMENTAL momentum-breakout mode: a real breakout can run on
+            # high ABSOLUTE volume even when relative volume has faded from an
+            # earlier peak (the VSME case). Allow it through — tagged for the
+            # scorecard — instead of rejecting on relative volume alone. Still
+            # subject to quick-scalp structure, shared quality, 10s, and R:R.
+            if getattr(self, "_momentum_breakout_enabled", False):
+                day_vol = 0.0
+                try:
+                    day_vol = float(latest.get("day_volume") or 0.0)
+                except (TypeError, ValueError):
+                    day_vol = 0.0
+                # Caveat-2 fix: only allow if recent tape is smooth enough that a
+                # tight stop actually holds. Violent gappy breakouts (VSME-style
+                # 6-11% bars) are skipped — that's where the stop slips and the
+                # edge dies. No bar data → can't assess → fall through to reject.
+                smooth = self._momentum_breakout_tape_is_smooth(sym)
+                if (
+                    active_rvol >= self._momentum_breakout_min_rvol
+                    and day_vol >= self._momentum_breakout_min_day_volume
+                    and smooth
+                ):
+                    self._momentum_breakout_armed[sym] = time.monotonic()
+                    logger.info(
+                        "MOMENTUM BREAKOUT %s: rvol %.2fx faded but day_vol %.0f high "
+                        "and tape smooth — allowing (experimental mode)",
+                        sym, active_rvol, day_vol,
+                    )
+                    return None
             return "HOD alert active RVOL too weak {:.2f}x (need 1.0x+)".format(active_rvol)
 
         return None
@@ -4893,6 +5167,39 @@ class AlpacaRunner:
         if max(rel_vol, bar_rvol) < 1.0:
             return False
         return change_session_pct >= 80.0 or change_from_close_pct >= 120.0
+
+    def _momentum_breakout_tape_is_smooth(self, symbol: str) -> bool:
+        """True when recent bars are tight enough that a tight stop holds.
+
+        Median per-bar range must be within the configured cap. Violent gappy
+        tape (where stops slip) returns False; missing bar data also returns
+        False (cannot confirm safety -> do not fire the experimental entry).
+        """
+        try:
+            bars = list(getattr(self, "_bar_buffer", {}).get(symbol.upper(), []))
+        except Exception:
+            return False
+        recent = [b for b in bars[-6:] if float(getattr(b, "close", 0) or 0) > 0]
+        if len(recent) < 3:
+            return False
+        ranges = sorted(
+            (float(b.high) - float(b.low)) / float(b.close) * 100.0 for b in recent
+        )
+        median = ranges[len(ranges) // 2]
+        return median <= self._momentum_breakout_max_bar_range_pct
+
+    def _momentum_breakout_consume(self, symbol: str, ttl_sec: float = 5.0) -> bool:
+        """Return True (and clear the marker) when the experimental breakout
+        bypass fired for this symbol this cycle — so the resulting entry can be
+        tagged for isolated scorecard measurement.
+        """
+        armed = getattr(self, "_momentum_breakout_armed", None)
+        if not armed:
+            return False
+        fired_at = armed.pop(symbol, None)
+        if fired_at is None:
+            return False
+        return (time.monotonic() - fired_at) <= ttl_sec
 
     def _new_entries_blocked(self, symbol: Optional[str], source: str) -> bool:
         """Return True when global controls should block any new entry path."""
@@ -4969,7 +5276,53 @@ class AlpacaRunner:
             source, risk / price * 100, target_risk / price * 100)
         return price, stop_price, target_price, rr_note
 
-    def _quick_scalp_recent_normal_reject(self, symbol: str) -> Optional[str]:
+    def _quick_scalp_has_tradeable_hod_alert(self, symbol: str) -> bool:
+        store = getattr(self, "_hod_alert_store", None)
+        if store is None:
+            return False
+        try:
+            rows = store.snapshot()
+        except Exception:
+            return False
+        sym = symbol.upper()
+        for row in rows or []:
+            if str(row.get("symbol") or "").upper() != sym:
+                continue
+            reject_reason = str(row.get("reject_reason") or "").strip()
+            if reject_reason and not reject_reason.lower().startswith("watch only"):
+                return False
+            try:
+                price = float(row.get("price") or 0.0)
+                day_volume = float(row.get("day_volume") or 0.0)
+                rel_vol = float(row.get("rel_vol") or 0.0)
+                bar_rvol = float(row.get("bar_rvol") or 0.0)
+            except Exception:
+                price = day_volume = rel_vol = bar_rvol = 0.0
+            if price > 0 and day_volume >= 1_000_000 and max(rel_vol, bar_rvol) >= 1.0:
+                return True
+            # Some tick HOD rows can arrive without normalized RVOL, but a
+            # cleared reject_reason means the alert gate already accepted them.
+            if not reject_reason and price > 0 and day_volume >= 5_000_000:
+                return True
+        return False
+
+    @staticmethod
+    def _quick_scalp_can_ignore_recent_shape_reject(reason: str) -> bool:
+        lower = str(reason or "").lower()
+        stale_shape_terms = (
+            "too far from hod",
+            "pullback too small",
+            "base range too wide",
+            "watching for fresh reclaim",
+        )
+        return any(term in lower for term in stale_shape_terms)
+
+    def _quick_scalp_recent_normal_reject(
+        self,
+        symbol: str,
+        *,
+        allow_fresh_hod_breakout: bool = False,
+    ) -> Optional[str]:
         """Block quick scalps when the regular entry path just saw a hard reject."""
         pipeline = getattr(self, "_pipeline", None)
         if pipeline is None:
@@ -4996,6 +5349,18 @@ class AlpacaRunner:
             return None
 
         lower = str(reason).lower()
+        if (
+            allow_fresh_hod_breakout
+            and self._quick_scalp_can_ignore_recent_shape_reject(reason)
+            and self._quick_scalp_has_tradeable_hod_alert(symbol)
+        ):
+            logger.info(
+                "BREAKOUT SCALP ignore stale normal reject %s: %s",
+                symbol,
+                reason,
+            )
+            return None
+
         hard_terms = (
             "spread too wide",
             "late continuation too weak",
@@ -5025,12 +5390,38 @@ class AlpacaRunner:
         bars: Sequence[Bar],
     ) -> Optional[str]:
         """Run quick scalps through the shared entry guard and ML monitor."""
-        return self._shared_entry_quality_reject(
+        reject = self._shared_entry_quality_reject(
             symbol,
             bars,
             stage="breakout_scalp_final_guard",
             source="breakout_scalp",
         )
+        # Caveat-1 fix (experimental momentum-breakout mode): catch the early
+        # breakout/reclaim that scores just under the 80 gate — but ONLY when the
+        # tape is smooth (stop holds). Scoped to the breakout-scalp path.
+        if (
+            reject
+            and getattr(self, "_momentum_breakout_enabled", False)
+            and "entry score too low" in reject
+        ):
+            score_val = None
+            try:
+                score_val = int(reject.split("(", 1)[1].split("/100", 1)[0])
+            except (IndexError, ValueError):
+                score_val = None
+            if (
+                score_val is not None
+                and score_val >= self._momentum_breakout_score_floor
+                and self._momentum_breakout_tape_is_smooth(symbol)
+            ):
+                self._momentum_breakout_armed[symbol] = time.monotonic()
+                logger.info(
+                    "MOMENTUM BREAKOUT %s: score %d below 80 but >= floor and tape "
+                    "smooth — allowing (experimental mode)",
+                    symbol, score_val,
+                )
+                return None
+        return reject
 
     @staticmethod
     def _quick_scalp_probe_signal(
@@ -5161,9 +5552,32 @@ class AlpacaRunner:
                 avg_spread_pct = avg_spread / avg_mid * 100 if avg_mid > 0 else 0.0
                 momentum_pct = max(day_change, recent_move)
                 max_spread = 1.5 if day_volume >= 1_000_000 and momentum_pct >= 50.0 else 0.8
-                if not tick_aware_spread_ok(avg_spread, avg_mid or price, max_spread / 100.0):
+                avg_depth = sum(min(q.bid_size, q.ask_size) for q in recent_quotes) / len(recent_quotes)
+                spread_decision = assess_opportunity_scaled_spread(
+                    price=avg_mid or price,
+                    spread=avg_spread,
+                    pattern="breakout_scalp",
+                    setup_tier="A+ setup" if momentum_pct >= 50.0 else "",
+                    entry_tier="",
+                    day_volume=day_volume,
+                    recent_avg_volume=recent_volume / 3.0,
+                    latest_volume=float(getattr(latest, "volume", 0.0) or 0.0),
+                    distance_from_hod=tradeable_hod_distance / 100.0,
+                    quote_depth=avg_depth,
+                    normal_pct_limit=max_spread / 100.0,
+                    setup_score=0.0,
+                )
+                if not spread_decision.ok:
                     return "quick scalp spread too wide {:.2f}% ({:.2f}c, max {:.1f}% or 1 tick)".format(
                         avg_spread_pct, avg_spread * 100.0, max_spread)
+                factors = getattr(self, "_quick_scalp_spread_size_factors", None)
+                if factors is None:
+                    factors = {}
+                    self._quick_scalp_spread_size_factors = factors
+                if spread_decision.exception:
+                    factors[symbol] = spread_decision.size_factor
+                else:
+                    factors.pop(symbol, None)
 
         ticks = list(self._tick_buffer.get(symbol, []))
         if len(ticks) >= 10:
@@ -5510,6 +5924,12 @@ class AlpacaRunner:
         """Log events and push them to the dashboard."""
         for decision in getattr(result, "entry_decisions", []) or []:
             try:
+                # Skip watch-only rows — shadow scanners (momentum_burst,
+                # bull_flag, level_breakout_watch) log "collecting data, not live
+                # A+" every cycle. They are monitoring chatter, not real entry
+                # attempts, and would dominate the funnel and bloat the journal.
+                if self._is_watch_only_decision(decision):
+                    continue
                 payload = dict(decision)
                 payload["source"] = payload.get("source") or "pipeline"
                 payload["market_phase"] = self._market_phase()
@@ -5595,14 +6015,14 @@ class AlpacaRunner:
 
         # Push entry fills
         for f in result.fills:
+            strategy = result.entry_strategies.get(f.symbol, "")
             logger.info(
                 "[Cycle %d] ENTRY %s %s %.0f @ $%.2f",
                 cycle_num, f.side.value.upper(), f.symbol, f.quantity, f.price,
             )
-            self._hub.on_fill(f, "entry")
+            self._hub.on_fill(f, "entry", strategy=strategy)
             self._hub.add_log("INFO", "ENTRY {} {} {:.0f} @ ${:.2f}".format(
                 f.side.value.upper(), f.symbol, f.quantity, f.price))
-            strategy = result.entry_strategies.get(f.symbol, "")
             self._journal.record("trade_fill", {
                 "symbol": f.symbol,
                 "side": f.side.value,
@@ -5650,11 +6070,12 @@ class AlpacaRunner:
         # Push scale-up fills
         if hasattr(result, 'scale_up_fills') and result.scale_up_fills:
             for f in result.scale_up_fills:
+                strategy = result.entry_strategies.get(f.symbol, "")
                 logger.info(
                     "[Cycle %d] SCALE UP %s %s +%.0f @ $%.2f",
                     cycle_num, f.side.value.upper(), f.symbol, f.quantity, f.price,
                 )
-                self._hub.on_fill(f, "scale_up")
+                self._hub.on_fill(f, "scale_up", strategy=strategy)
                 self._hub.add_log("INFO", "SCALE UP {} +{:.0f} @ ${:.2f}".format(
                     f.symbol, f.quantity, f.price))
                 self._journal.record("trade_fill", {
@@ -5664,16 +6085,18 @@ class AlpacaRunner:
                     "price": f.price,
                     "ts": f.ts,
                     "trade_type": "scale_up",
+                    "strategy": strategy,
                 }, ts=f.ts)
 
         # Push re-entry fills
         if hasattr(result, 'reentry_fills') and result.reentry_fills:
             for f in result.reentry_fills:
+                strategy = result.entry_strategies.get(f.symbol, "")
                 logger.info(
                     "[Cycle %d] RE-ENTRY %s %s %.0f @ $%.2f",
                     cycle_num, f.side.value.upper(), f.symbol, f.quantity, f.price,
                 )
-                self._hub.on_fill(f, "reentry")
+                self._hub.on_fill(f, "reentry", strategy=strategy)
                 self._hub.add_log("INFO", "RE-ENTRY {} {:.0f} @ ${:.2f}".format(
                     f.symbol, f.quantity, f.price))
                 self._journal.record("trade_fill", {
@@ -5683,6 +6106,7 @@ class AlpacaRunner:
                     "price": f.price,
                     "ts": f.ts,
                     "trade_type": "reentry",
+                    "strategy": strategy,
                 }, ts=f.ts)
 
         # Queue deferred signals into execution timer (10-sec micro-entry).
@@ -5774,6 +6198,7 @@ class AlpacaRunner:
                 universe, now=datetime.now(timezone.utc),
             )
             self._hub.on_missed_a_plus(self._pipeline.missed_a_plus_report())
+            self._hub.on_scanner_near_miss(self._pipeline.scanner_near_miss_summary())
         except Exception:
             pass
 

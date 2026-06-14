@@ -204,6 +204,7 @@ class TradingJournal:
                 CREATE INDEX IF NOT EXISTS idx_trades_symbol_ts ON trades(symbol, ts);
                 CREATE INDEX IF NOT EXISTS idx_trades_type ON trades(trade_type);
                 CREATE INDEX IF NOT EXISTS idx_trades_strategy ON trades(strategy);
+                CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades(ts);
 
                 CREATE TABLE IF NOT EXISTS market_context (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -219,6 +220,7 @@ class TradingJournal:
                     rejected INTEGER,
                     FOREIGN KEY(event_id) REFERENCES events(id)
                 );
+                CREATE INDEX IF NOT EXISTS idx_market_context_ts ON market_context(ts);
 
                 CREATE TABLE IF NOT EXISTS classifications (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -10,7 +10,7 @@ from typing import Optional
 
 from daytrading.classifier.regime import MarketRegimeClassifier
 from daytrading.classifier.router import AdaptiveRouter, StyleConfig
-from daytrading.execution.broker import PaperBroker
+from daytrading.execution.broker import Broker, PaperBroker
 from daytrading.exits.manager import ExitManager
 from daytrading.exits.scaler import (
     PositionScaler,
@@ -46,6 +46,26 @@ def create_scalping_pipeline(
     min_price: float = 1.0,
     max_price: float = 20.0,
 
+    # Deep-pullback tolerance (verifier "too far from HOD" gate)
+    late_pullback_max_hod_pct: float = 12.0,
+    late_pullback_max_hod_other_pct: float = 10.0,
+
+    # Experimental conservative fresh-VWAP-reclaim scout (default off)
+    fresh_vwap_reclaim_scout_enabled: bool = False,
+    fresh_vwap_reclaim_scout_max_float: float = 20_000_000.0,
+    level_breakout_scout_enabled: bool = False,
+    level_breakout_scout_min_session_move_pct: float = 3.0,
+    momentum_burst_live_enabled: bool = False,
+    level_capped_entry_enabled: bool = False,
+
+    # Runner back-half trail (post-partial). Wider rides continuation runners
+    # further but gives back more on top-and-fade names. See StrategyConfig.
+    runner_trail_pct: float = 0.03,
+    runner_min_confirm_pct: float = 0.018,
+    runner_trail_adaptive: bool = False,
+    runner_trail_atr_mult: float = 2.5,
+    runner_trail_cap: float = 0.10,
+
     # Position limits
     max_positions: int = 3,
     max_position_shares: float = 1000,
@@ -77,6 +97,7 @@ def create_scalping_pipeline(
     scalp_max_spread_pct: float = 0.15,
 
     portfolio: Optional[PortfolioState] = None,
+    broker: Optional[Broker] = None,
     float_checker: object = None,
     enable_daily_loser_blacklist: bool = False,
 ) -> TradingPipeline:
@@ -149,6 +170,8 @@ def create_scalping_pipeline(
     level_breakout_watch_scanner = LevelBreakoutWatchScanner(
         min_price=min_price,
         max_price=max_price,
+        min_live_scout_session_move_pct=level_breakout_scout_min_session_move_pct,
+        live_scout_enabled=level_breakout_scout_enabled,
     )
     runner_reclaim_scanner = RunnerReclaimContinuationScanner(
         min_price=min_price,
@@ -173,6 +196,10 @@ def create_scalping_pipeline(
         min_price=min_price,
         max_price=max_price,
         float_checker=float_checker,
+        late_pullback_max_hod_pct=late_pullback_max_hod_pct,
+        late_pullback_max_hod_other_pct=late_pullback_max_hod_other_pct,
+        fresh_vwap_reclaim_scout_enabled=fresh_vwap_reclaim_scout_enabled,
+        fresh_vwap_reclaim_scout_max_float=fresh_vwap_reclaim_scout_max_float,
     )
 
     # --- Classifier + Router ---
@@ -209,6 +236,8 @@ def create_scalping_pipeline(
         "shallow_stair_continuation": pattern_verifier,
         "early_vwap_reclaim_scout": pattern_verifier,
     }
+    if momentum_burst_live_enabled:
+        live_verifiers["momentum_burst"] = pattern_verifier
 
     scalp_config = StyleConfig(
         scanners=all_scanners,
@@ -221,7 +250,7 @@ def create_scalping_pipeline(
     )
 
     # --- Broker ---
-    broker = PaperBroker(commission_per_share=commission_per_share)
+    broker = broker or PaperBroker(commission_per_share=commission_per_share)
 
     # --- Re-entry detector ---
     # After a full profitable exit, keep watching the same runner for a
@@ -263,7 +292,14 @@ def create_scalping_pipeline(
         verifiers=live_verifiers,
         broker=broker,
         portfolio=portfolio,
-        exit_manager=ExitManager(max_unrealized_loss=pattern_max_dollar_risk),
+        exit_manager=ExitManager(
+            max_unrealized_loss=pattern_max_dollar_risk,
+            runner_trail_pct=runner_trail_pct,
+            runner_min_confirm_pct=runner_min_confirm_pct,
+            runner_trail_adaptive=runner_trail_adaptive,
+            runner_trail_atr_mult=runner_trail_atr_mult,
+            runner_trail_cap=runner_trail_cap,
+        ),
         router=router,
         scaler=runner_readd_scaler,
         reentry_detector=reentry_detector,
@@ -272,4 +308,5 @@ def create_scalping_pipeline(
         max_order_shares=max_order_shares,
         max_dollar_risk_per_trade=pattern_max_dollar_risk,
         enable_daily_loser_blacklist=enable_daily_loser_blacklist,
+        level_capped_entry_enabled=level_capped_entry_enabled,
     )

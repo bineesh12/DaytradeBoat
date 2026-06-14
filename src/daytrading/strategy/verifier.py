@@ -6,6 +6,7 @@ is actually tradeable — producing a TradeSignal or returning None to skip.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import List, Optional
 
 try:
@@ -28,6 +29,8 @@ class StrategyVerifier(Protocol):
         self,
         scan_result: ScanResult,
         portfolio: PortfolioState,
+        *,
+        now: Optional[datetime] = None,
     ) -> Optional[TradeSignal]:
         """Return a TradeSignal if the scan hit meets entry criteria, else None."""
         ...

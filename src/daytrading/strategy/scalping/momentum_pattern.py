@@ -16,11 +16,16 @@ Implements Warrior Trading's momentum day trading entry rules:
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Optional
 
 from daytrading.indicators.core import vwap
 from daytrading.models import PortfolioState, ScanResult, SignalAction, TradeSignal
-from daytrading.strategy.entry_guard import check_entry_quality, record_rule_rejection
+from daytrading.strategy.entry_guard import (
+    assess_opportunity_scaled_spread,
+    check_entry_quality,
+    record_rule_rejection,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +46,15 @@ class MomentumPatternVerifier:
         min_price: float = 1.0,
         max_price: float = 500.0,
         float_checker: object = None,
+        late_pullback_max_hod_pct: float = 12.0,
+        late_pullback_max_hod_other_pct: float = 10.0,
+        fresh_vwap_reclaim_scout_enabled: bool = False,
+        fresh_vwap_reclaim_scout_max_float: float = 20_000_000.0,
     ) -> None:
+        self._late_pullback_max_hod_pct = float(late_pullback_max_hod_pct)
+        self._late_pullback_max_hod_other_pct = float(late_pullback_max_hod_other_pct)
+        self._fresh_vwap_reclaim_scout_enabled = bool(fresh_vwap_reclaim_scout_enabled)
+        self._fresh_vwap_reclaim_scout_max_float = float(fresh_vwap_reclaim_scout_max_float)
         self._max_risk = max_risk_per_share
         self._rr_ratio = reward_risk_ratio
         self._trail = trail_ticks * TICK
@@ -453,6 +466,10 @@ class MomentumPatternVerifier:
         *,
         float_shares: Optional[float] = None,
         scan_result: Optional[ScanResult] = None,
+        max_hod_pct: float = 12.0,
+        max_hod_other_pct: float = 14.0,
+        fresh_scout_enabled: bool = False,
+        fresh_scout_max_float: float = 20_000_000.0,
     ) -> Optional[str]:
         """Extra quality gate for slower pullback entries."""
         if len(bars) < 10:
@@ -475,7 +492,7 @@ class MomentumPatternVerifier:
             scan_result.criteria.pop("entry_tier_reason", None)
 
         fresh_late_reclaim = False
-        max_hod_distance = 8.0 if pattern == "vwap_pullback" else 10.0
+        max_hod_distance = max_hod_pct if pattern == "vwap_pullback" else max_hod_other_pct
         if distance_from_hod > max_hod_distance:
             fresh_late_reclaim = MomentumPatternVerifier._is_fresh_late_reclaim(
                 pattern,
@@ -544,6 +561,9 @@ class MomentumPatternVerifier:
             pattern,
             bars,
             scan_result=scan_result,
+            float_shares=float_shares,
+            fresh_scout_enabled=fresh_scout_enabled,
+            fresh_scout_max_float=fresh_scout_max_float,
         )
         if structure_reject is not None:
             return structure_reject
@@ -589,6 +609,9 @@ class MomentumPatternVerifier:
         bars: list,
         *,
         scan_result: Optional[ScanResult] = None,
+        float_shares: Optional[float] = None,
+        fresh_scout_enabled: bool = False,
+        fresh_scout_max_float: float = 20_000_000.0,
     ) -> Optional[str]:
         """Reject pullbacks where 1-minute structure still favors sellers."""
         if pattern not in ("vwap_pullback", "pullback_base") or len(bars) < 8:
@@ -692,6 +715,16 @@ class MomentumPatternVerifier:
                 red_range_pct=red_range_pct,
             ):
                 return None
+            if fresh_scout_enabled and MomentumPatternVerifier._allows_fresh_vwap_reclaim_scout(
+                pattern,
+                bars,
+                scan_result=scan_result,
+                float_shares=float_shares,
+                max_float=fresh_scout_max_float,
+                red_body_pct=red_body_pct,
+                red_range_pct=red_range_pct,
+            ):
+                return None
             return (
                 "pullback has dump candle {:.1f}% body/{:.1f}% range "
                 "(wait for new base)"
@@ -781,6 +814,83 @@ class MomentumPatternVerifier:
         scan_result.criteria["entry_tier_reason"] = (
             "A+ runner reclaimed after dump candle; reduced-size scout still requires guard"
         )
+        return True
+
+    @staticmethod
+    def _allows_fresh_vwap_reclaim_scout(
+        pattern: str,
+        bars: list,
+        *,
+        scan_result: Optional[ScanResult],
+        float_shares: Optional[float],
+        max_float: float,
+        red_body_pct: float,
+        red_range_pct: float,
+    ) -> bool:
+        """Conservative DSY-style fresh-VWAP-reclaim scout (experimental, flag-gated).
+
+        After a dump candle, allow a REDUCED-size scout ONLY when a fresh green
+        base has rebuilt above VWAP on strong, rising volume and a low float —
+        the DSY profile. The failed/gappy reclaim that keeps rolling back below
+        VWAP (the GMM profile) stays rejected. Tags the entry distinctly so the
+        scorecard can measure this mode's standalone expectancy. Stop belongs
+        under the NEW base (handled downstream by the scout tier), not the old
+        wide pullback. Spread stays on the global rule — scout size, not wider.
+        """
+        if pattern not in ("vwap_pullback", "pullback_base") or len(bars) < 10:
+            return False
+        if scan_result is None:
+            return False
+        if str(scan_result.criteria.get("setup_tier") or "") != "A+ setup":
+            return False
+        # low-float thesis only
+        if float_shares is not None and max_float > 0 and float_shares > max_float:
+            return False
+        # the dump candle itself must not be extreme
+        if red_body_pct > 8.0 or red_range_pct > 14.0:
+            return False
+
+        latest = bars[-1]
+        # conservative: the reclaim candle must be GREEN and close above VWAP
+        if latest.close <= latest.open or latest.close <= 0:
+            return False
+        vwap_vals = vwap(bars)
+        current_vwap = vwap_vals[-1] if vwap_vals else 0.0
+        if current_vwap <= 0 or latest.close < current_vwap:
+            return False
+
+        # a fresh base of the last 3 bars, held above VWAP, with the reclaim
+        # closing in the upper third of the base (DSY held; GMM rolled back)
+        base = list(bars[-4:-1])
+        if len(base) < 3:
+            return False
+        base_high = max(b.high for b in base)
+        base_low = min(b.low for b in base)
+        if base_low <= 0 or base_high <= base_low:
+            return False
+        if base_low < current_vwap * 0.99:          # base must sit ~at/above VWAP
+            return False
+        reclaim_progress = (latest.close - base_low) / (base_high - base_low)
+        if reclaim_progress < 0.70 or latest.low < base_low * 0.99:
+            return False
+
+        # strong, RISING participation — buyers returning, not fading
+        recent_volume = sum(float(b.volume or 0.0) for b in bars[-3:])
+        prior_volume = sum(float(b.volume or 0.0) for b in bars[-6:-3])
+        latest_volume = float(latest.volume or 0.0)
+        if recent_volume < 250_000 or latest_volume < 75_000:
+            return False
+        if prior_volume > 0 and recent_volume < prior_volume:   # volume must not be fading
+            return False
+
+        stop_price = base_low - 0.02
+        scan_result.criteria["entry_tier"] = "fresh_vwap_reclaim_scout"
+        scan_result.criteria["entry_tier_reason"] = (
+            "fresh green base reclaimed above VWAP on rising volume; reduced-size scout only"
+        )
+        scan_result.criteria["base_low"] = round(base_low, 4)
+        scan_result.criteria["stop_price"] = round(stop_price, 4)
+        scan_result.criteria["size_factor"] = 0.35
         return True
 
     @staticmethod
@@ -1086,10 +1196,12 @@ class MomentumPatternVerifier:
             return 0.35, "A+ reclaim scout"
         if tier == "deep_runner_scout":
             return 0.35, "A+ deep runner scout"
+        if tier == "fresh_vwap_reclaim_scout":
+            return 0.35, "fresh VWAP reclaim scout"
         if tier == "stair_scout":
             return 0.45, "stair-step scout"
         if tier == "level_scout":
-            return 0.45, "level breakout scout"
+            return 0.35, "level breakout scout"
         if pattern == "early_vwap_reclaim_scout":
             return 0.45, "early VWAP reclaim scout"
 
@@ -1147,6 +1259,12 @@ class MomentumPatternVerifier:
         latest = bars[-1]
         if latest.close <= latest.open:
             return None
+        latest_range_pct = (
+            (latest.high - latest.low) / price
+            if price > 0 else 0.0
+        )
+        if latest_range_pct > 0.12:
+            return None
         body_range = latest.high - latest.low
         body_ratio = (
             (latest.close - latest.open) / body_range
@@ -1159,6 +1277,11 @@ class MomentumPatternVerifier:
         raw_stop = min(float(latest.low or price), price * 0.96) - 0.02
         capped_stop = max(raw_stop, price * 0.94)
         risk_pct = (price - capped_stop) / price
+        # Do not replace a wide structural ABC stop with a tactical stop that
+        # sits inside the trigger candle's normal noise. Those entries become
+        # late/climax scouts that stop out on ordinary 1m volatility.
+        if latest_range_pct > 0 and risk_pct < min(latest_range_pct * 0.60, 0.08):
+            return None
         if 0.005 < risk_pct <= 0.08:
             return capped_stop
         return None
@@ -1167,6 +1290,8 @@ class MomentumPatternVerifier:
         self,
         scan_result: ScanResult,
         portfolio: PortfolioState,
+        *,
+        now: Optional[datetime] = None,
     ) -> Optional[TradeSignal]:
         self._current_symbol = scan_result.symbol
         bars = scan_result.bars
@@ -1220,6 +1345,10 @@ class MomentumPatternVerifier:
                 bars,
                 float_shares=float_shares,
                 scan_result=scan_result,
+                max_hod_pct=self._late_pullback_max_hod_pct,
+                max_hod_other_pct=self._late_pullback_max_hod_other_pct,
+                fresh_scout_enabled=self._fresh_vwap_reclaim_scout_enabled,
+                fresh_scout_max_float=self._fresh_vwap_reclaim_scout_max_float,
             )
             if late_reject is not None:
                 logger.info("SCANNER REJECT %s: %s", scan_result.symbol, late_reject)
@@ -1258,6 +1387,7 @@ class MomentumPatternVerifier:
             entry_pattern=str(pattern or scan_result.scanner_name),
             setup_tier=str(scan_result.criteria.get("setup_tier") or ""),
             entry_tier=str(scan_result.criteria.get("entry_tier") or ""),
+            now=now,
         )
         if reject is not None:
             logger.info("ENTRY GUARD REJECT %s: %s", scan_result.symbol, reject)
@@ -1481,6 +1611,41 @@ class MomentumPatternVerifier:
 
         # Position sizing based on max dollar risk
         quality_factor, quality_label = self._setup_quality_factor(pattern, scan_result, bars)
+        quotes = list(self._quote_buffer.get(scan_result.symbol, [])) if self._quote_buffer else []
+        recent_quotes = [q for q in quotes[-5:] if q.ask > q.bid > 0]
+        if recent_quotes:
+            avg_spread = sum(q.ask - q.bid for q in recent_quotes) / len(recent_quotes)
+            avg_depth = sum(min(q.bid_size, q.ask_size) for q in recent_quotes) / len(recent_quotes)
+            day_volume = float(sum(getattr(b, "volume", 0.0) or 0.0 for b in bars))
+            recent_bars = list(bars[-5:])
+            recent_avg = (
+                float(sum(getattr(b, "volume", 0.0) or 0.0 for b in recent_bars)) / len(recent_bars)
+                if recent_bars else 0.0
+            )
+            session_high = max((float(getattr(b, "high", 0.0) or 0.0) for b in bars), default=price)
+            distance_from_hod = (session_high - price) / session_high if session_high > 0 else 1.0
+            spread_decision = assess_opportunity_scaled_spread(
+                price=price,
+                spread=avg_spread,
+                pattern=str(pattern or scan_result.scanner_name),
+                setup_tier=str(scan_result.criteria.get("setup_tier") or ""),
+                entry_tier=str(scan_result.criteria.get("entry_tier") or ""),
+                day_volume=day_volume,
+                recent_avg_volume=recent_avg,
+                latest_volume=float(getattr(bars[-1], "volume", 0.0) or 0.0),
+                distance_from_hod=distance_from_hod,
+                float_shares=float_shares,
+                quote_depth=avg_depth,
+                setup_score=float(getattr(scan_result, "score", 0.0) or 0.0),
+            )
+            if spread_decision.exception:
+                quality_factor = min(quality_factor, spread_decision.size_factor)
+                spread_mode = spread_decision.mode or "opportunity_scaled"
+                scan_result.criteria["spread_exception"] = spread_mode
+                scan_result.criteria["spread_size_factor"] = round(spread_decision.size_factor, 2)
+                if spread_mode == "elite_wide_spread":
+                    scan_result.criteria["entry_mode"] = "elite_wide_spread"
+                quality_label = "{} + spread-scout".format(quality_label)
         quantity = int((self._max_dollar_risk * quality_factor) / risk_per_share)
         quantity = max(1, min(quantity, 2000))
 

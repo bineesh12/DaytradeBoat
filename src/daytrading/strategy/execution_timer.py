@@ -19,7 +19,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
-from daytrading.models import Bar, SignalAction, TradeSignal
+from daytrading.models import Bar, SignalAction, Tick, TradeSignal
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +37,7 @@ class PendingEntry:
     require_pullback_reclaim: bool = False
     require_micro_signal: bool = False
     last_bar: Optional[Bar] = None
+    tick_confirm: int = 0   # consecutive qualifying ticks (for tick entry trigger)
 
 
 class ExecutionTimer:
@@ -52,10 +53,21 @@ class ExecutionTimer:
     are released. Structured pullback/reclaim signals are cancelled.
     """
 
-    def __init__(self, max_wait_bars: int = 1, enabled: bool = True) -> None:
+    def __init__(
+        self,
+        max_wait_bars: int = 1,
+        enabled: bool = True,
+        *,
+        tick_entry_enabled: bool = False,
+        tick_entry_confirm_count: int = 2,
+        tick_entry_max_above_anchor: float = 0.02,
+    ) -> None:
         self._max_wait = max_wait_bars
         self._enabled = enabled
         self._pending: Dict[str, PendingEntry] = {}
+        self._tick_entry_enabled = bool(tick_entry_enabled)
+        self._tick_entry_confirm_count = max(1, int(tick_entry_confirm_count))
+        self._tick_entry_max_above_anchor = float(tick_entry_max_above_anchor)
 
     @property
     def pending_symbols(self) -> List[str]:
@@ -117,6 +129,50 @@ class ExecutionTimer:
             )
         return True
 
+    def on_tick(self, tick: Tick) -> Optional[TradeSignal]:
+        """Release a pending entry off a live tick when price holds the base.
+
+        Mirrors ``_allows_early_strength_release`` but on tick granularity, so
+        fast movers are caught near the anchor before a 10s bar can confirm. The
+        execute-path chase/spread guards still run on release, so this can never
+        cause a chase — it only catches an early entry that is still near base.
+        """
+        if not self._tick_entry_enabled:
+            return None
+        sym = tick.symbol
+        pending = self._pending.get(sym)
+        if pending is None or not pending.require_micro_signal:
+            return None
+
+        price = float(getattr(tick, "price", 0) or 0.0)
+        if price <= 0:
+            return None
+
+        hit = pending.signal.scan_result
+        crit = hit.criteria if hit is not None else {}
+        anchor = (
+            ExecutionTimer._criteria_float(crit, "setup_anchor")
+            or ExecutionTimer._criteria_float(crit, "queued_entry_price")
+            or float(pending.signal.entry_price or 0.0)
+        )
+        if anchor <= 0:
+            return None
+        vwap = ExecutionTimer._criteria_float(crit, "vwap")
+
+        qualifies = (
+            price <= anchor * (1.0 + self._tick_entry_max_above_anchor)  # still near base
+            and price >= anchor * 0.985                                  # not broken down
+            and (vwap is None or vwap <= 0 or price >= vwap * 1.003)      # holding VWAP
+        )
+        pending.tick_confirm = pending.tick_confirm + 1 if qualifies else 0
+        if pending.tick_confirm >= self._tick_entry_confirm_count:
+            logger.info(
+                "EXEC_TIMER: %s — tick early entry confirmed (%d ticks @ %.4f, anchor=%.4f), executing",
+                sym, pending.tick_confirm, price, anchor,
+            )
+            return self._release(sym)
+        return None
+
     def on_10s_bar(self, bar: Bar) -> Optional[TradeSignal]:
         """Feed a 10-sec bar. Returns a signal if it's time to execute."""
         sym = bar.symbol
@@ -161,6 +217,12 @@ class ExecutionTimer:
                     sym,
                 )
             else:
+                if not self._has_active_10s_tape(pending.signal, bar):
+                    logger.info(
+                        "EXEC_TIMER: %s — green 10s bounce volume too light, waiting",
+                        sym,
+                    )
+                    return None
                 logger.info(
                     "EXEC_TIMER: %s — micro-pullback bounce confirmed (bar %d), executing",
                     sym, pending.bars_seen,
@@ -179,6 +241,12 @@ class ExecutionTimer:
                     and self._passes_pullback_reclaim_confirmation(pending, bar)
                 )
             ):
+                if not self._has_active_10s_tape(pending.signal, bar):
+                    logger.info(
+                        "EXEC_TIMER: %s — strong green 10s bar volume too light, waiting",
+                        sym,
+                    )
+                    return None
                 logger.info(
                     "EXEC_TIMER: %s — strong green 10s bar (bar %d), executing",
                     sym, pending.bars_seen,
@@ -512,8 +580,33 @@ class ExecutionTimer:
             return False
         if bar.close < vwap_level * 1.003:
             return False
+        if not ExecutionTimer._has_active_10s_tape(pending.signal, bar):
+            return False
 
         return True
+
+    @staticmethod
+    def _has_active_10s_tape(signal: TradeSignal, bar: Bar) -> bool:
+        """Require real 10s participation before releasing a queued entry.
+
+        Day/1m volume can make a setup look liquid, but names like PALI can go
+        dead right at the entry point. This blocks price-only holds on inactive
+        tape while keeping the floor scaled to cheap runners.
+        """
+        bar_volume = float(bar.volume or 0.0)
+        if bar_volume <= 0:
+            return False
+        hit = signal.scan_result
+        criteria = hit.criteria if hit is not None else {}
+        setup_volume = ExecutionTimer._criteria_float(criteria, "volume") or 0.0
+        price = float(bar.close or signal.entry_price or 0.0)
+        if price < 2.0 and setup_volume >= 500_000:
+            min_volume = max(5_000.0, setup_volume * 0.01)
+        elif price < 5.0 and setup_volume >= 250_000:
+            min_volume = 1_000.0
+        else:
+            min_volume = 500.0
+        return bar_volume >= min_volume
 
     @staticmethod
     def _is_level_breakout_signal(signal: TradeSignal) -> bool:

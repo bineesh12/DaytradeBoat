@@ -14,7 +14,7 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 
-from flask import Flask, Response, jsonify, render_template_string, request
+from flask import Flask, Response, jsonify, request
 from werkzeug.exceptions import BadRequest
 
 from daytrading.dashboard.hub import DashboardHub
@@ -24,12 +24,70 @@ logger = logging.getLogger(__name__)
 _hub: Optional[DashboardHub] = None
 
 
+def _missed_a_plus_spread_summary(rows: list[dict]) -> dict:
+    spread_rows = [r for r in rows if r.get("is_spread_reject") or "spread" in str(r.get("reason", "")).lower()]
+    false_blocks = [r for r in spread_rows if r.get("outcome") == "missed_opportunity"]
+    correct_rejects = [r for r in spread_rows if r.get("outcome") == "correct_reject"]
+    pending = [r for r in spread_rows if r.get("outcome") == "pending"]
+    symbols: dict[str, int] = {}
+    for row in spread_rows:
+        sym = str(row.get("symbol") or "")
+        if sym:
+            symbols[sym] = symbols.get(sym, 0) + 1
+    return {
+        "spread_blocked_runners": len(spread_rows),
+        "spread_false_blocks": len(false_blocks),
+        "spread_correct_rejects": len(correct_rejects),
+        "spread_pending": len(pending),
+        "symbols": symbols,
+    }
+
+
+def _missed_a_plus_risk_summary(rows: list[dict]) -> dict:
+    risk_rows = [
+        r for r in rows
+        if r.get("is_risk_reject")
+        or "risk too wide" in str(r.get("reason", "")).lower()
+        or "r:r" in str(r.get("reason", "")).lower()
+    ]
+    false_blocks = [r for r in risk_rows if r.get("outcome") == "missed_opportunity"]
+    correct_rejects = [r for r in risk_rows if r.get("outcome") == "correct_reject"]
+    pending = [r for r in risk_rows if r.get("outcome") == "pending"]
+    survived = [r for r in risk_rows if r.get("tactical_stop_survived") is True]
+    failed = [r for r in risk_rows if r.get("tactical_stop_survived") is False]
+    clean_survived = [r for r in risk_rows if r.get("tactical_stop_clean_survival") is True]
+    clean_failed = [r for r in risk_rows if r.get("tactical_stop_clean_survival") is False]
+    choppy_survived = [
+        r for r in risk_rows
+        if r.get("tactical_stop_survived") is True
+        and not r.get("smooth_for_tactical_stop")
+    ]
+    symbols: dict[str, int] = {}
+    for row in risk_rows:
+        sym = str(row.get("symbol") or "")
+        if sym:
+            symbols[sym] = symbols.get(sym, 0) + 1
+    return {
+        "risk_blocked_runners": len(risk_rows),
+        "risk_false_blocks": len(false_blocks),
+        "risk_correct_rejects": len(correct_rejects),
+        "risk_pending": len(pending),
+        "tactical_stop_survived": len(survived),
+        "tactical_stop_failed": len(failed),
+        "clean_tactical_stop_survived": len(clean_survived),
+        "clean_tactical_stop_failed": len(clean_failed),
+        "choppy_tactical_stop_survived": len(choppy_survived),
+        "symbols": symbols,
+    }
+
+
 def create_app(hub: DashboardHub) -> Flask:
     global _hub
     _hub = hub
 
     app = Flask(__name__)
     analytics_generation_lock = threading.Lock()
+    backtest_lock = threading.Lock()
     app.config["PROPAGATE_EXCEPTIONS"] = True
 
     @app.after_request
@@ -60,7 +118,7 @@ def create_app(hub: DashboardHub) -> Flask:
     @app.route("/")
     def index():
         from flask import make_response
-        resp = make_response(render_template_string(DASHBOARD_HTML))
+        resp = make_response(DASHBOARD_HTML)
         resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
         resp.headers["Pragma"] = "no-cache"
         resp.headers["Expires"] = "0"
@@ -101,9 +159,13 @@ def create_app(hub: DashboardHub) -> Flask:
     @app.route("/api/missed-a-plus")
     def missed_a_plus():
         """Return blocked A+ setups with later outcome labels."""
+        rows = list(getattr(_hub, "missed_a_plus", []))
         return jsonify({
             "ok": True,
-            "rows": list(getattr(_hub, "missed_a_plus", [])),
+            "rows": rows,
+            "spread_summary": _missed_a_plus_spread_summary(rows),
+            "risk_summary": _missed_a_plus_risk_summary(rows),
+            "scanner_near_miss": dict(getattr(_hub, "scanner_near_miss", {}) or {}),
             "loaded_at": datetime.now(timezone.utc).isoformat(),
         })
 
@@ -229,6 +291,71 @@ def create_app(hub: DashboardHub) -> Flask:
             limit = None
         events = _hub.journal.replay_frames(day=day, limit=limit)
         return jsonify({"ok": True, "count": len(events), "events": events})
+
+    @app.route("/api/backtest", methods=["POST"])
+    def backtest():
+        payload = request.get_json(silent=True) or {}
+        symbol = str(payload.get("symbol") or "").upper().strip()
+        day = str(payload.get("date") or "").strip()
+        flags = payload.get("flags") or {}
+        if not symbol:
+            return jsonify({"ok": False, "error": "symbol is required"}), 400
+        if not day:
+            return jsonify({"ok": False, "error": "date is required"}), 400
+        if not backtest_lock.acquire(blocking=False):
+            return jsonify({
+                "ok": False,
+                "error": "another backtest is already running",
+            }), 429
+        try:
+            from daytrading.config import Settings
+            from daytrading.backtest.service import run_backtest
+            result = run_backtest(symbol, day, flags=flags, settings=Settings())
+            return jsonify(result)
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        except Exception as exc:
+            logger.exception("Dashboard backtest failed")
+            return jsonify({"ok": False, "error": str(exc)}), 500
+        finally:
+            backtest_lock.release()
+
+    @app.route("/api/backtest/sweep", methods=["POST"])
+    def backtest_sweep():
+        payload = request.get_json(silent=True) or {}
+        symbols = payload.get("symbols") or []
+        dates = payload.get("dates") or []
+        experiments = payload.get("experiments") or None
+        if isinstance(symbols, str):
+            symbols = [s.strip() for s in symbols.split(",") if s.strip()]
+        if isinstance(dates, str):
+            dates = [d.strip() for d in dates.split(",") if d.strip()]
+        if not symbols:
+            return jsonify({"ok": False, "error": "symbols are required"}), 400
+        if not dates:
+            return jsonify({"ok": False, "error": "dates are required"}), 400
+        if not backtest_lock.acquire(blocking=False):
+            return jsonify({
+                "ok": False,
+                "error": "another backtest is already running",
+            }), 429
+        try:
+            from daytrading.config import Settings
+            from daytrading.backtest.service import run_backtest_sweep
+            result = run_backtest_sweep(
+                symbols,
+                dates,
+                experiments=experiments,
+                settings=Settings(),
+            )
+            return jsonify(result)
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        except Exception as exc:
+            logger.exception("Dashboard backtest sweep failed")
+            return jsonify({"ok": False, "error": str(exc)}), 500
+        finally:
+            backtest_lock.release()
 
     @app.route("/api/pause", methods=["POST"])
     def pause_trading():
@@ -445,6 +572,7 @@ body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkM
 .stat-value { font-size:28px; font-weight:700; margin:4px 0; letter-spacing:-1px; }
 .stat-label { font-size:12px; color:var(--text2); text-transform:uppercase; letter-spacing:0.5px; }
 .stat-sub { font-size:12px; margin-top:4px; }
+.mini-muted { color:var(--text2); font-size:11px; margin-top:4px; }
 
 /* Tables */
 table { width:100%; border-collapse:collapse; font-size:13px; }
@@ -551,6 +679,7 @@ tr:hover { background:var(--surface2); }
   <div class="tab" data-page="scanner">Scanner</div>
   <div class="tab" data-page="trades">Trades</div>
   <div class="tab" data-page="analytics">Analytics</div>
+  <div class="tab" data-page="backtest">Backtest</div>
   <div class="tab" data-page="journal">Journal</div>
   <div class="tab" data-page="logs">Logs</div>
 </div>
@@ -720,6 +849,15 @@ tr:hover { background:var(--surface2); }
 <!-- ================= ANALYTICS ================= -->
 <div class="page" id="page-analytics">
 <div class="container">
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-header">
+      <h3>Daily Scorecard</h3>
+      <span id="scorecard-verdict" class="pill pill-yellow">COLLECTING</span>
+    </div>
+    <div id="daily-scorecard-wrap">
+      <div class="empty"><div class="icon">&#128202;</div>Collecting scorecard data...</div>
+    </div>
+  </div>
   <div class="grid grid-4" style="margin-bottom:16px">
     <div class="card stat-card">
       <div class="stat-label">Avg Win</div>
@@ -811,6 +949,40 @@ tr:hover { background:var(--surface2); }
 </div>
 </div>
 
+<!-- ================= BACKTEST ================= -->
+<div class="page" id="page-backtest">
+<div class="container">
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-header">
+      <h3>Backtest</h3>
+      <span style="font-size:11px;color:var(--text2)">Single-symbol historical replay through the real entry pipeline</span>
+    </div>
+    <div style="display:grid;grid-template-columns:120px 170px 1fr 100px;gap:10px;align-items:end">
+      <label style="font-size:12px;color:var(--text2)">Symbol<br>
+        <input id="bt-symbol" value="CUPR" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--surface2);color:var(--text);text-transform:uppercase">
+      </label>
+      <label style="font-size:12px;color:var(--text2)">Date<br>
+        <input id="bt-date" placeholder="YYYY-MM-DD or DD/MM" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--surface2);color:var(--text)">
+      </label>
+      <div style="display:flex;gap:12px;flex-wrap:wrap;font-size:12px;color:var(--text2);padding-bottom:7px">
+        <label><input type="checkbox" id="bt-flag-fresh"> fresh VWAP scout</label>
+        <label><input type="checkbox" id="bt-flag-level"> level breakout scout</label>
+        <label><input type="checkbox" id="bt-flag-spread"> elite wide spread</label>
+        <label><input type="checkbox" id="bt-flag-momentum"> momentum burst live</label>
+        <label><input type="checkbox" id="bt-flag-capped"> level-capped entry</label>
+        <label><input type="checkbox" id="bt-flag-timer" checked> 10s timer replay</label>
+        <label><input type="checkbox" id="bt-flag-10s-scout"> 10s breakout scout</label>
+      </div>
+      <button id="bt-run" style="padding:9px 12px;border:1px solid var(--blue);background:var(--blue-bg);color:var(--blue);border-radius:6px;cursor:pointer;font-weight:700">Run</button>
+    </div>
+    <div class="mini-muted" style="margin-top:8px">This uses simulated fills only. It never sends live or paper orders. Date accepts YYYY-MM-DD or DD/MM.</div>
+  </div>
+  <div id="backtest-wrap">
+    <div class="empty"><div class="icon">&#128202;</div>Choose a symbol and date, then run a backtest.</div>
+  </div>
+</div>
+</div>
+
 <!-- ================= LOGS ================= -->
 <div class="page" id="page-logs">
 <div class="container">
@@ -865,12 +1037,14 @@ tr:hover { background:var(--surface2); }
 let state = {
   stats: {}, account: {}, positions: {}, symbols: {},
   recent_trades: [], recent_scans: [], pnl_history: [],
+  daily_scorecard: {}, rolling_scorecard: {},
   market_open: false, stream_connected: false,
   watchlist_scan: [], rt_movers: [], hod_momentum_alerts: [], hot_watch: [], trading_watchlist: [],
   missed_a_plus: [],
   candidate_hydration: {},
   watchlist_pinned: ['SPY'],
   hod_momentum_filter: 'all', rt_new_total: 0,
+  backtest: {loading: false, result: null, error: null, chart: {start: null, end: null, dragX: null}},
   news: {}, journal: {events: [], loaded: false, error: null, last_update: null},
   logs: [],
   ml_report: {report: null, loaded: false, error: null, message: null, last_update: null}
@@ -891,6 +1065,15 @@ document.querySelectorAll('.tab').forEach(tab => {
     }
   });
 });
+
+let btDate = document.getElementById('bt-date');
+if (btDate && !btDate.value) {
+  btDate.value = new Date().toISOString().slice(0, 10);
+}
+let btRun = document.getElementById('bt-run');
+if (btRun) {
+  btRun.addEventListener('click', runBacktest);
+}
 
 // Formatting helpers
 function fmt$(v) { return (v>=0?'':'') + '$' + Math.abs(v).toFixed(2); }
@@ -1518,10 +1701,596 @@ function renderNews() {
   wrap.innerHTML = html;
 }
 
+function fallbackDailyScorecard() {
+  let exits = (state.recent_trades || []).filter(t => t.trade_type === 'exit' && t.pnl != null);
+  let wins = exits.filter(t => Number(t.pnl) >= 0);
+  let losses = exits.filter(t => Number(t.pnl) < 0);
+  let totalWin = wins.reduce((s, t) => s + Number(t.pnl || 0), 0);
+  let totalLoss = Math.abs(losses.reduce((s, t) => s + Number(t.pnl || 0), 0));
+  let closed = exits.length;
+  let totalTrades = Number((state.stats || {}).total_trades || 0);
+  let signals = Number((state.stats || {}).total_signals || 0);
+  let rejected = Number((state.stats || {}).total_rejected || 0);
+  let scanHits = Number((state.stats || {}).total_scan_hits || 0);
+  let winRate = closed ? wins.length / closed * 100 : 0;
+  let avgWin = wins.length ? totalWin / wins.length : 0;
+  let avgLoss = losses.length ? totalLoss / losses.length : 0;
+  let pf = totalLoss > 0 ? totalWin / totalLoss : (totalWin > 0 ? 999 : 0);
+  let expectancy = ((winRate / 100) * avgWin) - ((1 - (winRate / 100)) * avgLoss);
+  let attempts = signals + rejected;
+  let rows = state.missed_a_plus || [];
+  let missedOpps = rows.filter(r => r.outcome === 'missed_opportunity').length;
+  let correctRejects = rows.filter(r => r.outcome === 'correct_reject').length;
+  let best = rows.reduce((acc, r) => Number(r.move_after_pct || 0) > Number((acc || {}).move_after_pct || 0) ? r : acc, null);
+  return {
+    trades_taken: totalTrades,
+    closed_trades: closed,
+    wins: wins.length,
+    losses: losses.length,
+    win_rate: winRate,
+    total_pnl: totalWin - totalLoss,
+    avg_win: avgWin,
+    avg_loss: avgLoss,
+    profit_factor: pf,
+    expectancy_per_trade: expectancy,
+    cycles: Number((state.stats || {}).cycle_count || 0),
+    funnel: {
+      scan_hits: scanHits,
+      signals: signals,
+      entries: totalTrades,
+      rejected: rejected,
+      hit_to_signal_pct: scanHits ? signals / scanHits * 100 : 0,
+      signal_to_entry_pct: signals ? totalTrades / signals * 100 : 0,
+      reject_rate_pct: attempts ? rejected / attempts * 100 : 0,
+      closed_rate_pct: totalTrades ? closed / totalTrades * 100 : 0
+    },
+    missed_a_plus: {
+      rows: rows.length,
+      missed_opportunities: missedOpps,
+      correct_rejects: correctRejects,
+      pending: rows.length - missedOpps - correctRejects,
+      best_symbol: best ? best.symbol : '',
+      best_move_pct: best ? Number(best.move_after_pct || 0) : 0,
+      best_pattern: best ? best.pattern : '',
+      best_reason: best ? best.reason : ''
+    },
+    verdict: closed < 5 ? 'collecting' : (expectancy > 0 && pf >= 1.2 ? 'positive_expectancy' : (expectancy < 0 || pf < 1 ? 'negative_expectancy' : 'mixed'))
+  };
+}
+
+function renderDailyScorecard() {
+  let wrap = document.getElementById('daily-scorecard-wrap');
+  if (!wrap) return;
+  let sc = state.daily_scorecard && Object.keys(state.daily_scorecard).length ? state.daily_scorecard : fallbackDailyScorecard();
+  let rolling = state.rolling_scorecard || {};
+  let verdict = String(sc.verdict || 'collecting');
+  let verdictMeta = {
+    collecting: ['COLLECTING', 'pill-yellow'],
+    positive_expectancy: ['POSITIVE', 'pill-green'],
+    negative_expectancy: ['NEGATIVE', 'pill-red'],
+    mixed: ['MIXED', 'pill-blue']
+  }[verdict] || ['COLLECTING', 'pill-yellow'];
+  let verdictEl = document.getElementById('scorecard-verdict');
+  if (verdictEl) {
+    verdictEl.textContent = verdictMeta[0];
+    verdictEl.className = 'pill ' + verdictMeta[1];
+  }
+
+  let f = sc.funnel || {};
+  let m = sc.missed_a_plus || {};
+  let pf = Number(sc.profit_factor || 0);
+  let bestMiss = m.best_symbol
+    ? escapeHtml(m.best_symbol) + ' +' + Number(m.best_move_pct || 0).toFixed(1) + '%'
+    : 'none';
+  let html = '<div class="grid grid-4" style="margin-bottom:12px">';
+  html += '<div class="stat-card"><div class="stat-label">P&L / Exp</div><div class="stat-value">' + fmtPnl(Number(sc.total_pnl || 0)) + '</div><div class="mini-muted">' + fmtPnl(Number(sc.expectancy_per_trade || 0)) + ' per trade</div></div>';
+  html += '<div class="stat-card"><div class="stat-label">Win Rate</div><div class="stat-value">' + Number(sc.win_rate || 0).toFixed(1) + '%</div><div class="mini-muted">' + (sc.wins || 0) + 'W / ' + (sc.losses || 0) + 'L</div></div>';
+  html += '<div class="stat-card"><div class="stat-label">Avg W / L</div><div class="stat-value"><span class="text-green">$' + Number(sc.avg_win || 0).toFixed(2) + '</span> <span style="color:var(--text2)">/</span> <span class="text-red">$' + Number(sc.avg_loss || 0).toFixed(2) + '</span></div><div class="mini-muted">PF ' + (pf >= 999 ? '999+' : pf.toFixed(2)) + '</div></div>';
+  html += '<div class="stat-card"><div class="stat-label">Trades</div><div class="stat-value">' + (sc.closed_trades || 0) + '/' + (sc.trades_taken || 0) + '</div><div class="mini-muted">closed / entries</div></div>';
+  html += '</div>';
+
+  html += '<table><tr><th>Funnel</th><th>Count</th><th>Conversion</th><th>Missed A+</th><th>Count</th></tr>';
+  html += '<tr><td>Scan hits -> signals</td><td>' + (f.scan_hits || 0) + ' -> ' + (f.signals || 0) + '</td><td>' + pctText(f.hit_to_signal_pct) + '</td><td>Missed opportunities</td><td class="text-red">' + (m.missed_opportunities || 0) + '</td></tr>';
+  html += '<tr><td>Signals -> entries</td><td>' + (f.signals || 0) + ' -> ' + (f.entries || 0) + '</td><td>' + pctText(f.signal_to_entry_pct) + '</td><td>Correct rejects</td><td class="text-green">' + (m.correct_rejects || 0) + '</td></tr>';
+  html += '<tr><td>Reject pressure</td><td>' + (f.rejected || 0) + ' rejects</td><td>' + pctText(f.reject_rate_pct) + '</td><td>Pending / best miss</td><td>' + (m.pending || 0) + ' / ' + bestMiss + '</td></tr>';
+  html += '</table>';
+
+  let strategies = Object.entries(sc.by_strategy || {})
+    .sort((a, b) => Number(b[1].total_pnl || 0) - Number(a[1].total_pnl || 0))
+    .slice(0, 6);
+  if (strategies.length) {
+    html += '<div class="card-header" style="margin:14px 0 8px"><h3>Strategy P&L</h3></div>';
+    html += '<table><tr><th>Strategy</th><th>Closed</th><th>Win Rate</th><th>P&L</th></tr>';
+    strategies.forEach(([name, row]) => {
+      let closed = Number(row.closed_trades || 0);
+      let wins = Number(row.wins || 0);
+      let wr = closed ? wins / closed * 100 : 0;
+      html += '<tr><td>' + escapeHtml(name || 'unknown') + '</td><td>' + closed + '</td><td>' + wr.toFixed(1) + '%</td><td>' + fmtPnl(Number(row.total_pnl || 0)) + '</td></tr>';
+    });
+    html += '</table>';
+  }
+
+  html += '<div class="card-header" style="margin:14px 0 8px"><h3>Rolling Go-Live Gauge</h3>';
+  if (rolling.available) {
+    let rv = String(rolling.verdict || 'collecting');
+    let rm = {
+      collecting: ['COLLECTING', 'pill-yellow'],
+      positive_expectancy: ['POSITIVE', 'pill-green'],
+      negative_expectancy: ['NEGATIVE', 'pill-red'],
+      mixed: ['MIXED', 'pill-blue']
+    }[rv] || ['COLLECTING', 'pill-yellow'];
+    html += '<span class="pill ' + rm[1] + '">' + rm[0] + '</span></div>';
+    let rf = rolling.funnel || {};
+    html += '<table><tr><th>Window</th><th>Sessions</th><th>Trades</th><th>P&L</th><th>Expectancy</th><th>Win Rate</th><th>PF</th><th>Signal -> Entry</th></tr>';
+    html += '<tr><td>' + (rolling.window_days || 20) + ' days</td>';
+    html += '<td>' + (rolling.sessions || 0) + '</td>';
+    html += '<td>' + (rolling.closed_trades || 0) + '/' + (rolling.trades_taken || 0) + '</td>';
+    html += '<td>' + fmtPnl(Number(rolling.total_pnl || 0)) + '</td>';
+    html += '<td>' + fmtPnl(Number(rolling.expectancy_per_trade || 0)) + '</td>';
+    html += '<td>' + Number(rolling.win_rate || 0).toFixed(1) + '%</td>';
+    html += '<td>' + (Number(rolling.profit_factor || 0) >= 999 ? '999+' : Number(rolling.profit_factor || 0).toFixed(2)) + '</td>';
+    html += '<td>' + pctText(rf.signal_to_entry_pct) + '</td></tr></table>';
+    if (rolling.verdict_reason) {
+      html += '<div class="mini-muted">Go-live verdict is collecting until ' + escapeHtml(rolling.verdict_reason) + ' are recorded.</div>';
+    }
+  } else {
+    html += '<span class="pill pill-red">NO JOURNAL</span></div>';
+    html += '<div class="mini-muted">Rolling scorecard unavailable: ' + escapeHtml(rolling.reason || 'journal not configured') + '</div>';
+  }
+  wrap.innerHTML = html;
+}
+
+function runBacktest() {
+  let btn = document.getElementById('bt-run');
+  let symbol = (document.getElementById('bt-symbol') || {}).value || '';
+  let date = (document.getElementById('bt-date') || {}).value || '';
+  symbol = symbol.trim().toUpperCase();
+  if (!symbol || !date) {
+    alert('Symbol and date are required');
+    return;
+  }
+  state.backtest = {loading: true, result: null, error: null};
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Running...';
+  }
+  renderBacktest();
+  fetchJsonWithRetry('/api/backtest', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      symbol: symbol,
+      date: date,
+      flags: {
+        fresh_vwap_reclaim_scout: !!(document.getElementById('bt-flag-fresh') || {}).checked,
+        level_breakout_scout: !!(document.getElementById('bt-flag-level') || {}).checked,
+        elite_wide_spread: !!(document.getElementById('bt-flag-spread') || {}).checked,
+        momentum_burst_live: !!(document.getElementById('bt-flag-momentum') || {}).checked,
+        level_capped_entry: !!(document.getElementById('bt-flag-capped') || {}).checked,
+        execution_timer_10s: !!(document.getElementById('bt-flag-timer') || {}).checked,
+        ten_second_breakout_scout: !!(document.getElementById('bt-flag-10s-scout') || {}).checked
+      }
+    })
+  }, 1).then(data => {
+    if (!data.ok) throw new Error(data.error || 'Backtest failed');
+    state.backtest = {loading: false, result: data, error: null, chart: {start: null, end: null, dragX: null}};
+    renderBacktest();
+  }).catch(err => {
+    state.backtest = {loading: false, result: null, error: err && err.message ? err.message : String(err)};
+    renderBacktest();
+  }).finally(() => {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = 'Run';
+    }
+  });
+}
+
+function backtestChartRange(barsLen) {
+  let chart = (state.backtest && state.backtest.chart) || {};
+  let start = Number.isFinite(Number(chart.start)) ? Number(chart.start) : 0;
+  let end = Number.isFinite(Number(chart.end)) ? Number(chart.end) : barsLen - 1;
+  start = Math.max(0, Math.min(start, Math.max(0, barsLen - 1)));
+  end = Math.max(start, Math.min(end, Math.max(0, barsLen - 1)));
+  if (end - start < 10 && barsLen > 10) {
+    end = Math.min(barsLen - 1, start + 10);
+    start = Math.max(0, end - 10);
+  }
+  return {start, end};
+}
+
+function setBacktestChartRange(start, end) {
+  let bars = (((state.backtest || {}).result || {}).bars_data || []);
+  if (!bars.length) return;
+  let minWindow = Math.min(20, bars.length);
+  start = Math.max(0, Math.min(Math.round(start), bars.length - 1));
+  end = Math.max(start, Math.min(Math.round(end), bars.length - 1));
+  if (end - start + 1 < minWindow) {
+    let center = (start + end) / 2;
+    start = Math.max(0, Math.round(center - minWindow / 2));
+    end = Math.min(bars.length - 1, start + minWindow - 1);
+    start = Math.max(0, end - minWindow + 1);
+  }
+  state.backtest.chart = Object.assign({}, state.backtest.chart || {}, {start, end});
+  renderBacktest();
+}
+
+function zoomBacktestChart(factor) {
+  let bars = (((state.backtest || {}).result || {}).bars_data || []);
+  if (!bars.length) return;
+  let r = backtestChartRange(bars.length);
+  let windowSize = r.end - r.start + 1;
+  let next = Math.max(20, Math.min(bars.length, Math.round(windowSize * factor)));
+  let center = (r.start + r.end) / 2;
+  setBacktestChartRange(center - next / 2, center + next / 2);
+}
+
+function resetBacktestChart() {
+  let bars = (((state.backtest || {}).result || {}).bars_data || []);
+  state.backtest.chart = {start: null, end: null, dragX: null};
+  if (bars.length) renderBacktest();
+}
+
+function panBacktestChart(barDelta) {
+  let bars = (((state.backtest || {}).result || {}).bars_data || []);
+  if (!bars.length) return;
+  let r = backtestChartRange(bars.length);
+  let width = r.end - r.start;
+  let start = Math.max(0, Math.min(r.start + barDelta, bars.length - width - 1));
+  setBacktestChartRange(start, start + width);
+}
+
+function beginBacktestChartDrag(ev) {
+  if (!state.backtest.chart) state.backtest.chart = {};
+  state.backtest.chart.dragX = ev.clientX;
+}
+
+function dragBacktestChart(ev) {
+  let chart = (state.backtest || {}).chart || {};
+  if (chart.dragX == null) return;
+  let bars = (((state.backtest || {}).result || {}).bars_data || []);
+  if (!bars.length) return;
+  let r = backtestChartRange(bars.length);
+  let visible = Math.max(1, r.end - r.start + 1);
+  let dx = ev.clientX - chart.dragX;
+  let barDelta = Math.round((-dx / 900) * visible);
+  if (barDelta !== 0) {
+    state.backtest.chart.dragX = ev.clientX;
+    panBacktestChart(barDelta);
+  }
+}
+
+function endBacktestChartDrag() {
+  if (!state.backtest.chart) state.backtest.chart = {};
+  state.backtest.chart.dragX = null;
+}
+
+function wheelBacktestChart(ev) {
+  ev.preventDefault();
+  zoomBacktestChart(ev.deltaY < 0 ? 0.75 : 1.35);
+}
+
+function etMinutes(ts) {
+  try {
+    let parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false
+    }).formatToParts(new Date(ts));
+    let h = Number((parts.find(p => p.type === 'hour') || {}).value || 0);
+    let m = Number((parts.find(p => p.type === 'minute') || {}).value || 0);
+    return h * 60 + m;
+  } catch(e) { return 0; }
+}
+
+function shortEtTime(ts) {
+  if (!ts) return '';
+  try {
+    return new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false
+    }).format(new Date(ts)) + ' ET';
+  } catch(e) { return String(ts || ''); }
+}
+
+function renderBacktestChart(r) {
+  let bars = r.bars_data || [];
+  if (!bars.length) {
+    return '<div class="card" style="margin-bottom:16px"><div class="empty"><div class="icon">&#128202;</div>No 1-minute bars returned for chart</div></div>';
+  }
+  let fullBars = bars;
+  let range = backtestChartRange(fullBars.length);
+  bars = fullBars.slice(range.start, range.end + 1);
+  let w = 1040, h = 380, padL = 46, padR = 12, padT = 18, padB = 34;
+  let priceH = 270, volTop = padT + priceH + 18, volH = h - volTop - padB;
+  let highs = bars.map(b => Number(b.high || b.close || 0));
+  let lows = bars.map(b => Number(b.low || b.close || 0));
+  let maxP = Math.max(...highs), minP = Math.min(...lows);
+  let pad = Math.max((maxP - minP) * 0.08, maxP * 0.002, 0.01);
+  maxP += pad; minP = Math.max(0, minP - pad);
+  let maxV = Math.max(...bars.map(b => Number(b.volume || 0)), 1);
+  let plotW = w - padL - padR;
+  let xAt = i => padL + (bars.length <= 1 ? 0 : (i / (bars.length - 1)) * plotW);
+  let yAt = p => padT + ((maxP - Number(p || 0)) / Math.max(maxP - minP, 0.01)) * priceH;
+  let bw = Math.max(1, Math.min(5, plotW / Math.max(bars.length, 1) * 0.7));
+  let viewLabel = shortEtTime(bars[0].ts) + ' - ' + shortEtTime(bars[bars.length - 1].ts);
+  let html = '<div class="card" style="margin-bottom:16px"><div class="card-header"><h3>1m Full Session Chart</h3><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span class="mini-muted">'+escapeHtml(viewLabel)+' · '+bars.length+'/'+fullBars.length+' bars</span><button onclick="zoomBacktestChart(0.65)" style="padding:5px 9px;border:1px solid var(--border);background:var(--surface2);color:var(--text);border-radius:6px;cursor:pointer">+</button><button onclick="zoomBacktestChart(1.45)" style="padding:5px 9px;border:1px solid var(--border);background:var(--surface2);color:var(--text);border-radius:6px;cursor:pointer">-</button><button onclick="resetBacktestChart()" style="padding:5px 9px;border:1px solid var(--border);background:var(--surface2);color:var(--text);border-radius:6px;cursor:pointer">Reset</button></div></div>';
+  html += '<div id="bt-svg-chart" style="overflow-x:auto;margin-top:8px"><svg id="bt-chart-svg" viewBox="0 0 '+w+' '+h+'" onmousedown="beginBacktestChartDrag(event)" onmousemove="dragBacktestChart(event)" onmouseup="endBacktestChartDrag()" onmouseleave="endBacktestChartDrag()" onwheel="wheelBacktestChart(event)" style="width:100%;min-width:860px;height:390px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;cursor:grab;user-select:none">';
+  let sessions = [];
+  let cur = null;
+  bars.forEach((b, i) => {
+    let m = etMinutes(b.ts);
+    let name = m < 570 ? 'premarket' : (m < 960 ? 'regular' : 'after');
+    if (!cur || cur.name !== name) {
+      if (cur) { cur.end = i - 1; sessions.push(cur); }
+      cur = {name: name, start: i, end: i};
+    } else {
+      cur.end = i;
+    }
+  });
+  if (cur) sessions.push(cur);
+  sessions.forEach(s => {
+    let x1 = xAt(s.start), x2 = xAt(s.end);
+    let fill = s.name === 'regular' ? 'rgba(34,197,94,0.05)' : 'rgba(59,130,246,0.06)';
+    html += '<rect x="'+x1.toFixed(1)+'" y="'+padT+'" width="'+Math.max(1, x2-x1).toFixed(1)+'" height="'+(h-padT-padB)+'" fill="'+fill+'"></rect>';
+    html += '<text x="'+(x1+5).toFixed(1)+'" y="14" fill="var(--text2)" font-size="10">'+s.name+'</text>';
+  });
+  let timeTicks = [240, 570, 720, 960, 1200];
+  timeTicks.forEach(minute => {
+    let idx = bars.findIndex(b => etMinutes(b.ts) >= minute);
+    if (idx < 0) return;
+    let x = xAt(idx);
+    let strong = minute === 570 || minute === 960;
+    html += '<line x1="'+x.toFixed(1)+'" y1="'+padT+'" x2="'+x.toFixed(1)+'" y2="'+(h-padB).toFixed(1)+'" stroke="'+(strong ? 'rgba(250,204,21,0.55)' : 'rgba(148,163,184,0.20)')+'" stroke-dasharray="'+(strong ? '4 4' : '2 6')+'"></line>';
+    let label = String(Math.floor(minute/60)).padStart(2, '0') + ':' + String(minute%60).padStart(2, '0');
+    html += '<text x="'+(x-18).toFixed(1)+'" y="'+(h-10)+'" fill="var(--text2)" font-size="10">'+label+' ET</text>';
+  });
+  for (let i=0; i<5; i++) {
+    let y = padT + (i/4)*priceH;
+    let p = maxP - (i/4)*(maxP-minP);
+    html += '<line x1="'+padL+'" y1="'+y.toFixed(1)+'" x2="'+(w-padR)+'" y2="'+y.toFixed(1)+'" stroke="rgba(148,163,184,0.16)"></line>';
+    html += '<text x="4" y="'+(y+4).toFixed(1)+'" fill="var(--text2)" font-size="10">$'+p.toFixed(2)+'</text>';
+  }
+  bars.forEach((b, i) => {
+    let x = xAt(i), o = Number(b.open || b.close || 0), c = Number(b.close || 0), hi = Number(b.high || c), lo = Number(b.low || c);
+    let col = c >= o ? '#14b8a6' : '#f43f5e';
+    let yO = yAt(o), yC = yAt(c), yHi = yAt(hi), yLo = yAt(lo);
+    html += '<line x1="'+x.toFixed(1)+'" y1="'+yHi.toFixed(1)+'" x2="'+x.toFixed(1)+'" y2="'+yLo.toFixed(1)+'" stroke="'+col+'" stroke-width="1"></line>';
+    html += '<rect x="'+(x-bw/2).toFixed(1)+'" y="'+Math.min(yO,yC).toFixed(1)+'" width="'+bw.toFixed(1)+'" height="'+Math.max(1, Math.abs(yC-yO)).toFixed(1)+'" fill="'+col+'"></rect>';
+    let vh = (Number(b.volume || 0) / maxV) * volH;
+    html += '<rect x="'+(x-bw/2).toFixed(1)+'" y="'+(volTop + volH - vh).toFixed(1)+'" width="'+bw.toFixed(1)+'" height="'+Math.max(1, vh).toFixed(1)+'" fill="'+col+'" opacity="0.28"></rect>';
+  });
+  let indexByTs = {};
+  bars.forEach((b, i) => { indexByTs[String(b.ts).slice(0,16)] = i; });
+  let markAt = (ts, price) => {
+    let key = String(ts || '').slice(0,16);
+    let idx = indexByTs[key];
+    if (idx == null) idx = bars.findIndex(b => Math.abs(new Date(b.ts) - new Date(ts || 0)) < 61000);
+    if (idx < 0) return null;
+    return {x: xAt(idx), y: yAt(price || bars[idx].close || 0)};
+  };
+  (r.scan_events || []).filter(e => e.a_plus).slice(0, 160).forEach(e => {
+    let pt = markAt(e.ts, e.price);
+    if (!pt) return;
+    let col = e.status === 'accepted' ? '#22c55e' : (e.reason ? '#ef4444' : '#facc15');
+    html += '<circle cx="'+pt.x.toFixed(1)+'" cy="'+pt.y.toFixed(1)+'" r="3.2" fill="'+col+'" opacity="0.85"><title>'+escapeHtml(shortEtTime(e.ts) + ' ' + (e.scanner||'') + ': ' + (e.reason||e.status||''))+'</title></circle>';
+    if (col === '#facc15') {
+      let labelX = Math.min(w - padR - 42, pt.x + 5);
+      let labelY = Math.max(padT + 10, pt.y - 6);
+      html += '<text x="'+labelX.toFixed(1)+'" y="'+labelY.toFixed(1)+'" fill="#facc15" font-size="10" font-weight="600">'+escapeHtml(shortEtTime(e.ts).replace(' ET', ''))+'</text>';
+    }
+  });
+  (r.round_trips || []).forEach(t => {
+    let ept = markAt(t.entry_time, t.entry_price);
+    let xpt = markAt(t.exit_time, t.exit_price);
+    if (ept) html += '<path d="M '+ept.x.toFixed(1)+' '+(ept.y-8).toFixed(1)+' l 6 10 h -12 z" fill="#22c55e"><title>Entry $'+Number(t.entry_price||0).toFixed(4)+'</title></path>';
+    if (xpt) html += '<path d="M '+xpt.x.toFixed(1)+' '+(xpt.y+8).toFixed(1)+' l 6 -10 h -12 z" fill="#f97316"><title>Exit $'+Number(t.exit_price||0).toFixed(4)+'</title></path>';
+  });
+  html += '<line x1="'+padL+'" y1="'+volTop+'" x2="'+(w-padR)+'" y2="'+volTop+'" stroke="rgba(148,163,184,0.20)"></line>';
+  html += '</svg></div>';
+  html += '<div class="mini-muted" style="margin-top:8px">Chart times are Eastern Time. Yellow dashed lines mark regular open/close. Red dots are A+ blocks/rejects, green dots are accepted A+ points, triangles are simulated entries/exits.</div>';
+  html += '</div>';
+  return html;
+}
+
+function backtestDecisionRows(r) {
+  let rows = [];
+  (r.scan_events || []).forEach(e => {
+    if (!e.a_plus) return;
+    rows.push({
+      ts: e.ts, pattern: e.pattern || e.scanner, stage: e.blocked_layer || 'scanner',
+      status: e.status || 'scan_hit', price: e.price, score: e.score,
+      reason: e.reason || '', setup_tier: e.setup_tier || '', source: 'scan'
+    });
+  });
+  (r.entry_decisions || []).forEach(d => {
+    let tier = String(d.setup_tier || d.entry_tier || '');
+    let pattern = String(d.pattern || '');
+    if (tier.indexOf('A+') < 0) return;
+    rows.push({
+      ts: d.ts || d.time || '', pattern: pattern, stage: d.stage || d.blocked_layer || 'entry',
+      status: d.passed ? 'accepted' : 'rejected', price: d.price || 0,
+      score: (d.metadata || {}).entry_score || '', reason: d.reason || d.reject_reason || '',
+      setup_tier: d.setup_tier || '', source: 'decision'
+    });
+  });
+  rows.sort((a,b) => String(a.ts || '').localeCompare(String(b.ts || '')));
+  return rows;
+}
+
+function decisionPill(status) {
+  let s = String(status || '').toLowerCase();
+  let cls = s === 'accepted' || s === 'passed' ? 'pill-green' : (s === 'scan_hit' ? 'pill-yellow' : 'pill-red');
+  return '<span class="pill '+cls+'">'+escapeHtml(s || 'unknown')+'</span>';
+}
+
+function renderBacktestFunnel(r) {
+  let rows = backtestDecisionRows(r);
+  let html = '<div class="card" style="margin-bottom:16px"><div class="card-header"><h3>A+ Funnel Detail</h3><span class="mini-muted">'+rows.length+' A+ scan/decision rows</span></div>';
+  if (!rows.length) {
+    html += '<div class="empty"><div class="icon">&#128269;</div>No A+ decisions recorded in this replay</div></div>';
+    return html;
+  }
+  html += '<table><tr><th>Time</th><th>Pattern</th><th>Status</th><th>Blocked At</th><th>Price</th><th>Score</th><th>Reason</th></tr>';
+  rows.slice(0, 300).forEach(row => {
+    html += '<tr>';
+    html += '<td>'+shortEtTime(row.ts)+'</td>';
+    html += '<td><strong>'+escapeHtml(row.pattern || '')+'</strong><div class="mini-muted">'+escapeHtml(row.setup_tier || row.source || '')+'</div></td>';
+    html += '<td>'+decisionPill(row.status)+'</td>';
+    html += '<td>'+escapeHtml(row.stage || '')+'</td>';
+    html += '<td>'+(Number(row.price || 0) > 0 ? '$'+Number(row.price || 0).toFixed(4) : '')+'</td>';
+    html += '<td>'+escapeHtml(row.score || '')+'</td>';
+    html += '<td style="max-width:520px;white-space:normal">'+escapeHtml(row.reason || '')+'</td>';
+    html += '</tr>';
+  });
+  if (rows.length > 300) {
+    html += '<tr><td colspan="7" class="mini-muted">Showing first 300 rows. Use the API response for full detail.</td></tr>';
+  }
+  html += '</table></div>';
+  return html;
+}
+
+function renderBacktestSection(title, renderer) {
+  try {
+    return renderer();
+  } catch (err) {
+    return '<div class="card" style="margin-bottom:16px"><div class="card-header"><h3>' +
+      escapeHtml(title) + '</h3></div><div class="empty"><div class="icon">&#9888;</div>' +
+      escapeHtml(err && err.message ? err.message : String(err)) + '</div></div>';
+  }
+}
+
+function renderBacktestLayerBreakdown(r) {
+  let f = r.funnel || {};
+  let layers = f.rejected_by_layer || r.rejected_by_layer || {};
+  let reasons = f.top_reject_reasons_by_layer || r.top_reject_reasons_by_layer || {};
+  let names = Object.keys(layers).sort((a, b) => Number(layers[b] || 0) - Number(layers[a] || 0));
+  let html = '<div class="card" style="margin-bottom:16px"><div class="card-header"><h3>Backtest Gate Breakdown</h3><span class="mini-muted">Deferred: '+Number(f.deferred || (r.deferred_signals || []).length || 0)+'</span></div>';
+  if (!names.length) {
+    html += '<div class="empty"><div class="icon">&#9989;</div>No layer-level rejects recorded in this replay</div></div>';
+    return html;
+  }
+  html += '<table><tr><th>Layer</th><th>Rejects</th><th>Top Reasons</th></tr>';
+  names.forEach(layer => {
+    let reasonRows = (reasons[layer] || []).map(row => {
+      return '<div><strong>'+Number(row.count || 0)+'</strong> × '+escapeHtml(row.reason || '')+'</div>';
+    }).join('');
+    html += '<tr>';
+    html += '<td><span class="pill pill-red">'+escapeHtml(layer)+'</span></td>';
+    html += '<td>'+Number(layers[layer] || 0)+'</td>';
+    html += '<td style="max-width:720px;white-space:normal">'+(reasonRows || '<span class="mini-muted">No reason detail</span>')+'</td>';
+    html += '</tr>';
+  });
+  html += '</table></div>';
+  return html;
+}
+
+function renderBacktestMicroOpportunities(r) {
+  let rows = (r.micro_opportunities || []).slice().sort((a, b) => Number(b.move_after_pct || 0) - Number(a.move_after_pct || 0));
+  let html = '<div class="card" style="margin-bottom:16px"><div class="card-header"><h3>10s Opportunity Map</h3><span class="mini-muted">'+rows.length+' real 10s candidates</span></div>';
+  if (!rows.length) {
+    html += '<div class="empty"><div class="icon">&#128269;</div>No real 10s breakout opportunities recorded</div></div>';
+    return html;
+  }
+  html += '<table><tr><th>Time</th><th>Pattern</th><th>Level</th><th>10s Price</th><th>Volume</th><th>Max After</th><th>Move After</th><th>Why</th></tr>';
+  rows.slice(0, 80).forEach(row => {
+    html += '<tr>';
+    html += '<td>'+shortEtTime(row.ts)+'</td>';
+    html += '<td><strong>'+escapeHtml(row.pattern || '')+'</strong></td>';
+    html += '<td>$'+Number(row.breakout_level || 0).toFixed(4)+'</td>';
+    html += '<td>$'+Number(row.price || 0).toFixed(4)+'</td>';
+    html += '<td>'+Number(row.volume || 0).toLocaleString()+'</td>';
+    html += '<td>$'+Number(row.max_after || 0).toFixed(4)+'</td>';
+    html += '<td>'+Number(row.move_after_pct || 0).toFixed(1)+'%</td>';
+    html += '<td style="max-width:420px;white-space:normal">'+escapeHtml(row.reason || '')+'</td>';
+    html += '</tr>';
+  });
+  html += '</table></div>';
+  return html;
+}
+
+function renderBacktest() {
+  let wrap = document.getElementById('backtest-wrap');
+  if (!wrap) return;
+  let bt = state.backtest || {};
+  if (bt.loading) {
+    wrap.innerHTML = '<div class="card"><div class="empty"><div class="icon">&#9203;</div>Running backtest...</div></div>';
+    return;
+  }
+  if (bt.error) {
+    wrap.innerHTML = '<div class="card"><div class="empty"><div class="icon">&#9888;</div>' + escapeHtml(bt.error) + '</div></div>';
+    return;
+  }
+  let r = bt.result;
+  if (!r) {
+    wrap.innerHTML = '<div class="empty"><div class="icon">&#128202;</div>Choose a symbol and date, then run a backtest.</div>';
+    return;
+  }
+  let sc = r.scorecard || {};
+  let f = r.funnel || {};
+  let trips = r.round_trips || [];
+  let flags = r.flags || {};
+  let html = '<div class="card" style="margin-bottom:16px">';
+  html += '<div class="card-header"><h3>' + escapeHtml(r.symbol) + ' · ' + escapeHtml(r.date) + '</h3>';
+  html += '<span class="pill pill-blue">' + (r.bars || 0) + ' bars · ' + (r.cycles || 0) + ' cycles</span></div>';
+  html += '<div class="grid grid-4" style="margin-bottom:12px">';
+  html += '<div class="stat-card"><div class="stat-label">P&L / Exp</div><div class="stat-value">' + fmtPnl(Number(sc.total_pnl || 0)) + '</div><div class="mini-muted">' + fmtPnl(Number(sc.expectancy_per_trade || 0)) + ' per trade</div></div>';
+  html += '<div class="stat-card"><div class="stat-label">Win Rate</div><div class="stat-value">' + Number(sc.win_rate || 0).toFixed(1) + '%</div><div class="mini-muted">' + (sc.wins || 0) + 'W / ' + (sc.losses || 0) + 'L</div></div>';
+  html += '<div class="stat-card"><div class="stat-label">Trades</div><div class="stat-value">' + (sc.closed_trades || 0) + '/' + (sc.trades_taken || 0) + '</div><div class="mini-muted">closed / entries</div></div>';
+  html += '<div class="stat-card"><div class="stat-label">Funnel</div><div class="stat-value">' + (f.scan_hits || 0) + ' -> ' + (f.signals || 0) + ' -> ' + (f.entries || 0) + '</div><div class="mini-muted">' + pctText(f.signal_to_entry_pct) + ' signal to entry</div></div>';
+  html += '</div>';
+  html += '<div class="mini-muted">Flags: fresh_vwap=' + (flags.fresh_vwap_reclaim_scout ? 'on' : 'off') + ', level_breakout=' + (flags.level_breakout_scout ? 'on' : 'off') + ', elite_wide_spread=' + (flags.elite_wide_spread ? 'on' : 'off') + ', momentum_burst_live=' + (flags.momentum_burst_live ? 'on' : 'off') + ', level_capped_entry=' + (flags.level_capped_entry ? 'on' : 'off') + ', 10s_timer=' + (flags.execution_timer_10s ? 'on' : 'off') + ', 10s_scout=' + (flags.ten_second_breakout_scout ? 'on' : 'off') + '</div>';
+  if (r.execution_timer_source) {
+    html += '<div class="mini-muted">Execution timer source: ' + escapeHtml(r.execution_timer_source) + '</div>';
+  }
+  if ((r.unsupported_flags || []).length) {
+    html += '<div class="mini-muted">Not simulated here: ' + escapeHtml((r.unsupported_flags || []).join(', ')) + '</div>';
+  }
+  html += '</div>';
+
+  html += renderBacktestSection('1m Full Session Chart', () => renderBacktestChart(r));
+  html += renderBacktestSection('10s Opportunity Map', () => renderBacktestMicroOpportunities(r));
+  html += renderBacktestSection('Backtest Gate Breakdown', () => renderBacktestLayerBreakdown(r));
+  html += renderBacktestSection('A+ Funnel Detail', () => renderBacktestFunnel(r));
+
+  html += '<div class="card" style="margin-bottom:16px"><div class="card-header"><h3>Trades</h3></div>';
+  if (!trips.length) {
+    html += '<div class="empty"><div class="icon">&#128269;</div>No completed trades in this replay</div>';
+  } else {
+    html += '<table><tr><th>Entry Time</th><th>Pattern / Mode</th><th>Entry</th><th>Exit</th><th>Qty</th><th>P&L</th><th>Reason</th></tr>';
+    trips.forEach(t => {
+      html += '<tr>';
+      html += '<td>' + shortEtTime(t.entry_time) + '</td>';
+      html += '<td>' + escapeHtml(t.pattern || t.mode || '') + '</td>';
+      html += '<td>$' + Number(t.entry_price || 0).toFixed(4) + '</td>';
+      html += '<td>$' + Number(t.exit_price || 0).toFixed(4) + '</td>';
+      html += '<td>' + Number(t.quantity || 0).toFixed(0) + '</td>';
+      html += '<td>' + fmtPnl(Number(t.pnl || 0)) + '</td>';
+      html += '<td>' + escapeHtml(t.exit_reason || '') + '</td>';
+      html += '</tr>';
+    });
+    html += '</table>';
+  }
+  html += '</div>';
+
+  let modes = Object.entries(sc.by_entry_mode || {});
+  if (modes.length) {
+    html += '<div class="card"><div class="card-header"><h3>By Entry Mode</h3></div>';
+    html += '<table><tr><th>Mode</th><th>Closed</th><th>Wins</th><th>P&L</th></tr>';
+    modes.forEach(([name, row]) => {
+      html += '<tr><td>' + escapeHtml(name) + '</td><td>' + (row.closed_trades || 0) + '</td><td>' + (row.wins || 0) + '</td><td>' + fmtPnl(Number(row.total_pnl || 0)) + '</td></tr>';
+    });
+    html += '</table></div>';
+  }
+  wrap.innerHTML = html;
+}
+
 function renderAnalytics() {
   renderMissedAPlus();
+  renderDailyScorecard();
   let exits = (state.recent_trades||[]).filter(t => t.trade_type === 'exit' && t.pnl != null);
   if (exits.length === 0) {
+    document.getElementById('an-avg-win').innerHTML = fmtPnl(0);
+    document.getElementById('an-avg-loss').innerHTML = fmtPnl(0);
+    document.getElementById('an-pf').textContent = '0.00';
+    document.getElementById('an-expect').innerHTML = fmtPnl(0);
     renderMLReport();
     renderAI();
     return;
@@ -1650,16 +2419,52 @@ function renderMissedAPlus() {
     wrap.innerHTML = '<div class="empty"><div class="icon">&#128269;</div>No blocked A+ setups labeled yet</div>';
     return;
   }
-  let html = '<table><tr><th>Symbol</th><th>Pattern</th><th>Blocked At</th><th>Reason</th><th>Move After</th><th>Correct?</th><th>Fix</th></tr>';
+  let spreadRows = rows.filter(r => r.is_spread_reject || String(r.reason || '').toLowerCase().includes('spread'));
+  let spreadFalse = spreadRows.filter(r => r.outcome === 'missed_opportunity').length;
+  let spreadCorrect = spreadRows.filter(r => r.outcome === 'correct_reject').length;
+  let riskRows = rows.filter(r => r.is_risk_reject || String(r.reason || '').toLowerCase().includes('risk too wide') || String(r.reason || '').toLowerCase().includes('r:r'));
+  let riskFalse = riskRows.filter(r => r.outcome === 'missed_opportunity').length;
+  let riskCorrect = riskRows.filter(r => r.outcome === 'correct_reject').length;
+  let riskSurvived = riskRows.filter(r => r.tactical_stop_survived === true).length;
+  let riskFailed = riskRows.filter(r => r.tactical_stop_survived === false).length;
+  let cleanRiskSurvived = riskRows.filter(r => r.tactical_stop_clean_survival === true).length;
+  let cleanRiskFailed = riskRows.filter(r => r.tactical_stop_clean_survival === false).length;
+  let choppyRiskSurvived = riskRows.filter(r => r.tactical_stop_survived === true && !r.smooth_for_tactical_stop).length;
+  let html = '';
+  if (spreadRows.length) {
+    html += '<div class="mini-muted" style="margin-bottom:8px">Spread blocks: ' + spreadRows.length +
+      ' | false blocks: ' + spreadFalse + ' | correct rejects: ' + spreadCorrect + '</div>';
+  }
+  if (riskRows.length) {
+    html += '<div class="mini-muted" style="margin-bottom:8px">Wide-risk blocks: ' + riskRows.length +
+      ' | false blocks: ' + riskFalse + ' | correct rejects: ' + riskCorrect +
+      ' | clean tactical survived/failed: ' + cleanRiskSurvived + '/' + cleanRiskFailed +
+      ' | choppy survived: ' + choppyRiskSurvived +
+      ' | raw survived/failed: ' + riskSurvived + '/' + riskFailed + '</div>';
+  }
+  html += '<table><tr><th>Symbol</th><th>Pattern</th><th>Blocked At</th><th>Reason</th><th>Spread</th><th>Risk</th><th>Move After</th><th>Correct?</th><th>Fix</th></tr>';
   rows.forEach(r => {
     let move = Number(r.move_after_pct || 0);
     let cls = move >= 3 ? 'text-green' : (Number(r.dump_after_pct || 0) <= -3 ? 'text-red' : '');
     let correct = r.correct === true ? '<span class="text-green">Yes</span>' : (r.correct === false ? '<span class="text-red">No</span>' : '<span class="text-yellow">Pending</span>');
+    let spread = Number(r.spread_pct || 0) > 0 ? Number(r.spread_pct || 0).toFixed(2) + '%' : '';
+    let risk = '';
+    if (Number(r.risk_pct || 0) > 0) {
+      risk = Number(r.risk_pct || 0).toFixed(1) + '%';
+      if (Number(r.tactical_stop_price || 0) > 0) {
+        let survived = r.tactical_stop_survived === true ? 'survived' : (r.tactical_stop_survived === false ? 'failed' : 'pending');
+        let smooth = r.smooth_for_tactical_stop ? 'smooth' : 'choppy';
+        let range = Number(r.median_bar_range_pct || 0) > 0 ? ' ' + Number(r.median_bar_range_pct || 0).toFixed(1) + '%rng' : '';
+        risk += '<div style="font-size:10px;color:var(--text2)">tac ' + Number(r.tactical_stop_price || 0).toFixed(2) + ' ' + survived + ' ' + smooth + range + '</div>';
+      }
+    }
     html += '<tr>';
     html += '<td><strong>' + escapeHtml(r.symbol || '') + '</strong></td>';
     html += '<td><span class="pill pill-blue">' + escapeHtml(r.pattern || r.scanner || '') + '</span><div style="font-size:10px;color:var(--text2)">' + escapeHtml(r.blocked_layer || '') + '</div></td>';
     html += '<td>' + shortTime(r.blocked_at) + '</td>';
     html += '<td style="max-width:360px;white-space:normal">' + escapeHtml(r.reason || '') + '</td>';
+    html += '<td>' + escapeHtml(spread) + '</td>';
+    html += '<td>' + risk + '</td>';
     html += '<td class="' + cls + '">' + move.toFixed(1) + '%</td>';
     html += '<td>' + correct + '</td>';
     html += '<td style="max-width:320px;white-space:normal">' + escapeHtml(r.suggested_fix || '') + '</td>';
@@ -1995,6 +2800,7 @@ function renderAll() {
   renderScanner();
   renderTrades();
   renderAnalytics();
+  renderBacktest();
   renderNews();
   renderJournal();
   updateStatus();
@@ -2100,6 +2906,8 @@ function applySnapshot(data) {
   state.hod_momentum_alerts = data.hod_momentum_alerts || [];
   state.hot_watch = data.hot_watch || [];
   state.missed_a_plus = data.missed_a_plus || [];
+  state.daily_scorecard = data.daily_scorecard || {};
+  state.rolling_scorecard = data.rolling_scorecard || {};
   state.trading_watchlist = data.trading_watchlist || [];
   state.candidate_hydration = data.candidate_hydration || {};
   state.watchlist_pinned = data.watchlist_pinned || ['SPY'];
@@ -2146,6 +2954,7 @@ es.onmessage = function(e) {
       });
       renderOverview();
       renderTrades();
+      renderAnalytics();
       break;
     case 'exit':
       state.recent_trades.push(msg.data);
@@ -2164,6 +2973,7 @@ es.onmessage = function(e) {
       });
       renderOverview();
       renderTrades();
+      renderAnalytics();
       break;
     case 'classification':
       state.symbols[msg.data.symbol] = msg.data;
@@ -2222,6 +3032,7 @@ es.onmessage = function(e) {
       });
       renderScanner();
       renderOverview();
+      renderAnalytics();
       break;
     case 'positions':
       state.positions = msg.data;
@@ -2238,6 +3049,7 @@ es.onmessage = function(e) {
           + ' fills=' + (msg.data.fills || 0),
       });
       updateStatus();
+      renderAnalytics();
       break;
     case 'market_status':
       state.market_open = msg.data.market_open;
@@ -2326,7 +3138,11 @@ function syncTradingControlState() {
       let incomingCycle = Number(data.stats.cycle_count || 0) || 0;
       state.stats.cycle_count = sameBotRun ? Math.max(savedCycle, incomingCycle) : incomingCycle;
     }
+    if (data.daily_scorecard) state.daily_scorecard = data.daily_scorecard;
+    if (data.rolling_scorecard) state.rolling_scorecard = data.rolling_scorecard;
+    if (data.missed_a_plus) state.missed_a_plus = data.missed_a_plus;
     updateStatus();
+    renderAnalytics();
   }).catch(()=>{});
 }
 setInterval(syncTradingControlState, 10000);

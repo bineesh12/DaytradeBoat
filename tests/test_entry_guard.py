@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from daytrading.models import Bar, Timeframe
+from daytrading.models import Bar, Quote, Timeframe
 from daytrading.strategy import entry_guard as eg
 
 
@@ -111,7 +111,7 @@ class TestHardRejects:
 
     def test_price_outside_range(self) -> None:
         now = datetime.now(timezone.utc)
-        bars = [_bar(i, close=1.49, open_=1.4, high=1.55, low=1.4, volume=100_000, base_ts=now, n=3) for i in range(3)]
+        bars = [_bar(i, close=1.10, open_=1.05, high=1.15, low=1.03, volume=100_000, base_ts=now, n=3) for i in range(3)]
         r = eg.check_entry_quality(bars, symbol="TST")
         assert r is not None and "price" in r.lower()
 
@@ -174,6 +174,54 @@ class TestHardRejects:
         ]
         r = eg.check_entry_quality(bars, symbol="TST", quotes=quotes)
         assert r is not None and "spread" in r.lower()
+
+    def test_spce_like_large_float_rejects_even_with_normal_spread(self, monkeypatch) -> None:
+        """Known large floats must be blocked on the universal entry path."""
+        monkeypatch.setattr(eg, "_xgb_model", None)
+        monkeypatch.setattr(eg, "ENTRY_MAX_FLOAT_SHARES", 20_000_000)
+        now = datetime.now(timezone.utc)
+        bars = _uptrend_bars_passing_default_guard()
+        quotes = [
+            Quote(symbol="SPCE", ts=now, bid=4.99, ask=5.00, bid_size=2000, ask_size=2000)
+            for _ in range(5)
+        ]
+
+        r = eg.check_entry_quality(
+            bars,
+            symbol="SPCE",
+            quotes=quotes,
+            avg_daily_volume=10_000_000,
+            float_shares=120_000_000,
+            entry_pattern="first_pullback_reclaim",
+            setup_tier="A+ setup",
+        )
+
+        assert r is not None
+        assert "float too large" in r.lower()
+        assert "spread" not in r.lower()
+
+    def test_unknown_float_still_reaches_other_entry_checks(self, monkeypatch) -> None:
+        """Unknown float is not treated as known-large; hydration can fill it later."""
+        monkeypatch.setattr(eg, "_xgb_model", None)
+        monkeypatch.setattr(eg, "ENTRY_MAX_FLOAT_SHARES", 20_000_000)
+        now = datetime.now(timezone.utc)
+        bars = _uptrend_bars_passing_default_guard()
+        quotes = [
+            Quote(symbol="UNK", ts=now, bid=4.99, ask=5.00, bid_size=2000, ask_size=2000)
+            for _ in range(5)
+        ]
+
+        r = eg.check_entry_quality(
+            bars,
+            symbol="UNK",
+            quotes=quotes,
+            avg_daily_volume=10_000_000,
+            float_shares=None,
+            entry_pattern="first_pullback_reclaim",
+            setup_tier="A+ setup",
+        )
+
+        assert r is None or "float too large" not in r.lower()
 
     def test_elite_a_plus_runner_can_reach_ml_with_slightly_wide_spread(self, monkeypatch) -> None:
         """CIIT-style A+ runners should not die at 0.5%-0.8% spread before ML."""
@@ -358,6 +406,7 @@ class TestHardRejects:
             assert "outside range" not in r
 
     def test_entry_guard_still_rejects_below_dollar_fifty(self) -> None:
+        # Strategy trades from $1.50; sub-$1.50 names are out of range.
         now = datetime.now(timezone.utc)
         n = 5
         bars = [
@@ -377,6 +426,33 @@ class TestHardRejects:
         r = eg.check_entry_quality(bars, symbol="LOW")
 
         assert r == "price $1.49 outside range $1.50-$20.00"
+
+    def test_large_known_float_rejected_off_thesis(self) -> None:
+        # SPCE-like: a large-float name (100M) is outside the low-float thesis
+        # and must be hard-rejected on the entry path, even with a clean setup.
+        now = datetime.now(timezone.utc)
+        n = 6
+        bars = [
+            _bar(i, close=6.00, open_=5.95, high=6.10, low=5.90, volume=500_000, base_ts=now, n=n)
+            for i in range(n)
+        ]
+
+        r = eg.check_entry_quality(bars, symbol="SPCE", float_shares=100_000_000)
+
+        assert r is not None and "float too large" in r
+
+    def test_low_float_not_rejected_by_float_gate(self) -> None:
+        # A genuine low-float name passes the float gate (may reject elsewhere).
+        now = datetime.now(timezone.utc)
+        n = 6
+        bars = [
+            _bar(i, close=6.00, open_=5.95, high=6.10, low=5.90, volume=500_000, base_ts=now, n=n)
+            for i in range(n)
+        ]
+
+        r = eg.check_entry_quality(bars, symbol="LOWF", float_shares=8_000_000)
+
+        assert r is None or "float too large" not in r
 
     def test_five_plus_runner_can_reach_scoring_with_100k_plus_day_volume(self) -> None:
         """FOXX-like $5+ runners should not fail the first gate near 200K volume."""
@@ -757,6 +833,47 @@ class TestScoringSystem:
 
         assert r is not None
         assert "thin liquidity score" in r
+
+    def test_pali_like_first_pullback_reclaim_rejects_weak_liquidity(self) -> None:
+        """PALI-like sub-$2 reclaim should not pass on stale day volume alone."""
+        from daytrading.models import Quote
+
+        now = datetime.now(timezone.utc)
+        n = 20
+        bars = []
+        for i in range(n):
+            frac = i / (n - 1)
+            close = 1.68 + (1.80 - 1.68) * frac
+            volume = 55_000 if i < 15 else 33_000
+            bars.append(_bar(
+                i,
+                close=close,
+                open_=close - 0.006,
+                high=close + 0.012,
+                low=close - 0.012,
+                volume=volume,
+                base_ts=now,
+                n=n,
+            ))
+        quotes = [
+            Quote(symbol="PALI", ts=now, bid=1.79, ask=1.80, bid_size=100, ask_size=100)
+            for _ in range(5)
+        ]
+
+        reason = eg.check_entry_quality(
+            bars,
+            symbol="PALI",
+            quotes=quotes,
+            avg_daily_volume=1_500_000,
+            float_shares=20_000_000,
+            entry_pattern="first_pullback_reclaim",
+            setup_tier="A+ setup",
+        )
+
+        assert reason is not None
+        assert "liquidity" in reason.lower() or "rvol" in reason.lower()
+        assert "outside range" not in reason.lower()
+        assert "below vwap" not in reason.lower()
 
     def test_full_liquidity_score_allows_hot_sub_five_tape(self) -> None:
         """A real high-volume sub-$5 runner should not be blocked by liquidity scoring."""
@@ -1246,3 +1363,206 @@ class TestLowRvolPenalty:
         r = eg.check_entry_quality(bars, symbol="TST")
         if r is not None:
             assert "rvol" not in r or "barvol" in r  # barvol is S3, not S9
+
+
+class TestOpportunityScaledSpread:
+    """Spread exceptions must be elite, measured, and size-reduced."""
+
+    def test_elite_wide_spread_default_tracks_paper_mode(self, monkeypatch) -> None:
+        monkeypatch.delenv("DAYTRADING_ELITE_WIDE_SPREAD_ENABLED", raising=False)
+
+        monkeypatch.setenv("DAYTRADING_ALPACA_PAPER", "true")
+        assert eg._elite_wide_spread_default_enabled() is True
+
+        monkeypatch.setenv("DAYTRADING_ALPACA_PAPER", "false")
+        assert eg._elite_wide_spread_default_enabled() is False
+
+    def test_elite_wide_spread_explicit_env_overrides_paper_default(self, monkeypatch) -> None:
+        monkeypatch.setenv("DAYTRADING_ALPACA_PAPER", "true")
+        monkeypatch.setenv("DAYTRADING_ELITE_WIDE_SPREAD_ENABLED", "false")
+        assert eg._elite_wide_spread_default_enabled() is False
+
+        monkeypatch.setenv("DAYTRADING_ALPACA_PAPER", "false")
+        monkeypatch.setenv("DAYTRADING_ELITE_WIDE_SPREAD_ENABLED", "true")
+        assert eg._elite_wide_spread_default_enabled() is True
+
+    def test_penny_wide_low_price_a_plus_runner_gets_reduced_spread_scout(self) -> None:
+        decision = eg.assess_opportunity_scaled_spread(
+            price=1.66,
+            spread=0.012,
+            pattern="runner_reclaim_continuation",
+            setup_tier="A+ setup",
+            day_volume=3_000_000,
+            recent_avg_volume=60_000,
+            latest_volume=35_000,
+            distance_from_hod=0.03,
+            quote_depth=1200,
+        )
+
+        assert decision.ok is True
+        assert decision.exception is True
+        assert decision.size_factor < 1.0
+
+    def test_higher_priced_a_plus_runner_normal_spread_passes_with_size_down(self) -> None:
+        # MNTS-like: $12.88 clean A+ runner, 11c/0.85% spread. Was vetoed at the
+        # execute step because $5+ names got a tighter 0.8% ceiling than sub-$5.
+        decision = eg.assess_opportunity_scaled_spread(
+            price=12.88,
+            spread=0.11,                 # 0.85% — normal for a $13 small-cap
+            pattern="hod_reclaim",
+            setup_tier="A+ setup",
+            day_volume=14_000_000,
+            recent_avg_volume=60_000,
+            latest_volume=30_000,
+            distance_from_hod=0.03,
+            float_shares=15_000_000,
+            quote_depth=600,
+        )
+
+        assert decision.ok is True
+        assert decision.exception is True
+        assert decision.size_factor < 1.0   # takes a smaller position for the wider spread
+
+    def test_higher_priced_runner_truly_wide_spread_still_rejected(self) -> None:
+        # Guard: above the 0.9% ceiling it still rejects (the fix didn't open the door).
+        decision = eg.assess_opportunity_scaled_spread(
+            price=12.88,
+            spread=0.16,                 # 1.24% — genuinely too wide
+            pattern="hod_reclaim",
+            setup_tier="A+ setup",
+            day_volume=14_000_000,
+            recent_avg_volume=60_000,
+            latest_volume=30_000,
+            distance_from_hod=0.03,
+            float_shares=15_000_000,
+            quote_depth=600,
+        )
+
+        assert decision.ok is False
+        assert "ceiling" in decision.reason
+
+    def test_cupr_like_top_score_runner_gets_elite_wide_spread_scout(self) -> None:
+        decision = eg.assess_opportunity_scaled_spread(
+            price=7.75,
+            spread=0.084,                # 1.08% — above normal elite ceiling
+            pattern="hod_reclaim",
+            setup_tier="A+ setup",
+            day_volume=26_000_000,
+            recent_avg_volume=120_000,
+            latest_volume=85_000,
+            distance_from_hod=0.02,
+            float_shares=920_000,
+            quote_depth=1800,
+            setup_score=197.0,
+        )
+
+        assert decision.ok is True
+        assert decision.exception is True
+        assert decision.mode == "elite_wide_spread"
+        assert decision.size_factor <= 0.25
+
+    def test_wide_spread_without_top_score_still_rejects(self) -> None:
+        decision = eg.assess_opportunity_scaled_spread(
+            price=7.75,
+            spread=0.084,
+            pattern="hod_reclaim",
+            setup_tier="A+ setup",
+            day_volume=26_000_000,
+            recent_avg_volume=120_000,
+            latest_volume=85_000,
+            distance_from_hod=0.02,
+            float_shares=920_000,
+            quote_depth=1800,
+            setup_score=120.0,
+        )
+
+        assert decision.ok is False
+        assert "ceiling" in decision.reason
+
+    def test_elite_wide_spread_requires_real_liquidity(self) -> None:
+        decision = eg.assess_opportunity_scaled_spread(
+            price=7.75,
+            spread=0.084,
+            pattern="hod_reclaim",
+            setup_tier="A+ setup",
+            day_volume=26_000_000,
+            recent_avg_volume=18_000,
+            latest_volume=7_000,
+            distance_from_hod=0.02,
+            float_shares=920_000,
+            quote_depth=100,
+            setup_score=197.0,
+        )
+
+        assert decision.ok is False
+        assert decision.exception is False
+
+    def test_multi_cent_spread_with_low_volume_depth_still_rejects(self) -> None:
+        decision = eg.assess_opportunity_scaled_spread(
+            price=2.70,
+            spread=0.052,
+            pattern="first_pullback_reclaim",
+            setup_tier="A+ setup",
+            day_volume=450_000,
+            recent_avg_volume=12_000,
+            latest_volume=3_678,
+            distance_from_hod=0.02,
+            quote_depth=100,
+        )
+
+        assert decision.ok is False
+        assert decision.exception is False
+
+    def test_high_rvol_deep_liquidity_moderate_spread_gets_reduced_scout(self) -> None:
+        decision = eg.assess_opportunity_scaled_spread(
+            price=2.13,
+            spread=0.018,
+            pattern="first_pullback_reclaim",
+            setup_tier="A+ setup",
+            day_volume=4_000_000,
+            recent_avg_volume=90_000,
+            latest_volume=50_000,
+            distance_from_hod=0.01,
+            quote_depth=1500,
+            float_shares=8_000_000,
+        )
+
+        assert decision.ok is True
+        assert decision.exception is True
+        assert decision.size_factor <= 0.45
+
+    def test_full_guard_keeps_crmt_style_thin_wide_spread_blocked(self) -> None:
+        now = datetime.now(timezone.utc)
+        n = 20
+        bars = []
+        for i in range(n):
+            frac = i / (n - 1)
+            close = 2.50 + 0.20 * frac
+            volume = 8_000 if i < 15 else 3_678
+            bars.append(_bar(
+                i,
+                close=close,
+                open_=close - 0.02,
+                high=close + 0.03,
+                low=close - 0.03,
+                volume=volume,
+                base_ts=now,
+                n=n,
+            ))
+        quotes = [
+            Quote(symbol="CRMT", ts=now, bid=2.674, ask=2.726, bid_size=100, ask_size=100)
+            for _ in range(5)
+        ]
+
+        reason = eg.check_entry_quality(
+            bars,
+            symbol="CRMT",
+            quotes=quotes,
+            avg_daily_volume=1_500_000,
+            float_shares=8_000_000,
+            entry_pattern="first_pullback_reclaim",
+            setup_tier="A+ setup",
+        )
+
+        assert reason is not None
+        assert "spread" in reason.lower() or "liquidity" in reason.lower() or "volume" in reason.lower()

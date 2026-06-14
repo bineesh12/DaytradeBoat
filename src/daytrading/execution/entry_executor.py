@@ -200,6 +200,28 @@ class EntryExecutor:
                 )
                 return
 
+            hit = signal.scan_result
+            criteria = hit.criteria if hit is not None else {}
+            try:
+                spread_size_factor = float(criteria.get("spread_size_factor") or 1.0)
+            except (TypeError, ValueError):
+                spread_size_factor = 1.0
+            if 0 < spread_size_factor < 1.0 and order.quantity > 1:
+                reduced_qty = max(1, int(float(order.quantity) * spread_size_factor))
+                if reduced_qty < order.quantity:
+                    logger.info(
+                        "TIMED ENTRY %s size down %.0f → %d for opportunity-scaled spread",
+                        sym,
+                        order.quantity,
+                        reduced_qty,
+                    )
+                    order = Order(
+                        symbol=order.symbol,
+                        side=order.side,
+                        quantity=float(reduced_qty),
+                        limit_price=order.limit_price,
+                    )
+
             quality_reject = ctx.shared_entry_quality_reject(
                 sym,
                 list(bars),
@@ -260,7 +282,7 @@ class EntryExecutor:
                     fill.price,
                     strategy,
                 )
-                ctx.hub.on_fill(fill, "entry")
+                ctx.hub.on_fill(fill, "entry", strategy=strategy)
                 ctx.hub.add_log(
                     "INFO",
                     "ENTRY {} {} {:.0f} @ ${:.2f} (10s timed)".format(
@@ -362,10 +384,27 @@ class EntryExecutor:
                 ctx.hub.add_log("WARNING", "RE-ADD SKIP {}: {}".format(sym, quality_reject))
                 return
 
+            try:
+                criteria = signal.scan_result.criteria if signal.scan_result is not None else {}
+                spread_size_factor = float(criteria.get("spread_size_factor") or 1.0)
+            except (AttributeError, TypeError, ValueError):
+                spread_size_factor = 1.0
+            quantity = signal.quantity
+            if 0 < spread_size_factor < 1.0 and quantity > 1:
+                reduced_qty = max(1, int(float(quantity) * spread_size_factor))
+                if reduced_qty < quantity:
+                    logger.info(
+                        "TIMED SCALE-UP %s size down %.0f → %d for opportunity-scaled spread",
+                        sym,
+                        quantity,
+                        reduced_qty,
+                    )
+                    quantity = float(reduced_qty)
+
             order = Order(
                 symbol=sym,
                 side=Side.BUY,
-                quantity=signal.quantity,
+                quantity=quantity,
                 limit_price=signal.entry_price,
             )
             fill, status = ctx.broker.submit(order, bar, ctx.pipeline.portfolio)
@@ -397,7 +436,11 @@ class EntryExecutor:
                     signal.stop_loss or 0.0,
                     signal.reason,
                 )
-                ctx.hub.on_fill(fill, "scale_up")
+                strategy = (
+                    signal.scan_result.scanner_name if signal.scan_result
+                    else signal.reason or "unknown"
+                )
+                ctx.hub.on_fill(fill, "scale_up", strategy=strategy)
                 ctx.hub.add_log(
                     "INFO",
                     "RE-ADD {} +{:.0f} @ ${:.2f}".format(
@@ -413,7 +456,7 @@ class EntryExecutor:
                     "price": fill.price,
                     "ts": fill.ts,
                     "trade_type": "scale_up",
-                    "strategy": "runner_readd",
+                    "strategy": strategy,
                     "execution_method": "10s_timed",
                     "market_context": {"phase": ctx.market_phase()},
                 }, ts=fill.ts)

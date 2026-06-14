@@ -57,11 +57,78 @@ class StrategyConfig:
     hot_watch_min_day_volume: float = 200_000
     hot_watch_sub5_min_day_volume: float = 500_000
     hot_watch_min_score: float = 0.30
+    hot_watch_setup_refresh_enabled: bool = True
+    hot_watch_setup_refresh_max_pullback_pct: float = 4.0
+    hot_watch_setup_refresh_min_recent_volume: float = 100_000
     max_watchlist_symbols: int = 50
     candidate_hydrate_queue_max: int = 500
     candidate_hydrate_batch_max: int = 10
     fast_scan_process_max: int = 80
     timed_entry_anchor_ttl_sec: float = 300.0
+    missed_a_plus_chase_window_sec: float = 1800.0
+    missed_a_plus_chase_pct_sub5: float = 0.035
+    missed_a_plus_chase_pct_5plus: float = 0.025
+    # Normal anti-chase cap: max % a fill may sit above the setup base before the
+    # entry is rejected as a late chase. Cheap fast movers (< price tier) get more
+    # room; pricier names stay tight. Now config-driven (was hardcoded 0.025/0.035,
+    # $5 tier). Loosened to 0.05 / $10: on the live 10s-execution-timer path a
+    # 6/12 mover basket netted +$76 vs +$28 tight — the extra room added only the
+    # CUPR HOD reclaim (+$49) with no added losers (the 10s timer stays selective;
+    # the looser-but-less-selective 1m path did add losers, so this only holds with
+    # execution_timer_10s on, which is the live default).
+    entry_chase_pct_low: float = 0.05
+    entry_chase_pct_high: float = 0.025
+    entry_chase_price_tier: float = 10.0
+    # Runner back-half trail (post-partial), for confirmed runner candidates.
+    # A 6/12 sweep: 3% locks top-and-fade winners (EDHL +$32) but stops CUPR
+    # early (+$49); 8% rides CUPR's continuation (+$179) but gives EDHL back
+    # (+$2). No single flat value wins both, so default stays tight (3%) and is
+    # tunable. runner_min_confirm_pct = how far past the partial it must run to
+    # earn the wider trail.
+    runner_trail_pct: float = 0.03
+    runner_min_confirm_pct: float = 0.018
+    # Adaptive runner trail: scale trail width to the name's own recent 1m
+    # volatility so wide-swinging runners (CUPR, ~2.7% bars) breathe while smooth
+    # names (EDHL, ~1.4% bars) trail tight. trail = clamp(atr_mult * median bar
+    # range, runner_trail_pct floor, runner_trail_cap). Off by default = flat.
+    # Kept OFF: backtests on CUPR/EDHL/SUNE showed adaptive == flat 8% and it
+    # gives back the back-half on fade/chop names (EDHL, SUNE) to help only the
+    # rare continuation runner (CUPR). Volatility is the wrong signal (it widens
+    # near tops). Needs a structure-aware formula + unbiased basket before on.
+    runner_trail_adaptive: bool = False
+    runner_trail_atr_mult: float = 2.5
+    runner_trail_cap: float = 0.10
+    tick_entry_enabled: bool = False
+    tick_entry_confirm_count: int = 2
+    tick_entry_max_above_anchor: float = 0.02
+    # Deep-pullback tolerance: how far below HOD a late pullback may sit before
+    # the verifier rejects it (was 8/10 — too tight, missed reclaim runners).
+    late_pullback_max_hod_pct: float = 12.0
+    late_pullback_max_hod_other_pct: float = 10.0
+    # EXPERIMENTAL momentum-breakout mode (default OFF). Lets the fast breakout
+    # scalp fire on a high-ABSOLUTE-volume breakout whose relative volume has
+    # faded from an earlier peak (the VSME case). Paper-test via the scorecard.
+    momentum_breakout_enabled: bool = False
+    momentum_breakout_min_rvol: float = 0.4
+    momentum_breakout_min_day_volume: float = 5_000_000
+    # Only fire the breakout when recent tape is smooth enough that a stop holds
+    # (per-bar range). This is the key guard — it skips the violent gappy tape
+    # (VSME-style 6-11% bars) where stops slip, and the slippage eats the edge.
+    momentum_breakout_max_bar_range_pct: float = 3.0
+    # Caveat-1 fix: catch the early breakout/VWAP reclaim that scores just under
+    # the 80 gate. On the breakout-scalp path only, when the mode is on and the
+    # tape is smooth + high-volume, allow a score down to this floor.
+    momentum_breakout_score_floor: float = 72.0
+    # EXPERIMENTAL conservative fresh-VWAP-reclaim scout (default OFF). After a
+    # dump candle, allow a reduced-size scout IF a fresh green base rebuilt above
+    # VWAP on strong volume + low float (the DSY case). First dump still blocked;
+    # gappy/failed reclaims (the GMM case) stay rejected. Paper-test the scorecard.
+    fresh_vwap_reclaim_scout_enabled: bool = False
+    fresh_vwap_reclaim_scout_max_float: float = 20_000_000
+    # Earlier reduced-size level-breakout scout for smooth/liquid names that
+    # would otherwise enter later via first_pullback_reclaim (CONL timing case).
+    level_breakout_scout_enabled: bool = False
+    level_breakout_scout_min_session_move_pct: float = 3.0
 
     @classmethod
     def from_env(cls) -> "StrategyConfig":
@@ -90,6 +157,18 @@ class StrategyConfig:
                 cls.hot_watch_sub5_min_day_volume,
             ),
             hot_watch_min_score=_env_float("HOT_WATCH_MIN_SCORE", cls.hot_watch_min_score),
+            hot_watch_setup_refresh_enabled=_env_bool(
+                "HOT_WATCH_SETUP_REFRESH_ENABLED",
+                cls.hot_watch_setup_refresh_enabled,
+            ),
+            hot_watch_setup_refresh_max_pullback_pct=_env_float(
+                "HOT_WATCH_SETUP_REFRESH_MAX_PULLBACK_PCT",
+                cls.hot_watch_setup_refresh_max_pullback_pct,
+            ),
+            hot_watch_setup_refresh_min_recent_volume=_env_float(
+                "HOT_WATCH_SETUP_REFRESH_MIN_RECENT_VOLUME",
+                cls.hot_watch_setup_refresh_min_recent_volume,
+            ),
             max_watchlist_symbols=_env_int("MAX_WATCHLIST_SYMBOLS", cls.max_watchlist_symbols),
             candidate_hydrate_queue_max=_env_int(
                 "CANDIDATE_HYDRATE_QUEUE_MAX",
@@ -103,6 +182,91 @@ class StrategyConfig:
             timed_entry_anchor_ttl_sec=_env_float(
                 "TIMED_ENTRY_ANCHOR_TTL_SEC",
                 cls.timed_entry_anchor_ttl_sec,
+            ),
+            missed_a_plus_chase_window_sec=_env_float(
+                "MISSED_A_PLUS_CHASE_WINDOW_SEC",
+                cls.missed_a_plus_chase_window_sec,
+            ),
+            missed_a_plus_chase_pct_sub5=_env_float(
+                "MISSED_A_PLUS_CHASE_PCT_SUB5",
+                cls.missed_a_plus_chase_pct_sub5,
+            ),
+            missed_a_plus_chase_pct_5plus=_env_float(
+                "MISSED_A_PLUS_CHASE_PCT_5PLUS",
+                cls.missed_a_plus_chase_pct_5plus,
+            ),
+            entry_chase_pct_low=_env_float("ENTRY_CHASE_PCT_LOW", cls.entry_chase_pct_low),
+            entry_chase_pct_high=_env_float("ENTRY_CHASE_PCT_HIGH", cls.entry_chase_pct_high),
+            entry_chase_price_tier=_env_float(
+                "ENTRY_CHASE_PRICE_TIER",
+                cls.entry_chase_price_tier,
+            ),
+            runner_trail_pct=_env_float("RUNNER_TRAIL_PCT", cls.runner_trail_pct),
+            runner_min_confirm_pct=_env_float(
+                "RUNNER_MIN_CONFIRM_PCT",
+                cls.runner_min_confirm_pct,
+            ),
+            runner_trail_adaptive=_env_bool(
+                "RUNNER_TRAIL_ADAPTIVE",
+                cls.runner_trail_adaptive,
+            ),
+            runner_trail_atr_mult=_env_float(
+                "RUNNER_TRAIL_ATR_MULT",
+                cls.runner_trail_atr_mult,
+            ),
+            runner_trail_cap=_env_float("RUNNER_TRAIL_CAP", cls.runner_trail_cap),
+            tick_entry_enabled=_env_bool("TICK_ENTRY_ENABLED", cls.tick_entry_enabled),
+            tick_entry_confirm_count=_env_int(
+                "TICK_ENTRY_CONFIRM_COUNT",
+                cls.tick_entry_confirm_count,
+            ),
+            tick_entry_max_above_anchor=_env_float(
+                "TICK_ENTRY_MAX_ABOVE_ANCHOR",
+                cls.tick_entry_max_above_anchor,
+            ),
+            late_pullback_max_hod_pct=_env_float(
+                "LATE_PULLBACK_MAX_HOD_PCT",
+                cls.late_pullback_max_hod_pct,
+            ),
+            late_pullback_max_hod_other_pct=_env_float(
+                "LATE_PULLBACK_MAX_HOD_OTHER_PCT",
+                cls.late_pullback_max_hod_other_pct,
+            ),
+            momentum_breakout_enabled=_env_bool(
+                "MOMENTUM_BREAKOUT_ENABLED",
+                cls.momentum_breakout_enabled,
+            ),
+            momentum_breakout_min_rvol=_env_float(
+                "MOMENTUM_BREAKOUT_MIN_RVOL",
+                cls.momentum_breakout_min_rvol,
+            ),
+            momentum_breakout_min_day_volume=_env_float(
+                "MOMENTUM_BREAKOUT_MIN_DAY_VOLUME",
+                cls.momentum_breakout_min_day_volume,
+            ),
+            momentum_breakout_max_bar_range_pct=_env_float(
+                "MOMENTUM_BREAKOUT_MAX_BAR_RANGE_PCT",
+                cls.momentum_breakout_max_bar_range_pct,
+            ),
+            momentum_breakout_score_floor=_env_float(
+                "MOMENTUM_BREAKOUT_SCORE_FLOOR",
+                cls.momentum_breakout_score_floor,
+            ),
+            fresh_vwap_reclaim_scout_enabled=_env_bool(
+                "FRESH_VWAP_RECLAIM_SCOUT_ENABLED",
+                cls.fresh_vwap_reclaim_scout_enabled,
+            ),
+            fresh_vwap_reclaim_scout_max_float=_env_float(
+                "FRESH_VWAP_RECLAIM_SCOUT_MAX_FLOAT",
+                cls.fresh_vwap_reclaim_scout_max_float,
+            ),
+            level_breakout_scout_enabled=_env_bool(
+                "LEVEL_BREAKOUT_SCOUT_ENABLED",
+                cls.level_breakout_scout_enabled,
+            ),
+            level_breakout_scout_min_session_move_pct=_env_float(
+                "LEVEL_BREAKOUT_SCOUT_MIN_SESSION_MOVE_PCT",
+                cls.level_breakout_scout_min_session_move_pct,
             ),
         )
 
