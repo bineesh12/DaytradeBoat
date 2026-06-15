@@ -148,6 +148,57 @@ class TestHalfSellAt2to1:
         assert tracked is not None
         assert tracked.remaining_qty == 60
 
+    def test_runner_candidate_defaults_to_breakeven_after_first_partial(self) -> None:
+        em = ExitManager()
+        pos = _long_pos(entry=5.00, stop=4.80, qty=90)
+        pos.reason = "Quick Momentum Scalp AIIO breakout"
+        pos.runner_candidate = True
+        pos.trend_strength = 0.9
+        em.track(pos)
+
+        exits = em.check_exits({"ABC": 5.10}, _ts(10))
+
+        assert len(exits) == 1
+        tracked = em.tracked.get("ABC")
+        assert tracked is not None
+        assert tracked.sold_half is True
+        assert tracked.breakeven_locked is True
+        assert tracked.stop_loss == pytest.approx(5.00)
+
+    def test_runner_give_room_keeps_structural_stop_after_first_partial(self) -> None:
+        em = ExitManager(runner_give_room_after_partial=True)
+        pos = _long_pos(entry=5.00, stop=4.80, qty=90)
+        pos.reason = "Quick Momentum Scalp AIIO breakout"
+        pos.runner_candidate = True
+        pos.trend_strength = 0.9
+        em.track(pos)
+
+        exits = em.check_exits({"ABC": 5.10}, _ts(10))
+
+        assert len(exits) == 1
+        tracked = em.tracked.get("ABC")
+        assert tracked is not None
+        assert tracked.sold_half is True
+        assert tracked.runner_confirmed is True
+        assert tracked.breakeven_locked is True
+        assert tracked.stop_loss == pytest.approx(4.80)
+
+    def test_runner_give_room_does_not_apply_to_non_runner_partial(self) -> None:
+        em = ExitManager(runner_give_room_after_partial=True)
+        pos = _long_pos(entry=5.00, stop=4.80, qty=90)
+        pos.reason = "Momentum Burst AIIO"
+        pos.runner_candidate = False
+        em.track(pos)
+
+        exits = em.check_exits({"ABC": 5.10}, _ts(10))
+
+        assert len(exits) == 1
+        tracked = em.tracked.get("ABC")
+        assert tracked is not None
+        assert tracked.sold_half is True
+        assert tracked.breakeven_locked is True
+        assert tracked.stop_loss == pytest.approx(5.00)
+
     def test_ordinary_scalp_partial_does_not_confirm_runner(self) -> None:
         em = ExitManager()
         pos = _long_pos(entry=5.00, stop=4.80)
@@ -380,3 +431,33 @@ class TestAdaptiveRunnerTrail:
         for _ in range(5):
             crazy.record_bar_range(0.10)     # 10% -> 25%, above cap
         assert em._runner_trail_for(crazy) == pytest.approx(0.10)
+
+
+class TestGiveRunnerRoom:
+    def _runner(self, em: ExitManager) -> TrackedPosition:
+        pos = _long_pos(entry=5.00, stop=4.90, qty=100)  # risk 0.10, 1:1 target 5.20
+        pos.runner_candidate = True
+        em._positions[pos.symbol] = pos
+        return pos
+
+    def test_breakeven_by_default_after_partial(self) -> None:
+        em = ExitManager(runner_give_room_after_partial=False)
+        pos = self._runner(em)
+        em.check_exits({"ABC": 5.20}, _ts(30))  # hits 1:1 target -> half sell
+        assert pos.sold_half is True
+        assert pos.stop_loss == pytest.approx(5.00)  # snapped to breakeven
+
+    def test_give_room_keeps_wider_stop_after_partial(self) -> None:
+        em = ExitManager(runner_give_room_after_partial=True)
+        pos = self._runner(em)
+        em.check_exits({"ABC": 5.20}, _ts(30))
+        assert pos.sold_half is True
+        assert pos.breakeven_locked is True
+        assert pos.stop_loss == pytest.approx(4.90)  # kept the wider original stop
+
+    def test_give_room_ignored_for_non_runner(self) -> None:
+        em = ExitManager(runner_give_room_after_partial=True)
+        pos = _long_pos(entry=5.00, stop=4.90, qty=100)  # runner_candidate stays False
+        em._positions[pos.symbol] = pos
+        em.check_exits({"ABC": 5.20}, _ts(30))
+        assert pos.stop_loss == pytest.approx(5.00)  # non-runners still go breakeven

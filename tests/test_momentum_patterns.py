@@ -2266,3 +2266,58 @@ def test_fresh_vwap_reclaim_scout_verify_uses_new_base_stop_and_reduced_size(
     assert hit.criteria["size_factor"] == pytest.approx(0.35)
     assert "fresh VWAP reclaim scout" in signal.reason
     assert signal.quantity == int(35.0 / (signal.entry_price - signal.stop_loss))
+
+
+def test_vwap_reclaim_scout_retries_near_miss_score_as_reduced_size() -> None:
+    now = datetime.now(timezone.utc)
+    bars = [
+        _bar(0, close=2.20, open_=2.20, high=2.24, low=2.16, volume=60_000, base_ts=now, n=12),
+        _bar(1, close=2.32, open_=2.20, high=2.36, low=2.19, volume=70_000, base_ts=now, n=12),
+        _bar(2, close=2.46, open_=2.32, high=2.50, low=2.31, volume=80_000, base_ts=now, n=12),
+        _bar(3, close=2.62, open_=2.46, high=2.68, low=2.44, volume=90_000, base_ts=now, n=12),
+        _bar(4, close=2.56, open_=2.62, high=2.66, low=2.50, volume=60_000, base_ts=now, n=12),
+        _bar(5, close=2.58, open_=2.56, high=2.64, low=2.52, volume=58_000, base_ts=now, n=12),
+        _bar(6, close=2.60, open_=2.58, high=2.66, low=2.54, volume=62_000, base_ts=now, n=12),
+        _bar(7, close=2.63, open_=2.60, high=2.69, low=2.58, volume=64_000, base_ts=now, n=12),
+        _bar(8, close=2.66, open_=2.63, high=2.70, low=2.60, volume=72_000, base_ts=now, n=12),
+        _bar(9, close=2.67, open_=2.63, high=2.69, low=2.58, volume=58_000, base_ts=now, n=12),
+    ]
+    hit = ScanResult(
+        symbol="AIIO",
+        scanner_name="vwap_pullback",
+        ts=now,
+        score=100.0,
+        criteria={
+            "setup_tier": "A+ setup",
+            "pattern": "vwap_pullback",
+            "direction": "up",
+            "close": bars[-1].close,
+            "pullback_low": 2.50,
+            "volume": bars[-1].volume,
+        },
+        bars=bars,
+    )
+    calls = []
+
+    def fake_guard(*args, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return "entry score too low (77/100, need 80+) [test]"
+        return None
+
+    verifier = MomentumPatternVerifier(
+        max_dollar_risk=100.0,
+        vwap_reclaim_scout_enabled=True,
+    )
+
+    with patch("daytrading.strategy.scalping.momentum_pattern.check_entry_quality", side_effect=fake_guard):
+        signal = verifier.verify(hit, PortfolioState(cash=100_000))
+
+    assert signal is not None
+    assert len(calls) == 2
+    assert calls[0]["entry_tier"] == ""
+    assert calls[1]["entry_tier"] == "vwap_reclaim_scout"
+    assert hit.criteria["entry_tier"] == "vwap_reclaim_scout"
+    assert hit.criteria["entry_score_at_signal"] == 77
+    assert hit.criteria["size_factor"] == pytest.approx(0.30)
+    assert "VWAP reclaim scout" in signal.reason

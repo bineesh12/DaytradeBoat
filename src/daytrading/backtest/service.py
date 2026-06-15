@@ -20,6 +20,7 @@ from daytrading.pipeline.factory import create_scalping_pipeline
 
 SUPPORTED_FLAGS = {
     "fresh_vwap_reclaim_scout",
+    "vwap_reclaim_scout",
     "level_breakout_scout",
     "elite_wide_spread",
     "momentum_burst_live",
@@ -80,6 +81,7 @@ def normalize_session_date(value: str | date) -> date:
 DEFAULT_EXPERIMENTS: Dict[str, Dict[str, bool]] = {
     "baseline": {
         "fresh_vwap_reclaim_scout": False,
+        "vwap_reclaim_scout": False,
         "level_breakout_scout": False,
         "elite_wide_spread": False,
         "momentum_burst_live": False,
@@ -89,6 +91,17 @@ DEFAULT_EXPERIMENTS: Dict[str, Dict[str, bool]] = {
     },
     "fresh_vwap_reclaim_scout": {
         "fresh_vwap_reclaim_scout": True,
+        "vwap_reclaim_scout": False,
+        "level_breakout_scout": False,
+        "elite_wide_spread": False,
+        "momentum_burst_live": False,
+        "level_capped_entry": False,
+        "execution_timer_10s": True,
+        "ten_second_breakout_scout": False,
+    },
+    "vwap_reclaim_scout": {
+        "fresh_vwap_reclaim_scout": False,
+        "vwap_reclaim_scout": True,
         "level_breakout_scout": False,
         "elite_wide_spread": False,
         "momentum_burst_live": False,
@@ -98,6 +111,7 @@ DEFAULT_EXPERIMENTS: Dict[str, Dict[str, bool]] = {
     },
     "level_breakout_scout": {
         "fresh_vwap_reclaim_scout": False,
+        "vwap_reclaim_scout": False,
         "level_breakout_scout": True,
         "elite_wide_spread": False,
         "momentum_burst_live": False,
@@ -107,6 +121,7 @@ DEFAULT_EXPERIMENTS: Dict[str, Dict[str, bool]] = {
     },
     "elite_wide_spread": {
         "fresh_vwap_reclaim_scout": False,
+        "vwap_reclaim_scout": False,
         "level_breakout_scout": False,
         "elite_wide_spread": True,
         "momentum_burst_live": False,
@@ -116,6 +131,7 @@ DEFAULT_EXPERIMENTS: Dict[str, Dict[str, bool]] = {
     },
     "momentum_burst_live": {
         "fresh_vwap_reclaim_scout": False,
+        "vwap_reclaim_scout": False,
         "level_breakout_scout": False,
         "elite_wide_spread": False,
         "momentum_burst_live": True,
@@ -125,6 +141,7 @@ DEFAULT_EXPERIMENTS: Dict[str, Dict[str, bool]] = {
     },
     "level_capped_entry": {
         "fresh_vwap_reclaim_scout": False,
+        "vwap_reclaim_scout": False,
         "level_breakout_scout": False,
         "elite_wide_spread": False,
         "momentum_burst_live": False,
@@ -134,6 +151,7 @@ DEFAULT_EXPERIMENTS: Dict[str, Dict[str, bool]] = {
     },
     "ten_second_breakout_scout": {
         "fresh_vwap_reclaim_scout": False,
+        "vwap_reclaim_scout": False,
         "level_breakout_scout": False,
         "elite_wide_spread": False,
         "momentum_burst_live": False,
@@ -143,6 +161,7 @@ DEFAULT_EXPERIMENTS: Dict[str, Dict[str, bool]] = {
     },
     "level_reclaim_10s_scout": {
         "fresh_vwap_reclaim_scout": False,
+        "vwap_reclaim_scout": False,
         "level_breakout_scout": False,
         "elite_wide_spread": False,
         "momentum_burst_live": False,
@@ -165,6 +184,7 @@ def normalize_flags(flags: Optional[Dict[str, Any]]) -> Dict[str, bool]:
     raw = flags or {}
     return {
         "fresh_vwap_reclaim_scout": bool(raw.get("fresh_vwap_reclaim_scout", False)),
+        "vwap_reclaim_scout": bool(raw.get("vwap_reclaim_scout", False)),
         "level_breakout_scout": bool(raw.get("level_breakout_scout", False)),
         "elite_wide_spread": bool(raw.get("elite_wide_spread", False)),
         "momentum_burst_live": bool(raw.get("momentum_burst_live", False)),
@@ -313,6 +333,7 @@ def run_backtest(
                 broker=broker,
                 portfolio=portfolio,
                 fresh_vwap_reclaim_scout_enabled=active_flags["fresh_vwap_reclaim_scout"],
+                vwap_reclaim_scout_enabled=active_flags["vwap_reclaim_scout"],
                 level_breakout_scout_enabled=active_flags["level_breakout_scout"],
                 momentum_burst_live_enabled=active_flags["momentum_burst_live"],
                 level_capped_entry_enabled=active_flags["level_capped_entry"],
@@ -337,6 +358,9 @@ def run_backtest(
                 runner_trail_cap=(
                     settings.strategy.runner_trail_cap if settings else 0.10
                 ),
+                runner_give_room_after_partial=(
+                    settings.strategy.runner_give_room_after_partial if settings else False
+                ),
             )
             # The chase guards are configured via methods (not factory kwargs), so
             # the backtest must apply settings here or it silently runs the engine
@@ -346,6 +370,8 @@ def run_backtest(
                     window_sec=settings.strategy.missed_a_plus_chase_window_sec,
                     pct_sub5=settings.strategy.missed_a_plus_chase_pct_sub5,
                     pct_5plus=settings.strategy.missed_a_plus_chase_pct_5plus,
+                    fresh_base_reset=settings.strategy.missed_a_plus_fresh_base_reset,
+                    fresh_base_pct=settings.strategy.missed_a_plus_fresh_base_pct,
                 )
                 pipeline.configure_entry_chase_guard(
                     pct_low=settings.strategy.entry_chase_pct_low,

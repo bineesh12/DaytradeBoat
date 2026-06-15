@@ -68,6 +68,14 @@ class StrategyConfig:
     missed_a_plus_chase_window_sec: float = 1800.0
     missed_a_plus_chase_pct_sub5: float = 0.035
     missed_a_plus_chase_pct_5plus: float = 0.025
+    # Fresh-base reset for the anti-chase MEMORY: when the current setup's own
+    # base has migrated >= this % above a stale blocked level, treat that level as
+    # stale (a new higher base formed) and don't let the memory veto an entry the
+    # primary own-base chase guard already approves. Off by default; this is what
+    # lets a genuine re-entry (e.g. SUNE hod_reclaim) through without globally
+    # loosening chase. Validate on a basket before enabling.
+    missed_a_plus_fresh_base_reset: bool = False
+    missed_a_plus_fresh_base_pct: float = 0.08
     # Normal anti-chase cap: max % a fill may sit above the setup base before the
     # entry is rejected as a late chase. Cheap fast movers (< price tier) get more
     # room; pricier names stay tight. Now config-driven (was hardcoded 0.025/0.035,
@@ -98,6 +106,11 @@ class StrategyConfig:
     runner_trail_adaptive: bool = False
     runner_trail_atr_mult: float = 2.5
     runner_trail_cap: float = 0.10
+    # EXPERIMENTAL (default OFF). After the first partial, runner candidates keep
+    # their original structural stop instead of snapping the back-half to
+    # breakeven. This gives AIIO/CUPR-style runners room for a normal dip, but it
+    # increases give-back when the move fails after the partial.
+    runner_give_room_after_partial: bool = False
     tick_entry_enabled: bool = False
     tick_entry_confirm_count: int = 2
     tick_entry_max_above_anchor: float = 0.02
@@ -125,10 +138,19 @@ class StrategyConfig:
     # gappy/failed reclaims (the GMM case) stay rejected. Paper-test the scorecard.
     fresh_vwap_reclaim_scout_enabled: bool = False
     fresh_vwap_reclaim_scout_max_float: float = 20_000_000
+    # EXPERIMENTAL (default OFF). Lets near-miss A+ VWAP pullbacks with rule
+    # score 75-79 enter as a reduced-size scout when price is reclaiming VWAP on
+    # active liquid tape. This targets AIIO-style 77/100 misses without lowering
+    # the global hard 80 score gate.
+    vwap_reclaim_scout_enabled: bool = False
     # Earlier reduced-size level-breakout scout for smooth/liquid names that
     # would otherwise enter later via first_pullback_reclaim (CONL timing case).
     level_breakout_scout_enabled: bool = False
     level_breakout_scout_min_session_move_pct: float = 3.0
+    # EXPERIMENTAL (default OFF). Promote the momentum_burst scanner from
+    # watch-only to a live A+ entry. Was backtest-only; wired to live for paper
+    # A/B. Adds losers on the basket — paper-test the by_entry_mode scorecard.
+    momentum_burst_live_enabled: bool = False
 
     @classmethod
     def from_env(cls) -> "StrategyConfig":
@@ -195,6 +217,14 @@ class StrategyConfig:
                 "MISSED_A_PLUS_CHASE_PCT_5PLUS",
                 cls.missed_a_plus_chase_pct_5plus,
             ),
+            missed_a_plus_fresh_base_reset=_env_bool(
+                "MISSED_A_PLUS_FRESH_BASE_RESET",
+                cls.missed_a_plus_fresh_base_reset,
+            ),
+            missed_a_plus_fresh_base_pct=_env_float(
+                "MISSED_A_PLUS_FRESH_BASE_PCT",
+                cls.missed_a_plus_fresh_base_pct,
+            ),
             entry_chase_pct_low=_env_float("ENTRY_CHASE_PCT_LOW", cls.entry_chase_pct_low),
             entry_chase_pct_high=_env_float("ENTRY_CHASE_PCT_HIGH", cls.entry_chase_pct_high),
             entry_chase_price_tier=_env_float(
@@ -215,6 +245,10 @@ class StrategyConfig:
                 cls.runner_trail_atr_mult,
             ),
             runner_trail_cap=_env_float("RUNNER_TRAIL_CAP", cls.runner_trail_cap),
+            runner_give_room_after_partial=_env_bool(
+                "RUNNER_GIVE_ROOM_AFTER_PARTIAL",
+                cls.runner_give_room_after_partial,
+            ),
             tick_entry_enabled=_env_bool("TICK_ENTRY_ENABLED", cls.tick_entry_enabled),
             tick_entry_confirm_count=_env_int(
                 "TICK_ENTRY_CONFIRM_COUNT",
@@ -260,6 +294,10 @@ class StrategyConfig:
                 "FRESH_VWAP_RECLAIM_SCOUT_MAX_FLOAT",
                 cls.fresh_vwap_reclaim_scout_max_float,
             ),
+            vwap_reclaim_scout_enabled=_env_bool(
+                "VWAP_RECLAIM_SCOUT_ENABLED",
+                cls.vwap_reclaim_scout_enabled,
+            ),
             level_breakout_scout_enabled=_env_bool(
                 "LEVEL_BREAKOUT_SCOUT_ENABLED",
                 cls.level_breakout_scout_enabled,
@@ -267,6 +305,10 @@ class StrategyConfig:
             level_breakout_scout_min_session_move_pct=_env_float(
                 "LEVEL_BREAKOUT_SCOUT_MIN_SESSION_MOVE_PCT",
                 cls.level_breakout_scout_min_session_move_pct,
+            ),
+            momentum_burst_live_enabled=_env_bool(
+                "MOMENTUM_BURST_LIVE_ENABLED",
+                cls.momentum_burst_live_enabled,
             ),
         )
 

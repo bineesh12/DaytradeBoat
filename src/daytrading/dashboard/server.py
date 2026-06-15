@@ -966,6 +966,7 @@ tr:hover { background:var(--surface2); }
       </label>
       <div style="display:flex;gap:12px;flex-wrap:wrap;font-size:12px;color:var(--text2);padding-bottom:7px">
         <label><input type="checkbox" id="bt-flag-fresh"> fresh VWAP scout</label>
+        <label><input type="checkbox" id="bt-flag-vwap-scout"> VWAP reclaim scout</label>
         <label><input type="checkbox" id="bt-flag-level"> level breakout scout</label>
         <label><input type="checkbox" id="bt-flag-spread"> elite wide spread</label>
         <label><input type="checkbox" id="bt-flag-momentum"> momentum burst live</label>
@@ -1863,12 +1864,14 @@ function runBacktest() {
       date: date,
       flags: {
         fresh_vwap_reclaim_scout: !!(document.getElementById('bt-flag-fresh') || {}).checked,
+        vwap_reclaim_scout: !!(document.getElementById('bt-flag-vwap-scout') || {}).checked,
         level_breakout_scout: !!(document.getElementById('bt-flag-level') || {}).checked,
         elite_wide_spread: !!(document.getElementById('bt-flag-spread') || {}).checked,
         momentum_burst_live: !!(document.getElementById('bt-flag-momentum') || {}).checked,
         level_capped_entry: !!(document.getElementById('bt-flag-capped') || {}).checked,
         execution_timer_10s: !!(document.getElementById('bt-flag-timer') || {}).checked,
-        ten_second_breakout_scout: !!(document.getElementById('bt-flag-10s-scout') || {}).checked
+        ten_second_breakout_scout: !!(document.getElementById('bt-flag-10s-scout') || {}).checked,
+        level_reclaim_10s_scout: !!(document.getElementById('bt-flag-10s-scout') || {}).checked
       }
     })
   }, 1).then(data => {
@@ -2236,7 +2239,7 @@ function renderBacktest() {
   html += '<div class="stat-card"><div class="stat-label">Trades</div><div class="stat-value">' + (sc.closed_trades || 0) + '/' + (sc.trades_taken || 0) + '</div><div class="mini-muted">closed / entries</div></div>';
   html += '<div class="stat-card"><div class="stat-label">Funnel</div><div class="stat-value">' + (f.scan_hits || 0) + ' -> ' + (f.signals || 0) + ' -> ' + (f.entries || 0) + '</div><div class="mini-muted">' + pctText(f.signal_to_entry_pct) + ' signal to entry</div></div>';
   html += '</div>';
-  html += '<div class="mini-muted">Flags: fresh_vwap=' + (flags.fresh_vwap_reclaim_scout ? 'on' : 'off') + ', level_breakout=' + (flags.level_breakout_scout ? 'on' : 'off') + ', elite_wide_spread=' + (flags.elite_wide_spread ? 'on' : 'off') + ', momentum_burst_live=' + (flags.momentum_burst_live ? 'on' : 'off') + ', level_capped_entry=' + (flags.level_capped_entry ? 'on' : 'off') + ', 10s_timer=' + (flags.execution_timer_10s ? 'on' : 'off') + ', 10s_scout=' + (flags.ten_second_breakout_scout ? 'on' : 'off') + '</div>';
+  html += '<div class="mini-muted">Flags: fresh_vwap=' + (flags.fresh_vwap_reclaim_scout ? 'on' : 'off') + ', vwap_reclaim=' + (flags.vwap_reclaim_scout ? 'on' : 'off') + ', level_breakout=' + (flags.level_breakout_scout ? 'on' : 'off') + ', elite_wide_spread=' + (flags.elite_wide_spread ? 'on' : 'off') + ', momentum_burst_live=' + (flags.momentum_burst_live ? 'on' : 'off') + ', level_capped_entry=' + (flags.level_capped_entry ? 'on' : 'off') + ', 10s_timer=' + (flags.execution_timer_10s ? 'on' : 'off') + ', 10s_scout=' + (flags.ten_second_breakout_scout ? 'on' : 'off') + ', 10s_reclaim=' + (flags.level_reclaim_10s_scout ? 'on' : 'off') + '</div>';
   if (r.execution_timer_source) {
     html += '<div class="mini-muted">Execution timer source: ' + escapeHtml(r.execution_timer_source) + '</div>';
   }

@@ -210,6 +210,25 @@ def test_scorecard_isolates_fresh_vwap_reclaim_scout_mode() -> None:
     assert bm["fresh_vwap_reclaim_scout"]["total_pnl"] == 16.0
 
 
+def test_scorecard_isolates_vwap_reclaim_scout_mode() -> None:
+    from daytrading.dashboard.hub import _daily_scorecard
+
+    trades = [
+        {"symbol": "VR", "trade_type": "entry", "strategy": "vwap_reclaim_scout",
+         "entry_time": "t0", "pnl": None},
+        {"symbol": "VR", "trade_type": "exit", "strategy": "vwap_reclaim_scout",
+         "exit_time": "t1", "pnl": 29.78},
+    ]
+    sc = _daily_scorecard(
+        trades=trades, total_trades=1, total_scan_hits=0, total_signals=0,
+        total_rejected=0, cycle_count=0, missed_a_plus=[],
+    )
+    bm = sc["by_entry_mode"]
+    assert bm["vwap_reclaim_scout"]["closed_trades"] == 1
+    assert bm["vwap_reclaim_scout"]["total_pnl"] == 29.78
+    assert "standard" not in bm
+
+
 def test_scorecard_isolates_elite_wide_spread_mode() -> None:
     from daytrading.dashboard.hub import _daily_scorecard
 

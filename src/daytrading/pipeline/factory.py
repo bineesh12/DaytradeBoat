@@ -53,6 +53,7 @@ def create_scalping_pipeline(
     # Experimental conservative fresh-VWAP-reclaim scout (default off)
     fresh_vwap_reclaim_scout_enabled: bool = False,
     fresh_vwap_reclaim_scout_max_float: float = 20_000_000.0,
+    vwap_reclaim_scout_enabled: bool = False,
     level_breakout_scout_enabled: bool = False,
     level_breakout_scout_min_session_move_pct: float = 3.0,
     momentum_burst_live_enabled: bool = False,
@@ -65,6 +66,9 @@ def create_scalping_pipeline(
     runner_trail_adaptive: bool = False,
     runner_trail_atr_mult: float = 2.5,
     runner_trail_cap: float = 0.10,
+    runner_give_room_after_partial: bool = False,
+    step_trail_exit_enabled: bool = False,
+    step_trail_pct: float = 0.025,
 
     # Position limits
     max_positions: int = 3,
@@ -200,6 +204,7 @@ def create_scalping_pipeline(
         late_pullback_max_hod_other_pct=late_pullback_max_hod_other_pct,
         fresh_vwap_reclaim_scout_enabled=fresh_vwap_reclaim_scout_enabled,
         fresh_vwap_reclaim_scout_max_float=fresh_vwap_reclaim_scout_max_float,
+        vwap_reclaim_scout_enabled=vwap_reclaim_scout_enabled,
     )
 
     # --- Classifier + Router ---
@@ -238,6 +243,15 @@ def create_scalping_pipeline(
     }
     if momentum_burst_live_enabled:
         live_verifiers["momentum_burst"] = pattern_verifier
+        # The engine classifies A+ vs watch-only from module-level sets, so adding
+        # the verifier is not enough — promote momentum_burst there too. The
+        # backtest does this via a temp context manager; for a single live
+        # pipeline we set it for the process. Idempotent.
+        import daytrading.pipeline.engine as _engine
+        _engine.LIVE_A_PLUS_SCANNERS = frozenset({*_engine.LIVE_A_PLUS_SCANNERS, "momentum_burst"})
+        _engine.WATCH_ONLY_SCANNERS = frozenset(
+            s for s in _engine.WATCH_ONLY_SCANNERS if s != "momentum_burst"
+        )
 
     scalp_config = StyleConfig(
         scanners=all_scanners,
@@ -299,6 +313,9 @@ def create_scalping_pipeline(
             runner_trail_adaptive=runner_trail_adaptive,
             runner_trail_atr_mult=runner_trail_atr_mult,
             runner_trail_cap=runner_trail_cap,
+            runner_give_room_after_partial=runner_give_room_after_partial,
+            step_trail_exit_enabled=step_trail_exit_enabled,
+            step_trail_pct=step_trail_pct,
         ),
         router=router,
         scaler=runner_readd_scaler,

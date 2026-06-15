@@ -203,9 +203,17 @@ class ExitManager:
         runner_trail_adaptive: bool = False,
         runner_trail_atr_mult: float = 2.5,
         runner_trail_cap: float = 0.10,
+        runner_give_room_after_partial: bool = False,
+        step_trail_exit_enabled: bool = False,
+        step_trail_pct: float = 0.025,
     ) -> None:
         self._positions: Dict[str, TrackedPosition] = {}
         self._max_unrealized_loss = max_unrealized_loss
+        # Step-trail exit (default off): ride a long while it keeps clearing
+        # step_trail_pct-sized steps up; cut the moment it stalls back below the
+        # last step. Overrides the partial/breakeven/runner-trail logic when on.
+        self._step_trail_exit = bool(step_trail_exit_enabled)
+        self._step_trail_pct = max(0.001, float(step_trail_pct))
         # How wide the back half of a confirmed runner trails behind the high, and
         # how far it must run past the partial before it earns that wider trail.
         # Tunable: a wider trail rides continuation runners (CUPR) further but
@@ -219,6 +227,25 @@ class ExitManager:
         self._runner_trail_adaptive = bool(runner_trail_adaptive)
         self._runner_trail_atr_mult = max(0.0, float(runner_trail_atr_mult))
         self._runner_trail_cap = max(0.0, float(runner_trail_cap))
+        # Give runner candidates room: after the first partial, keep the wider
+        # entry stop through the first pullback instead of snapping to breakeven
+        # (breakeven shakes a runner out on a normal dip right before it
+        # continues). Off by default. Trade-off: bigger give-back on the ones
+        # that break down after the partial.
+        self._runner_give_room = bool(runner_give_room_after_partial)
+
+    def _apply_post_partial_stop(self, pos: "TrackedPosition") -> None:
+        """Stop to set after the first partial: breakeven, or keep the wider
+        original stop for a give-room runner candidate."""
+        pos.breakeven_locked = True
+        if (
+            self._runner_give_room
+            and pos.runner_candidate
+            and pos.stop_loss is not None
+            and 0 < pos.stop_loss < pos.entry_price
+        ):
+            return  # keep the original (wider) stop — give the runner room
+        pos.stop_loss = pos.entry_price
 
     def _runner_trail_for(self, pos: "TrackedPosition") -> float:
         """Trail width for a confirmed runner: flat, or volatility-adaptive."""
@@ -434,6 +461,25 @@ class ExitManager:
     ) -> List[TradeSignal]:
         is_long = pos.side is Side.BUY
 
+        # --- step-trail exit (overrides the rest when enabled) ---
+        # Ride while price keeps clearing step_trail_pct steps up; cut the moment
+        # it stalls back below the last cleared step. No partial — full position
+        # rides, so winners run and faders are cut on the first stall.
+        if self._step_trail_exit and is_long and pos.entry_price > 0:
+            steps = int(max(0.0, pos.highest_price / pos.entry_price - 1.0) / self._step_trail_pct)
+            if steps <= 0:
+                trail_stop = pos.entry_price * (1.0 - self._step_trail_pct)
+            else:
+                trail_stop = pos.entry_price * (1.0 + (steps - 1) * self._step_trail_pct)
+            if pos.stop_loss is None or trail_stop > pos.stop_loss:
+                pos.stop_loss = round(trail_stop, 4)
+            if price <= pos.stop_loss:
+                reason = ExitReason.TRAILING_STOP if steps > 0 else ExitReason.STOP_LOSS
+                sig = self._make_exit(pos, pos.remaining_qty, price, reason)
+                pos.remaining_qty = 0
+                return [sig]
+            return []
+
         # --- dynamic step sizing based on momentum and trend strength ---
         if not pos._step_adjusted and pos.current_step == 0:
             if is_long:
@@ -514,9 +560,8 @@ class ExitManager:
                 )
                 pos.sold_half = True
                 pos.remaining_qty -= partial_qty
-                pos.stop_loss = pos.entry_price
-                pos.breakeven_locked = True
                 self._maybe_confirm_runner(pos, price)
+                self._apply_post_partial_stop(pos)
                 sig = self._make_exit(pos, partial_qty, price, ExitReason.TAKE_PROFIT)
                 return [sig]
 
@@ -530,9 +575,8 @@ class ExitManager:
                 )
                 pos.sold_half = True
                 pos.remaining_qty -= partial_qty
-                pos.stop_loss = pos.entry_price  # breakeven stop on remaining
-                pos.breakeven_locked = True
                 self._maybe_confirm_runner(pos, price)
+                self._apply_post_partial_stop(pos)
                 sig = self._make_exit(pos, partial_qty, price, ExitReason.TAKE_PROFIT)
                 return [sig]
 

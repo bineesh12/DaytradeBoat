@@ -114,6 +114,8 @@ def _entry_strategy_label(signal: TradeSignal) -> str:
         tier = str(criteria.get("entry_tier") or "")
         if tier == "fresh_vwap_reclaim_scout":
             return "fresh_vwap_reclaim_scout"
+        if tier == "vwap_reclaim_scout":
+            return "vwap_reclaim_scout"
         if sr.scanner_name:
             return sr.scanner_name
     return signal.reason or "unknown"
@@ -183,6 +185,8 @@ class TradingPipeline:
         self._missed_a_plus_chase_window_sec: float = 1800.0
         self._missed_a_plus_chase_pct_sub5: float = 0.035
         self._missed_a_plus_chase_pct_5plus: float = 0.025
+        self._missed_a_plus_fresh_base_reset: bool = False
+        self._missed_a_plus_fresh_base_pct: float = 0.08
         # Normal anti-chase cap (see configure_entry_chase_guard / StrategyConfig).
         self._entry_chase_pct_low: float = 0.05
         self._entry_chase_pct_high: float = 0.025
@@ -249,10 +253,14 @@ class TradingPipeline:
         window_sec: float,
         pct_sub5: float,
         pct_5plus: float,
+        fresh_base_reset: bool = False,
+        fresh_base_pct: float = 0.08,
     ) -> None:
         self._missed_a_plus_chase_window_sec = max(0.0, float(window_sec))
         self._missed_a_plus_chase_pct_sub5 = max(0.0, float(pct_sub5))
         self._missed_a_plus_chase_pct_5plus = max(0.0, float(pct_5plus))
+        self._missed_a_plus_fresh_base_reset = bool(fresh_base_reset)
+        self._missed_a_plus_fresh_base_pct = max(0.0, float(fresh_base_pct))
 
     def configure_entry_chase_guard(
         self,
@@ -644,6 +652,61 @@ class TradingPipeline:
                 )
         except Exception:
             pass
+
+    @staticmethod
+    def _allow_vwap_reclaim_scout_trade_guard_exception(
+        signal: TradeSignal,
+        *,
+        bars: Optional[Sequence[Bar]],
+        quotes: Optional[Sequence[Quote]],
+        reason: Optional[str],
+    ) -> bool:
+        """Let a reduced VWAP reclaim scout pass the duplicate liquidity-trap check.
+
+        The main entry guard already scored this as a near-miss A+ VWAP reclaim.
+        This exception is intentionally narrow: it only clears the trade guard's
+        spread/weak-volume trap when the scout is tagged and the recent tape is
+        still active enough. Spike-and-fade and gap-up trap rejects remain hard.
+        """
+        text = str(reason or "").lower()
+        if "liquidity trap: spread" not in text:
+            return False
+        sr = signal.scan_result
+        criteria = sr.criteria if sr is not None else {}
+        if str(criteria.get("entry_tier") or "") != "vwap_reclaim_scout":
+            return False
+        if not bars or len(bars) < 6 or not quotes:
+            return False
+
+        latest = bars[-1]
+        quote = quotes[-1]
+        if latest.close <= 0 or latest.close <= latest.open:
+            return False
+        if quote.spread_pct > 1.0:
+            return False
+
+        day_volume = sum(max(0.0, float(b.volume or 0.0)) for b in bars)
+        recent_volume = sum(max(0.0, float(b.volume or 0.0)) for b in bars[-3:])
+        prior_5 = list(bars[-6:-1])
+        avg_prior = (
+            sum(max(0.0, float(b.volume or 0.0)) for b in prior_5) / len(prior_5)
+            if prior_5 else 0.0
+        )
+        latest_volume = max(0.0, float(latest.volume or 0.0))
+        if day_volume < 500_000 or recent_volume < 150_000 or latest_volume < 40_000:
+            return False
+        if avg_prior > 0 and latest_volume < avg_prior * 0.75:
+            return False
+
+        body = abs(latest.close - latest.open)
+        upper_wick = latest.high - max(latest.open, latest.close)
+        if body > 0 and upper_wick > body * 2.0:
+            return False
+
+        vwap = float(criteria.get("vwap") or 0.0)
+        if vwap > 0 and latest.close < vwap * 1.003:
+            return False
+        return True
 
     @staticmethod
     def _log_shadow_execution(
@@ -1525,6 +1588,17 @@ class TradingPipeline:
                 guard_ok, guard_reason = self._trade_guard.check_entry(
                     signal, bars=sym_bars, quotes=sym_quotes,
                 )
+                if (
+                    not guard_ok
+                    and self._allow_vwap_reclaim_scout_trade_guard_exception(
+                        signal, bars=sym_bars, quotes=sym_quotes, reason=guard_reason,
+                    )
+                ):
+                    guard_ok = True
+                    logger.info(
+                        "GUARD PASS %s: VWAP reclaim scout liquidity exception: %s",
+                        signal.symbol, guard_reason,
+                    )
                 if not guard_ok:
                     logger.info("GUARD REJECT %s: %s", signal.symbol, guard_reason)
                     result.rejected_orders += 1
@@ -1684,6 +1758,9 @@ class TradingPipeline:
         if live <= 0:
             return None
 
+        # Own-base anchor first: it both gates the primary chase check below and
+        # tells the memory whether the setup base has moved up off a stale level.
+        anchor = self._signal_chase_anchor(signal)
         missed_reject = self._missed_a_plus.chase_reject(
             symbol=signal.symbol,
             price=live,
@@ -1692,11 +1769,12 @@ class TradingPipeline:
             max_age_seconds=self._missed_a_plus_chase_window_sec,
             max_chase_pct_sub5=self._missed_a_plus_chase_pct_sub5,
             max_chase_pct_5plus=self._missed_a_plus_chase_pct_5plus,
+            fresh_base_anchor=(anchor if self._missed_a_plus_fresh_base_reset else 0.0),
+            fresh_base_reset_pct=self._missed_a_plus_fresh_base_pct,
         )
         if missed_reject:
             return missed_reject
 
-        anchor = self._signal_chase_anchor(signal)
         if anchor <= 0:
             return None
         # Price-tiered: cheap fast movers cover ground quickly between signal and

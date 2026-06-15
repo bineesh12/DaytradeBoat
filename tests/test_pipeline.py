@@ -12,6 +12,7 @@ from daytrading.strategy.gap_reversal import GapReversalVerifier
 from daytrading.models import (
     Bar,
     PortfolioState,
+    Quote,
     ScanResult,
     SignalAction,
     TradeSignal,
@@ -143,6 +144,96 @@ def _bar(
     h = high if high is not None else close + 1.0
     lo = low if low is not None else close - 1.0
     return Bar(symbol=symbol, ts=TS, open=o, high=h, low=lo, close=close, volume=volume)
+
+
+def _vwap_scout_signal(
+    *,
+    entry_tier: str = "vwap_reclaim_scout",
+    pattern: str = "vwap_pullback",
+) -> TradeSignal:
+    hit = ScanResult(
+        symbol="HOT",
+        scanner_name=pattern,
+        ts=TS,
+        score=77.0,
+        criteria={
+            "pattern": pattern,
+            "entry_tier": entry_tier,
+            "setup_tier": "A+ setup",
+            "vwap": 2.60,
+        },
+    )
+    return TradeSignal(
+        symbol="HOT",
+        action=SignalAction.ENTER_LONG,
+        quantity=30,
+        entry_price=2.67,
+        stop_loss=2.55,
+        take_profit=3.05,
+        reason="VWAP reclaim scout",
+        scan_result=hit,
+    )
+
+
+def _vwap_scout_bars() -> list[Bar]:
+    closes = [2.45, 2.50, 2.54, 2.58, 2.62, 2.67]
+    volumes = [100_000, 110_000, 105_000, 80_000, 75_000, 85_000]
+    return [
+        _bar(
+            "HOT",
+            close=close,
+            open_=close - 0.03,
+            high=close + 0.02,
+            low=close - 0.04,
+            volume=volume,
+        )
+        for close, volume in zip(closes, volumes)
+    ]
+
+
+def test_vwap_reclaim_scout_can_clear_mild_trade_guard_spread_trap() -> None:
+    signal = _vwap_scout_signal()
+    bars = _vwap_scout_bars()
+    quotes = [Quote("HOT", TS, bid=2.659, ask=2.681, bid_size=1400, ask_size=1300)]
+
+    assert TradingPipeline._allow_vwap_reclaim_scout_trade_guard_exception(
+        signal,
+        bars=bars,
+        quotes=quotes,
+        reason="liquidity trap: spread 0.82% with weak volume 58177 vs avg 71657",
+    )
+
+
+def test_vwap_reclaim_scout_trade_guard_exception_requires_tag() -> None:
+    signal = _vwap_scout_signal(entry_tier="")
+    bars = _vwap_scout_bars()
+    quotes = [Quote("HOT", TS, bid=2.659, ask=2.681, bid_size=1400, ask_size=1300)]
+
+    assert not TradingPipeline._allow_vwap_reclaim_scout_trade_guard_exception(
+        signal,
+        bars=bars,
+        quotes=quotes,
+        reason="liquidity trap: spread 0.82% with weak volume 58177 vs avg 71657",
+    )
+
+
+def test_vwap_reclaim_scout_trade_guard_exception_keeps_hard_traps() -> None:
+    signal = _vwap_scout_signal()
+    bars = _vwap_scout_bars()
+    quotes = [Quote("HOT", TS, bid=2.63, ask=2.71, bid_size=1400, ask_size=1300)]
+
+    assert not TradingPipeline._allow_vwap_reclaim_scout_trade_guard_exception(
+        signal,
+        bars=bars,
+        quotes=quotes,
+        reason="liquidity trap: spread 2.99% with weak volume 58177 vs avg 71657",
+    )
+    assert not TradingPipeline._allow_vwap_reclaim_scout_trade_guard_exception(
+        signal,
+        bars=bars,
+        quotes=[Quote("HOT", TS, bid=2.659, ask=2.681, bid_size=1400, ask_size=1300)],
+        reason="liquidity trap: spike-and-fade (wick 0.20 > 2x body 0.05)",
+    )
 
 
 class _CountingBroker(PaperBroker):

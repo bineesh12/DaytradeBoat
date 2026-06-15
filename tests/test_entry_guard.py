@@ -956,6 +956,45 @@ class TestScoringSystem:
 
         assert r is None or "below VWAP" not in r
 
+    def test_vwap_reclaim_scout_final_guard_can_use_original_setup_score(self) -> None:
+        """The timed release bar should confirm timing, not replace the accepted 1m setup score."""
+        now = datetime.now(timezone.utc)
+        rows = [
+            (2.35, 2.40, 2.44, 2.34, 80_000),
+            (2.40, 2.46, 2.50, 2.39, 90_000),
+            (2.46, 2.54, 2.58, 2.44, 100_000),
+            (2.54, 2.62, 2.68, 2.52, 110_000),
+            (2.62, 2.56, 2.66, 2.50, 70_000),
+            (2.56, 2.58, 2.64, 2.52, 65_000),
+            (2.58, 2.60, 2.66, 2.54, 70_000),
+            (2.60, 2.63, 2.69, 2.58, 75_000),
+            (2.63, 2.67, 2.70, 2.58, 58_000),
+            # 10s/timed release context: clean hold, but doji-ish score is lower.
+            (2.672, 2.75, 2.78, 2.665, 40_342),
+        ]
+        bars = [
+            _bar(i, close=c, open_=o, high=h, low=l, volume=v, base_ts=now, n=len(rows))
+            for i, (o, c, h, l, v) in enumerate(rows)
+        ]
+        quotes = [
+            Quote(symbol="AIIO", ts=now, bid=2.745, ask=2.755, bid_size=1500, ask_size=1400)
+            for _ in range(5)
+        ]
+
+        r = eg.check_entry_quality(
+            bars,
+            symbol="AIIO",
+            avg_daily_volume=1_500_000,
+            float_shares=8_000_000,
+            quotes=quotes,
+            entry_pattern="vwap_pullback",
+            setup_tier="A+ setup",
+            entry_tier="vwap_reclaim_scout",
+            setup_score=77,
+        )
+
+        assert r is None
+
     def test_normal_setup_still_rejects_below_spike_distorted_vwap(self) -> None:
         """The recent-VWAP exception is only for A+ reclaim scouts."""
         now = datetime.now(timezone.utc)

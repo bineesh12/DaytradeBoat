@@ -480,6 +480,7 @@ def test_run_backtest_service_passes_runner_trail_settings(monkeypatch) -> None:
         seen["runner_trail_adaptive"] = kwargs.get("runner_trail_adaptive")
         seen["runner_trail_atr_mult"] = kwargs.get("runner_trail_atr_mult")
         seen["runner_trail_cap"] = kwargs.get("runner_trail_cap")
+        seen["runner_give_room_after_partial"] = kwargs.get("runner_give_room_after_partial")
         return real_factory(*args, **kwargs)
 
     monkeypatch.setattr(
@@ -495,6 +496,7 @@ def test_run_backtest_service_passes_runner_trail_settings(monkeypatch) -> None:
             "runner_trail_adaptive": True,
             "runner_trail_atr_mult": 3.0,
             "runner_trail_cap": 0.12,
+            "runner_give_room_after_partial": True,
         }
     )
 
@@ -511,6 +513,7 @@ def test_run_backtest_service_passes_runner_trail_settings(monkeypatch) -> None:
         "runner_trail_adaptive": True,
         "runner_trail_atr_mult": 3.0,
         "runner_trail_cap": 0.12,
+        "runner_give_room_after_partial": True,
     }
 
 
@@ -525,8 +528,9 @@ def test_backtest_service_passes_chase_guard_settings(monkeypatch) -> None:
     def cap_entry(self, *, pct_low, pct_high, price_tier):
         seen["entry"] = (pct_low, pct_high, price_tier)
 
-    def cap_missed(self, *, window_sec, pct_sub5, pct_5plus):
+    def cap_missed(self, *, window_sec, pct_sub5, pct_5plus, fresh_base_reset=False, fresh_base_pct=0.08):
         seen["missed"] = (window_sec, pct_sub5, pct_5plus)
+        seen["fresh"] = (fresh_base_reset, fresh_base_pct)
 
     monkeypatch.setattr(TradingPipeline, "configure_entry_chase_guard", cap_entry)
     monkeypatch.setattr(TradingPipeline, "configure_missed_a_plus_chase_guard", cap_missed)
@@ -541,6 +545,8 @@ def test_backtest_service_passes_chase_guard_settings(monkeypatch) -> None:
             "missed_a_plus_chase_window_sec": 900.0,
             "missed_a_plus_chase_pct_sub5": 0.06,
             "missed_a_plus_chase_pct_5plus": 0.04,
+            "missed_a_plus_fresh_base_reset": True,
+            "missed_a_plus_fresh_base_pct": 0.09,
         }
     )
 
@@ -548,6 +554,7 @@ def test_backtest_service_passes_chase_guard_settings(monkeypatch) -> None:
 
     assert seen["entry"] == (0.07, 0.04, 8.0)
     assert seen["missed"] == (900.0, 0.06, 0.04)
+    assert seen["fresh"] == (True, 0.09)
 
 
 def test_backtest_service_accepts_european_date_shorthand() -> None:

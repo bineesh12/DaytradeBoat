@@ -16,6 +16,7 @@ Implements Warrior Trading's momentum day trading entry rules:
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime
 from typing import Optional
 
@@ -50,11 +51,13 @@ class MomentumPatternVerifier:
         late_pullback_max_hod_other_pct: float = 10.0,
         fresh_vwap_reclaim_scout_enabled: bool = False,
         fresh_vwap_reclaim_scout_max_float: float = 20_000_000.0,
+        vwap_reclaim_scout_enabled: bool = False,
     ) -> None:
         self._late_pullback_max_hod_pct = float(late_pullback_max_hod_pct)
         self._late_pullback_max_hod_other_pct = float(late_pullback_max_hod_other_pct)
         self._fresh_vwap_reclaim_scout_enabled = bool(fresh_vwap_reclaim_scout_enabled)
         self._fresh_vwap_reclaim_scout_max_float = float(fresh_vwap_reclaim_scout_max_float)
+        self._vwap_reclaim_scout_enabled = bool(vwap_reclaim_scout_enabled)
         self._max_risk = max_risk_per_share
         self._rr_ratio = reward_risk_ratio
         self._trail = trail_ticks * TICK
@@ -1198,6 +1201,8 @@ class MomentumPatternVerifier:
             return 0.35, "A+ deep runner scout"
         if tier == "fresh_vwap_reclaim_scout":
             return 0.35, "fresh VWAP reclaim scout"
+        if tier == "vwap_reclaim_scout":
+            return 0.30, "VWAP reclaim scout"
         if tier == "stair_scout":
             return 0.45, "stair-step scout"
         if tier == "level_scout":
@@ -1216,6 +1221,55 @@ class MomentumPatternVerifier:
         if pattern in ("hod_reclaim", "pullback_base") and recent_volume >= 200_000:
             return 1.0, "A momentum"
         return 0.70, "normal quality"
+
+    @staticmethod
+    def _allows_near_miss_vwap_reclaim_scout(
+        bars: list,
+        scan_result: ScanResult,
+        reject: str,
+    ) -> bool:
+        if "entry score too low" not in str(reject).lower():
+            return False
+        if str(scan_result.criteria.get("setup_tier") or "").lower() != "a+ setup":
+            return False
+        if len(bars) < 10:
+            return False
+        latest = bars[-1]
+        price = float(latest.close or 0.0)
+        if price <= 0 or latest.close <= latest.open:
+            return False
+        vwap_vals = vwap(bars)
+        current_vwap = vwap_vals[-1] if vwap_vals else 0.0
+        if current_vwap <= 0 or price < current_vwap * 1.003:
+            return False
+        session_open = float(bars[0].open or 0.0)
+        session_high = max((float(b.high or 0.0) for b in bars), default=0.0)
+        if session_open <= 0 or session_high <= 0:
+            return False
+        day_move_pct = (session_high - session_open) / session_open * 100.0
+        distance_from_hod = (session_high - price) / session_high * 100.0
+        day_volume = sum(float(b.volume or 0.0) for b in bars)
+        recent_volume = sum(float(b.volume or 0.0) for b in bars[-3:])
+        latest_volume = float(latest.volume or 0.0)
+        if day_move_pct < 10.0 or distance_from_hod > 8.0:
+            return False
+        if day_volume < 500_000 or recent_volume < 150_000 or latest_volume < 40_000:
+            return False
+        base = list(bars[-4:-1])
+        if len(base) < 3:
+            return False
+        base_high = max(float(b.high or 0.0) for b in base)
+        base_low = min(float(b.low or 0.0) for b in base)
+        if base_low <= 0 or base_high <= base_low:
+            return False
+        extension_pct = (price - base_high) / base_high * 100.0
+        if extension_pct > 3.0:
+            return False
+        scan_result.criteria["base_high"] = round(base_high, 4)
+        scan_result.criteria["base_low"] = round(base_low, 4)
+        scan_result.criteria["setup_anchor"] = round(base_high, 4)
+        scan_result.criteria["vwap"] = round(current_vwap, 4)
+        return True
 
     @staticmethod
     def _abc_scout_tactical_stop(price: float, scan_result: ScanResult, bars: list) -> Optional[float]:
@@ -1389,6 +1443,32 @@ class MomentumPatternVerifier:
             entry_tier=str(scan_result.criteria.get("entry_tier") or ""),
             now=now,
         )
+        if (
+            reject is not None
+            and self._vwap_reclaim_scout_enabled
+            and pattern == "vwap_pullback"
+            and self._allows_near_miss_vwap_reclaim_scout(bars, scan_result, reject)
+        ):
+            score_match = re.search(r"(\d+)/100", str(reject))
+            if score_match:
+                scan_result.criteria["entry_score_at_signal"] = int(score_match.group(1))
+            scan_result.criteria["entry_tier"] = "vwap_reclaim_scout"
+            scan_result.criteria["entry_tier_reason"] = (
+                "near-miss A+ VWAP reclaim score; reduced-size scout still requires guard"
+            )
+            reject = check_entry_quality(
+                bars,
+                symbol=scan_result.symbol,
+                avg_daily_volume=self._get_avg_volume(scan_result.symbol),
+                bars_5m=bars_5m,
+                float_shares=float_shares,
+                ticks=list(self._tick_buffer.get(scan_result.symbol, [])) if self._tick_buffer else None,
+                quotes=list(self._quote_buffer.get(scan_result.symbol, [])) if self._quote_buffer else None,
+                entry_pattern=str(pattern or scan_result.scanner_name),
+                setup_tier=str(scan_result.criteria.get("setup_tier") or ""),
+                entry_tier=str(scan_result.criteria.get("entry_tier") or ""),
+                now=now,
+            )
         if reject is not None:
             logger.info("ENTRY GUARD REJECT %s: %s", scan_result.symbol, reject)
             self._last_reject = reject

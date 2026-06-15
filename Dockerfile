@@ -24,7 +24,6 @@ COPY src/ ./src/
 
 RUN pip install --no-cache-dir --no-deps .
 
-COPY data/ ./data/
 COPY retrain-model.sh ./retrain-model.sh
 RUN chmod +x /app/retrain-model.sh
 

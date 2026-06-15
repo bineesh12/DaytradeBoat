@@ -708,6 +708,8 @@ def _daily_scorecard(
             mode = "momentum_breakout"
         elif "fresh_vwap_reclaim" in _s:
             mode = "fresh_vwap_reclaim_scout"
+        elif "vwap_reclaim_scout" in _s:
+            mode = "vwap_reclaim_scout"
         elif "level_breakout_scout" in _s:
             mode = "level_breakout_scout"
         elif "level_capped_scout" in _s:

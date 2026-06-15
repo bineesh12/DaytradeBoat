@@ -209,6 +209,16 @@ class ExecutionTimer:
             )
             return self._release(sym)
 
+        if self._is_vwap_reclaim_scout_signal(pending.signal) and self._allows_vwap_reclaim_release(
+            pending,
+            latest_bar=bar,
+        ):
+            logger.info(
+                "EXEC_TIMER: %s — VWAP reclaim scout released on clean 10s hold (bar %d)",
+                sym, pending.bars_seen,
+            )
+            return self._release(sym)
+
         # Trigger 1: Micro-pullback bounce — red bar followed by green bar
         if pending.saw_red and is_green:
             if not self._passes_pullback_reclaim_confirmation(pending, bar):
@@ -550,6 +560,7 @@ class ExecutionTimer:
                 "deep_runner_scout",
                 "level_scout",
                 "stair_scout",
+                "vwap_reclaim_scout",
             }
             or pattern in {
                 "level_breakout_reclaim",
@@ -928,7 +939,9 @@ class ExecutionTimer:
         if pattern != "vwap_pullback" and scanner != "vwap_pullback":
             return False
 
-        if pending.saw_red:
+        entry_tier = str(hit.criteria.get("entry_tier") or "").lower()
+        is_reduced_scout = entry_tier == "vwap_reclaim_scout"
+        if pending.saw_red and not is_reduced_scout:
             return False
         if latest_bar is None:
             return False
@@ -943,9 +956,11 @@ class ExecutionTimer:
             return False
         if close < open_ * 0.998:
             return False
-        if close < price * 0.995:
+        min_hold = 0.990 if is_reduced_scout else 0.995
+        max_extension = 1.030 if is_reduced_scout else 1.015
+        if close < price * min_hold:
             return False
-        if close > price * 1.015:
+        if close > price * max_extension:
             return False
 
         vwap_level = ExecutionTimer._criteria_float(hit.criteria, "vwap")
@@ -955,11 +970,31 @@ class ExecutionTimer:
             return False
 
         pullback_low = ExecutionTimer._criteria_float(hit.criteria, "pullback_low")
+        if pullback_low is None:
+            pullback_low = ExecutionTimer._criteria_float(hit.criteria, "base_low")
         if pullback_low is not None and pullback_low > 0 and close < pullback_low:
+            return False
+
+        stop = ExecutionTimer._criteria_float(hit.criteria, "stop_price")
+        if stop is None and signal.stop_loss is not None:
+            stop = float(signal.stop_loss)
+        if (
+            stop is not None
+            and stop > 0
+            and stop < price
+            and float(latest_bar.low or 0.0) <= stop
+        ):
             return False
 
         score = float(hit.score or 0.0)
         volume = float(hit.criteria.get("volume") or 0.0)
+        if is_reduced_scout:
+            if not ExecutionTimer._has_active_10s_tape(signal, latest_bar):
+                return False
+            if score < 6.0 and volume < 250_000:
+                return False
+            return True
+
         if score < 12.0 and volume < 100_000:
             return False
 
@@ -1088,6 +1123,19 @@ class ExecutionTimer:
         if hit is None:
             return False
         return str(hit.criteria.get("entry_tier", "")) == "pullback_scout"
+
+    @staticmethod
+    def _is_vwap_reclaim_scout_signal(signal: TradeSignal) -> bool:
+        hit = signal.scan_result
+        if hit is None:
+            return False
+        criteria = hit.criteria
+        pattern = str(criteria.get("pattern") or "")
+        scanner = str(hit.scanner_name or "")
+        return (
+            str(criteria.get("entry_tier") or "").lower() == "vwap_reclaim_scout"
+            and (pattern == "vwap_pullback" or scanner == "vwap_pullback")
+        )
 
     @staticmethod
     def _pullback_volume_profile_score(signal: TradeSignal) -> float:

@@ -31,6 +31,8 @@ def test_dashboard_renders_backtest_page() -> None:
     assert ".replace(' ET', '')" in html
     assert "A+ Funnel Detail" in html
     assert "Backtest Gate Breakdown" in html
+    assert "level_reclaim_10s_scout" in html
+    assert "10s_reclaim=" in html
 
 
 def test_backtest_endpoint_returns_service_result(monkeypatch) -> None:

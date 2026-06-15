@@ -445,11 +445,20 @@ class MissedAPlusTracker:
         max_age_seconds: float = 1800.0,
         max_chase_pct_sub5: float = 0.035,
         max_chase_pct_5plus: float = 0.025,
+        fresh_base_anchor: float = 0.0,
+        fresh_base_reset_pct: float = 0.0,
     ) -> Optional[str]:
         """Reject late buys far above a recent blocked A+ setup.
 
         This keeps the system from missing the early A+ decision point and then
         buying the same move much higher a few minutes later.
+
+        ``fresh_base_anchor`` is the CURRENT signal's own setup base (the price
+        the primary chase guard measures from). When it has migrated materially
+        above a stale blocked level (by >= ``fresh_base_reset_pct``), that level
+        is treated as stale — a new, higher base has formed, so this is a fresh
+        setup, not a re-chase of the old move. The primary own-base chase guard
+        still applies after this returns.
         """
         now = _utc(now)
         if price <= 0:
@@ -465,6 +474,13 @@ class MissedAPlusTracker:
             if (now - rec.first_seen).total_seconds() > max_age_seconds:
                 continue
             if self._is_non_actionable_chase_anchor(rec):
+                continue
+            if (
+                fresh_base_anchor > 0
+                and fresh_base_reset_pct > 0
+                and fresh_base_anchor >= rec.price_at_reject * (1.0 + fresh_base_reset_pct)
+            ):
+                # Setup base moved up off this stale level -> new base, not a chase.
                 continue
             candidates.append(rec)
         if not candidates:

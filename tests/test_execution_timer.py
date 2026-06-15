@@ -98,6 +98,34 @@ def _bgms_vwap_signal(symbol: str = "BGMS", price: float = 2.93) -> TradeSignal:
     )
 
 
+def _vwap_reclaim_scout_signal(symbol: str = "AIIO", price: float = 2.67) -> TradeSignal:
+    return TradeSignal(
+        symbol=symbol,
+        action=SignalAction.ENTER_LONG,
+        quantity=107,
+        entry_price=price,
+        stop_loss=2.53,
+        reason="vwap reclaim scout",
+        scan_result=ScanResult(
+            symbol=symbol,
+            scanner_name="vwap_pullback",
+            ts=datetime.now(timezone.utc),
+            score=77.0,
+            criteria={
+                "pattern": "vwap_pullback",
+                "setup_tier": "A+ setup",
+                "entry_tier": "vwap_reclaim_scout",
+                "direction": "up",
+                "close": price,
+                "vwap": 2.60,
+                "base_low": 2.55,
+                "stop_price": 2.53,
+                "volume": 3_700_000,
+            },
+        ),
+    )
+
+
 def _hot_momentum_signal(symbol: str = "MOMO", price: float = 4.84) -> TradeSignal:
     return TradeSignal(
         symbol=symbol,
@@ -675,6 +703,49 @@ class TestExecutionTimerTriggers:
             pending,
             latest_bar=_10s_bar("SUBT", base, 1.87, 1.88, h=1.89, l=1.85, volume=20_000),
         )
+
+    def test_vwap_reclaim_scout_can_release_after_clean_vwap_hold_even_after_dip(self) -> None:
+        timer = ExecutionTimer(max_wait_bars=2, enabled=True)
+        signal = _vwap_reclaim_scout_signal()
+        timer.queue(signal)
+        base = datetime(2026, 6, 1, 10, 15, 0, tzinfo=timezone.utc)
+
+        assert timer.on_10s_bar(
+            _10s_bar("AIIO", base, 2.67, 2.64, h=2.68, l=2.58, volume=18_000)
+        ) is None
+        released = timer.on_10s_bar(
+            _10s_bar("AIIO", base + timedelta(seconds=10), 2.64, 2.69, h=2.70, l=2.62, volume=22_000)
+        )
+
+        assert released is not None
+        assert released.symbol == "AIIO"
+        assert released.scan_result.criteria["entry_tier"] == "vwap_reclaim_scout"
+
+    def test_vwap_reclaim_scout_can_release_on_first_clean_10s_hold(self) -> None:
+        timer = ExecutionTimer(max_wait_bars=3, enabled=True)
+        signal = _vwap_reclaim_scout_signal()
+        timer.queue(signal)
+        base = datetime(2026, 6, 1, 10, 16, 0, tzinfo=timezone.utc)
+
+        released = timer.on_10s_bar(
+            _10s_bar("AIIO", base, 2.672, 2.75, h=2.78, l=2.665, volume=40_342)
+        )
+
+        assert released is not None
+        assert released.symbol == "AIIO"
+
+    def test_vwap_reclaim_scout_still_waits_on_dead_10s_tape(self) -> None:
+        timer = ExecutionTimer(max_wait_bars=2, enabled=True)
+        signal = _vwap_reclaim_scout_signal()
+        timer.queue(signal)
+        base = datetime(2026, 6, 1, 10, 15, 0, tzinfo=timezone.utc)
+
+        released = timer.on_10s_bar(
+            _10s_bar("AIIO", base, 2.67, 2.68, h=2.69, l=2.65, volume=300)
+        )
+
+        assert released is None
+        assert "AIIO" in timer.pending_symbols
 
     def test_sub_two_runner_does_not_release_on_dead_10s_tape(self) -> None:
         timer = ExecutionTimer(max_wait_bars=2, enabled=True)

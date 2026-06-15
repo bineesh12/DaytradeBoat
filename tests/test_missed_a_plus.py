@@ -353,6 +353,30 @@ def test_recent_missed_a_plus_rejects_late_chase_entry() -> None:
     assert "earlier blocked A+" in reason
 
 
+def test_fresh_base_reset_skips_stale_chase_anchor() -> None:
+    now = datetime.now(timezone.utc)
+    tracker = MissedAPlusTracker(label_after_seconds=60)
+    bars = _a_plus_bars(now)
+    tracker.record_blocked(
+        layer="scanner",
+        reason="not on HOD momentum alert board",
+        universe={"HOT": bars},
+        hit=_hit(bars, pattern="hod_reclaim"),
+        now=now,
+    )
+    # Stale level (~$5.42) blocks a $6.20 late chase by default.
+    assert tracker.chase_reject(
+        symbol="HOT", price=6.20, now=now + timedelta(minutes=10),
+    ) is not None
+    # But when the current setup's own base ($6.00) has migrated well above the
+    # stale level, the fresh-base reset skips that anchor and allows the entry
+    # (the primary own-base chase guard still vets it upstream).
+    assert tracker.chase_reject(
+        symbol="HOT", price=6.20, now=now + timedelta(minutes=10),
+        fresh_base_anchor=6.00, fresh_base_reset_pct=0.08,
+    ) is None
+
+
 def test_old_missed_a_plus_does_not_block_fresh_setup() -> None:
     now = datetime.now(timezone.utc)
     tracker = MissedAPlusTracker(label_after_seconds=60)

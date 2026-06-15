@@ -402,6 +402,7 @@ def assess_opportunity_scaled_spread(
         "stair_scout",
         "second_chance_reclaim",
         "abc_scout",
+        "vwap_reclaim_scout",
     }
     is_elite_runner = (
         pattern in runner_patterns
@@ -1147,8 +1148,15 @@ def check_entry_quality(
         except Exception as exc:
             logger.debug("ML scoring skipped for %s: %s", symbol, exc)
 
+    vwap_reclaim_scout_score_ok = (
+        tier_context == "vwap_reclaim_scout"
+        and pattern_context == "vwap_pullback"
+        and "a+" in setup_context
+        and max(float(setup_score or 0.0), float(score or 0.0)) >= 75
+        and score >= 60
+    )
     elite_sub2_score_ok = elite_sub2_reclaim and score >= 50
-    if score < ENTRY_SCORE_THRESHOLD and not elite_sub2_score_ok:
+    if score < ENTRY_SCORE_THRESHOLD and not elite_sub2_score_ok and not vwap_reclaim_scout_score_ok:
         reason = "entry score too low ({}/100, need {}+) [{}]".format(
             score, ENTRY_SCORE_THRESHOLD, ", ".join(breakdown),
         )
@@ -1162,6 +1170,13 @@ def check_entry_quality(
     if elite_sub2_score_ok:
         logger.info(
             "ENTRY GUARD %s: elite sub-$2 reclaim score exception %d/%d",
+            symbol,
+            score,
+            ENTRY_SCORE_THRESHOLD,
+        )
+    if vwap_reclaim_scout_score_ok:
+        logger.info(
+            "ENTRY GUARD %s: VWAP reclaim scout score exception %d/%d",
             symbol,
             score,
             ENTRY_SCORE_THRESHOLD,
