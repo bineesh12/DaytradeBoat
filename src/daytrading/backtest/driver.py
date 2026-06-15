@@ -87,6 +87,12 @@ class PipelineBacktestDriver:
         self._use_micro_breakout_scout = bool(use_micro_breakout_scout)
         self._use_level_reclaim_10s_scout = bool(use_level_reclaim_10s_scout)
         self._use_breakout_scalp_replay = bool(use_breakout_scalp_replay)
+        # breakout_scalp_replay fires on every fresh 10s HOD expansion, so left
+        # alone it re-chases the same move (a 30s re-entry right after a winner)
+        # and stacks late top-chases. The live runner takes one entry per
+        # breakout; mirror that with a per-symbol cooldown between replay entries.
+        self._breakout_scalp_last_entry: Dict[str, datetime] = {}
+        self._breakout_scalp_cooldown_sec = 600.0
         self._timer = ExecutionTimer(max_wait_bars=3, enabled=True) if self._use_execution_timer else None
         self._timer_bars_by_symbol = {
             sym.upper(): sorted(list(bars), key=lambda b: b.ts)
@@ -715,6 +721,9 @@ class PipelineBacktestDriver:
                 continue
             if self._pipeline._symbol_entry_counts.get(symbol, 0) >= self._pipeline._max_entries_per_symbol:
                 continue
+            last_entry = self._breakout_scalp_last_entry.get(symbol)
+            if last_entry is not None and (now - last_entry).total_seconds() < self._breakout_scalp_cooldown_sec:
+                continue
             ten_sec = self._ten_sec_bar_at(symbol, now)
             if ten_sec is None:
                 continue
@@ -768,6 +777,7 @@ class PipelineBacktestDriver:
             result.fills.append(fill)
             self._pipeline._symbol_entry_counts[symbol] = self._pipeline._symbol_entry_counts.get(symbol, 0) + 1
             self._pipeline.exit_manager.register_from_signal(signal, now, fill_price=fill.price)
+            self._breakout_scalp_last_entry[symbol] = now
             ledger.record_entry(fill, strategy="breakout_scalp_replay")
             result.entry_decisions.append({
                 "ts": now.isoformat(),
