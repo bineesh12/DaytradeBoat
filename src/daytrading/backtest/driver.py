@@ -108,6 +108,32 @@ class PipelineBacktestDriver:
         )
         if self._timer is not None:
             self._pipeline._execution_timer = self._timer
+        self._wire_bar_aggregator()
+
+    def _wire_bar_aggregator(self) -> None:
+        """Give the backtest a 5-minute bar context, like the live runner.
+
+        Without this the entry scorer always sees ``no5m=5`` (no 5-minute
+        bars) and scores ~5 points lower than live, which silently rejects
+        otherwise-passing setups. We build 5m bars from the 1m universe each
+        cycle and attach the aggregator to the pipeline + verifiers, mirroring
+        ``runner.py`` so the backtest scores entries on the same inputs.
+        """
+        from daytrading.data.bar_aggregator import BarAggregator
+
+        self._bar_aggregator = BarAggregator()
+        self._pipeline._bar_aggregator = self._bar_aggregator
+        for verifier in getattr(self._pipeline, "_verifiers", {}).values():
+            if hasattr(verifier, "_bar_aggregator"):
+                verifier._bar_aggregator = self._bar_aggregator
+
+    def _refresh_5m_context(self, universe: Dict[str, Sequence[Bar]]) -> None:
+        """Rebuild 5m bars from the current 1m universe before a scan cycle."""
+        if self._bar_aggregator is None:
+            return
+        self._bar_aggregator.update_all_5m({
+            sym: list(bars) for sym, bars in universe.items() if bars
+        })
 
     def run(
         self,
@@ -183,6 +209,7 @@ class PipelineBacktestDriver:
                 bar_by_symbol={sym: bars[-1] for sym, bars in universe.items() if bars},
                 now=now,
             )
+            self._refresh_5m_context(universe)
             cycle = self._pipeline.run_cycle(universe, now=now, quotes=quotes)
             self._record_cycle(result, ledger, cycle, now=now)
             self._queue_deferred(cycle)
@@ -238,6 +265,7 @@ class PipelineBacktestDriver:
                             universe=universe,
                             quotes=quotes,
                         )
+            self._refresh_5m_context(universe)
             cycle = self._pipeline.run_cycle(universe, now=t10, quotes=quotes)
             self._record_cycle(result, ledger, cycle, now=t10)
             self._queue_deferred(cycle)
