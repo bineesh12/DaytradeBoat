@@ -297,6 +297,7 @@ def create_app(hub: DashboardHub) -> Flask:
         payload = request.get_json(silent=True) or {}
         symbol = str(payload.get("symbol") or "").upper().strip()
         day = str(payload.get("date") or "").strip()
+        start_time = str(payload.get("start_time") or "").strip()
         flags = payload.get("flags") or {}
         if not symbol:
             return jsonify({"ok": False, "error": "symbol is required"}), 400
@@ -310,7 +311,13 @@ def create_app(hub: DashboardHub) -> Flask:
         try:
             from daytrading.config import Settings
             from daytrading.backtest.service import run_backtest
-            result = run_backtest(symbol, day, flags=flags, settings=Settings())
+            result = run_backtest(
+                symbol,
+                day,
+                flags=flags,
+                start_time=start_time,
+                settings=Settings(),
+            )
             return jsonify(result)
         except ValueError as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
@@ -319,6 +326,39 @@ def create_app(hub: DashboardHub) -> Flask:
             return jsonify({"ok": False, "error": str(exc)}), 500
         finally:
             backtest_lock.release()
+
+    @app.route("/api/entry_scores", methods=["GET"])
+    def entry_scores():
+        """Live/paper entry-quality scores for a symbol+date (what it scored in paper).
+
+        Surfaces the existing ml/entry_candidates.jsonl log so paper scores can
+        be compared against a backtest of the same name/day — e.g. why a name
+        passed at 85 live but the backtest scores it under 80.
+        """
+        symbol = str(request.args.get("symbol") or "").upper().strip()
+        day = str(request.args.get("date") or "").strip()
+        if not symbol or not day:
+            return jsonify({"ok": False, "error": "symbol and date are required"}), 400
+        try:
+            from daytrading.ml.data_collector import load_candidates_for
+            rows = load_candidates_for(symbol, day)
+        except Exception as exc:
+            logger.exception("entry_scores load failed")
+            return jsonify({"ok": False, "error": str(exc)}), 500
+        passed = [r for r in rows if r.get("passed")]
+        best = max((r.get("score") or 0) for r in rows) if rows else None
+        best_passed = max((r.get("score") or 0) for r in passed) if passed else None
+        return jsonify({
+            "ok": True,
+            "symbol": symbol,
+            "date": day,
+            "total": len(rows),
+            "passed": len(passed),
+            "rejected": len(rows) - len(passed),
+            "best_score": best,
+            "best_passed_score": best_passed,
+            "candidates": rows,
+        })
 
     @app.route("/api/backtest/sweep", methods=["POST"])
     def backtest_sweep():
@@ -957,12 +997,15 @@ tr:hover { background:var(--surface2); }
       <h3>Backtest</h3>
       <span style="font-size:11px;color:var(--text2)">Single-symbol historical replay through the real entry pipeline</span>
     </div>
-    <div style="display:grid;grid-template-columns:120px 170px 1fr 100px;gap:10px;align-items:end">
+    <div style="display:grid;grid-template-columns:120px 170px 110px 1fr 100px;gap:10px;align-items:end">
       <label style="font-size:12px;color:var(--text2)">Symbol<br>
         <input id="bt-symbol" value="CUPR" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--surface2);color:var(--text);text-transform:uppercase">
       </label>
       <label style="font-size:12px;color:var(--text2)">Date<br>
         <input id="bt-date" placeholder="YYYY-MM-DD or DD/MM" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--surface2);color:var(--text)">
+      </label>
+      <label style="font-size:12px;color:var(--text2)">Start ET<br>
+        <input id="bt-start-time" placeholder="optional" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--surface2);color:var(--text)">
       </label>
       <div style="display:flex;gap:12px;flex-wrap:wrap;font-size:12px;color:var(--text2);padding-bottom:7px">
         <label><input type="checkbox" id="bt-flag-fresh"> fresh VWAP scout</label>
@@ -973,10 +1016,11 @@ tr:hover { background:var(--surface2); }
         <label><input type="checkbox" id="bt-flag-capped"> level-capped entry</label>
         <label><input type="checkbox" id="bt-flag-timer" checked> 10s timer replay</label>
         <label><input type="checkbox" id="bt-flag-10s-scout"> 10s breakout scout</label>
+        <label title="Run scans + exits on a 10s clock with partial 1m bars — closest to paper for fast scalps"><input type="checkbox" id="bt-flag-live-like"> live-like 10s (paper-faithful)</label>
       </div>
       <button id="bt-run" style="padding:9px 12px;border:1px solid var(--blue);background:var(--blue-bg);color:var(--blue);border-radius:6px;cursor:pointer;font-weight:700">Run</button>
     </div>
-    <div class="mini-muted" style="margin-top:8px">This uses simulated fills only. It never sends live or paper orders. Date accepts YYYY-MM-DD or DD/MM.</div>
+    <div class="mini-muted" style="margin-top:8px">This uses simulated fills only. It never sends live or paper orders. Date accepts YYYY-MM-DD or DD/MM. Start ET accepts HH:MM, for example 10:10.</div>
   </div>
   <div id="backtest-wrap">
     <div class="empty"><div class="icon">&#128202;</div>Choose a symbol and date, then run a backtest.</div>
@@ -1845,7 +1889,9 @@ function runBacktest() {
   let btn = document.getElementById('bt-run');
   let symbol = (document.getElementById('bt-symbol') || {}).value || '';
   let date = (document.getElementById('bt-date') || {}).value || '';
+  let startTime = (document.getElementById('bt-start-time') || {}).value || '';
   symbol = symbol.trim().toUpperCase();
+  startTime = startTime.trim();
   if (!symbol || !date) {
     alert('Symbol and date are required');
     return;
@@ -1862,6 +1908,7 @@ function runBacktest() {
     body: JSON.stringify({
       symbol: symbol,
       date: date,
+      start_time: startTime,
       flags: {
         fresh_vwap_reclaim_scout: !!(document.getElementById('bt-flag-fresh') || {}).checked,
         vwap_reclaim_scout: !!(document.getElementById('bt-flag-vwap-scout') || {}).checked,
@@ -1871,13 +1918,24 @@ function runBacktest() {
         level_capped_entry: !!(document.getElementById('bt-flag-capped') || {}).checked,
         execution_timer_10s: !!(document.getElementById('bt-flag-timer') || {}).checked,
         ten_second_breakout_scout: !!(document.getElementById('bt-flag-10s-scout') || {}).checked,
-        level_reclaim_10s_scout: !!(document.getElementById('bt-flag-10s-scout') || {}).checked
+        level_reclaim_10s_scout: !!(document.getElementById('bt-flag-10s-scout') || {}).checked,
+        live_like_10s: !!(document.getElementById('bt-flag-live-like') || {}).checked
       }
     })
   }, 1).then(data => {
     if (!data.ok) throw new Error(data.error || 'Backtest failed');
-    state.backtest = {loading: false, result: data, error: null, chart: {start: null, end: null, dragX: null}};
+    state.backtest = {loading: false, result: data, error: null, chart: {start: null, end: null, dragX: null}, liveScores: null};
     renderBacktest();
+    // Fetch what this name actually scored in paper/live for the same day, so
+    // the paper-vs-backtest score gap is visible side by side.
+    fetch('/api/entry_scores?symbol=' + encodeURIComponent(symbol) + '&date=' + encodeURIComponent(date))
+      .then(r => r.json())
+      .then(ls => {
+        if (state.backtest && state.backtest.result) {
+          state.backtest.liveScores = (ls && ls.ok) ? ls : null;
+          renderBacktest();
+        }
+      }).catch(() => {});
   }).catch(err => {
     state.backtest = {loading: false, result: null, error: err && err.message ? err.message : String(err)};
     renderBacktest();
@@ -2209,6 +2267,40 @@ function renderBacktestMicroOpportunities(r) {
   return html;
 }
 
+function renderLivePaperScores() {
+  let ls = state.backtest && state.backtest.liveScores;
+  let html = '<div class="card" style="margin-bottom:16px"><div class="card-header"><h3>Live Paper Entry Scores</h3>';
+  if (!ls) {
+    html += '<span class="mini-muted">loading / none logged</span></div>';
+    html += '<div class="empty"><div class="icon">&#128202;</div>No paper entry-score records for this name/day (data/ml/entry_candidates.jsonl). The live bot logs these; run the paper bot on this day to populate.</div></div>';
+    return html;
+  }
+  let best = (ls.best_passed_score != null) ? ls.best_passed_score : (ls.best_score != null ? ls.best_score : '--');
+  html += '<span class="mini-muted">' + ls.total + ' checks &middot; ' + ls.passed + ' passed &middot; best passed ' + best + '/100</span></div>';
+  html += '<div class="mini-muted" style="padding:0 0 8px">What this name actually scored in paper — compare against the backtest gate rejections above. A pass here that the backtest rejects = a scoring/data gap (often rvol/surge), not a strategy gap.</div>';
+  let cands = (ls.candidates || []);
+  let passed = cands.filter(c => c.passed);
+  let rejected = cands.filter(c => !c.passed).sort((a, b) => Number(b.score || 0) - Number(a.score || 0));
+  function rowHtml(c) {
+    let h = '<tr>';
+    h += '<td>' + shortEtTime(c.ts) + '</td>';
+    h += '<td>' + (c.passed ? '<strong style="color:var(--green)">PASS ' : '<span style="color:var(--text2)">rej ') + Number(c.score || 0) + '</strong></td>';
+    h += '<td>$' + Number(c.price || 0).toFixed(4) + '</td>';
+    h += '<td style="max-width:520px;white-space:normal">' + escapeHtml(c.breakdown || c.reject_reason || '') + '</td>';
+    h += '</tr>';
+    return h;
+  }
+  html += '<table><tr><th>Time (ET)</th><th>Score</th><th>Price</th><th>Breakdown</th></tr>';
+  if (passed.length) {
+    html += '<tr><td colspan="4" class="mini-muted" style="background:var(--bg2)">PASSED entries (' + passed.length + ')</td></tr>';
+    passed.slice(0, 40).forEach(c => { html += rowHtml(c); });
+  }
+  html += '<tr><td colspan="4" class="mini-muted" style="background:var(--bg2)">Top rejected by score (' + rejected.length + ' total)</td></tr>';
+  rejected.slice(0, 20).forEach(c => { html += rowHtml(c); });
+  html += '</table></div>';
+  return html;
+}
+
 function renderBacktest() {
   let wrap = document.getElementById('backtest-wrap');
   if (!wrap) return;
@@ -2239,7 +2331,7 @@ function renderBacktest() {
   html += '<div class="stat-card"><div class="stat-label">Trades</div><div class="stat-value">' + (sc.closed_trades || 0) + '/' + (sc.trades_taken || 0) + '</div><div class="mini-muted">closed / entries</div></div>';
   html += '<div class="stat-card"><div class="stat-label">Funnel</div><div class="stat-value">' + (f.scan_hits || 0) + ' -> ' + (f.signals || 0) + ' -> ' + (f.entries || 0) + '</div><div class="mini-muted">' + pctText(f.signal_to_entry_pct) + ' signal to entry</div></div>';
   html += '</div>';
-  html += '<div class="mini-muted">Flags: fresh_vwap=' + (flags.fresh_vwap_reclaim_scout ? 'on' : 'off') + ', vwap_reclaim=' + (flags.vwap_reclaim_scout ? 'on' : 'off') + ', level_breakout=' + (flags.level_breakout_scout ? 'on' : 'off') + ', elite_wide_spread=' + (flags.elite_wide_spread ? 'on' : 'off') + ', momentum_burst_live=' + (flags.momentum_burst_live ? 'on' : 'off') + ', level_capped_entry=' + (flags.level_capped_entry ? 'on' : 'off') + ', 10s_timer=' + (flags.execution_timer_10s ? 'on' : 'off') + ', 10s_scout=' + (flags.ten_second_breakout_scout ? 'on' : 'off') + ', 10s_reclaim=' + (flags.level_reclaim_10s_scout ? 'on' : 'off') + '</div>';
+  html += '<div class="mini-muted">Flags: fresh_vwap=' + (flags.fresh_vwap_reclaim_scout ? 'on' : 'off') + ', vwap_reclaim=' + (flags.vwap_reclaim_scout ? 'on' : 'off') + ', level_breakout=' + (flags.level_breakout_scout ? 'on' : 'off') + ', elite_wide_spread=' + (flags.elite_wide_spread ? 'on' : 'off') + ', momentum_burst_live=' + (flags.momentum_burst_live ? 'on' : 'off') + ', level_capped_entry=' + (flags.level_capped_entry ? 'on' : 'off') + ', 10s_timer=' + (flags.execution_timer_10s ? 'on' : 'off') + ', 10s_scout=' + (flags.ten_second_breakout_scout ? 'on' : 'off') + ', 10s_reclaim=' + (flags.level_reclaim_10s_scout ? 'on' : 'off') + ', live_like_10s=' + (flags.live_like_10s ? 'on' : 'off') + '</div>';
   if (r.execution_timer_source) {
     html += '<div class="mini-muted">Execution timer source: ' + escapeHtml(r.execution_timer_source) + '</div>';
   }
@@ -2252,6 +2344,7 @@ function renderBacktest() {
   html += renderBacktestSection('10s Opportunity Map', () => renderBacktestMicroOpportunities(r));
   html += renderBacktestSection('Backtest Gate Breakdown', () => renderBacktestLayerBreakdown(r));
   html += renderBacktestSection('A+ Funnel Detail', () => renderBacktestFunnel(r));
+  html += renderBacktestSection('Live Paper Entry Scores (same name/day)', () => renderLivePaperScores());
 
   html += '<div class="card" style="margin-bottom:16px"><div class="card-header"><h3>Trades</h3></div>';
   if (!trips.length) {

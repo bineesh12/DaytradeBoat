@@ -136,3 +136,33 @@ def test_deferred_entry_outcomes_do_not_label_different_day_rows():
     assert changed == 0
     [row] = _rows()
     assert row["outcome_pnl"] is None
+
+
+def test_load_candidates_for_filters_by_symbol_and_day():
+    # Two CAST records on 6/15 (one pass, one reject), plus noise that must be excluded.
+    dc._CANDIDATES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    dc._CANDIDATES_FILE.write_text("\n".join([
+        json.dumps({"ts": "2026-06-15T14:17:32+00:00", "symbol": "CAST", "price": 1.54,
+                    "score": 95, "passed": True, "reject_reason": None,
+                    "breakdown": "day+170%=20, surge5.7x=15, rvol2.0x=-5", "rel_vol": 2.0}),
+        json.dumps({"ts": "2026-06-15T18:50:00+00:00", "symbol": "CAST", "price": 3.63,
+                    "score": 72, "passed": False, "reject_reason": "entry score too low (72/100, need 80+)",
+                    "breakdown": "rvol0.4x=-25", "rel_vol": 0.4}),
+        json.dumps({"ts": "2026-06-14T14:00:00+00:00", "symbol": "CAST", "price": 2.0,
+                    "score": 50, "passed": False}),          # wrong day
+        json.dumps({"ts": "2026-06-15T15:00:00+00:00", "symbol": "AHMA", "price": 2.3,
+                    "score": 80, "passed": True}),            # wrong symbol
+    ]) + "\n")
+
+    rows = dc.load_candidates_for("cast", "2026-06-15")  # case-insensitive symbol
+    assert [r["score"] for r in rows] == [95, 72]          # sorted by ts, only CAST 6/15
+    assert rows[0]["passed"] is True and rows[1]["passed"] is False
+    assert rows[0]["rel_vol"] == 2.0
+    assert "rvol0.4x=-25" in rows[1]["breakdown"]
+
+
+def test_load_candidates_for_missing_inputs_and_file():
+    assert dc.load_candidates_for("", "2026-06-15") == []
+    assert dc.load_candidates_for("CAST", "") == []
+    # No file written yet under the isolated dir -> empty, no error.
+    assert dc.load_candidates_for("NONE", "2026-06-15") == []

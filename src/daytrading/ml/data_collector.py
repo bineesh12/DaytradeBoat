@@ -251,6 +251,59 @@ def load_training_data() -> List[dict]:
     return records
 
 
+def load_candidates_for(
+    symbol: str,
+    day: str,
+    *,
+    limit: int = 5000,
+) -> List[dict]:
+    """Return the live entry-score candidates for one symbol on one UTC date.
+
+    The live/paper bot writes one record per entry-quality check (pass AND
+    reject) from ``check_entry_quality`` — score, the full point breakdown, and
+    rvol. This surfaces them so the dashboard can show what a name actually
+    scored in paper next to a backtest of the same name/day (the paper-vs-
+    backtest score gap). The file is large, so each line is string-prefiltered
+    before JSON parsing. ``day`` is a ``YYYY-MM-DD`` UTC date.
+    """
+    if not _CANDIDATES_FILE.exists():
+        return []
+    sym = str(symbol or "").upper().strip()
+    day = str(day or "").strip()
+    if not sym or not day:
+        return []
+    sym_token = '"symbol": "{}"'.format(sym)
+    records: List[dict] = []
+    with open(_CANDIDATES_FILE) as f:
+        for line in f:
+            if sym_token not in line or day not in line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if str(rec.get("symbol", "")).upper() != sym:
+                continue
+            ts = str(rec.get("ts", ""))
+            if not ts.startswith(day):
+                continue
+            records.append({
+                "ts": ts,
+                "symbol": rec.get("symbol"),
+                "price": rec.get("price"),
+                "score": rec.get("score"),
+                "passed": bool(rec.get("passed")),
+                "reject_reason": rec.get("reject_reason"),
+                "breakdown": rec.get("breakdown"),
+                "rel_vol": rec.get("rel_vol"),
+                "ml_prob": rec.get("ml_prob"),
+            })
+    records.sort(key=lambda r: r["ts"])
+    if limit and len(records) > limit:
+        records = records[-limit:]
+    return records
+
+
 def count_candidates() -> int:
     """Count total logged candidates."""
     if not _CANDIDATES_FILE.exists():

@@ -39,12 +39,14 @@ def test_backtest_endpoint_returns_service_result(monkeypatch) -> None:
     app = create_app(DashboardHub())
     seen = {}
 
-    def fake_run(symbol, session_date, *, flags=None, settings=None):
+    def fake_run(symbol, session_date, *, flags=None, start_time=None, settings=None):
         seen["settings"] = settings
+        seen["start_time"] = start_time
         return {
             "ok": True,
             "symbol": symbol,
             "date": session_date,
+            "start_time": start_time or "",
             "bars": 10,
             "cycles": 9,
             "round_trips": [],
@@ -58,6 +60,7 @@ def test_backtest_endpoint_returns_service_result(monkeypatch) -> None:
     resp = app.test_client().post("/api/backtest", json={
         "symbol": "cupr",
         "date": "2026-06-10",
+        "start_time": "10:10",
         "flags": {"level_breakout_scout": True},
     })
 
@@ -66,8 +69,10 @@ def test_backtest_endpoint_returns_service_result(monkeypatch) -> None:
     assert data["ok"] is True
     assert data["symbol"] == "CUPR"
     assert data["date"] == "2026-06-10"
+    assert data["start_time"] == "10:10"
     assert data["flags"]["level_breakout_scout"] is True
     assert seen["settings"] is not None
+    assert seen["start_time"] == "10:10"
 
 
 def test_backtest_endpoint_validates_required_fields() -> None:
@@ -115,3 +120,43 @@ def test_backtest_sweep_endpoint_validates_required_fields() -> None:
 
     assert resp.status_code == 400
     assert resp.get_json()["ok"] is False
+
+def test_entry_scores_endpoint_returns_live_candidates(monkeypatch) -> None:
+    app = create_app(DashboardHub())
+
+    def fake_load(symbol, day, *, limit=5000):
+        assert symbol == "CAST" and day == "2026-06-15"
+        return [
+            {"ts": "2026-06-15T14:17:32+00:00", "symbol": "CAST", "price": 1.54,
+             "score": 95, "passed": True, "reject_reason": None,
+             "breakdown": "surge5.7x=15, rvol2.0x=-5", "rel_vol": 2.0, "ml_prob": None},
+            {"ts": "2026-06-15T18:50:00+00:00", "symbol": "CAST", "price": 3.63,
+             "score": 72, "passed": False, "reject_reason": "entry score too low",
+             "breakdown": "rvol0.4x=-25", "rel_vol": 0.4, "ml_prob": None},
+        ]
+
+    monkeypatch.setattr("daytrading.ml.data_collector.load_candidates_for", fake_load)
+
+    resp = app.test_client().get("/api/entry_scores?symbol=cast&date=2026-06-15")
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["ok"] is True
+    assert data["total"] == 2 and data["passed"] == 1 and data["rejected"] == 1
+    assert data["best_passed_score"] == 95
+    assert len(data["candidates"]) == 2
+
+
+def test_entry_scores_endpoint_requires_symbol_and_date() -> None:
+    app = create_app(DashboardHub())
+    resp = app.test_client().get("/api/entry_scores?symbol=CAST")
+    assert resp.status_code == 400
+
+
+def test_backtest_page_renders_live_paper_scores_panel() -> None:
+    app = create_app(DashboardHub())
+    html = app.test_client().get("/").get_data(as_text=True)
+    assert "function renderLivePaperScores" in html
+    assert "Live Paper Entry Scores" in html
+    assert "/api/entry_scores?symbol=" in html
+    assert 'id="bt-flag-live-like"' in html
+    assert "live_like_10s=" in html
