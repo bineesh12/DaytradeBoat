@@ -3,8 +3,9 @@ from __future__ import annotations
 import re
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from zoneinfo import ZoneInfo
 
 from daytrading.backtest.data_loader import (
     fetch_alpaca_10s_bars_for_day,
@@ -28,6 +29,7 @@ SUPPORTED_FLAGS = {
     "execution_timer_10s",
     "ten_second_breakout_scout",
     "level_reclaim_10s_scout",
+    "live_like_10s",
 }
 
 
@@ -77,6 +79,36 @@ def normalize_session_date(value: str | date) -> date:
         return date(year, month, day)
     except ValueError as exc:
         raise ValueError("invalid date format; use YYYY-MM-DD or DD/MM") from exc
+
+
+def normalize_start_time(value: Optional[str], session_date: date) -> Optional[datetime]:
+    """Parse optional dashboard replay start.
+
+    A plain ``HH:MM`` is treated as US/Eastern on the selected session date,
+    matching the chart language traders use. Full ISO datetimes are accepted
+    too and converted to UTC when timezone-aware.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if "T" in text:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=ZoneInfo("UTC"))
+        return parsed.astimezone(ZoneInfo("UTC"))
+    parts = text.split(":")
+    if len(parts) not in (2, 3) or not all(part.isdigit() for part in parts):
+        raise ValueError("invalid start time; use HH:MM ET or ISO datetime")
+    hour = int(parts[0])
+    minute = int(parts[1])
+    second = int(parts[2]) if len(parts) == 3 else 0
+    eastern = ZoneInfo("America/New_York")
+    try:
+        local_dt = datetime.combine(session_date, time(hour, minute, second), tzinfo=eastern)
+    except ValueError as exc:
+        raise ValueError("invalid start time; use HH:MM ET or ISO datetime") from exc
+    return local_dt.astimezone(ZoneInfo("UTC"))
+
 
 DEFAULT_EXPERIMENTS: Dict[str, Dict[str, bool]] = {
     "baseline": {
@@ -192,6 +224,7 @@ def normalize_flags(flags: Optional[Dict[str, Any]]) -> Dict[str, bool]:
         "execution_timer_10s": bool(raw.get("execution_timer_10s", True)),
         "ten_second_breakout_scout": bool(raw.get("ten_second_breakout_scout", False)),
         "level_reclaim_10s_scout": bool(raw.get("level_reclaim_10s_scout", False)),
+        "live_like_10s": bool(raw.get("live_like_10s", False)),
     }
 
 
@@ -287,11 +320,13 @@ def run_backtest(
     session_date: str,
     *,
     flags: Optional[Dict[str, Any]] = None,
+    start_time: Optional[str] = None,
     bars_by_symbol: Optional[Dict[str, List[Bar]]] = None,
     settings: Optional[Settings] = None,
 ) -> Dict[str, Any]:
     sym = normalize_symbol(symbol)
     day = normalize_session_date(session_date)
+    start_dt = normalize_start_time(start_time, day)
     active_flags = normalize_flags(flags)
 
     bars = bars_by_symbol or fetch_alpaca_bars_for_day(sym, day, settings=settings)
@@ -324,7 +359,8 @@ def run_backtest(
             portfolio = PortfolioState(cash=initial_cash)
             timer_bars = (
                 fetch_alpaca_10s_bars_for_day(sym, day, settings=settings)
-                if active_flags["execution_timer_10s"] and bars_by_symbol is None
+                if (active_flags["execution_timer_10s"] or active_flags["live_like_10s"])
+                and bars_by_symbol is None
                 else None
             )
             pipeline = create_scalping_pipeline(
@@ -387,7 +423,8 @@ def run_backtest(
                 timer_bars_by_symbol=timer_bars,
                 use_micro_breakout_scout=active_flags["ten_second_breakout_scout"],
                 use_level_reclaim_10s_scout=active_flags["level_reclaim_10s_scout"],
-            ).run()
+                live_like_10s=active_flags["live_like_10s"],
+            ).run(start=start_dt)
 
     trips = _round_trips(result.trades)
     scorecard = dict(result.scorecard or {})
@@ -395,6 +432,8 @@ def run_backtest(
         "ok": True,
         "symbol": sym,
         "date": day.isoformat(),
+        "start_time": start_time or "",
+        "start_time_utc": start_dt.isoformat() if start_dt is not None else "",
         "bars": len(symbol_bars),
         "bars_data": _bars_payload(symbol_bars),
         "cycles": result.cycles,

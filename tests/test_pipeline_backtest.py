@@ -9,7 +9,13 @@ from daytrading.backtest.broker import BacktestBroker, FillModel
 from daytrading.backtest.data_loader import load_bars_csv
 from daytrading.backtest.driver import PipelineBacktestDriver
 from daytrading.backtest.report import BacktestLedger
-from daytrading.backtest.service import normalize_flags, normalize_session_date, run_backtest, run_backtest_sweep
+from daytrading.backtest.service import (
+    normalize_flags,
+    normalize_session_date,
+    normalize_start_time,
+    run_backtest,
+    run_backtest_sweep,
+)
 from daytrading.config import Settings, StrategyConfig
 from daytrading.exits.manager import ExitManager
 from daytrading.backtest.service import normalize_symbol
@@ -562,6 +568,13 @@ def test_backtest_service_accepts_european_date_shorthand() -> None:
     assert normalize_session_date("2026-06-12").isoformat() == "2026-06-12"
 
 
+def test_backtest_service_treats_plain_start_time_as_eastern() -> None:
+    parsed = normalize_start_time("10:10", normalize_session_date("2026-06-15"))
+
+    assert parsed is not None
+    assert parsed.isoformat() == "2026-06-15T14:10:00+00:00"
+
+
 def test_backtest_flags_default_experiments_off() -> None:
     flags = normalize_flags(None)
 
@@ -707,3 +720,86 @@ def test_daily_loser_blacklist_uses_consecutive_losses_not_single_scalp() -> Non
 
     realize("CCC", -60)               # single blowout >= $50
     assert "CCC" in p._daily_losers              # banned immediately
+
+
+def _ten_sec(symbol: str, minute: int, slot: int, close: float, *, high: float = None, low: float = None, volume: float = 40_000) -> Bar:
+    """A real 10s bar with a distinct 10s timestamp (slot 0..5 within the minute)."""
+    ts = _BASE_TS + timedelta(minutes=minute, seconds=slot * 10)
+    return Bar(
+        symbol=symbol,
+        ts=ts,
+        open=close - 0.01,
+        high=high if high is not None else close + 0.01,
+        low=low if low is not None else close - 0.01,
+        close=close,
+        volume=volume,
+        timeframe=Timeframe.SEC_10,
+    )
+
+
+def _live_like_driver():
+    one_min = {"TEST": [_bar("TEST", m, 4.00 + 0.05 * m) for m in range(4)]}
+    # Minute 3 has a sharp intra-minute high wick at slot 2 that a 1m close hides.
+    ten_sec = {
+        "TEST": [
+            _ten_sec("TEST", 3, 0, 4.16),
+            _ten_sec("TEST", 3, 1, 4.18),
+            _ten_sec("TEST", 3, 2, 4.40, high=4.55),  # spike wick
+            _ten_sec("TEST", 3, 3, 4.30),
+            _ten_sec("TEST", 3, 4, 4.22),
+            _ten_sec("TEST", 3, 5, 4.20),
+        ]
+    }
+    return PipelineBacktestDriver(
+        one_min,
+        timer_bars_by_symbol=ten_sec,
+        use_execution_timer=True,
+        live_like_10s=True,
+    )
+
+
+def test_live_like_mode_engages_only_with_real_10s_bars():
+    driver = _live_like_driver()
+    assert driver._live_like_10s is True
+    # Without 10s bars, live-like must fall back to the 1m loop.
+    fallback = PipelineBacktestDriver(
+        {"TEST": [_bar("TEST", m, 4.0 + 0.05 * m) for m in range(4)]},
+        use_execution_timer=True,
+        live_like_10s=True,
+    )
+    assert fallback._live_like_10s is False
+
+
+def test_partial_minute_bar_tracks_latest_10s_close_and_wick():
+    driver = _live_like_driver()
+    minute_start = _BASE_TS + timedelta(minutes=3)
+    # Early in the minute: close == first slot close, no spike yet.
+    early = driver._partial_minute_bar("TEST", minute_start, minute_start)
+    assert early is not None
+    assert early.close == pytest.approx(4.16)
+    assert early.high == pytest.approx(4.17)
+    assert early.timeframe is Timeframe.MIN_1
+    # After the spike slot: close is the current 10s close, high captures the wick
+    # that a 1m-close-only backtest would never see.
+    after_spike = driver._partial_minute_bar(
+        "TEST", minute_start, minute_start + timedelta(seconds=20)
+    )
+    assert after_spike.close == pytest.approx(4.40)
+    assert after_spike.high == pytest.approx(4.55)
+    assert after_spike.open == pytest.approx(4.15)  # first slot open
+
+
+def test_ten_sec_bar_at_returns_exact_timestamp_bar():
+    driver = _live_like_driver()
+    t = _BASE_TS + timedelta(minutes=3, seconds=20)
+    bar = driver._ten_sec_bar_at("TEST", t)
+    assert bar is not None and bar.ts == t and bar.close == pytest.approx(4.40)
+    assert driver._ten_sec_bar_at("TEST", t + timedelta(seconds=3)) is None
+
+
+def test_live_like_run_uses_10s_clock_and_reports_source():
+    driver = _live_like_driver()
+    result = driver.run()
+    assert result.execution_timer_source == "real_trades_10s_live_like"
+    # 10s cadence over minute 3's 6 slots => more cycles than the 4 one-minute bars.
+    assert result.cycles >= 6

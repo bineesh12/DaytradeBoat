@@ -67,6 +67,7 @@ class PipelineBacktestDriver:
         timer_bars_by_symbol: Optional[Dict[str, Sequence[Bar]]] = None,
         use_micro_breakout_scout: bool = False,
         use_level_reclaim_10s_scout: bool = False,
+        live_like_10s: bool = False,
     ) -> None:
         self._bars_by_symbol = {
             sym.upper(): sorted(list(bars), key=lambda b: b.ts)
@@ -90,8 +91,16 @@ class PipelineBacktestDriver:
             for sym, bars in (timer_bars_by_symbol or {}).items()
             if bars
         }
+        # Live-like mode only engages when we actually have real 10s bars to
+        # build partial 1m bars from; with synthetic 10s (all stamped at the 1m
+        # ts) there is no real 10s clock to iterate, so we fall back to 1m.
+        self._live_like_10s = bool(live_like_10s) and bool(self._timer_bars_by_symbol)
+        if self._live_like_10s and self._timer is None:
+            self._timer = ExecutionTimer(max_wait_bars=3, enabled=True)
+            self._use_execution_timer = True
+            self._pipeline._execution_timer = self._timer
         self._execution_timer_source = (
-            "real_trades_10s"
+            ("real_trades_10s_live_like" if self._live_like_10s else "real_trades_10s")
             if self._timer is not None and self._timer_bars_by_symbol
             else ("synthetic_1m_to_10s" if self._timer is not None else "off")
         )
@@ -109,6 +118,43 @@ class PipelineBacktestDriver:
             final_portfolio=self._portfolio,
             execution_timer_source=self._execution_timer_source,
         )
+        if self._live_like_10s:
+            self._run_live_like(result, ledger, start=start, end=end)
+        else:
+            self._run_one_minute(result, ledger, start=start, end=end)
+
+        result.trades = ledger.trades
+        result.rejected = len(result.rejection_details)
+        result.missed_a_plus = self._pipeline.missed_a_plus_report(limit=100)
+        result.scorecard = build_backtest_scorecard(
+            trades=result.trades,
+            total_scan_hits=result.scan_hits,
+            total_signals=result.signals,
+            total_rejected=result.rejected,
+            total_deferred=result.deferred,
+            cycle_count=result.cycles,
+            missed_a_plus=result.missed_a_plus,
+            rejected_by_layer=result.rejected_by_layer,
+            rejected_reasons_by_layer=result.rejected_reasons_by_layer,
+        )
+        result.final_portfolio = self._portfolio
+        return result
+
+    def _run_one_minute(
+        self,
+        result: PipelineBacktestResult,
+        ledger: BacktestLedger,
+        *,
+        start: Optional[datetime],
+        end: Optional[datetime],
+    ) -> None:
+        """Original replay: one cycle per closed 1m bar.
+
+        Scans and exits both run on closed 1-minute bars. Faithful for
+        gate/funnel analysis; intra-minute price action (the wick that hits a
+        stop, the spike a trail would ride) is invisible. The 10s execution
+        timer still gives entries partial intra-minute timing.
+        """
         times = merge_bar_times(self._bars_by_symbol)
         for now in times:
             if start is not None and now < start:
@@ -140,22 +186,115 @@ class PipelineBacktestDriver:
             self._queue_deferred(cycle)
             self._record_10s_opportunities(result, ledger, universe=universe, now=now, cycle=cycle)
 
-        result.trades = ledger.trades
-        result.rejected = len(result.rejection_details)
-        result.missed_a_plus = self._pipeline.missed_a_plus_report(limit=100)
-        result.scorecard = build_backtest_scorecard(
-            trades=result.trades,
-            total_scan_hits=result.scan_hits,
-            total_signals=result.signals,
-            total_rejected=result.rejected,
-            total_deferred=result.deferred,
-            cycle_count=result.cycles,
-            missed_a_plus=result.missed_a_plus,
-            rejected_by_layer=result.rejected_by_layer,
-            rejected_reasons_by_layer=result.rejected_reasons_by_layer,
+    def _run_live_like(
+        self,
+        result: PipelineBacktestResult,
+        ledger: BacktestLedger,
+        *,
+        start: Optional[datetime],
+        end: Optional[datetime],
+    ) -> None:
+        """Live-like replay: run the pipeline on a 10s clock.
+
+        Mirrors the live bot, which polls a *partial* (in-progress) 1m bar every
+        ~10s and runs exits off the current price. At each 10s step we rebuild
+        each symbol's universe as ``closed 1m history + partial 1m bar`` (the
+        partial aggregated from the real 10s bars seen so far this minute) and
+        run one full cycle — so scans, stops and trails all react intra-minute
+        instead of waiting for the 1m close. Requires real 10s bars.
+        """
+        times10 = merge_bar_times(self._timer_bars_by_symbol)
+        for t10 in times10:
+            if start is not None and t10 < start:
+                continue
+            if end is not None and t10 > end:
+                continue
+            minute_start = t10.replace(second=0, microsecond=0)
+            universe = self._live_like_universe(minute_start, t10)
+            if not universe:
+                continue
+            quotes = {
+                sym: [estimate_quote_from_bar(bars[-1], self._broker)]
+                for sym, bars in universe.items()
+                if bars
+            }
+            # Feed the current 10s bar to the timer first (release entries that
+            # were deferred on an earlier cycle) — matching the 1m loop's order
+            # of timer-feed before run_cycle queues anything new.
+            if self._timer is not None:
+                for symbol in list(universe.keys()):
+                    ten_sec = self._ten_sec_bar_at(symbol, t10)
+                    if ten_sec is None:
+                        continue
+                    released = self._timer.on_10s_bar(ten_sec)
+                    if released is not None:
+                        self._execute_timed_signal(
+                            released,
+                            ten_sec,
+                            result,
+                            ledger,
+                            universe=universe,
+                            quotes=quotes,
+                        )
+            cycle = self._pipeline.run_cycle(universe, now=t10, quotes=quotes)
+            self._record_cycle(result, ledger, cycle, now=t10)
+            self._queue_deferred(cycle)
+
+    def _live_like_universe(
+        self,
+        minute_start: datetime,
+        t10: datetime,
+    ) -> Dict[str, List[Bar]]:
+        """Universe at a 10s step: closed 1m history + partial in-progress 1m bar."""
+        universe: Dict[str, List[Bar]] = {}
+        symbols = set(self._bars_by_symbol) | set(self._timer_bars_by_symbol)
+        for sym in symbols:
+            one_min = self._bars_by_symbol.get(sym, [])
+            closed = [bar for bar in one_min if bar.ts < minute_start]
+            partial = self._partial_minute_bar(sym, minute_start, t10)
+            if partial is not None:
+                bars = closed[-(self._max_bars_per_symbol - 1):] + [partial]
+            else:
+                bars = closed[-self._max_bars_per_symbol:]
+            if bars:
+                universe[sym] = bars
+        return universe
+
+    def _partial_minute_bar(
+        self,
+        symbol: str,
+        minute_start: datetime,
+        t10: datetime,
+    ) -> Optional[Bar]:
+        """Aggregate the real 10s bars of the current minute up to ``t10``.
+
+        The close advances to the latest 10s close (== current price), so exits
+        and chase guards see the live intra-minute price, while high/low capture
+        the wick that a 1m-close-only backtest would miss.
+        """
+        tens = self._timer_bars_by_symbol.get(symbol.upper(), [])
+        slice_ = [bar for bar in tens if minute_start <= bar.ts <= t10]
+        if not slice_:
+            return None
+        one_min = self._bars_by_symbol.get(symbol, [])
+        timeframe = one_min[0].timeframe if one_min else Timeframe.MIN_1
+        return Bar(
+            symbol=symbol,
+            ts=minute_start,
+            open=float(slice_[0].open),
+            high=max(float(bar.high) for bar in slice_),
+            low=min(float(bar.low) for bar in slice_),
+            close=float(slice_[-1].close),
+            volume=sum(float(bar.volume or 0.0) for bar in slice_),
+            timeframe=timeframe,
         )
-        result.final_portfolio = self._portfolio
-        return result
+
+    def _ten_sec_bar_at(self, symbol: str, t10: datetime) -> Optional[Bar]:
+        """The single real 10s bar for ``symbol`` stamped exactly at ``t10``."""
+        for bar in self._timer_bars_by_symbol.get(symbol.upper(), []):
+            if bar.ts == t10:
+                return bar
+        return None
 
     def _record_10s_opportunities(
         self,

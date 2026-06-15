@@ -1380,7 +1380,19 @@ class TradingPipeline:
             if signal.action in (SignalAction.ENTER_LONG, SignalAction.REENTER_LONG):
                 signal = self._maybe_apply_level_capped_entry(signal, universe)
 
-            if signal.action in (SignalAction.ENTER_LONG, SignalAction.REENTER_LONG, SignalAction.SCALE_UP_LONG):
+            will_defer_to_timer = (
+                self._execution_timer is not None
+                and signal.action in (SignalAction.ENTER_LONG, SignalAction.ENTER_SHORT)
+            )
+
+            if (
+                signal.action in (
+                    SignalAction.ENTER_LONG,
+                    SignalAction.REENTER_LONG,
+                    SignalAction.SCALE_UP_LONG,
+                )
+                and not will_defer_to_timer
+            ):
                 final_quality_reject = self._final_entry_quality_reject(
                     signal, universe=universe, quotes=quotes,
                     result=result, stage="final_entry_guard", now=now,
@@ -1434,6 +1446,34 @@ class TradingPipeline:
                         quotes=quotes,
                         scanner=signal.scan_result.scanner_name if signal.scan_result else "",
                         fallback_price=self._latest_price_for_signal(signal, universe),
+                    )
+                    continue
+
+            if will_defer_to_timer:
+                final_quality_reject = self._final_entry_quality_reject(
+                    signal, universe=universe, quotes=quotes,
+                    result=result, stage="final_entry_guard", now=now,
+                )
+                if final_quality_reject:
+                    logger.info(
+                        "FINAL ENTRY GUARD REJECT %s: %s",
+                        signal.symbol, final_quality_reject,
+                    )
+                    result.rejected_orders += 1
+                    result.rejection_details.append({
+                        "symbol": signal.symbol,
+                        "reason": "final entry guard: {}".format(final_quality_reject),
+                    })
+                    self._scan_rejections[signal.symbol] = "final entry guard: {}".format(
+                        final_quality_reject,
+                    )
+                    self._log_shadow_missed(
+                        symbol=signal.symbol,
+                        reason="final entry guard: {}".format(final_quality_reject),
+                        universe=universe,
+                        quotes=quotes,
+                        scanner=signal.scan_result.scanner_name if signal.scan_result else "",
+                        fallback_price=signal.entry_price,
                     )
                     continue
 

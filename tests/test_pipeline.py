@@ -569,6 +569,64 @@ def test_pipeline_blocks_late_entry_after_earlier_missed_a_plus(monkeypatch) -> 
     assert "earlier blocked A+" in result.rejection_details[-1]["reason"]
 
 
+def test_pipeline_defers_timed_entry_before_missed_a_plus_chase_memory(monkeypatch) -> None:
+    early = [
+        _bar("HOT", 3.10, volume=300_000, open_=3.00, high=3.20, low=2.95),
+        _bar("HOT", 3.30, volume=450_000, open_=3.10, high=3.35, low=3.05),
+        _bar("HOT", 3.53, volume=700_000, open_=3.30, high=3.60, low=3.25),
+    ]
+    late = [
+        _bar("HOT", 5.90, volume=500_000, open_=5.75, high=6.00, low=5.70),
+        _bar("HOT", 6.05, volume=600_000, open_=5.90, high=6.10, low=5.85),
+        _bar("HOT", 6.15, volume=800_000, open_=6.05, high=6.20, low=6.00),
+    ]
+    scanner = _OneHitScannerWithCriteria(
+        "abc_continuation",
+        {"pattern": "abc_continuation", "setup_tier": "A+ setup"},
+    )
+    broker = _CountingBroker()
+    pipeline = TradingPipeline(
+        scanners=[scanner],
+        verifiers={"abc_continuation": _SignalVerifier()},
+        broker=broker,
+        portfolio=PortfolioState(cash=50_000.0, positions={}),
+    )
+    pipeline._execution_timer = object()
+    monkeypatch.setattr("daytrading.pipeline.engine.check_entry_quality", lambda *a, **k: None)
+    hit = ScanResult(
+        symbol="HOT",
+        scanner_name="hod_reclaim",
+        ts=TS,
+        score=80.0,
+        criteria={
+            "pattern": "hod_reclaim",
+            "setup_tier": "A+ setup",
+            "close": 3.53,
+            "volume": 700_000,
+            "breakout_level": 3.43,
+        },
+        bars=early,
+    )
+    pipeline.missed_a_plus.record_blocked(
+        layer="scanner",
+        reason="not on HOD momentum alert board",
+        universe={"HOT": early},
+        hit=hit,
+        now=TS,
+    )
+
+    result = pipeline.run_cycle({"HOT": late}, now=TS)
+
+    assert broker.submits == 0
+    assert not result.fills
+    assert len(result.deferred_signals) == 1
+    assert result.deferred_signals[0].symbol == "HOT"
+    assert all(
+        row.get("stage") != "entry_chase_guard"
+        for row in result.entry_decisions
+    )
+
+
 def test_final_entry_guard_applies_to_long_entry_reentry_and_scale(monkeypatch) -> None:
     pipeline = TradingPipeline(
         scanners=[],
