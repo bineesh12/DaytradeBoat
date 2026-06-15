@@ -682,3 +682,28 @@ def test_level_reclaim_contexts_filters_far_and_thin_hits() -> None:
     ]
     ctx = PipelineBacktestDriver._level_reclaim_contexts(cycle)
     assert ctx == {}
+
+
+def test_daily_loser_blacklist_uses_consecutive_losses_not_single_scalp() -> None:
+    """A single normal scalp loss must NOT ban a name (it can set up a clean
+    re-entry later); ban only after consecutive losses, or one real blowout."""
+    p = TradingPipeline(
+        scanners=[], verifiers={}, broker=BacktestBroker(),
+        portfolio=PortfolioState(cash=25_000), enable_daily_loser_blacklist=True,
+    )
+
+    def realize(sym, dollars):  # loss/win of $dollars via 1000 shares
+        p.record_realized_exit(sym, 1.00, 1.00 + dollars / 1000.0, 1000)
+
+    realize("AAA", -20)               # one normal scalp loss
+    assert "AAA" not in p._daily_losers          # not banned
+    realize("AAA", -20)               # second consecutive loss
+    assert "AAA" in p._daily_losers              # now banned (2 consecutive)
+
+    realize("BBB", -20)
+    realize("BBB", +15)               # a win resets the consecutive counter
+    realize("BBB", -20)
+    assert "BBB" not in p._daily_losers          # loss-win-loss != 2 consecutive
+
+    realize("CCC", -60)               # single blowout >= $50
+    assert "CCC" in p._daily_losers              # banned immediately

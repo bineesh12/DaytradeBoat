@@ -371,9 +371,17 @@ class Settings:
         self.min_avg_volume: float = _env_float("MIN_AVG_VOLUME", 50_000)
         self.scalp_max_spread_pct: float = _env_float("SCALP_MAX_SPREAD_PCT", 0.15)
 
-        # Risk — block re-entry on symbols that lost money today
+        # Risk — block re-entry on symbols that lost money today. A single normal
+        # scalp loss should NOT ban a name (it can set up a clean afternoon
+        # re-entry); ban only on a real blowout (>= min_loss) or after N losses.
         self.enable_daily_loser_blacklist: bool = _env_bool(
             "ENABLE_DAILY_LOSER_BLACKLIST", True,
+        )
+        self.daily_loser_blacklist_min_loss: float = _env_float(
+            "DAILY_LOSER_BLACKLIST_MIN_LOSS", 50.0,
+        )
+        self.daily_loser_blacklist_max_losses: int = _env_int(
+            "DAILY_LOSER_BLACKLIST_MAX_LOSSES", 2,
         )
         self.max_dollar_risk_per_trade: float = _env_float(
             "MAX_DOLLAR_RISK_PER_TRADE", 50.0,

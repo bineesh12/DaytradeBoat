@@ -104,6 +104,8 @@ def create_scalping_pipeline(
     broker: Optional[Broker] = None,
     float_checker: object = None,
     enable_daily_loser_blacklist: bool = False,
+    daily_loser_blacklist_min_loss: float = 50.0,
+    daily_loser_blacklist_max_losses: int = 2,
 ) -> TradingPipeline:
     """Create a fully wired scalping pipeline for $1–$20 stocks.
 
@@ -325,5 +327,7 @@ def create_scalping_pipeline(
         max_order_shares=max_order_shares,
         max_dollar_risk_per_trade=pattern_max_dollar_risk,
         enable_daily_loser_blacklist=enable_daily_loser_blacklist,
+        daily_loser_blacklist_min_loss=daily_loser_blacklist_min_loss,
+        daily_loser_blacklist_max_losses=daily_loser_blacklist_max_losses,
         level_capped_entry_enabled=level_capped_entry_enabled,
     )

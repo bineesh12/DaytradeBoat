@@ -140,6 +140,8 @@ class TradingPipeline:
         max_order_shares: float = 200,
         max_dollar_risk_per_trade: float = 50.0,
         enable_daily_loser_blacklist: bool = False,
+        daily_loser_blacklist_min_loss: float = 50.0,
+        daily_loser_blacklist_max_losses: int = 2,
         level_capped_entry_enabled: bool = False,
     ) -> None:
         self._scanners = list(scanners)
@@ -170,8 +172,12 @@ class TradingPipeline:
         self._enable_daily_loser_blacklist = enable_daily_loser_blacklist
         self._daily_losers: set = set()  # symbols blocked from re-entry today
         self._daily_loss_counts: Dict[str, int] = {}
-        self._daily_loser_blacklist_min_loss: float = 10.0
-        self._daily_loser_blacklist_max_losses: int = 2
+        # A single normal scalp loss shouldn't ban a name for the day — a name
+        # that loses a small morning scalp can set up a clean afternoon re-entry
+        # (the GLXG case: −$20 morning loss blocked a +$100 afternoon reclaim).
+        # Ban only on a real blowout (>= min_loss) OR after max_losses losses.
+        self._daily_loser_blacklist_min_loss: float = max(0.0, float(daily_loser_blacklist_min_loss))
+        self._daily_loser_blacklist_max_losses: int = max(1, int(daily_loser_blacklist_max_losses))
         self._symbol_entry_counts: Dict[str, int] = {}  # per-symbol entries this session
         self._max_entries_per_symbol: int = 3
         self._daily_pnl: float = 0.0  # running realized P&L for the day
@@ -483,6 +489,8 @@ class TradingPipeline:
         self._daily_pnl += trade_pnl
         if trade_pnl < 0 and self._enable_daily_loser_blacklist:
             loss_amount = abs(trade_pnl)
+            # CONSECUTIVE losses (reset on a win below) — a name that loses a
+            # normal scalp then wins shouldn't carry that loss toward a ban.
             loss_count = self._daily_loss_counts.get(symbol, 0) + 1
             self._daily_loss_counts[symbol] = loss_count
             if (
@@ -491,16 +499,18 @@ class TradingPipeline:
             ):
                 self._daily_losers.add(symbol)
                 logger.info(
-                    "DAILY BLACKLIST %s: loss #%d, lost $%.2f - no re-entry today",
+                    "DAILY BLACKLIST %s: %d consecutive loss(es), lost $%.2f - no re-entry today",
                     symbol, loss_count, loss_amount,
                 )
             else:
                 logger.info(
-                    "DAILY LOSS %s: loss #%d, lost $%.2f - not blacklisted yet",
+                    "DAILY LOSS %s: %d consecutive loss(es), lost $%.2f - not blacklisted yet",
                     symbol, loss_count, loss_amount,
                 )
         # Shorter cooldown for profitable exits to allow pullback re-entry
         if trade_pnl > 0:
+            # A win resets the consecutive-loss counter for this symbol.
+            self._daily_loss_counts[symbol] = 0
             self._exit_cooldowns[symbol] = (now or datetime.now(timezone.utc)) - timedelta(
                 seconds=self._cooldown_seconds - 120
             )

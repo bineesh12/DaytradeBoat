@@ -422,6 +422,8 @@ class AlpacaRunner:
             portfolio=portfolio,
             float_checker=float_checker,
             enable_daily_loser_blacklist=cfg.enable_daily_loser_blacklist,
+            daily_loser_blacklist_min_loss=cfg.daily_loser_blacklist_min_loss,
+            daily_loser_blacklist_max_losses=cfg.daily_loser_blacklist_max_losses,
         )
         if cfg.enable_daily_loser_blacklist:
             logger.info("Daily loser blacklist: ON")
