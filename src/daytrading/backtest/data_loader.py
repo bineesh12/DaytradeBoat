@@ -172,6 +172,19 @@ def _date_window_utc(day: date) -> tuple[datetime, datetime]:
     return start_et.astimezone(timezone.utc), end_et.astimezone(timezone.utc)
 
 
+def _bars_cover_session(bars: Sequence[Bar], session_end: datetime) -> bool:
+    """True when a cache reached the normal extended-hours session end.
+
+    Backtests are often run during the live session. If we keep a partial cache
+    written at noon, every later replay silently misses the afternoon. Treat
+    cache files as reusable only once they reach close enough to the 20:00 ET
+    extended-hours end.
+    """
+    if not bars:
+        return False
+    return max(bar.ts for bar in bars) >= session_end - timedelta(minutes=5)
+
+
 def fetch_alpaca_bars_for_day(
     symbol: str,
     day: str | date,
@@ -191,11 +204,13 @@ def fetch_alpaca_bars_for_day(
     )
     os.makedirs(cache_root, exist_ok=True)
     cache_path = os.path.join(cache_root, f"{sym}_{session_day.isoformat()}_1m.json")
+    start, end = _date_window_utc(session_day)
     if os.path.exists(cache_path):
         with open(cache_path, encoding="utf-8") as fh:
             payload = json.load(fh)
         bars = [_bar_from_dict(item) for item in payload.get("bars", [])]
-        return {sym: bars} if bars else {}
+        if _bars_cover_session(bars, end):
+            return {sym: bars}
 
     cfg = settings or Settings()
     if feed is None:
@@ -208,7 +223,6 @@ def fetch_alpaca_bars_for_day(
             bar_fetch_batch_size=1,
             bar_fetch_batch_delay_sec=0.0,
         )
-    start, end = _date_window_utc(session_day)
     result = feed.get_bars([sym], timeframe="1Min", start=start, end=end, limit=2000)
     bars = sorted(result.get(sym, []), key=lambda b: b.ts)
     if bars:
