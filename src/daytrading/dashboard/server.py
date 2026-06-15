@@ -1016,6 +1016,7 @@ tr:hover { background:var(--surface2); }
         <label><input type="checkbox" id="bt-flag-capped"> level-capped entry</label>
         <label><input type="checkbox" id="bt-flag-timer" checked> 10s timer replay</label>
         <label><input type="checkbox" id="bt-flag-10s-scout"> 10s breakout scout</label>
+        <label title="Replay the runner HOD-alert quick-scalp path from real 10s bars"><input type="checkbox" id="bt-flag-breakout-scalp"> breakout scalp replay</label>
         <label title="Run scans + exits on a 10s clock with partial 1m bars — closest to paper for fast scalps"><input type="checkbox" id="bt-flag-live-like"> live-like 10s (paper-faithful)</label>
       </div>
       <button id="bt-run" style="padding:9px 12px;border:1px solid var(--blue);background:var(--blue-bg);color:var(--blue);border-radius:6px;cursor:pointer;font-weight:700">Run</button>
@@ -1919,6 +1920,7 @@ function runBacktest() {
         execution_timer_10s: !!(document.getElementById('bt-flag-timer') || {}).checked,
         ten_second_breakout_scout: !!(document.getElementById('bt-flag-10s-scout') || {}).checked,
         level_reclaim_10s_scout: !!(document.getElementById('bt-flag-10s-scout') || {}).checked,
+        breakout_scalp_replay: !!(document.getElementById('bt-flag-breakout-scalp') || {}).checked,
         live_like_10s: !!(document.getElementById('bt-flag-live-like') || {}).checked
       }
     })
@@ -2331,7 +2333,7 @@ function renderBacktest() {
   html += '<div class="stat-card"><div class="stat-label">Trades</div><div class="stat-value">' + (sc.closed_trades || 0) + '/' + (sc.trades_taken || 0) + '</div><div class="mini-muted">closed / entries</div></div>';
   html += '<div class="stat-card"><div class="stat-label">Funnel</div><div class="stat-value">' + (f.scan_hits || 0) + ' -> ' + (f.signals || 0) + ' -> ' + (f.entries || 0) + '</div><div class="mini-muted">' + pctText(f.signal_to_entry_pct) + ' signal to entry</div></div>';
   html += '</div>';
-  html += '<div class="mini-muted">Flags: fresh_vwap=' + (flags.fresh_vwap_reclaim_scout ? 'on' : 'off') + ', vwap_reclaim=' + (flags.vwap_reclaim_scout ? 'on' : 'off') + ', level_breakout=' + (flags.level_breakout_scout ? 'on' : 'off') + ', elite_wide_spread=' + (flags.elite_wide_spread ? 'on' : 'off') + ', momentum_burst_live=' + (flags.momentum_burst_live ? 'on' : 'off') + ', level_capped_entry=' + (flags.level_capped_entry ? 'on' : 'off') + ', 10s_timer=' + (flags.execution_timer_10s ? 'on' : 'off') + ', 10s_scout=' + (flags.ten_second_breakout_scout ? 'on' : 'off') + ', 10s_reclaim=' + (flags.level_reclaim_10s_scout ? 'on' : 'off') + ', live_like_10s=' + (flags.live_like_10s ? 'on' : 'off') + '</div>';
+  html += '<div class="mini-muted">Flags: fresh_vwap=' + (flags.fresh_vwap_reclaim_scout ? 'on' : 'off') + ', vwap_reclaim=' + (flags.vwap_reclaim_scout ? 'on' : 'off') + ', level_breakout=' + (flags.level_breakout_scout ? 'on' : 'off') + ', elite_wide_spread=' + (flags.elite_wide_spread ? 'on' : 'off') + ', momentum_burst_live=' + (flags.momentum_burst_live ? 'on' : 'off') + ', level_capped_entry=' + (flags.level_capped_entry ? 'on' : 'off') + ', 10s_timer=' + (flags.execution_timer_10s ? 'on' : 'off') + ', 10s_scout=' + (flags.ten_second_breakout_scout ? 'on' : 'off') + ', 10s_reclaim=' + (flags.level_reclaim_10s_scout ? 'on' : 'off') + ', breakout_scalp=' + (flags.breakout_scalp_replay ? 'on' : 'off') + ', live_like_10s=' + (flags.live_like_10s ? 'on' : 'off') + '</div>';
   if (r.execution_timer_source) {
     html += '<div class="mini-muted">Execution timer source: ' + escapeHtml(r.execution_timer_source) + '</div>';
   }

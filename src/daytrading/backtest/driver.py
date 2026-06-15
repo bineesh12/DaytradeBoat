@@ -67,6 +67,7 @@ class PipelineBacktestDriver:
         timer_bars_by_symbol: Optional[Dict[str, Sequence[Bar]]] = None,
         use_micro_breakout_scout: bool = False,
         use_level_reclaim_10s_scout: bool = False,
+        use_breakout_scalp_replay: bool = False,
         live_like_10s: bool = False,
     ) -> None:
         self._bars_by_symbol = {
@@ -85,6 +86,7 @@ class PipelineBacktestDriver:
         self._use_execution_timer = bool(use_execution_timer)
         self._use_micro_breakout_scout = bool(use_micro_breakout_scout)
         self._use_level_reclaim_10s_scout = bool(use_level_reclaim_10s_scout)
+        self._use_breakout_scalp_replay = bool(use_breakout_scalp_replay)
         self._timer = ExecutionTimer(max_wait_bars=3, enabled=True) if self._use_execution_timer else None
         self._timer_bars_by_symbol = {
             sym.upper(): sorted(list(bars), key=lambda b: b.ts)
@@ -239,6 +241,14 @@ class PipelineBacktestDriver:
             cycle = self._pipeline.run_cycle(universe, now=t10, quotes=quotes)
             self._record_cycle(result, ledger, cycle, now=t10)
             self._queue_deferred(cycle)
+            if self._use_breakout_scalp_replay:
+                self._maybe_execute_breakout_scalp_replay(
+                    result,
+                    ledger,
+                    universe=universe,
+                    quotes=quotes,
+                    now=t10,
+                )
 
     def _live_like_universe(
         self,
@@ -652,6 +662,178 @@ class PipelineBacktestDriver:
             "price": fill.price,
             "metadata": {"source": "real_trades_10s", "context_pattern": pattern},
         })
+
+    def _maybe_execute_breakout_scalp_replay(
+        self,
+        result: PipelineBacktestResult,
+        ledger: BacktestLedger,
+        *,
+        universe: Dict[str, Sequence[Bar]],
+        quotes: Dict[str, Sequence[Quote]],
+        now: datetime,
+    ) -> None:
+        """Replay the runner's HOD-alert breakout scalp path on 10s bars.
+
+        The live runner fires this path from HOD tick alerts and true tick
+        prints. Historical backtests do not have that runner loop, so without a
+        replay hook a profitable paper quick-scalp can look like "0 trades".
+        Keep this intentionally narrow: fresh 10s HOD expansion, real volume,
+        final entry guard, risk/order checks, then normal exit manager handling.
+        """
+        for symbol, bars in universe.items():
+            if self._portfolio.positions.get(symbol) and not self._portfolio.positions[symbol].is_flat:
+                continue
+            if self._pipeline.exit_manager.tracked.get(symbol) is not None:
+                continue
+            if self._pipeline._symbol_entry_counts.get(symbol, 0) >= self._pipeline._max_entries_per_symbol:
+                continue
+            ten_sec = self._ten_sec_bar_at(symbol, now)
+            if ten_sec is None:
+                continue
+            signal = self._breakout_scalp_replay_signal(symbol, ten_sec, list(bars))
+            if signal is None:
+                continue
+            minute_start = now.replace(second=0, microsecond=0)
+            guard_bars = [b for b in list(bars) if b.ts < minute_start] or list(bars)
+            final_reject = self._pipeline._final_entry_quality_reject(
+                signal,
+                universe={symbol: guard_bars},
+                quotes=quotes,
+                stage="breakout_scalp_replay_final_guard",
+                now=now,
+            )
+            if final_reject:
+                self._append_rejection(result, {
+                    "ts": now.isoformat(),
+                    "symbol": symbol,
+                    "blocked_layer": "breakout_scalp_replay_final_guard",
+                    "reason": "final entry guard: {}".format(final_reject),
+                })
+                continue
+            order = self._pipeline._signal_to_order(signal)
+            if order is None:
+                continue
+            if not allow_order(
+                order,
+                ten_sec,
+                self._pipeline.portfolio,
+                max_position_shares=self._pipeline._max_position_shares,
+                max_order_shares=self._pipeline._max_order_shares,
+            ):
+                self._append_rejection(result, {
+                    "ts": now.isoformat(),
+                    "symbol": symbol,
+                    "blocked_layer": "breakout_scalp_replay_risk",
+                    "reason": "position_risk_limit",
+                })
+                continue
+            fill, status = self._broker.submit(order, ten_sec, self._pipeline.portfolio)
+            if status is not OrderStatus.FILLED or fill is None:
+                self._append_rejection(result, {
+                    "ts": now.isoformat(),
+                    "symbol": symbol,
+                    "blocked_layer": "breakout_scalp_replay_order",
+                    "reason": "order_{}".format(status.value if status else "not_filled"),
+                })
+                continue
+            apply_fill(self._pipeline.portfolio, fill)
+            result.fills.append(fill)
+            self._pipeline._symbol_entry_counts[symbol] = self._pipeline._symbol_entry_counts.get(symbol, 0) + 1
+            self._pipeline.exit_manager.register_from_signal(signal, now, fill_price=fill.price)
+            ledger.record_entry(fill, strategy="breakout_scalp_replay")
+            result.entry_decisions.append({
+                "ts": now.isoformat(),
+                "symbol": symbol,
+                "stage": "breakout_scalp_replay",
+                "passed": True,
+                "blocked_layer": "",
+                "reason": "",
+                "action": signal.action.value,
+                "pattern": "breakout_scalp",
+                "scanner": "breakout_scalp_replay",
+                "setup_tier": "A+ setup",
+                "entry_tier": "quick_scalp",
+                "price": fill.price,
+                "metadata": {"source": "real_trades_10s_live_like"},
+            })
+            break
+
+    def _breakout_scalp_replay_signal(
+        self,
+        symbol: str,
+        bar: Bar,
+        bars: Sequence[Bar],
+    ) -> Optional[TradeSignal]:
+        price = float(bar.close or 0.0)
+        if price < 1.5 or price > 20.0:
+            return None
+        ten_history = [
+            b for b in self._timer_bars_by_symbol.get(symbol.upper(), [])
+            if b.ts <= bar.ts
+        ]
+        if len(ten_history) < 12:
+            return None
+        prior = ten_history[:-1]
+        prior_hod = max(float(b.high or 0.0) for b in prior[-36:])
+        if prior_hod <= 0 or float(bar.high or 0.0) < prior_hod * 1.05:
+            return None
+        if price < prior_hod * 1.03:
+            return None
+        if float(bar.close or 0.0) <= float(bar.open or 0.0):
+            return None
+        latest_volume = float(bar.volume or 0.0)
+        recent_volume = sum(float(b.volume or 0.0) for b in ten_history[-3:])
+        day_volume = sum(float(b.volume or 0.0) for b in ten_history)
+        if day_volume < 500_000 or latest_volume < 100_000 or recent_volume < 350_000:
+            return None
+        closed_bars = [b for b in bars if b.ts <= bar.ts.replace(second=0, microsecond=0)]
+        if len(closed_bars) < 3:
+            return None
+        session_open = float(closed_bars[0].open or 0.0)
+        day_change = ((price - session_open) / session_open * 100.0) if session_open > 0 else 0.0
+        if day_change < 30.0:
+            return None
+        risk = max(price * 0.016, 0.08)
+        risk = min(risk, price * 0.04)
+        stop_price = round(price - risk, 2)
+        target_price = round(price + max(risk * 1.25, price * 0.02), 2)
+        if stop_price <= 0 or stop_price >= price:
+            return None
+        max_order = int(getattr(self._pipeline, "_max_order_shares", 750) or 750)
+        quantity = max(1, min(750, max_order, int(50.0 / (price - stop_price))))
+        hit = ScanResult(
+            symbol=symbol,
+            scanner_name="breakout_scalp_replay",
+            ts=bar.ts,
+            score=125.0,
+            criteria={
+                "pattern": "breakout_scalp",
+                "setup_tier": "A+ setup",
+                "entry_tier": "quick_scalp",
+                "entry_mode": "breakout_scalp_replay",
+                "breakout_level": round(prior_hod, 4),
+                "day_volume": round(day_volume, 0),
+                "recent_volume": round(recent_volume, 0),
+                "latest_volume": round(latest_volume, 0),
+                "stop_price": stop_price,
+                "size_factor": 1.0,
+            },
+            bars=list(closed_bars[-30:]) + [bar],
+        )
+        return TradeSignal(
+            symbol=symbol,
+            action=SignalAction.ENTER_LONG,
+            quantity=float(quantity),
+            entry_price=price,
+            stop_loss=stop_price,
+            take_profit=target_price,
+            max_hold_seconds=90,
+            reason="Quick Momentum Scalp {} ${:.2f}, stop=${:.2f}, target=${:.2f} (10s replay)".format(
+                symbol, price, stop_price, target_price,
+            ),
+            scan_result=hit,
+            trend_strength=0.8,
+        )
 
     def _queue_deferred(self, cycle: PipelineResult) -> None:
         if self._timer is None:

@@ -29,6 +29,7 @@ SUPPORTED_FLAGS = {
     "execution_timer_10s",
     "ten_second_breakout_scout",
     "level_reclaim_10s_scout",
+    "breakout_scalp_replay",
     "live_like_10s",
 }
 
@@ -120,6 +121,7 @@ DEFAULT_EXPERIMENTS: Dict[str, Dict[str, bool]] = {
         "level_capped_entry": False,
         "execution_timer_10s": True,
         "ten_second_breakout_scout": False,
+        "breakout_scalp_replay": False,
     },
     "fresh_vwap_reclaim_scout": {
         "fresh_vwap_reclaim_scout": True,
@@ -130,6 +132,7 @@ DEFAULT_EXPERIMENTS: Dict[str, Dict[str, bool]] = {
         "level_capped_entry": False,
         "execution_timer_10s": True,
         "ten_second_breakout_scout": False,
+        "breakout_scalp_replay": False,
     },
     "vwap_reclaim_scout": {
         "fresh_vwap_reclaim_scout": False,
@@ -140,6 +143,7 @@ DEFAULT_EXPERIMENTS: Dict[str, Dict[str, bool]] = {
         "level_capped_entry": False,
         "execution_timer_10s": True,
         "ten_second_breakout_scout": False,
+        "breakout_scalp_replay": False,
     },
     "level_breakout_scout": {
         "fresh_vwap_reclaim_scout": False,
@@ -150,6 +154,7 @@ DEFAULT_EXPERIMENTS: Dict[str, Dict[str, bool]] = {
         "level_capped_entry": False,
         "execution_timer_10s": True,
         "ten_second_breakout_scout": False,
+        "breakout_scalp_replay": False,
     },
     "elite_wide_spread": {
         "fresh_vwap_reclaim_scout": False,
@@ -160,6 +165,7 @@ DEFAULT_EXPERIMENTS: Dict[str, Dict[str, bool]] = {
         "level_capped_entry": False,
         "execution_timer_10s": True,
         "ten_second_breakout_scout": False,
+        "breakout_scalp_replay": False,
     },
     "momentum_burst_live": {
         "fresh_vwap_reclaim_scout": False,
@@ -170,6 +176,7 @@ DEFAULT_EXPERIMENTS: Dict[str, Dict[str, bool]] = {
         "level_capped_entry": False,
         "execution_timer_10s": True,
         "ten_second_breakout_scout": False,
+        "breakout_scalp_replay": False,
     },
     "level_capped_entry": {
         "fresh_vwap_reclaim_scout": False,
@@ -180,6 +187,7 @@ DEFAULT_EXPERIMENTS: Dict[str, Dict[str, bool]] = {
         "level_capped_entry": True,
         "execution_timer_10s": True,
         "ten_second_breakout_scout": False,
+        "breakout_scalp_replay": False,
     },
     "ten_second_breakout_scout": {
         "fresh_vwap_reclaim_scout": False,
@@ -190,6 +198,7 @@ DEFAULT_EXPERIMENTS: Dict[str, Dict[str, bool]] = {
         "level_capped_entry": False,
         "execution_timer_10s": True,
         "ten_second_breakout_scout": True,
+        "breakout_scalp_replay": False,
     },
     "level_reclaim_10s_scout": {
         "fresh_vwap_reclaim_scout": False,
@@ -201,6 +210,20 @@ DEFAULT_EXPERIMENTS: Dict[str, Dict[str, bool]] = {
         "execution_timer_10s": True,
         "ten_second_breakout_scout": False,
         "level_reclaim_10s_scout": True,
+        "breakout_scalp_replay": False,
+    },
+    "breakout_scalp_replay": {
+        "fresh_vwap_reclaim_scout": False,
+        "vwap_reclaim_scout": False,
+        "level_breakout_scout": False,
+        "elite_wide_spread": False,
+        "momentum_burst_live": False,
+        "level_capped_entry": False,
+        "execution_timer_10s": True,
+        "ten_second_breakout_scout": False,
+        "level_reclaim_10s_scout": False,
+        "breakout_scalp_replay": True,
+        "live_like_10s": True,
     },
 }
 
@@ -224,6 +247,7 @@ def normalize_flags(flags: Optional[Dict[str, Any]]) -> Dict[str, bool]:
         "execution_timer_10s": bool(raw.get("execution_timer_10s", True)),
         "ten_second_breakout_scout": bool(raw.get("ten_second_breakout_scout", False)),
         "level_reclaim_10s_scout": bool(raw.get("level_reclaim_10s_scout", False)),
+        "breakout_scalp_replay": bool(raw.get("breakout_scalp_replay", False)),
         "live_like_10s": bool(raw.get("live_like_10s", False)),
     }
 
@@ -423,6 +447,7 @@ def run_backtest(
                 timer_bars_by_symbol=timer_bars,
                 use_micro_breakout_scout=active_flags["ten_second_breakout_scout"],
                 use_level_reclaim_10s_scout=active_flags["level_reclaim_10s_scout"],
+                use_breakout_scalp_replay=active_flags["breakout_scalp_replay"],
                 live_like_10s=active_flags["live_like_10s"],
             ).run(start=start_dt)
 

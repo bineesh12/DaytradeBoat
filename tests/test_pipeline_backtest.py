@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+import json
+from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Sequence
 
 import pytest
 
 from daytrading.backtest.broker import BacktestBroker, FillModel
 from daytrading.backtest.data_loader import load_bars_csv
+from daytrading.backtest.data_loader import fetch_alpaca_bars_for_day
 from daytrading.backtest.driver import PipelineBacktestDriver
 from daytrading.backtest.report import BacktestLedger
 from daytrading.backtest.service import (
@@ -803,3 +805,109 @@ def test_live_like_run_uses_10s_clock_and_reports_source():
     assert result.execution_timer_source == "real_trades_10s_live_like"
     # 10s cadence over minute 3's 6 slots => more cycles than the 4 one-minute bars.
     assert result.cycles >= 6
+
+
+def test_backtest_1m_cache_refreshes_partial_session(tmp_path):
+    cache = tmp_path / "CAST_2026-06-15_1m.json"
+    cache.write_text(json.dumps({
+        "symbol": "CAST",
+        "date": "2026-06-15",
+        "bars": [{
+            "symbol": "CAST",
+            "ts": "2026-06-15T14:18:00+00:00",
+            "open": 1.0,
+            "high": 1.1,
+            "low": 0.9,
+            "close": 1.0,
+            "volume": 1000,
+            "timeframe": "1m",
+        }],
+    }))
+
+    complete = [
+        Bar(
+            symbol="CAST",
+            ts=datetime(2026, 6, 15, 8, 0, tzinfo=timezone.utc),
+            open=1.0,
+            high=1.1,
+            low=0.9,
+            close=1.0,
+            volume=1000,
+            timeframe=Timeframe.MIN_1,
+        ),
+        Bar(
+            symbol="CAST",
+            ts=datetime(2026, 6, 15, 23, 56, tzinfo=timezone.utc),
+            open=2.0,
+            high=2.1,
+            low=1.9,
+            close=2.0,
+            volume=2000,
+            timeframe=Timeframe.MIN_1,
+        ),
+    ]
+
+    class _Feed:
+        calls = 0
+
+        def get_bars(self, symbols, timeframe, start, end, limit):
+            self.calls += 1
+            return {"CAST": complete}
+
+    feed = _Feed()
+    rows = fetch_alpaca_bars_for_day("CAST", date(2026, 6, 15), cache_dir=str(tmp_path), feed=feed)
+
+    assert feed.calls == 1
+    assert rows["CAST"][-1].close == pytest.approx(2.0)
+
+
+def test_live_like_breakout_scalp_replay_can_enter_from_10s_hod_expansion():
+    broker = BacktestBroker(FillModel(min_spread_cents=0.01, spread_pct_of_range=0.0))
+    portfolio = PortfolioState(cash=10_000)
+    pipeline = TradingPipeline(
+        scanners=[],
+        verifiers={},
+        broker=broker,
+        portfolio=portfolio,
+        exit_manager=ExitManager(max_unrealized_loss=500.0),
+    )
+    pipeline._final_entry_quality_reject = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    one_min = {
+        "CAST": [
+            Bar("CAST", _BASE_TS + timedelta(minutes=idx), 1.8 + idx * 0.1, 1.9 + idx * 0.1, 1.75 + idx * 0.1, 1.85 + idx * 0.1, 200_000, Timeframe.MIN_1)
+            for idx in range(4)
+        ]
+    }
+    ten_sec = {
+        "CAST": [
+            *[
+                _ten_sec(
+                    "CAST",
+                    1 + idx // 6,
+                    idx % 6,
+                    2.00 + idx * 0.01,
+                    high=2.02 + idx * 0.01,
+                    low=1.98 + idx * 0.01,
+                    volume=35_000,
+                )
+                for idx in range(12)
+            ],
+            _ten_sec("CAST", 3, 0, 2.20, high=2.22, low=2.18, volume=80_000),
+            _ten_sec("CAST", 3, 1, 2.22, high=2.23, low=2.20, volume=80_000),
+            _ten_sec("CAST", 3, 2, 2.24, high=2.25, low=2.21, volume=80_000),
+            _ten_sec("CAST", 3, 3, 2.50, high=2.52, low=2.42, volume=250_000),
+        ]
+    }
+
+    result = PipelineBacktestDriver(
+        one_min,
+        pipeline=pipeline,
+        portfolio=portfolio,
+        timer_bars_by_symbol=ten_sec,
+        use_execution_timer=True,
+        live_like_10s=True,
+        use_breakout_scalp_replay=True,
+    ).run()
+
+    assert any(t.get("strategy") == "breakout_scalp_replay" for t in result.trades)
+    assert any(d.get("stage") == "breakout_scalp_replay" for d in result.entry_decisions)
