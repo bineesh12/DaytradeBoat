@@ -1013,6 +1013,7 @@ tr:hover { background:var(--surface2); }
         <label><input type="checkbox" id="bt-flag-level"> level breakout scout</label>
         <label><input type="checkbox" id="bt-flag-spread"> elite wide spread</label>
         <label><input type="checkbox" id="bt-flag-momentum"> momentum burst live</label>
+        <label title="Replay the rapid momentum-burst hit-and-run state machine from real 10s bars"><input type="checkbox" id="bt-flag-mb-hit-run"> momentum hit-run</label>
         <label><input type="checkbox" id="bt-flag-capped"> level-capped entry</label>
         <label><input type="checkbox" id="bt-flag-timer" checked> 10s timer replay</label>
         <label><input type="checkbox" id="bt-flag-10s-scout"> 10s breakout scout</label>
@@ -1916,6 +1917,7 @@ function runBacktest() {
         level_breakout_scout: !!(document.getElementById('bt-flag-level') || {}).checked,
         elite_wide_spread: !!(document.getElementById('bt-flag-spread') || {}).checked,
         momentum_burst_live: !!(document.getElementById('bt-flag-momentum') || {}).checked,
+        momentum_burst_hit_run: !!(document.getElementById('bt-flag-mb-hit-run') || {}).checked,
         level_capped_entry: !!(document.getElementById('bt-flag-capped') || {}).checked,
         execution_timer_10s: !!(document.getElementById('bt-flag-timer') || {}).checked,
         ten_second_breakout_scout: !!(document.getElementById('bt-flag-10s-scout') || {}).checked,
@@ -2210,6 +2212,31 @@ function renderBacktestFunnel(r) {
   return html;
 }
 
+function renderBacktestManifest(r) {
+  let m = r.manifest || {};
+  let data = m.data || {};
+  let settings = (m.settings || {});
+  let strat = settings.strategy || {};
+  let flags = m.flags || r.flags || {};
+  let onFlags = Object.entries(flags).filter(([k,v]) => !!v).map(([k]) => k);
+  let cache1 = data.cache_1m || {};
+  let cache10 = data.cache_10s || {};
+  let html = '<div class="card" style="margin-bottom:16px"><div class="card-header"><h3>Run Manifest</h3><span class="mini-muted">Reproducibility</span></div>';
+  html += '<div class="grid grid-4" style="margin-bottom:10px">';
+  html += '<div class="stat-card"><div class="stat-label">Mode</div><div class="stat-value" style="font-size:18px">'+escapeHtml(data.source || 'unknown')+'</div><div class="mini-muted">'+(data.bars_1m || 0)+' x 1m / '+(data.bars_10s || 0)+' x 10s</div></div>';
+  html += '<div class="stat-card"><div class="stat-label">Code</div><div class="stat-value" style="font-size:18px">'+escapeHtml(m.code_version || '')+'</div><div class="mini-muted">'+escapeHtml((m.generated_at || '').slice(0,19))+'</div></div>';
+  html += '<div class="stat-card"><div class="stat-label">Hit-Run Window</div><div class="stat-value" style="font-size:18px">'+escapeHtml(strat.momentum_burst_hit_run_end_et || 'all day')+'</div><div class="mini-muted">end ET</div></div>';
+  html += '<div class="stat-card"><div class="stat-label">Runner Trail</div><div class="stat-value" style="font-size:18px">'+(strat.runner_trail_adaptive ? 'adaptive' : String(strat.runner_trail_pct || ''))+'</div><div class="mini-muted">cap '+escapeHtml(String(strat.runner_trail_cap || ''))+'</div></div>';
+  html += '</div>';
+  html += '<div class="mini-muted"><strong>Active flags:</strong> '+escapeHtml(onFlags.length ? onFlags.join(', ') : 'none')+'</div>';
+  html += '<div class="mini-muted"><strong>1m cache:</strong> '+escapeHtml(cache1.path || '')+' '+(cache1.sha1 ? '('+escapeHtml(cache1.sha1)+', '+Number(cache1.bytes || 0)+' bytes)' : '')+'</div>';
+  if (cache10.path || data.bars_10s) {
+    html += '<div class="mini-muted"><strong>10s cache:</strong> '+escapeHtml(cache10.path || '')+' '+(cache10.sha1 ? '('+escapeHtml(cache10.sha1)+', '+Number(cache10.bytes || 0)+' bytes)' : '')+'</div>';
+  }
+  html += '</div>';
+  return html;
+}
+
 function renderBacktestSection(title, renderer) {
   try {
     return renderer();
@@ -2333,7 +2360,7 @@ function renderBacktest() {
   html += '<div class="stat-card"><div class="stat-label">Trades</div><div class="stat-value">' + (sc.closed_trades || 0) + '/' + (sc.trades_taken || 0) + '</div><div class="mini-muted">closed / entries</div></div>';
   html += '<div class="stat-card"><div class="stat-label">Funnel</div><div class="stat-value">' + (f.scan_hits || 0) + ' -> ' + (f.signals || 0) + ' -> ' + (f.entries || 0) + '</div><div class="mini-muted">' + pctText(f.signal_to_entry_pct) + ' signal to entry</div></div>';
   html += '</div>';
-  html += '<div class="mini-muted">Flags: fresh_vwap=' + (flags.fresh_vwap_reclaim_scout ? 'on' : 'off') + ', vwap_reclaim=' + (flags.vwap_reclaim_scout ? 'on' : 'off') + ', level_breakout=' + (flags.level_breakout_scout ? 'on' : 'off') + ', elite_wide_spread=' + (flags.elite_wide_spread ? 'on' : 'off') + ', momentum_burst_live=' + (flags.momentum_burst_live ? 'on' : 'off') + ', level_capped_entry=' + (flags.level_capped_entry ? 'on' : 'off') + ', 10s_timer=' + (flags.execution_timer_10s ? 'on' : 'off') + ', 10s_scout=' + (flags.ten_second_breakout_scout ? 'on' : 'off') + ', 10s_reclaim=' + (flags.level_reclaim_10s_scout ? 'on' : 'off') + ', breakout_scalp=' + (flags.breakout_scalp_replay ? 'on' : 'off') + ', live_like_10s=' + (flags.live_like_10s ? 'on' : 'off') + '</div>';
+  html += '<div class="mini-muted">Flags: fresh_vwap=' + (flags.fresh_vwap_reclaim_scout ? 'on' : 'off') + ', vwap_reclaim=' + (flags.vwap_reclaim_scout ? 'on' : 'off') + ', level_breakout=' + (flags.level_breakout_scout ? 'on' : 'off') + ', elite_wide_spread=' + (flags.elite_wide_spread ? 'on' : 'off') + ', momentum_burst_live=' + (flags.momentum_burst_live ? 'on' : 'off') + ', momentum_hit_run=' + (flags.momentum_burst_hit_run ? 'on' : 'off') + ', level_capped_entry=' + (flags.level_capped_entry ? 'on' : 'off') + ', 10s_timer=' + (flags.execution_timer_10s ? 'on' : 'off') + ', 10s_scout=' + (flags.ten_second_breakout_scout ? 'on' : 'off') + ', 10s_reclaim=' + (flags.level_reclaim_10s_scout ? 'on' : 'off') + ', breakout_scalp=' + (flags.breakout_scalp_replay ? 'on' : 'off') + ', live_like_10s=' + (flags.live_like_10s ? 'on' : 'off') + '</div>';
   if (r.execution_timer_source) {
     html += '<div class="mini-muted">Execution timer source: ' + escapeHtml(r.execution_timer_source) + '</div>';
   }
@@ -2342,6 +2369,7 @@ function renderBacktest() {
   }
   html += '</div>';
 
+  html += renderBacktestManifest(r);
   html += renderBacktestSection('1m Full Session Chart', () => renderBacktestChart(r));
   html += renderBacktestSection('10s Opportunity Map', () => renderBacktestMicroOpportunities(r));
   html += renderBacktestSection('Backtest Gate Breakdown', () => renderBacktestLayerBreakdown(r));

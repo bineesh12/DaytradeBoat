@@ -1155,8 +1155,18 @@ def check_entry_quality(
         and max(float(setup_score or 0.0), float(score or 0.0)) >= 75
         and score >= 60
     )
+    post_blowoff_micro_base_score_ok = (
+        "post_blowoff_micro_base_scout" in (tier_context, pattern_context)
+        and "a+" in setup_context
+        and score >= 75
+    )
     elite_sub2_score_ok = elite_sub2_reclaim and score >= 50
-    if score < ENTRY_SCORE_THRESHOLD and not elite_sub2_score_ok and not vwap_reclaim_scout_score_ok:
+    if (
+        score < ENTRY_SCORE_THRESHOLD
+        and not elite_sub2_score_ok
+        and not vwap_reclaim_scout_score_ok
+        and not post_blowoff_micro_base_score_ok
+    ):
         reason = "entry score too low ({}/100, need {}+) [{}]".format(
             score, ENTRY_SCORE_THRESHOLD, ", ".join(breakdown),
         )
@@ -1170,6 +1180,13 @@ def check_entry_quality(
     if elite_sub2_score_ok:
         logger.info(
             "ENTRY GUARD %s: elite sub-$2 reclaim score exception %d/%d",
+            symbol,
+            score,
+            ENTRY_SCORE_THRESHOLD,
+        )
+    if post_blowoff_micro_base_score_ok:
+        logger.info(
+            "ENTRY GUARD %s: post-blowoff micro-base scout score exception %d/%d",
             symbol,
             score,
             ENTRY_SCORE_THRESHOLD,

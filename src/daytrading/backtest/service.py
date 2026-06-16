@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import hashlib
+import logging
+import os
 import re
+import subprocess
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, time
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
@@ -30,6 +35,8 @@ SUPPORTED_FLAGS = {
     "ten_second_breakout_scout",
     "level_reclaim_10s_scout",
     "breakout_scalp_replay",
+    "momentum_burst_replay",
+    "momentum_burst_hit_run",
     "live_like_10s",
 }
 
@@ -122,6 +129,7 @@ DEFAULT_EXPERIMENTS: Dict[str, Dict[str, bool]] = {
         "execution_timer_10s": True,
         "ten_second_breakout_scout": False,
         "breakout_scalp_replay": False,
+        "momentum_burst_hit_run": False,
     },
     "fresh_vwap_reclaim_scout": {
         "fresh_vwap_reclaim_scout": True,
@@ -133,6 +141,7 @@ DEFAULT_EXPERIMENTS: Dict[str, Dict[str, bool]] = {
         "execution_timer_10s": True,
         "ten_second_breakout_scout": False,
         "breakout_scalp_replay": False,
+        "momentum_burst_hit_run": False,
     },
     "vwap_reclaim_scout": {
         "fresh_vwap_reclaim_scout": False,
@@ -144,6 +153,7 @@ DEFAULT_EXPERIMENTS: Dict[str, Dict[str, bool]] = {
         "execution_timer_10s": True,
         "ten_second_breakout_scout": False,
         "breakout_scalp_replay": False,
+        "momentum_burst_hit_run": False,
     },
     "level_breakout_scout": {
         "fresh_vwap_reclaim_scout": False,
@@ -155,6 +165,7 @@ DEFAULT_EXPERIMENTS: Dict[str, Dict[str, bool]] = {
         "execution_timer_10s": True,
         "ten_second_breakout_scout": False,
         "breakout_scalp_replay": False,
+        "momentum_burst_hit_run": False,
     },
     "elite_wide_spread": {
         "fresh_vwap_reclaim_scout": False,
@@ -166,6 +177,7 @@ DEFAULT_EXPERIMENTS: Dict[str, Dict[str, bool]] = {
         "execution_timer_10s": True,
         "ten_second_breakout_scout": False,
         "breakout_scalp_replay": False,
+        "momentum_burst_hit_run": False,
     },
     "momentum_burst_live": {
         "fresh_vwap_reclaim_scout": False,
@@ -177,6 +189,7 @@ DEFAULT_EXPERIMENTS: Dict[str, Dict[str, bool]] = {
         "execution_timer_10s": True,
         "ten_second_breakout_scout": False,
         "breakout_scalp_replay": False,
+        "momentum_burst_hit_run": False,
     },
     "level_capped_entry": {
         "fresh_vwap_reclaim_scout": False,
@@ -188,6 +201,7 @@ DEFAULT_EXPERIMENTS: Dict[str, Dict[str, bool]] = {
         "execution_timer_10s": True,
         "ten_second_breakout_scout": False,
         "breakout_scalp_replay": False,
+        "momentum_burst_hit_run": False,
     },
     "ten_second_breakout_scout": {
         "fresh_vwap_reclaim_scout": False,
@@ -199,6 +213,7 @@ DEFAULT_EXPERIMENTS: Dict[str, Dict[str, bool]] = {
         "execution_timer_10s": True,
         "ten_second_breakout_scout": True,
         "breakout_scalp_replay": False,
+        "momentum_burst_hit_run": False,
     },
     "level_reclaim_10s_scout": {
         "fresh_vwap_reclaim_scout": False,
@@ -211,6 +226,7 @@ DEFAULT_EXPERIMENTS: Dict[str, Dict[str, bool]] = {
         "ten_second_breakout_scout": False,
         "level_reclaim_10s_scout": True,
         "breakout_scalp_replay": False,
+        "momentum_burst_hit_run": False,
     },
     "breakout_scalp_replay": {
         "fresh_vwap_reclaim_scout": False,
@@ -223,6 +239,37 @@ DEFAULT_EXPERIMENTS: Dict[str, Dict[str, bool]] = {
         "ten_second_breakout_scout": False,
         "level_reclaim_10s_scout": False,
         "breakout_scalp_replay": True,
+        "momentum_burst_hit_run": False,
+        "live_like_10s": True,
+    },
+    "momentum_burst_replay": {
+        "fresh_vwap_reclaim_scout": False,
+        "vwap_reclaim_scout": False,
+        "level_breakout_scout": False,
+        "elite_wide_spread": False,
+        "momentum_burst_live": False,
+        "level_capped_entry": False,
+        "execution_timer_10s": True,
+        "ten_second_breakout_scout": False,
+        "level_reclaim_10s_scout": False,
+        "breakout_scalp_replay": False,
+        "momentum_burst_replay": True,
+        "momentum_burst_hit_run": False,
+        "live_like_10s": True,
+    },
+    "momentum_burst_hit_run": {
+        "fresh_vwap_reclaim_scout": False,
+        "vwap_reclaim_scout": False,
+        "level_breakout_scout": False,
+        "elite_wide_spread": False,
+        "momentum_burst_live": False,
+        "level_capped_entry": False,
+        "execution_timer_10s": True,
+        "ten_second_breakout_scout": False,
+        "level_reclaim_10s_scout": False,
+        "breakout_scalp_replay": False,
+        "momentum_burst_replay": False,
+        "momentum_burst_hit_run": True,
         "live_like_10s": True,
     },
 }
@@ -248,6 +295,8 @@ def normalize_flags(flags: Optional[Dict[str, Any]]) -> Dict[str, bool]:
         "ten_second_breakout_scout": bool(raw.get("ten_second_breakout_scout", False)),
         "level_reclaim_10s_scout": bool(raw.get("level_reclaim_10s_scout", False)),
         "breakout_scalp_replay": bool(raw.get("breakout_scalp_replay", False)),
+        "momentum_burst_replay": bool(raw.get("momentum_burst_replay", False)),
+        "momentum_burst_hit_run": bool(raw.get("momentum_burst_hit_run", False)),
         "live_like_10s": bool(raw.get("live_like_10s", False)),
     }
 
@@ -299,6 +348,32 @@ def _momentum_burst_live_flag(enabled: bool):
         engine.WATCH_ONLY_SCANNERS = previous_watch
 
 
+@contextmanager
+def _quiet_backtest_logs():
+    """Keep dashboard backtests from flooding live Cloud Logging.
+
+    Live-like 10s replays can run hundreds of miniature pipeline cycles. At the
+    normal live INFO level each scanner logs every cycle, which makes remote
+    dashboard backtests slow and can leave the UI looking stuck. Preserve
+    warnings/errors, but mute routine scanner/router chatter while replaying.
+    """
+    names = (
+        "daytrading.pipeline.engine",
+        "daytrading.classifier.router",
+        "daytrading.scanner.scalping",
+        "daytrading.strategy.scalping.momentum_pattern",
+    )
+    loggers = [logging.getLogger(name) for name in names]
+    previous = [logger.level for logger in loggers]
+    try:
+        for logger in loggers:
+            logger.setLevel(logging.WARNING)
+        yield
+    finally:
+        for logger, level in zip(loggers, previous):
+            logger.setLevel(level)
+
+
 def _round_trips(trades: List[dict]) -> List[dict]:
     entries: Dict[str, dict] = {}
     trips: List[dict] = []
@@ -339,6 +414,103 @@ def _bars_payload(bars: List[Bar]) -> List[dict]:
     ]
 
 
+def _git_version() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).resolve().parents[3],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=1.5,
+        ).strip()
+    except Exception:
+        return ""
+
+
+def _cache_file_info(symbol: str, day: date, suffix: str) -> dict:
+    cache_root = Path(os.environ.get("DAYTRADING_BACKTEST_CACHE_DIR", "data/backtest_cache"))
+    path = cache_root / f"{symbol}_{day.isoformat()}_{suffix}.json"
+    if not path.exists():
+        return {"path": str(path), "exists": False}
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return {"path": str(path), "exists": True, "readable": False}
+    return {
+        "path": str(path),
+        "exists": True,
+        "bytes": len(data),
+        "sha1": hashlib.sha1(data).hexdigest()[:12],
+    }
+
+
+def _strategy_manifest(settings: Optional[Settings]) -> dict:
+    if settings is None:
+        return {}
+    strategy = settings.strategy
+    fields = (
+        "momentum_burst_hit_run_enabled",
+        "momentum_burst_hit_run_end_et",
+        "momentum_burst_hit_run_max_entries",
+        "momentum_burst_hit_run_reward_risk",
+        "momentum_burst_hit_run_stop_after_giveback",
+        "momentum_burst_hit_run_max_giveback",
+        "momentum_burst_hit_run_daily_loss_stop",
+        "momentum_burst_live_enabled",
+        "momentum_burst_cycle_enabled",
+        "runner_trail_pct",
+        "runner_trail_adaptive",
+        "runner_trail_atr_mult",
+        "runner_trail_cap",
+        "runner_give_room_after_partial",
+        "entry_chase_pct_low",
+        "entry_chase_pct_high",
+        "missed_a_plus_chase_pct_sub5",
+        "missed_a_plus_chase_pct_5plus",
+        "late_pullback_max_hod_pct",
+        "late_pullback_max_hod_other_pct",
+    )
+    return {field: getattr(strategy, field, None) for field in fields}
+
+
+def _backtest_manifest(
+    *,
+    symbol: str,
+    day: date,
+    flags: Dict[str, Any],
+    settings: Optional[Settings],
+    bars_by_symbol: Optional[Dict[str, List[Bar]]],
+    timer_bars: Optional[Dict[str, List[Bar]]],
+    symbol_bars: Sequence[Bar],
+) -> dict:
+    timer_count = len((timer_bars or {}).get(symbol, []) or [])
+    effective_settings = settings or Settings()
+    return {
+        "symbol": symbol,
+        "date": day.isoformat(),
+        "generated_at": datetime.now(ZoneInfo("UTC")).isoformat(),
+        "code_version": _git_version(),
+        "flags": dict(flags),
+        "settings": {
+            "initial_cash": effective_settings.initial_cash,
+            "commission_per_share": effective_settings.commission_per_share,
+            "alpaca_feed": getattr(effective_settings, "alpaca_feed", ""),
+            "strategy": _strategy_manifest(effective_settings),
+        },
+        "data": {
+            "source": "in_memory" if bars_by_symbol is not None else "alpaca_cache",
+            "bars_1m": len(symbol_bars),
+            "bars_10s": timer_count,
+            "cache_1m": _cache_file_info(symbol, day, "1m") if bars_by_symbol is None else {},
+            "cache_10s": (
+                _cache_file_info(symbol, day, "10s_trades")
+                if bars_by_symbol is None and (flags.get("execution_timer_10s") or flags.get("live_like_10s"))
+                else {}
+            ),
+        },
+    }
+
+
 def run_backtest(
     symbol: str,
     session_date: str,
@@ -355,7 +527,17 @@ def run_backtest(
 
     bars = bars_by_symbol or fetch_alpaca_bars_for_day(sym, day, settings=settings)
     symbol_bars = list(bars.get(sym, []))
+    timer_bars = None
     if not symbol_bars:
+        manifest = _backtest_manifest(
+            symbol=sym,
+            day=day,
+            flags=active_flags,
+            settings=settings,
+            bars_by_symbol=bars_by_symbol,
+            timer_bars=None,
+            symbol_bars=[],
+        )
         return {
             "ok": True,
             "symbol": sym,
@@ -373,11 +555,12 @@ def run_backtest(
             "scorecard": {},
             "funnel": {},
             "flags": active_flags,
+            "manifest": manifest,
             "message": "No bars found for symbol/date",
         }
 
-    with _elite_wide_spread_flag(active_flags["elite_wide_spread"]):
-        with _momentum_burst_live_flag(active_flags["momentum_burst_live"]):
+    with _quiet_backtest_logs():
+        with _elite_wide_spread_flag(active_flags["elite_wide_spread"]), _momentum_burst_live_flag(active_flags["momentum_burst_live"]):
             initial_cash = settings.initial_cash if settings else 25_000.0
             broker = BacktestBroker()
             portfolio = PortfolioState(cash=initial_cash)
@@ -438,6 +621,7 @@ def run_backtest(
                     pct_high=settings.strategy.entry_chase_pct_high,
                     price_tier=settings.strategy.entry_chase_price_tier,
                 )
+                pipeline._max_entry_risk_pct = float(settings.strategy.max_entry_risk_pct)
             result = PipelineBacktestDriver(
                 {sym: symbol_bars},
                 pipeline=pipeline,
@@ -448,11 +632,55 @@ def run_backtest(
                 use_micro_breakout_scout=active_flags["ten_second_breakout_scout"],
                 use_level_reclaim_10s_scout=active_flags["level_reclaim_10s_scout"],
                 use_breakout_scalp_replay=active_flags["breakout_scalp_replay"],
+                use_momentum_burst_replay=active_flags["momentum_burst_replay"],
+                use_momentum_burst_hit_run=active_flags["momentum_burst_hit_run"],
+                momentum_burst_window_sec=(
+                    settings.strategy.momentum_burst_window_sec if settings else 300.0
+                ),
+                momentum_burst_cooldown_sec=(
+                    settings.strategy.momentum_burst_scalp_cooldown_sec if settings else 300.0
+                ),
+                momentum_burst_hit_run_max_entries=(
+                    settings.strategy.momentum_burst_hit_run_max_entries if settings else 1
+                ),
+                momentum_burst_hit_run_win_cooldown_sec=(
+                    settings.strategy.momentum_burst_hit_run_win_cooldown_sec if settings else 15.0
+                ),
+                momentum_burst_hit_run_loss_cooldown_sec=(
+                    settings.strategy.momentum_burst_hit_run_loss_cooldown_sec if settings else 90.0
+                ),
+                momentum_burst_hit_run_max_hold_sec=(
+                    settings.strategy.momentum_burst_hit_run_max_hold_sec if settings else 45.0
+                ),
+                momentum_burst_hit_run_reward_risk=(
+                    settings.strategy.momentum_burst_hit_run_reward_risk if settings else 1.0
+                ),
+                momentum_burst_hit_run_stop_after_giveback=(
+                    settings.strategy.momentum_burst_hit_run_stop_after_giveback if settings else True
+                ),
+                momentum_burst_hit_run_max_giveback=(
+                    settings.strategy.momentum_burst_hit_run_max_giveback if settings else 50.0
+                ),
+                momentum_burst_hit_run_daily_loss_stop=(
+                    settings.strategy.momentum_burst_hit_run_daily_loss_stop if settings else 50.0
+                ),
+                momentum_burst_hit_run_end_et=(
+                    settings.strategy.momentum_burst_hit_run_end_et if settings else "11:30"
+                ),
                 live_like_10s=active_flags["live_like_10s"],
             ).run(start=start_dt)
 
     trips = _round_trips(result.trades)
     scorecard = dict(result.scorecard or {})
+    manifest = _backtest_manifest(
+        symbol=sym,
+        day=day,
+        flags=active_flags,
+        settings=settings,
+        bars_by_symbol=bars_by_symbol,
+        timer_bars=timer_bars,
+        symbol_bars=symbol_bars,
+    )
     return {
         "ok": True,
         "symbol": sym,
@@ -476,6 +704,7 @@ def run_backtest(
         "funnel": scorecard.get("funnel", {}),
         "missed_a_plus": result.missed_a_plus,
         "flags": active_flags,
+        "manifest": manifest,
         "execution_timer_source": result.execution_timer_source,
         "unsupported_flags": ["momentum_breakout"],
         "final_cash": round(result.final_portfolio.cash, 2) if result.final_portfolio else None,

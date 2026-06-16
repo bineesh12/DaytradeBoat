@@ -39,6 +39,21 @@ QUICK_SCALP_PARTIAL_PCT = 0.01  # harvest first quick scalp pop before it fades
 RUNNER_MIN_CONFIRM_PCT = 0.018  # prove strength before giving the back half room
 RUNNER_TRAIL_PCT = 0.03         # protected runners trail 3% instead of 1%
 
+# Strategy labels that share the hit-run lifecycle: full 1R first-target exit,
+# per-symbol give-back/daily-stop P&L tracking, and win/loss cooldowns. The
+# post-blowoff micro-base scout is a hit-run re-entry under a different label,
+# so it must be treated the same everywhere or it escapes those controls.
+HIT_RUN_STRATEGIES = frozenset({
+    "momentum_burst_hit_run",
+    "post_blowoff_micro_base_scout",
+})
+
+
+def is_hit_run_strategy(label: Optional[str]) -> bool:
+    """True if a strategy/reason label belongs to the hit-run lifecycle."""
+    text = (label or "").lower()
+    return any(name in text for name in HIT_RUN_STRATEGIES)
+
 
 @dataclass
 class ExitTier:
@@ -568,6 +583,14 @@ class ExitManager:
         # --- Exit #1: Sell half at first profit target (1:1 R:R) ---
         if is_long and not pos.sold_half and pos.first_target_price > 0:
             if price >= pos.first_target_price:
+                if self._uses_full_first_target(pos):
+                    logger.info(
+                        "FULL TARGET %s @ %.4f | hit 1:1 target %.4f | selling all %.0f shares",
+                        pos.symbol, price, pos.first_target_price, pos.remaining_qty,
+                    )
+                    sig = self._make_exit(pos, pos.remaining_qty, price, ExitReason.TAKE_PROFIT)
+                    pos.remaining_qty = 0
+                    return [sig]
                 partial_qty = self._first_partial_qty(pos)
                 logger.info(
                     "HALF SELL %s @ %.4f | hit 1:1 target %.4f | selling %d of %d shares, moving stop to breakeven %.4f",
@@ -651,7 +674,7 @@ class ExitManager:
         # AFTER selling half: use wider steps (4%) and let the winner run.
         if not pos.sold_half:
             # Pre-half: only move stop to breakeven once price moves 2% above entry
-            if is_long and not pos.breakeven_locked:
+            if is_long and not pos.breakeven_locked and not self._is_vwap_pullback(pos):
                 breakeven_trigger = pos.entry_price * (1 + STEP_PCT)
                 if price >= breakeven_trigger:
                     pos.stop_loss = pos.entry_price
@@ -827,9 +850,13 @@ class ExitManager:
 
     @staticmethod
     def _uses_quick_scalp_partial(pos: TrackedPosition) -> bool:
-        reason = (pos.reason or "").lower()
+        if ExitManager._uses_full_first_target(pos):
+            return False
+        if ExitManager._is_vwap_pullback(pos):
+            return False
+        text = ExitManager._position_text(pos)
         return any(
-            key in reason
+            key in text
             for key in (
                 "momentum",
                 "quick",
@@ -840,6 +867,34 @@ class ExitManager:
                 "breakout",
             )
         )
+
+    @staticmethod
+    def _is_vwap_pullback(pos: TrackedPosition) -> bool:
+        text = ExitManager._position_text(pos)
+        return "vwap_pullback" in text or "vwap pullback" in text
+
+    @staticmethod
+    def _position_text(pos: TrackedPosition) -> str:
+        return " ".join(
+            str(part or "").lower()
+            for part in (
+                pos.reason,
+                pos.entry_strategy,
+                pos.entry_pattern,
+            )
+        )
+
+    @staticmethod
+    def _uses_full_first_target(pos: TrackedPosition) -> bool:
+        text = " ".join(
+            str(part or "").lower()
+            for part in (
+                pos.reason,
+                pos.entry_strategy,
+                pos.entry_pattern,
+            )
+        )
+        return is_hit_run_strategy(text)
 
     @staticmethod
     def _first_partial_qty(pos: TrackedPosition) -> int:

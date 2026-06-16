@@ -151,6 +151,43 @@ class StrategyConfig:
     # watch-only to a live A+ entry. Was backtest-only; wired to live for paper
     # A/B. Adds losers on the basket — paper-test the by_entry_mode scorecard.
     momentum_burst_live_enabled: bool = False
+    # EXPERIMENTAL (default OFF). Watch-only momentum_burst can arm a short
+    # fixed window; if the symbol prints a fresh 10s high during that window,
+    # the runner may take a reduced quick scalp through the same safety gates as
+    # HOD breakout scalps. Tagged separately as momentum_burst_scalp.
+    momentum_burst_cycle_enabled: bool = False
+    momentum_burst_window_sec: float = 300.0
+    momentum_burst_scalp_cooldown_sec: float = 300.0
+    # EXPERIMENTAL (default OFF). Fast entry/exit/re-entry momentum-burst mode:
+    # confirm on 10s, exit full at 1R/stop/time, then re-enter only after the
+    # symbol prints a fresh confirmation and the win/loss cooldown has expired.
+    momentum_burst_hit_run_enabled: bool = False
+    momentum_burst_hit_run_max_entries: int = 1
+    momentum_burst_hit_run_win_cooldown_sec: float = 15.0
+    momentum_burst_hit_run_loss_cooldown_sec: float = 90.0
+    momentum_burst_hit_run_max_hold_sec: float = 45.0
+    momentum_burst_hit_run_reward_risk: float = 1.0
+    momentum_burst_hit_run_stop_after_giveback: bool = True
+    momentum_burst_hit_run_max_giveback: float = 50.0
+    momentum_burst_hit_run_daily_loss_stop: float = 50.0
+    # Hit-run is meant for premarket/early momentum bursts. Later in the day it
+    # can cannibalize better standard runner entries and add small noisy scalps.
+    # Empty string disables the cutoff.
+    momentum_burst_hit_run_end_et: str = "11:30"
+    # Reject any long entry whose stop sits more than this fraction below the
+    # entry — a wide stop turns a single fail into many small wins lost (EDHL:
+    # an 8.3% vwap_pullback stop on a $10 name = one -$55 stop-out). Applies to
+    # the shared final entry guard (all pipeline + scalp-replay paths). 0 = off.
+    max_entry_risk_pct: float = 0.06
+    # Capital-aware sizing: risk this fraction of live account equity per trade
+    # (1.5% of a $2,000 account = $30 risk), and never let one position exceed
+    # this fraction of equity (1.0 = full buying power). Scales as the balance
+    # grows/shrinks. min_risk_dollars floors tiny accounts. 0 risk_pct = fall
+    # back to the old fixed $ risk.
+    risk_pct_of_equity: float = 0.015
+    max_position_pct_of_equity: float = 1.0
+    min_risk_dollars: float = 5.0
+    fallback_equity: float = 2000.0
 
     @classmethod
     def from_env(cls) -> "StrategyConfig":
@@ -310,6 +347,68 @@ class StrategyConfig:
                 "MOMENTUM_BURST_LIVE_ENABLED",
                 cls.momentum_burst_live_enabled,
             ),
+            momentum_burst_cycle_enabled=_env_bool(
+                "MOMENTUM_BURST_CYCLE_ENABLED",
+                cls.momentum_burst_cycle_enabled,
+            ),
+            momentum_burst_window_sec=_env_float(
+                "MOMENTUM_BURST_WINDOW_SEC",
+                cls.momentum_burst_window_sec,
+            ),
+            momentum_burst_scalp_cooldown_sec=_env_float(
+                "MOMENTUM_BURST_SCALP_COOLDOWN_SEC",
+                cls.momentum_burst_scalp_cooldown_sec,
+            ),
+            momentum_burst_hit_run_enabled=_env_bool(
+                "MOMENTUM_BURST_HIT_RUN_ENABLED",
+                cls.momentum_burst_hit_run_enabled,
+            ),
+            momentum_burst_hit_run_max_entries=_env_int(
+                "MOMENTUM_BURST_HIT_RUN_MAX_ENTRIES",
+                cls.momentum_burst_hit_run_max_entries,
+            ),
+            momentum_burst_hit_run_win_cooldown_sec=_env_float(
+                "MOMENTUM_BURST_HIT_RUN_WIN_COOLDOWN_SEC",
+                cls.momentum_burst_hit_run_win_cooldown_sec,
+            ),
+            momentum_burst_hit_run_loss_cooldown_sec=_env_float(
+                "MOMENTUM_BURST_HIT_RUN_LOSS_COOLDOWN_SEC",
+                cls.momentum_burst_hit_run_loss_cooldown_sec,
+            ),
+            momentum_burst_hit_run_max_hold_sec=_env_float(
+                "MOMENTUM_BURST_HIT_RUN_MAX_HOLD_SEC",
+                cls.momentum_burst_hit_run_max_hold_sec,
+            ),
+            momentum_burst_hit_run_reward_risk=_env_float(
+                "MOMENTUM_BURST_HIT_RUN_REWARD_RISK",
+                cls.momentum_burst_hit_run_reward_risk,
+            ),
+            momentum_burst_hit_run_stop_after_giveback=_env_bool(
+                "MOMENTUM_BURST_HIT_RUN_STOP_AFTER_GIVEBACK",
+                cls.momentum_burst_hit_run_stop_after_giveback,
+            ),
+            momentum_burst_hit_run_max_giveback=_env_float(
+                "MOMENTUM_BURST_HIT_RUN_MAX_GIVEBACK",
+                cls.momentum_burst_hit_run_max_giveback,
+            ),
+            momentum_burst_hit_run_daily_loss_stop=_env_float(
+                "MOMENTUM_BURST_HIT_RUN_DAILY_LOSS_STOP",
+                cls.momentum_burst_hit_run_daily_loss_stop,
+            ),
+            momentum_burst_hit_run_end_et=_env(
+                "MOMENTUM_BURST_HIT_RUN_END_ET",
+                cls.momentum_burst_hit_run_end_et,
+            ),
+            max_entry_risk_pct=_env_float(
+                "MAX_ENTRY_RISK_PCT",
+                cls.max_entry_risk_pct,
+            ),
+            risk_pct_of_equity=_env_float("RISK_PCT_OF_EQUITY", cls.risk_pct_of_equity),
+            max_position_pct_of_equity=_env_float(
+                "MAX_POSITION_PCT_OF_EQUITY", cls.max_position_pct_of_equity,
+            ),
+            min_risk_dollars=_env_float("MIN_RISK_DOLLARS", cls.min_risk_dollars),
+            fallback_equity=_env_float("FALLBACK_EQUITY", cls.fallback_equity),
         )
 
 

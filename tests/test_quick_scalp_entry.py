@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
+import time
 from types import SimpleNamespace
 
-from daytrading.models import Bar, Quote, Side, Tick, Timeframe
+from daytrading.models import Bar, Fill, OrderStatus, PortfolioState, Position, Quote, ScanResult, Side, Tick, Timeframe
 from daytrading.runner import AlpacaRunner
 
 
@@ -24,7 +25,21 @@ class _QuickScalpRunner:
     _quick_scalp_shared_quality_reject = AlpacaRunner._quick_scalp_shared_quality_reject
     _shared_entry_quality_reject = AlpacaRunner._shared_entry_quality_reject
     _quick_scalp_10s_reject = AlpacaRunner._quick_scalp_10s_reject
+    _breakout_scalp_10s_reject = AlpacaRunner._breakout_scalp_10s_reject
     _quick_scalp_tick_rr = AlpacaRunner._quick_scalp_tick_rr
+    _maybe_arm_momentum_burst_scalp = AlpacaRunner._maybe_arm_momentum_burst_scalp
+    _process_momentum_burst_scalps = AlpacaRunner._process_momentum_burst_scalps
+    _latest_momentum_burst_10s_bar = AlpacaRunner._latest_momentum_burst_10s_bar
+    _momentum_burst_recent_10s = AlpacaRunner._momentum_burst_recent_10s
+    _momentum_burst_violent_liquid_ok = AlpacaRunner._momentum_burst_violent_liquid_ok
+    _momentum_burst_stop_trading_reason = AlpacaRunner._momentum_burst_stop_trading_reason
+    _momentum_burst_continuation_base_ok = AlpacaRunner._momentum_burst_continuation_base_ok
+    _momentum_burst_hit_run_time_allowed = AlpacaRunner._momentum_burst_hit_run_time_allowed
+    _record_momentum_burst_hit_run_pnl = AlpacaRunner._record_momentum_burst_hit_run_pnl
+    _execute_momentum_burst_scalp = AlpacaRunner._execute_momentum_burst_scalp
+    _capital_aware_quantity = AlpacaRunner._capital_aware_quantity
+    _current_equity = AlpacaRunner._current_equity
+    _new_entries_blocked = AlpacaRunner._new_entries_blocked
     _quick_scalp_allows_extreme_hod_runner_alert = staticmethod(
         AlpacaRunner._quick_scalp_allows_extreme_hod_runner_alert
     )
@@ -36,6 +51,37 @@ class _QuickScalpRunner:
         self._float_checker = None
         self._hod_alert_store = None
         self._pipeline = SimpleNamespace(scan_rejections={})
+        self._risk_pct_of_equity = 0.015
+        self._max_position_pct_of_equity = 1.0
+        self._min_risk_dollars = 5.0
+        self._fallback_equity = 25_000.0
+        self._account_equity = 25_000.0
+        self._account_equity_at = time.monotonic()
+        self._momentum_burst_cycle_enabled = False
+        self._momentum_burst_window_sec = 300.0
+        self._momentum_burst_scalp_cooldown_sec = 300.0
+        self._momentum_burst_armed = {}
+        self._momentum_burst_window_high = {}
+        self._momentum_burst_session_anchor_high = {}
+        self._momentum_burst_pending = {}
+        self._momentum_burst_hit_run_enabled = False
+        self._momentum_burst_hit_run_max_entries = 1
+        self._momentum_burst_hit_run_win_cooldown_sec = 15.0
+        self._momentum_burst_hit_run_loss_cooldown_sec = 90.0
+        self._momentum_burst_hit_run_max_hold_sec = 45.0
+        self._momentum_burst_hit_run_reward_risk = 1.0
+        self._momentum_burst_hit_run_end_et = "11:30"
+        self._momentum_burst_hit_run_counts = {}
+        self._momentum_burst_hit_run_block_until = {}
+        self._momentum_burst_hit_run_stop_after_giveback = True
+        self._momentum_burst_hit_run_max_giveback = 50.0
+        self._momentum_burst_hit_run_daily_loss_stop = 50.0
+        self._momentum_burst_hit_run_symbol_pnl = {}
+        self._momentum_burst_hit_run_symbol_peak_pnl = {}
+        self._momentum_burst_hit_run_day_blocked = {}
+        self._breakout_scalp_active = False
+        self._breakout_scalp_cooldown = {}
+        self._quick_scalp_spread_size_factors = {}
 
 
 def _bar(
@@ -221,6 +267,74 @@ def test_quick_scalp_ignores_stale_late_hod_reject_for_fresh_hod_alert() -> None
     assert reject is None
 
 
+def test_breakout_scalp_requires_clean_reclaim_to_ignore_stale_late_reject() -> None:
+    runner = _QuickScalpRunner()
+    runner._pipeline = SimpleNamespace(
+        scan_rejections={
+            "CRVO": (
+                "cached reject: late pullback too far from HOD 10.7% "
+                "(max 10.0%; watching for fresh reclaim) (26s left)"
+            ),
+        }
+    )
+    runner._hod_alert_store = SimpleNamespace(
+        snapshot=lambda: [{
+            "symbol": "CRVO",
+            "reject_reason": None,
+            "price": 5.16,
+            "day_volume": 93_000_000,
+            "rel_vol": 1.3,
+            "bar_rvol": 1.3,
+        }]
+    )
+    runner._momentum_burst_continuation_base_ok = (
+        lambda symbol: (False, "volume faded", {})
+    )
+
+    reject = runner._quick_scalp_recent_normal_reject(
+        "CRVO",
+        allow_fresh_hod_breakout=True,
+        require_clean_reclaim=True,
+    )
+
+    assert reject == (
+        "fresh HOD breakout needs clean 10s reclaim after recent reject: volume faded"
+    )
+
+
+def test_breakout_scalp_can_clear_stale_reject_with_clean_reclaim() -> None:
+    runner = _QuickScalpRunner()
+    runner._pipeline = SimpleNamespace(
+        scan_rejections={
+            "CUPR": (
+                "cached reject: late pullback too far from HOD 17.1% "
+                "(max 12.0%; watching for fresh reclaim) (21s left)"
+            ),
+        }
+    )
+    runner._hod_alert_store = SimpleNamespace(
+        snapshot=lambda: [{
+            "symbol": "CUPR",
+            "reject_reason": None,
+            "price": 5.09,
+            "day_volume": 22_000_000,
+            "rel_vol": 1.3,
+            "bar_rvol": 1.3,
+        }]
+    )
+    runner._momentum_burst_continuation_base_ok = (
+        lambda symbol: (True, "fresh continuation base", {})
+    )
+
+    reject = runner._quick_scalp_recent_normal_reject(
+        "CUPR",
+        allow_fresh_hod_breakout=True,
+        require_clean_reclaim=True,
+    )
+
+    assert reject is None
+
+
 def test_quick_scalp_still_respects_recent_spread_reject_on_hod_alert() -> None:
     runner = _QuickScalpRunner()
     runner._pipeline = SimpleNamespace(
@@ -383,6 +497,189 @@ def test_quick_scalp_allows_green_expanding_10s_confirmation() -> None:
     assert runner._quick_scalp_10s_reject("OLOX") is None
 
 
+def test_breakout_scalp_rejects_weak_close_10s_confirmation() -> None:
+    runner = _QuickScalpRunner()
+    previous = Bar(
+        symbol="OLOX",
+        ts=datetime.now(timezone.utc) - timedelta(seconds=10),
+        open=8.00,
+        high=8.08,
+        low=7.98,
+        close=8.04,
+        volume=24_000,
+        timeframe=Timeframe.SEC_10,
+    )
+    latest = Bar(
+        symbol="OLOX",
+        ts=datetime.now(timezone.utc),
+        open=8.04,
+        high=8.20,
+        low=8.00,
+        close=8.08,
+        volume=25_000,
+        timeframe=Timeframe.SEC_10,
+    )
+    runner._bar_aggregator = SimpleNamespace(
+        get_latest_10s=lambda symbol, count=2: [previous, latest],
+    )
+
+    reject = runner._breakout_scalp_10s_reject("OLOX")
+
+    assert reject == "10s confirmation weak close (40% location)"
+
+
+def test_breakout_scalp_rejects_faded_10s_confirmation_volume() -> None:
+    runner = _QuickScalpRunner()
+    previous = Bar(
+        symbol="OLOX",
+        ts=datetime.now(timezone.utc) - timedelta(seconds=10),
+        open=8.00,
+        high=8.08,
+        low=7.98,
+        close=8.04,
+        volume=60_000,
+        timeframe=Timeframe.SEC_10,
+    )
+    latest = Bar(
+        symbol="OLOX",
+        ts=datetime.now(timezone.utc),
+        open=8.04,
+        high=8.16,
+        low=8.03,
+        close=8.14,
+        volume=20_000,
+        timeframe=Timeframe.SEC_10,
+    )
+    runner._bar_aggregator = SimpleNamespace(
+        get_latest_10s=lambda symbol, count=2: [previous, latest],
+    )
+
+    reject = runner._breakout_scalp_10s_reject("OLOX")
+
+    assert reject == "10s confirmation volume faded 20000 < 50% prior 60000"
+
+
+def test_breakout_scalp_rejects_violent_confirmation_without_high_close() -> None:
+    runner = _QuickScalpRunner()
+    previous = Bar(
+        symbol="OLOX",
+        ts=datetime.now(timezone.utc) - timedelta(seconds=10),
+        open=9.40,
+        high=9.70,
+        low=9.30,
+        close=9.55,
+        volume=130_000,
+        timeframe=Timeframe.SEC_10,
+    )
+    latest = Bar(
+        symbol="OLOX",
+        ts=datetime.now(timezone.utc),
+        open=9.50,
+        high=11.34,
+        low=9.33,
+        close=10.69,
+        volume=291_000,
+        timeframe=Timeframe.SEC_10,
+    )
+    runner._bar_aggregator = SimpleNamespace(
+        get_latest_10s=lambda symbol, count=4: [previous, latest],
+    )
+
+    reject = runner._breakout_scalp_10s_reject("OLOX")
+
+    assert reject == "10s breakout candle too volatile without strong close (68% location, 18.8% range)"
+
+
+def test_breakout_scalp_rejects_recent_dump_before_breakout() -> None:
+    runner = _QuickScalpRunner()
+    older = Bar(
+        symbol="OLOX",
+        ts=datetime.now(timezone.utc) - timedelta(seconds=30),
+        open=2.32,
+        high=2.38,
+        low=2.28,
+        close=2.35,
+        volume=90_000,
+        timeframe=Timeframe.SEC_10,
+    )
+    dump = Bar(
+        symbol="OLOX",
+        ts=datetime.now(timezone.utc) - timedelta(seconds=20),
+        open=2.29,
+        high=2.32,
+        low=2.21,
+        close=2.22,
+        volume=175_000,
+        timeframe=Timeframe.SEC_10,
+    )
+    previous = Bar(
+        symbol="OLOX",
+        ts=datetime.now(timezone.utc) - timedelta(seconds=10),
+        open=2.22,
+        high=2.48,
+        low=2.20,
+        close=2.47,
+        volume=130_000,
+        timeframe=Timeframe.SEC_10,
+    )
+    latest = Bar(
+        symbol="OLOX",
+        ts=datetime.now(timezone.utc),
+        open=2.47,
+        high=2.62,
+        low=2.50,
+        close=2.60,
+        volume=180_000,
+        timeframe=Timeframe.SEC_10,
+    )
+    runner._bar_aggregator = SimpleNamespace(
+        get_latest_10s=lambda symbol, count=4: [older, dump, previous, latest],
+    )
+
+    reject = runner._breakout_scalp_10s_reject("OLOX")
+
+    assert reject == "recent 10s dump candle before breakout (3.1% body, 9% close location)"
+
+
+def test_breakout_scalp_allows_wide_candle_with_high_close_and_no_prior_dump() -> None:
+    runner = _QuickScalpRunner()
+    older = Bar(
+        symbol="OLOX",
+        ts=datetime.now(timezone.utc) - timedelta(seconds=30),
+        open=4.20,
+        high=4.42,
+        low=4.15,
+        close=4.37,
+        volume=180_000,
+        timeframe=Timeframe.SEC_10,
+    )
+    previous = Bar(
+        symbol="OLOX",
+        ts=datetime.now(timezone.utc) - timedelta(seconds=10),
+        open=4.37,
+        high=4.80,
+        low=4.30,
+        close=4.73,
+        volume=450_000,
+        timeframe=Timeframe.SEC_10,
+    )
+    latest = Bar(
+        symbol="OLOX",
+        ts=datetime.now(timezone.utc),
+        open=4.73,
+        high=5.17,
+        low=4.61,
+        close=5.17,
+        volume=725_000,
+        timeframe=Timeframe.SEC_10,
+    )
+    runner._bar_aggregator = SimpleNamespace(
+        get_latest_10s=lambda symbol, count=4: [older, previous, latest],
+    )
+
+    assert runner._breakout_scalp_10s_reject("OLOX") is None
+
+
 def test_quick_scalp_allows_big_volume_runner_just_under_50k_recent_volume() -> None:
     runner = _QuickScalpRunner()
     _add_clean_execution_context(runner, symbol="IOTR")
@@ -532,3 +829,347 @@ def test_momentum_breakout_score_floor_off_keeps_reject() -> None:
     # mode OFF -> no override
     r = runner._quick_scalp_shared_quality_reject("RUNR", [])
     assert r is not None and "entry score too low" in r
+
+
+def _momentum_burst_hit(symbol: str = "MBUR", high: float = 2.40) -> ScanResult:
+    bars = [
+        Bar(
+            symbol=symbol,
+            ts=datetime.now(timezone.utc) - timedelta(minutes=idx),
+            open=high - 0.05,
+            high=high,
+            low=high - 0.10,
+            close=high - 0.02,
+            volume=250_000,
+            timeframe=Timeframe.MIN_1,
+        )
+        for idx in range(3, 0, -1)
+    ]
+    return ScanResult(
+        symbol=symbol,
+        scanner_name="momentum_burst",
+        ts=bars[-1].ts,
+        score=4.2,
+        criteria={"pattern": "momentum_burst", "setup_tier": "watch only", "close": high - 0.02},
+        bars=bars,
+    )
+
+
+def test_momentum_burst_cycle_arms_only_when_enabled() -> None:
+    runner = _QuickScalpRunner()
+    hit = _momentum_burst_hit()
+
+    runner._maybe_arm_momentum_burst_scalp(hit)
+    assert runner._momentum_burst_armed == {}
+
+    runner._momentum_burst_cycle_enabled = True
+    runner._maybe_arm_momentum_burst_scalp(hit)
+
+    assert "MBUR" in runner._momentum_burst_armed
+    assert runner._momentum_burst_window_high["MBUR"] == 2.40
+
+
+def test_momentum_burst_hit_run_arms_when_hit_run_enabled() -> None:
+    runner = _QuickScalpRunner()
+    hit = _momentum_burst_hit()
+
+    runner._momentum_burst_hit_run_enabled = True
+    runner._maybe_arm_momentum_burst_scalp(hit)
+
+    assert "MBUR" in runner._momentum_burst_armed
+    assert runner._momentum_burst_window_high["MBUR"] == 2.40
+
+
+def test_momentum_burst_cycle_expires_window() -> None:
+    runner = _QuickScalpRunner()
+    runner._momentum_burst_cycle_enabled = True
+    runner._momentum_burst_window_sec = 1.0
+    runner._momentum_burst_armed = {"MBUR": time.monotonic() - 2.0}
+    runner._momentum_burst_window_high = {"MBUR": 2.40}
+    runner._hub = SimpleNamespace(trading_paused=False)
+    runner._pipeline = SimpleNamespace(_circuit_breaker_tripped=False, _daily_pnl=0.0)
+
+    runner._process_momentum_burst_scalps()
+
+    assert runner._momentum_burst_armed == {}
+    assert runner._momentum_burst_window_high == {}
+
+
+class _Bars10:
+    def __init__(self, bars):
+        self._bars = list(bars)
+
+    def append(self, bar):
+        self._bars.append(bar)
+
+    def get_latest_10s(self, symbol, count=2):
+        return self._bars[-count:]
+
+
+class _FillBroker:
+    def submit(self, order, bar, portfolio):
+        return (
+            Fill(
+                symbol=order.symbol,
+                side=order.side,
+                quantity=order.quantity,
+                price=order.limit_price,
+                ts=datetime.now(timezone.utc),
+            ),
+            OrderStatus.FILLED,
+        )
+
+
+def _momentum_burst_trade_runner() -> _QuickScalpRunner:
+    runner = _QuickScalpRunner()
+    sym = "MBUR"
+    now = datetime.now(timezone.utc)
+    runner._momentum_burst_cycle_enabled = True
+    runner._momentum_burst_hit_run_end_et = ""
+    runner._momentum_burst_window_sec = 300.0
+    runner._momentum_burst_scalp_cooldown_sec = 120.0
+    runner._momentum_burst_armed = {sym: time.monotonic()}
+    runner._momentum_burst_window_high = {sym: 2.40}
+    runner._test_now = now
+    runner._bar_buffer = {
+        sym: deque([
+            Bar(sym, now - timedelta(minutes=4 - idx), 1.80 + idx * 0.15, 1.90 + idx * 0.15,
+                1.75 + idx * 0.15, 1.85 + idx * 0.15, 250_000, Timeframe.MIN_1)
+            for idx in range(5)
+        ])
+    }
+    runner._bar_aggregator = _Bars10([
+        Bar(sym, now - timedelta(seconds=10), 2.38, 2.40, 2.36, 2.39, 75_000, Timeframe.SEC_10),
+        Bar(sym, now, 2.39, 2.55, 2.38, 2.52, 125_000, Timeframe.SEC_10),
+    ])
+    for i in range(12):
+        runner._tick_buffer[sym].append(
+            Tick(
+                symbol=sym,
+                ts=now - timedelta(seconds=11 - i),
+                price=2.48 + i * 0.005,
+                size=1000,
+                side=Side.BUY,
+            )
+        )
+    runner._pipeline = SimpleNamespace(
+        scan_rejections={},
+        portfolio=PortfolioState(cash=10_000),
+        _exit_cooldowns={},
+        _cooldown_seconds=120,
+        _symbol_entry_counts={},
+        _max_entries_per_symbol=2,
+        _circuit_breaker_tripped=False,
+        _daily_pnl=0.0,
+    )
+    runner._broker = _FillBroker()
+    runner._hub = SimpleNamespace(
+        trading_paused=False,
+        on_fill=lambda *args, **kwargs: None,
+        add_log=lambda *args, **kwargs: None,
+    )
+    runner._journal = SimpleNamespace(record=lambda *args, **kwargs: None)
+    runner._shared_entry_quality_reject = lambda *args, **kwargs: None
+    runner._record_entry_reject = lambda *args, **kwargs: None
+    runner._on_position_opened = lambda *args, **kwargs: setattr(runner, "_opened", args)
+    runner._seed_recent_order_ids = lambda: None
+    runner._market_phase = lambda: "TEST"
+    return runner
+
+
+def test_momentum_burst_cycle_arms_then_fires_on_confirmation_bar() -> None:
+    runner = _momentum_burst_trade_runner()
+    now = runner._test_now
+
+    # First pass sees the fresh-high spike bar — it must NOT buy it, only arm a
+    # pending breakout awaiting the next 10s bar.
+    runner._process_momentum_burst_scalps()
+    assert runner._breakout_scalp_active is False
+    assert "MBUR" in runner._momentum_burst_pending
+    assert not getattr(runner, "_opened", None)
+
+    # Next 10s bar confirms the breakout with continuation and a strong close.
+    runner._bar_aggregator.append(
+        Bar("MBUR", now + timedelta(seconds=10), 2.53, 2.62, 2.52, 2.59, 130_000, Timeframe.SEC_10)
+    )
+    runner._process_momentum_burst_scalps()
+
+    assert runner._breakout_scalp_active is True
+    assert runner._momentum_burst_armed == {}
+    assert runner._pipeline._symbol_entry_counts["MBUR"] == 1
+    signal = runner._opened[0]
+    assert signal.scan_result.scanner_name == "momentum_burst_scalp"
+    assert signal.scan_result.criteria["entry_mode"] == "momentum_burst_scalp"
+    assert runner._breakout_scalp_cooldown["MBUR"] > time.monotonic()
+
+
+def test_momentum_burst_hit_run_keeps_window_after_confirmed_entry() -> None:
+    runner = _momentum_burst_trade_runner()
+    runner._momentum_burst_cycle_enabled = False
+    runner._momentum_burst_hit_run_enabled = True
+    now = runner._test_now
+
+    runner._process_momentum_burst_scalps()
+    runner._bar_aggregator.append(
+        Bar("MBUR", now + timedelta(seconds=10), 2.53, 2.62, 2.52, 2.59, 130_000, Timeframe.SEC_10)
+    )
+    runner._process_momentum_burst_scalps()
+
+    assert runner._breakout_scalp_active is True
+    assert "MBUR" in runner._momentum_burst_armed
+    assert runner._momentum_burst_hit_run_counts["MBUR"] == 1
+    signal = runner._opened[0]
+    assert signal.max_hold_seconds == 45.0
+    assert signal.scan_result.scanner_name == "momentum_burst_hit_run"
+    assert signal.scan_result.criteria["entry_mode"] == "momentum_burst_hit_run"
+    assert signal.take_profit == round(
+        signal.entry_price + (signal.entry_price - signal.stop_loss),
+        2,
+    )
+
+
+def test_momentum_burst_hit_run_max_entries_blocks_extra_entries() -> None:
+    runner = _momentum_burst_trade_runner()
+    runner._momentum_burst_cycle_enabled = False
+    runner._momentum_burst_hit_run_enabled = True
+    runner._momentum_burst_hit_run_counts = {"MBUR": 3}
+
+    runner._process_momentum_burst_scalps()
+
+    assert "MBUR" not in runner._momentum_burst_pending
+    assert not getattr(runner, "_opened", None)
+
+
+def test_momentum_burst_hit_run_giveback_blocks_symbol_for_day() -> None:
+    runner = _momentum_burst_trade_runner()
+    runner._momentum_burst_hit_run_max_giveback = 25.0
+
+    assert runner._record_momentum_burst_hit_run_pnl("MBUR", 60.0) is None
+    reason = runner._record_momentum_burst_hit_run_pnl("MBUR", -30.0)
+
+    assert "gave back" in reason
+    assert "MBUR" in runner._momentum_burst_hit_run_day_blocked
+
+
+def test_momentum_burst_hit_run_daily_loss_blocks_symbol_for_day() -> None:
+    runner = _momentum_burst_trade_runner()
+    runner._momentum_burst_hit_run_daily_loss_stop = 20.0
+
+    reason = runner._record_momentum_burst_hit_run_pnl("MBUR", -22.0)
+
+    assert "daily hit-run loss" in reason
+    assert "MBUR" in runner._momentum_burst_hit_run_day_blocked
+
+
+def test_momentum_burst_hit_run_daily_loss_still_blocks_when_giveback_disabled() -> None:
+    runner = _momentum_burst_trade_runner()
+    runner._momentum_burst_hit_run_stop_after_giveback = False
+    runner._momentum_burst_hit_run_daily_loss_stop = 20.0
+
+    reason = runner._record_momentum_burst_hit_run_pnl("MBUR", -22.0)
+
+    assert "daily hit-run loss" in reason
+    assert "MBUR" in runner._momentum_burst_hit_run_day_blocked
+
+
+def test_momentum_burst_hit_run_giveback_can_be_disabled_independently() -> None:
+    runner = _momentum_burst_trade_runner()
+    runner._momentum_burst_hit_run_stop_after_giveback = False
+    runner._momentum_burst_hit_run_max_giveback = 25.0
+
+    assert runner._record_momentum_burst_hit_run_pnl("MBUR", 60.0) is None
+    assert runner._record_momentum_burst_hit_run_pnl("MBUR", -30.0) is None
+    assert "MBUR" not in runner._momentum_burst_hit_run_day_blocked
+
+
+def test_momentum_burst_hit_run_reentry_uses_normal_chase_cap() -> None:
+    runner = _momentum_burst_trade_runner()
+    runner._momentum_burst_cycle_enabled = False
+    runner._momentum_burst_hit_run_enabled = True
+    runner._momentum_burst_hit_run_counts = {"MBUR": 1}
+    runner._momentum_burst_hit_run_max_entries = 3
+    runner._momentum_burst_continuation_base_ok = lambda symbol: (True, "fresh continuation base", {})
+    runner._momentum_burst_violent_liquid_ok = lambda symbol: (True, {})
+    now = runner._test_now
+    runner._momentum_burst_pending = {
+        "MBUR": {
+            "ts": now - timedelta(seconds=10),
+            "breakout_close": 2.40,
+            "breakout_high": 2.45,
+            "breakout_volume": 100_000,
+        }
+    }
+
+    # This would pass the first-entry violent cap (8%), but as a re-entry it is
+    # a 5% chase from the breakout close and must reject under the normal 3% cap.
+    runner._process_momentum_burst_scalps()
+
+    assert runner._breakout_scalp_active is False
+    assert not getattr(runner, "_opened", None)
+    assert "MBUR" not in runner._momentum_burst_pending
+
+
+def test_momentum_burst_cycle_skips_unconfirmed_reversal() -> None:
+    # The CUPR failure mode: spike bar makes a new high, next bar reverses red.
+    # The confirmation rule must skip it (no entry).
+    runner = _momentum_burst_trade_runner()
+    now = runner._test_now
+
+    runner._process_momentum_burst_scalps()
+    assert "MBUR" in runner._momentum_burst_pending
+
+    # Next bar reverses (red, closes below the breakout close) — not confirmed.
+    runner._bar_aggregator.append(
+        Bar("MBUR", now + timedelta(seconds=10), 2.51, 2.53, 2.30, 2.34, 140_000, Timeframe.SEC_10)
+    )
+    runner._process_momentum_burst_scalps()
+
+    assert runner._breakout_scalp_active is False
+    assert not getattr(runner, "_opened", None)
+    assert "MBUR" not in runner._momentum_burst_pending
+
+
+def test_momentum_burst_hit_run_requires_continuation_high() -> None:
+    # CAST 04:13-style failure: spike bar makes the high, the next bar is green
+    # and holds the breakout close, but it does not trade above the spike high.
+    runner = _momentum_burst_trade_runner()
+    runner._momentum_burst_cycle_enabled = False
+    runner._momentum_burst_hit_run_enabled = True
+    now = runner._test_now
+
+    runner._process_momentum_burst_scalps()
+    assert "MBUR" in runner._momentum_burst_pending
+
+    runner._bar_aggregator.append(
+        Bar("MBUR", now + timedelta(seconds=10), 2.53, 2.55, 2.52, 2.54, 130_000, Timeframe.SEC_10)
+    )
+    runner._process_momentum_burst_scalps()
+
+    assert runner._breakout_scalp_active is False
+    assert not getattr(runner, "_opened", None)
+    assert "MBUR" not in runner._momentum_burst_pending
+
+
+def test_momentum_burst_hit_run_time_window_allows_early_et() -> None:
+    runner = _QuickScalpRunner()
+
+    assert runner._momentum_burst_hit_run_time_allowed(
+        datetime(2026, 6, 8, 14, 30, tzinfo=timezone.utc)
+    ) is True
+
+
+def test_momentum_burst_hit_run_time_window_blocks_afternoon_et() -> None:
+    runner = _QuickScalpRunner()
+
+    assert runner._momentum_burst_hit_run_time_allowed(
+        datetime(2026, 6, 8, 18, 0, tzinfo=timezone.utc)
+    ) is False
+
+
+def test_momentum_burst_hit_run_time_window_blank_allows_all_day() -> None:
+    runner = _QuickScalpRunner()
+    runner._momentum_burst_hit_run_end_et = ""
+
+    assert runner._momentum_burst_hit_run_time_allowed(
+        datetime(2026, 6, 8, 18, 0, tzinfo=timezone.utc)
+    ) is True

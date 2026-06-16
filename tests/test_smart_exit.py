@@ -115,6 +115,22 @@ class TestHalfSellAt2to1:
         assert tracked.stop_loss == pytest.approx(5.00)
         assert tracked.remaining_qty == 50
 
+    def test_vwap_pullback_does_not_use_quick_scalp_partial(self) -> None:
+        em = ExitManager()
+        pos = _long_pos(entry=5.00, stop=4.80)
+        pos.reason = "Vwap Pullback CRVO"
+        pos.entry_strategy = "vwap_pullback"
+        pos.entry_pattern = "vwap_pullback"
+        em.track(pos)
+
+        exits = em.check_exits({"ABC": 5.05}, _ts(10))
+
+        assert exits == []
+        tracked = em.tracked.get("ABC")
+        assert tracked is not None
+        assert tracked.sold_half is False
+        assert tracked.stop_loss == pytest.approx(4.80)
+
     def test_runner_candidate_confirms_after_first_partial(self) -> None:
         em = ExitManager()
         pos = _long_pos(entry=5.00, stop=4.80)

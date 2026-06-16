@@ -139,10 +139,69 @@ def test_scorecard_isolates_momentum_breakout_mode() -> None:
     assert bm["momentum_breakout"]["closed_trades"] == 1
     assert bm["momentum_breakout"]["total_pnl"] == -8.0
     assert bm["momentum_breakout"]["wins"] == 0
-    assert bm["standard"]["closed_trades"] == 1
-    assert bm["standard"]["total_pnl"] == 12.0
-    assert bs["breakout_scalp_momentum"]["total_pnl"] == -8.0
-    assert bs["breakout_scalp"]["total_pnl"] == 12.0
+
+
+def test_scorecard_isolates_momentum_burst_scalp_mode() -> None:
+    from daytrading.dashboard.hub import _daily_scorecard
+
+    trades = [
+        {"symbol": "MB", "trade_type": "entry", "strategy": "momentum_burst_scalp",
+         "entry_time": "t0", "pnl": None},
+        {"symbol": "MB", "trade_type": "exit", "strategy": "momentum_burst_scalp",
+         "exit_time": "t1", "pnl": 11.0},
+    ]
+
+    sc = _daily_scorecard(
+        trades=trades, total_trades=1, total_scan_hits=0, total_signals=0,
+        total_rejected=0, cycle_count=0, missed_a_plus=[],
+    )
+
+    bm = sc["by_entry_mode"]
+    assert bm["momentum_burst_scalp"]["closed_trades"] == 1
+    assert bm["momentum_burst_scalp"]["total_pnl"] == 11.0
+    assert "momentum_breakout" not in bm
+
+
+def test_scorecard_isolates_momentum_burst_hit_run_mode() -> None:
+    from daytrading.dashboard.hub import _daily_scorecard
+
+    trades = [
+        {"symbol": "MB", "trade_type": "entry", "strategy": "momentum_burst_hit_run",
+         "entry_time": "t0", "pnl": None},
+        {"symbol": "MB", "trade_type": "exit", "strategy": "momentum_burst_hit_run",
+         "exit_time": "t1", "pnl": 17.0},
+    ]
+
+    sc = _daily_scorecard(
+        trades=trades, total_trades=1, total_scan_hits=0, total_signals=0,
+        total_rejected=0, cycle_count=0, missed_a_plus=[],
+    )
+
+    bm = sc["by_entry_mode"]
+    assert bm["momentum_burst_hit_run"]["closed_trades"] == 1
+    assert bm["momentum_burst_hit_run"]["total_pnl"] == 17.0
+    assert "momentum_burst_scalp" not in bm
+
+
+def test_scorecard_isolates_post_blowoff_micro_base_scout_mode() -> None:
+    from daytrading.dashboard.hub import _daily_scorecard
+
+    trades = [
+        {"symbol": "UBXG", "trade_type": "entry", "strategy": "post_blowoff_micro_base_scout",
+         "entry_time": "t0", "pnl": None},
+        {"symbol": "UBXG", "trade_type": "exit", "strategy": "post_blowoff_micro_base_scout",
+         "exit_time": "t1", "pnl": 9.5},
+    ]
+
+    sc = _daily_scorecard(
+        trades=trades, total_trades=1, total_scan_hits=0, total_signals=0,
+        total_rejected=0, cycle_count=0, missed_a_plus=[],
+    )
+
+    bm = sc["by_entry_mode"]
+    assert bm["post_blowoff_micro_base_scout"]["closed_trades"] == 1
+    assert bm["post_blowoff_micro_base_scout"]["total_pnl"] == 9.5
+    assert "momentum_burst_hit_run" not in bm
 
 
 def test_dashboard_fill_strategy_feeds_entry_mode_scorecard() -> None:

@@ -417,6 +417,219 @@ def test_10s_breakout_scout_can_enter_for_matching_a_plus_context() -> None:
     assert direct.entry_decisions[0]["metadata"]["context_pattern"] == "hod_reclaim"
 
 
+def _momentum_burst_backtest_driver(ten_sec: Sequence[Bar]) -> PipelineBacktestDriver:
+    bars = {"MBUR": [_bar("MBUR", idx, 2.00 + idx * 0.02, volume=100_000) for idx in range(12)]}
+    pipeline = TradingPipeline(
+        scanners=[],
+        verifiers={},
+        broker=BacktestBroker(FillModel(min_spread_cents=0.01, spread_pct_of_range=0.0)),
+        portfolio=PortfolioState(cash=10_000),
+        exit_manager=ExitManager(max_unrealized_loss=50.0),
+    )
+    return PipelineBacktestDriver(
+        bars,
+        pipeline=pipeline,
+        timer_bars_by_symbol={"MBUR": list(ten_sec)},
+        use_momentum_burst_replay=True,
+    )
+
+
+def _ten_bar(second: int, close: float, *, width_pct: float, volume: float = 5_000) -> Bar:
+    width = close * width_pct
+    return Bar(
+        symbol="MBUR",
+        ts=_BASE_TS + timedelta(seconds=second),
+        open=close - width * 0.15,
+        high=close + width * 0.5,
+        low=close - width * 0.5,
+        close=close,
+        volume=volume,
+        timeframe=Timeframe.SEC_10,
+    )
+
+
+def test_momentum_burst_replay_allows_smooth_10s_tape() -> None:
+    ten_sec = [_ten_bar(i * 10, 2.00 + i * 0.01, width_pct=0.006, volume=5_000) for i in range(12)]
+    driver = _momentum_burst_backtest_driver(ten_sec)
+
+    smooth, median_range = driver._momentum_burst_10s_tape_is_smooth("MBUR", ten_sec[-1].ts)
+    signal = driver._momentum_burst_replay_signal("MBUR", ten_sec[-1], driver._bars_by_symbol["MBUR"])
+
+    assert smooth is True
+    assert median_range <= 2.0
+    assert signal is not None
+    assert signal.scan_result is not None
+    assert signal.scan_result.criteria["median_10s_range_pct"] <= 2.0
+
+
+def test_momentum_burst_hit_run_signal_uses_1r_and_short_hold() -> None:
+    ten_sec = [_ten_bar(i * 10, 2.00 + i * 0.01, width_pct=0.006, volume=5_000) for i in range(12)]
+    driver = _momentum_burst_backtest_driver(ten_sec)
+    driver._use_momentum_burst_hit_run = True
+
+    signal = driver._momentum_burst_replay_signal(
+        "MBUR",
+        ten_sec[-1],
+        driver._bars_by_symbol["MBUR"],
+        hit_run=True,
+    )
+
+    assert signal is not None
+    assert signal.max_hold_seconds == 45.0
+    assert signal.scan_result.scanner_name == "momentum_burst_hit_run"
+    assert signal.scan_result.criteria["entry_mode"] == "momentum_burst_hit_run"
+    assert signal.take_profit == round(
+        signal.entry_price + (signal.entry_price - signal.stop_loss),
+        2,
+    )
+
+
+def test_momentum_burst_hit_run_backtest_defaults_to_one_entry() -> None:
+    ten_sec = [_ten_bar(i * 10, 2.00 + i * 0.01, width_pct=0.006, volume=5_000) for i in range(12)]
+    driver = _momentum_burst_backtest_driver(ten_sec)
+
+    assert driver._mb_hit_run_max_entries == 1
+
+
+def test_momentum_burst_hit_run_backtest_giveback_blocks_symbol() -> None:
+    ten_sec = [_ten_bar(i * 10, 2.00 + i * 0.01, width_pct=0.006, volume=5_000) for i in range(12)]
+    driver = _momentum_burst_backtest_driver(ten_sec)
+    driver._mb_hit_run_max_giveback = 20.0
+
+    assert driver._record_mb_hit_run_pnl("MBUR", 55.0) == ""
+    reason = driver._record_mb_hit_run_pnl("MBUR", -25.0)
+
+    assert "gave back" in reason
+    assert "MBUR" in driver._mb_hit_run_day_blocked
+
+
+def test_momentum_burst_hit_run_backtest_daily_loss_works_when_giveback_disabled() -> None:
+    ten_sec = [_ten_bar(i * 10, 2.00 + i * 0.01, width_pct=0.006, volume=5_000) for i in range(12)]
+    driver = _momentum_burst_backtest_driver(ten_sec)
+    driver._mb_hit_run_stop_after_giveback = False
+    driver._mb_hit_run_daily_loss_stop = 20.0
+
+    reason = driver._record_mb_hit_run_pnl("MBUR", -22.0)
+
+    assert "daily hit-run loss" in reason
+    assert "MBUR" in driver._mb_hit_run_day_blocked
+
+
+def test_momentum_burst_hit_run_backtest_giveback_can_be_disabled() -> None:
+    ten_sec = [_ten_bar(i * 10, 2.00 + i * 0.01, width_pct=0.006, volume=5_000) for i in range(12)]
+    driver = _momentum_burst_backtest_driver(ten_sec)
+    driver._mb_hit_run_stop_after_giveback = False
+    driver._mb_hit_run_max_giveback = 20.0
+
+    assert driver._record_mb_hit_run_pnl("MBUR", 55.0) == ""
+    assert driver._record_mb_hit_run_pnl("MBUR", -25.0) == ""
+    assert "MBUR" not in driver._mb_hit_run_day_blocked
+
+
+def test_post_blowoff_micro_base_scout_signal_is_reduced_and_tagged() -> None:
+    ten_sec = [_ten_bar(i * 10, 2.00 + i * 0.01, width_pct=0.006, volume=80_000) for i in range(12)]
+    driver = _momentum_burst_backtest_driver(ten_sec)
+    driver._use_momentum_burst_hit_run = True
+
+    normal = driver._momentum_burst_replay_signal(
+        "MBUR",
+        ten_sec[-1],
+        driver._bars_by_symbol["MBUR"],
+        hit_run=True,
+    )
+    scout = driver._momentum_burst_replay_signal(
+        "MBUR",
+        ten_sec[-1],
+        driver._bars_by_symbol["MBUR"],
+        hit_run=True,
+        post_blowoff_micro_base=True,
+    )
+
+    assert normal is not None
+    assert scout is not None
+    assert scout.scan_result.scanner_name == "post_blowoff_micro_base_scout"
+    assert scout.scan_result.criteria["entry_mode"] == "post_blowoff_micro_base_scout"
+    assert scout.scan_result.criteria["variant"] == "post_blowoff_micro_base"
+    assert scout.scan_result.criteria["size_factor"] == 0.35
+    assert scout.quantity < normal.quantity
+    assert scout.stop_loss == round(scout.entry_price - max(scout.entry_price * 0.015, 0.06), 2)
+    assert scout.take_profit == round(scout.entry_price + (scout.entry_price - scout.stop_loss), 2)
+
+
+def test_momentum_burst_hit_run_rejects_confirm_bar_that_sweeps_stop() -> None:
+    ten_sec = [_ten_bar(i * 10, 2.00 + i * 0.01, width_pct=0.006, volume=60_000) for i in range(12)]
+    unstable = Bar(
+        symbol="MBUR",
+        ts=ten_sec[-1].ts + timedelta(seconds=10),
+        open=2.46,
+        high=2.62,
+        low=2.43,
+        close=2.50,
+        volume=120_000,
+        timeframe=Timeframe.SEC_10,
+    )
+    ten_sec.append(unstable)
+    driver = _momentum_burst_backtest_driver(ten_sec)
+    driver._use_momentum_burst_hit_run = True
+
+    signal = driver._momentum_burst_replay_signal(
+        "MBUR",
+        unstable,
+        driver._bars_by_symbol["MBUR"],
+        hit_run=True,
+        violent_liquid=True,
+    )
+
+    assert signal is None
+
+
+def test_momentum_burst_hit_run_backtest_time_window_blocks_afternoon_et() -> None:
+    ten_sec = [_ten_bar(i * 10, 2.00 + i * 0.01, width_pct=0.006, volume=5_000) for i in range(12)]
+    driver = _momentum_burst_backtest_driver(ten_sec)
+    driver._mb_hit_run_end_et = "11:30"
+
+    assert driver._momentum_burst_hit_run_time_allowed(
+        datetime(2026, 6, 8, 14, 30, tzinfo=timezone.utc)
+    ) is True
+    assert driver._momentum_burst_hit_run_time_allowed(
+        datetime(2026, 6, 8, 18, 0, tzinfo=timezone.utc)
+    ) is False
+
+
+def test_momentum_burst_hit_run_backtest_time_window_blank_allows_all_day() -> None:
+    ten_sec = [_ten_bar(i * 10, 2.00 + i * 0.01, width_pct=0.006, volume=5_000) for i in range(12)]
+    driver = _momentum_burst_backtest_driver(ten_sec)
+    driver._mb_hit_run_end_et = ""
+
+    assert driver._momentum_burst_hit_run_time_allowed(
+        datetime(2026, 6, 8, 18, 0, tzinfo=timezone.utc)
+    ) is True
+
+
+def test_momentum_burst_continuation_base_allows_extended_runner() -> None:
+    ten_sec = [
+        _ten_bar(i * 10, close, width_pct=0.025, volume=120_000)
+        for i, close in enumerate([8.8, 8.7, 8.9, 9.0, 9.15, 9.3, 9.55, 9.8])
+    ]
+    driver = _momentum_burst_backtest_driver(ten_sec)
+
+    ok, reason, meta = driver._momentum_burst_continuation_base_ok("MBUR", ten_sec[-1].ts)
+
+    assert ok is True
+    assert reason == "fresh continuation base"
+    assert meta["recent_10s_volume"] >= 150_000
+
+
+def test_momentum_burst_replay_rejects_gappy_10s_tape() -> None:
+    ten_sec = [_ten_bar(i * 10, 2.00 + i * 0.01, width_pct=0.045, volume=5_000) for i in range(12)]
+    driver = _momentum_burst_backtest_driver(ten_sec)
+
+    smooth, median_range = driver._momentum_burst_10s_tape_is_smooth("MBUR", ten_sec[-1].ts)
+
+    assert smooth is False
+    assert median_range > 2.0
+
+
 def test_backtest_csv_loader_groups_bars(tmp_path) -> None:
     path = tmp_path / "bars.csv"
     path.write_text(
@@ -463,6 +676,14 @@ def test_run_backtest_service_uses_in_memory_bars_and_flags() -> None:
     assert result["flags"]["execution_timer_10s"] is True
     assert result["execution_timer_source"] == "synthetic_1m_to_10s"
     assert "scorecard" in result
+    manifest = result["manifest"]
+    assert manifest["symbol"] == "TEST"
+    assert manifest["date"] == "2026-06-01"
+    assert manifest["data"]["source"] == "in_memory"
+    assert manifest["data"]["bars_1m"] == 6
+    assert manifest["flags"]["fresh_vwap_reclaim_scout"] is True
+    assert "code_version" in manifest
+    assert "momentum_burst_hit_run_end_et" in manifest["settings"]["strategy"]
 
 
 def test_run_backtest_service_passes_runner_trail_settings(monkeypatch) -> None:
@@ -584,8 +805,16 @@ def test_backtest_flags_default_experiments_off() -> None:
     assert flags["level_breakout_scout"] is False
     assert flags["elite_wide_spread"] is False
     assert flags["momentum_burst_live"] is False
+    assert flags["momentum_burst_hit_run"] is False
     assert flags["level_capped_entry"] is False
     assert flags["execution_timer_10s"] is True
+
+
+def test_backtest_flags_accept_momentum_burst_hit_run() -> None:
+    flags = normalize_flags({"momentum_burst_hit_run": True, "live_like_10s": True})
+
+    assert flags["momentum_burst_hit_run"] is True
+    assert flags["live_like_10s"] is True
 
 
 def test_run_backtest_sweep_compares_experiments_against_baseline() -> None:
@@ -911,3 +1140,72 @@ def test_live_like_breakout_scalp_replay_can_enter_from_10s_hod_expansion():
 
     assert any(t.get("strategy") == "breakout_scalp_replay" for t in result.trades)
     assert any(d.get("stage") == "breakout_scalp_replay" for d in result.entry_decisions)
+
+
+def test_breakout_scalp_replay_rejects_violent_10s_without_high_close():
+    driver = PipelineBacktestDriver(
+        {"CAST": [_bar("CAST", 0, 2.00)]},
+        timer_bars_by_symbol={
+            "CAST": [
+                _ten_sec("CAST", 0, 0, 9.55, high=9.70, low=9.30, volume=130_000),
+                _ten_sec("CAST", 0, 1, 10.69, high=11.34, low=9.33, volume=291_000),
+            ]
+        },
+    )
+
+    reject = driver._breakout_scalp_10s_quality_reject(
+        "CAST",
+        driver._timer_bars_by_symbol["CAST"][-1],
+    )
+
+    assert reject == "10s breakout candle too volatile without strong close (68% location, 18.8% range)"
+
+
+def test_breakout_scalp_replay_rejects_recent_10s_dump_before_breakout():
+    driver = PipelineBacktestDriver(
+        {"CAST": [_bar("CAST", 0, 2.00)]},
+        timer_bars_by_symbol={
+            "CAST": [
+                _ten_sec("CAST", 0, 0, 2.35, high=2.38, low=2.28, volume=90_000),
+                Bar(
+                    "CAST",
+                    _BASE_TS + timedelta(seconds=10),
+                    2.29,
+                    2.32,
+                    2.21,
+                    2.22,
+                    175_000,
+                    Timeframe.SEC_10,
+                ),
+                _ten_sec("CAST", 0, 2, 2.47, high=2.48, low=2.20, volume=130_000),
+                _ten_sec("CAST", 0, 3, 2.60, high=2.62, low=2.50, volume=180_000),
+            ]
+        },
+    )
+
+    reject = driver._breakout_scalp_10s_quality_reject(
+        "CAST",
+        driver._timer_bars_by_symbol["CAST"][-1],
+    )
+
+    assert reject == "recent 10s dump candle before breakout (3.1% body, 9% close location)"
+
+
+def test_breakout_scalp_replay_allows_high_close_wide_10s_without_prior_dump():
+    driver = PipelineBacktestDriver(
+        {"CAST": [_bar("CAST", 0, 2.00)]},
+        timer_bars_by_symbol={
+            "CAST": [
+                _ten_sec("CAST", 0, 0, 4.37, high=4.42, low=4.15, volume=180_000),
+                _ten_sec("CAST", 0, 1, 4.73, high=4.80, low=4.30, volume=450_000),
+                _ten_sec("CAST", 0, 2, 5.17, high=5.17, low=4.61, volume=725_000),
+            ]
+        },
+    )
+
+    reject = driver._breakout_scalp_10s_quality_reject(
+        "CAST",
+        driver._timer_bars_by_symbol["CAST"][-1],
+    )
+
+    assert reject is None

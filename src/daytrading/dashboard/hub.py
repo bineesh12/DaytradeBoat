@@ -704,7 +704,13 @@ def _daily_scorecard(
     for pnl, strategy in trips:
         strategy_name = strategy or "unknown"
         _s = strategy.lower()
-        if "momentum" in _s:
+        if "post_blowoff_micro_base_scout" in _s:
+            mode = "post_blowoff_micro_base_scout"
+        elif "momentum_burst_hit_run" in _s:
+            mode = "momentum_burst_hit_run"
+        elif "momentum_burst_scalp" in _s:
+            mode = "momentum_burst_scalp"
+        elif "momentum" in _s:
             mode = "momentum_breakout"
         elif "fresh_vwap_reclaim" in _s:
             mode = "fresh_vwap_reclaim_scout"

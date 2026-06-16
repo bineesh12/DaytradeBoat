@@ -197,6 +197,9 @@ class TradingPipeline:
         self._entry_chase_pct_low: float = 0.05
         self._entry_chase_pct_high: float = 0.025
         self._entry_chase_price_tier: float = 10.0
+        # Max stop distance (fraction below entry) allowed before rejecting a
+        # long entry as too-wide-risk. 0 disables. Set from StrategyConfig.
+        self._max_entry_risk_pct: float = 0.0
         self._level_capped_entry_enabled = bool(level_capped_entry_enabled)
 
     def _append_entry_decision(
@@ -1767,6 +1770,27 @@ class TradingPipeline:
             SignalAction.SCALE_UP_LONG,
         ):
             return None
+        # Risk-profile gate: a stop more than max_entry_risk_pct below entry is
+        # too wide for a scalp/momentum entry — one fail erases many wins.
+        cap = float(getattr(self, "_max_entry_risk_pct", 0.0) or 0.0)
+        entry_px = float(signal.entry_price or 0.0)
+        stop_px = float(signal.stop_loss or 0.0)
+        if cap > 0 and entry_px > 0 and 0 < stop_px < entry_px:
+            risk_pct = (entry_px - stop_px) / entry_px
+            if risk_pct > cap:
+                reason = "stop too wide: {:.1f}% risk > {:.1f}% cap".format(
+                    risk_pct * 100.0, cap * 100.0,
+                )
+                if result is not None:
+                    self._append_entry_reject(
+                        result,
+                        symbol=signal.symbol,
+                        stage=stage,
+                        reason=reason,
+                        signal=signal,
+                        price=entry_px,
+                    )
+                return reason
         sym_bars = universe.get(signal.symbol) or []
         sym_quotes = quotes.get(signal.symbol) if quotes else None
         decision = self._entry_policy.evaluate(

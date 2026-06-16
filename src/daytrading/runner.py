@@ -39,7 +39,7 @@ from daytrading.execution.alpaca_broker import AlpacaBroker
 from daytrading.execution.entry_executor import EntryExecutionContext, EntryExecutor
 from daytrading.execution.live_prices import resolve_live_prices
 from daytrading.execution.position_reconciler import PositionReconciler
-from daytrading.exits.manager import ExitManager
+from daytrading.exits.manager import ExitManager, is_hit_run_strategy
 from daytrading.exits.scaler import PositionScaler, ReentryDetector
 from daytrading.exits.tape_pressure import TapePressureExit
 from daytrading.indicators.core import vwap
@@ -227,6 +227,29 @@ class AlpacaRunner:
         # symbol -> monotonic time when the experimental breakout bypass fired,
         # so the resulting entry can be tagged for isolated scorecard measurement
         self._momentum_breakout_armed: Dict[str, float] = {}
+        self._momentum_burst_cycle_enabled = False
+        self._momentum_burst_window_sec = 300.0
+        self._momentum_burst_scalp_cooldown_sec = 300.0
+        self._momentum_burst_armed: Dict[str, float] = {}
+        self._momentum_burst_window_high: Dict[str, float] = {}
+        self._momentum_burst_session_anchor_high: Dict[str, float] = {}
+        # symbol -> {ts, breakout_close} of a 10s high awaiting next-bar confirm
+        self._momentum_burst_pending: Dict[str, Dict[str, Any]] = {}
+        self._momentum_burst_hit_run_enabled = False
+        self._momentum_burst_hit_run_max_entries = 1
+        self._momentum_burst_hit_run_win_cooldown_sec = 15.0
+        self._momentum_burst_hit_run_loss_cooldown_sec = 90.0
+        self._momentum_burst_hit_run_max_hold_sec = 45.0
+        self._momentum_burst_hit_run_reward_risk = 1.0
+        self._momentum_burst_hit_run_end_et = "11:30"
+        self._momentum_burst_hit_run_counts: Dict[str, int] = {}
+        self._momentum_burst_hit_run_block_until: Dict[str, float] = {}
+        self._momentum_burst_hit_run_stop_after_giveback = True
+        self._momentum_burst_hit_run_max_giveback = 50.0
+        self._momentum_burst_hit_run_daily_loss_stop = 50.0
+        self._momentum_burst_hit_run_symbol_pnl: Dict[str, float] = {}
+        self._momentum_burst_hit_run_symbol_peak_pnl: Dict[str, float] = {}
+        self._momentum_burst_hit_run_day_blocked: Dict[str, str] = {}
         self._trade_analyzer = None
         self._analysis_interval = 10  # run analysis every N cycles
         self._reconciler = PositionReconciler()
@@ -310,6 +333,16 @@ class AlpacaRunner:
         # Watchlist bar refresh — keep 1m bars fresh for pattern scanners
         self._last_watchlist_bar_refresh: float = 0.0
         self._watchlist_bar_refresh_sec: float = 30.0
+
+        # Capital-aware sizing: risk a % of live equity per trade, scaled to
+        # account size and capped at buying power. Equity is cached (~60s) so we
+        # don't hit the broker API on every entry.
+        self._risk_pct_of_equity: float = 0.015
+        self._max_position_pct_of_equity: float = 1.0
+        self._min_risk_dollars: float = 5.0
+        self._fallback_equity: float = 2000.0
+        self._account_equity: float = 0.0
+        self._account_equity_at: float = 0.0
 
         # Breakout scalp — instant entry on HOD tick alerts
         self._pending_breakout_scalps: deque = deque(maxlen=10)
@@ -441,6 +474,7 @@ class AlpacaRunner:
             pct_high=cfg.strategy.entry_chase_pct_high,
             price_tier=cfg.strategy.entry_chase_price_tier,
         )
+        pipeline._max_entry_risk_pct = float(cfg.strategy.max_entry_risk_pct)
 
         # replace the PaperBroker in the pipeline with the real AlpacaBroker
         pipeline._broker = broker  # type: ignore[assignment]
@@ -545,6 +579,29 @@ class AlpacaRunner:
         runner._momentum_breakout_min_day_volume = float(cfg.strategy.momentum_breakout_min_day_volume)
         runner._momentum_breakout_max_bar_range_pct = float(cfg.strategy.momentum_breakout_max_bar_range_pct)
         runner._momentum_breakout_score_floor = float(cfg.strategy.momentum_breakout_score_floor)
+        runner._momentum_burst_cycle_enabled = bool(cfg.strategy.momentum_burst_cycle_enabled)
+        runner._momentum_burst_window_sec = float(cfg.strategy.momentum_burst_window_sec)
+        runner._momentum_burst_scalp_cooldown_sec = float(cfg.strategy.momentum_burst_scalp_cooldown_sec)
+        runner._momentum_burst_hit_run_enabled = bool(cfg.strategy.momentum_burst_hit_run_enabled)
+        runner._risk_pct_of_equity = float(cfg.strategy.risk_pct_of_equity)
+        runner._max_position_pct_of_equity = float(cfg.strategy.max_position_pct_of_equity)
+        runner._min_risk_dollars = float(cfg.strategy.min_risk_dollars)
+        runner._fallback_equity = float(cfg.strategy.fallback_equity)
+        runner._momentum_burst_hit_run_max_entries = int(cfg.strategy.momentum_burst_hit_run_max_entries)
+        runner._momentum_burst_hit_run_win_cooldown_sec = float(cfg.strategy.momentum_burst_hit_run_win_cooldown_sec)
+        runner._momentum_burst_hit_run_loss_cooldown_sec = float(cfg.strategy.momentum_burst_hit_run_loss_cooldown_sec)
+        runner._momentum_burst_hit_run_max_hold_sec = float(cfg.strategy.momentum_burst_hit_run_max_hold_sec)
+        runner._momentum_burst_hit_run_reward_risk = float(cfg.strategy.momentum_burst_hit_run_reward_risk)
+        runner._momentum_burst_hit_run_end_et = str(cfg.strategy.momentum_burst_hit_run_end_et or "")
+        runner._momentum_burst_hit_run_stop_after_giveback = bool(
+            cfg.strategy.momentum_burst_hit_run_stop_after_giveback
+        )
+        runner._momentum_burst_hit_run_max_giveback = float(
+            cfg.strategy.momentum_burst_hit_run_max_giveback
+        )
+        runner._momentum_burst_hit_run_daily_loss_stop = float(
+            cfg.strategy.momentum_burst_hit_run_daily_loss_stop
+        )
         runner._exec_timer._tick_entry_enabled = bool(cfg.strategy.tick_entry_enabled)
         runner._exec_timer._tick_entry_confirm_count = max(1, int(cfg.strategy.tick_entry_confirm_count))
         runner._exec_timer._tick_entry_max_above_anchor = float(cfg.strategy.tick_entry_max_above_anchor)
@@ -2335,6 +2392,8 @@ class AlpacaRunner:
         # Push initial account info and trade history to dashboard
         try:
             acct = self._broker.get_account()
+            self._account_equity = float(acct.get("equity") or 0.0)
+            self._account_equity_at = time.monotonic()
             self._hub.on_startup(acct["cash"], acct["equity"], acct["buying_power"])
             self._hub.starting_cash = acct["equity"]
             self._hub.total_pnl = 0.0
@@ -2573,6 +2632,7 @@ class AlpacaRunner:
                 # Process instant breakout scalps from HOD tick alerts
                 if in_trading_window and not timed_entry_pending:
                     self._process_breakout_scalps()
+                    self._process_momentum_burst_scalps()
 
                 should_run = False
                 if timed_entry_pending:
@@ -3068,8 +3128,33 @@ class AlpacaRunner:
             }
         self._journal.record("trade_exit", payload, ts=fill.ts)
 
-        if strategy == "breakout_scalp":
+        if strategy in (
+            "breakout_scalp",
+            "breakout_scalp_momentum",
+            "momentum_burst_scalp",
+        ) or is_hit_run_strategy(strategy):
             self._breakout_scalp_active = False
+        if is_hit_run_strategy(strategy):
+            try:
+                block_reason = self._record_momentum_burst_hit_run_pnl(fill.symbol, pnl)
+                if block_reason:
+                    self._hub.add_log(
+                        "WARN",
+                        "MOMENTUM BURST HIT-RUN {} stopped for day: {}".format(
+                            fill.symbol, block_reason,
+                        ),
+                    )
+                lower_reason = (reason or "").lower()
+                is_win = pnl > 0.0 and "stop" not in lower_reason and "loss" not in lower_reason
+                cooldown = (
+                    self._momentum_burst_hit_run_win_cooldown_sec
+                    if is_win else self._momentum_burst_hit_run_loss_cooldown_sec
+                )
+                self._momentum_burst_hit_run_block_until[fill.symbol] = time.monotonic() + cooldown
+            except Exception:
+                self._momentum_burst_hit_run_block_until[fill.symbol] = (
+                    time.monotonic() + self._momentum_burst_hit_run_loss_cooldown_sec
+                )
 
         # Cancel any pending entry signals for this symbol (prevent re-entry race)
         self._exec_timer.cancel(fill.symbol)
@@ -3100,6 +3185,33 @@ class AlpacaRunner:
         else:
             self._refresh_broker_stop(fill.symbol)
         return pnl
+
+    def _record_momentum_burst_hit_run_pnl(self, symbol: str, pnl: float) -> Optional[str]:
+        """Track per-symbol hit-run realized P&L and block overtrading after give-back."""
+        sym = symbol.upper()
+        current = float(self._momentum_burst_hit_run_symbol_pnl.get(sym, 0.0) or 0.0) + float(pnl or 0.0)
+        self._momentum_burst_hit_run_symbol_pnl[sym] = current
+        peak = max(float(self._momentum_burst_hit_run_symbol_peak_pnl.get(sym, 0.0) or 0.0), current)
+        self._momentum_burst_hit_run_symbol_peak_pnl[sym] = peak
+
+        loss_stop = max(0.0, float(getattr(self, "_momentum_burst_hit_run_daily_loss_stop", 0.0) or 0.0))
+        if loss_stop > 0 and current <= -loss_stop:
+            reason = "daily hit-run loss ${:.2f} reached stop ${:.2f}".format(abs(current), loss_stop)
+            self._momentum_burst_hit_run_day_blocked[sym] = reason
+            return reason
+
+        giveback_stop = max(0.0, float(getattr(self, "_momentum_burst_hit_run_max_giveback", 0.0) or 0.0))
+        giveback = peak - current
+        if (
+            getattr(self, "_momentum_burst_hit_run_stop_after_giveback", True)
+            and peak > 0
+            and giveback_stop > 0
+            and giveback >= giveback_stop
+        ):
+            reason = "gave back ${:.2f} from hit-run peak ${:.2f}".format(giveback, peak)
+            self._momentum_burst_hit_run_day_blocked[sym] = reason
+            return reason
+        return None
 
     def _seed_recent_order_ids(self) -> None:
         """Add recent closed order IDs to prevent duplicate dashboard pushes."""
@@ -3301,6 +3413,26 @@ class AlpacaRunner:
         # Clear per-symbol timed-entry chase anchors for the new day
         if getattr(self, "_timed_entry_anchor", None):
             self._timed_entry_anchor.clear()
+        if getattr(self, "_momentum_burst_armed", None):
+            self._momentum_burst_armed.clear()
+        if getattr(self, "_momentum_burst_window_high", None):
+            self._momentum_burst_window_high.clear()
+        if getattr(self, "_momentum_burst_session_anchor_high", None):
+            self._momentum_burst_session_anchor_high.clear()
+        if getattr(self, "_momentum_burst_pending", None):
+            self._momentum_burst_pending.clear()
+        if getattr(self, "_momentum_burst_hit_run_counts", None):
+            self._momentum_burst_hit_run_counts.clear()
+        if getattr(self, "_momentum_burst_hit_run_block_until", None):
+            self._momentum_burst_hit_run_block_until.clear()
+        if getattr(self, "_momentum_burst_hit_run_symbol_pnl", None):
+            self._momentum_burst_hit_run_symbol_pnl.clear()
+        if getattr(self, "_momentum_burst_hit_run_symbol_peak_pnl", None):
+            self._momentum_burst_hit_run_symbol_peak_pnl.clear()
+        if getattr(self, "_momentum_burst_hit_run_day_blocked", None):
+            self._momentum_burst_hit_run_day_blocked.clear()
+        # Defensive: never carry a latched quick-scalp-open flag across a session
+        self._breakout_scalp_active = False
 
         # Reset daily P&L tracking
         self._pipeline._daily_pnl = 0.0
@@ -3758,6 +3890,10 @@ class AlpacaRunner:
                 sym: pos.entry_price
                 for sym, pos in self._pipeline.exit_manager._positions.items()
             }
+            entry_strategies = {
+                sym: getattr(pos, "entry_strategy", "") or ""
+                for sym, pos in self._pipeline.exit_manager._positions.items()
+            }
 
             exit_signals = self._pipeline.exit_manager.check_exits(prices, now)
 
@@ -3795,6 +3931,7 @@ class AlpacaRunner:
                             ep = pos.avg_price
                     pnl = self._record_trade_exit(
                         fill, ep, sig.reason or "fast_exit",
+                        strategy=entry_strategies.get(sig.symbol, ""),
                     )
                     logger.info(
                         "FAST EXIT %s %s %.0f @ %.4f (entry=%.4f, P&L=$%.2f, day P&L=$%.2f)",
@@ -3847,6 +3984,7 @@ class AlpacaRunner:
                                 ep = pos.avg_price
                         pnl = self._record_trade_exit(
                             fill2, ep, sig.reason or "market_stop",
+                            strategy=entry_strategies.get(sig.symbol, ""),
                         )
                         logger.info(
                             "MARKET EXIT %s %s %.0f @ %.4f (entry=%.4f, P&L=$%.2f)",
@@ -4379,9 +4517,15 @@ class AlpacaRunner:
                     live, breakout_level,
                 )
 
+        if pattern == "hod_reclaim" or scanner == "hod_reclaim":
+            hod_10s_reject = self._timed_hod_reclaim_10s_reject(signal, live, original)
+            if hod_10s_reject is not None:
+                return hod_10s_reject
+
         max_chase_pct = 0.025 if original >= 5.0 else 0.035
         if pattern in (
             "abc_continuation",
+            "hod_reclaim",
             "level_breakout_reclaim",
             "pullback_base",
             "vwap_pullback",
@@ -4460,6 +4604,86 @@ class AlpacaRunner:
                 if b.close < b.open and live >= original:
                     return "latest 10s candle turned red during entry wait"
 
+        return None
+
+    def _timed_hod_reclaim_10s_reject(
+        self,
+        signal: TradeSignal,
+        live: float,
+        original: float,
+    ) -> Optional[str]:
+        """Require HOD timed releases to still show 10s follow-through.
+
+        HOD reclaims are especially sensitive to buying the last push after a
+        deferred timer wait. The normal timer can release on a green 10s bar; this
+        final check makes sure that bar is not just a weak hold before a fade.
+        """
+        aggregator = getattr(self, "_bar_aggregator", None)
+        if aggregator is None:
+            return None
+        try:
+            bars_10s = list(aggregator.get_latest_10s(signal.symbol, count=2) or [])
+        except Exception:
+            return None
+        if not bars_10s:
+            return None
+        latest = bars_10s[-1]
+        latest_open = float(getattr(latest, "open", 0.0) or 0.0)
+        latest_high = float(getattr(latest, "high", 0.0) or 0.0)
+        latest_low = float(getattr(latest, "low", 0.0) or 0.0)
+        latest_close = float(getattr(latest, "close", 0.0) or 0.0)
+        latest_volume = float(getattr(latest, "volume", 0.0) or 0.0)
+        if latest_close <= 0:
+            return None
+
+        hit = signal.scan_result
+        criteria = hit.criteria if hit is not None else {}
+        try:
+            reclaim_level = float(
+                criteria.get("hod")
+                or criteria.get("close")
+                or signal.entry_price
+                or original
+                or 0.0
+            )
+        except (TypeError, ValueError):
+            reclaim_level = float(signal.entry_price or original or 0.0)
+        if reclaim_level > 0 and latest_close < reclaim_level * 0.998:
+            return "HOD reclaim 10s close {:.4f} lost reclaim level {:.4f}".format(
+                latest_close,
+                reclaim_level,
+            )
+        if latest_close <= latest_open:
+            return "HOD reclaim 10s confirmation red/flat"
+
+        latest_range = max(latest_high - latest_low, 0.0)
+        if latest_range > 0:
+            close_location = (latest_close - latest_low) / latest_range
+            if close_location < 0.65:
+                return "HOD reclaim 10s confirmation weak close ({:.0%} location)".format(
+                    close_location,
+                )
+
+        if len(bars_10s) >= 2:
+            prev = bars_10s[-2]
+            prev_high = float(getattr(prev, "high", 0.0) or 0.0)
+            if prev_high > 0 and latest_high <= prev_high * 1.001:
+                return "HOD reclaim 10s confirmation no expansion"
+
+        try:
+            setup_volume = float(criteria.get("volume") or 0.0)
+        except (TypeError, ValueError):
+            setup_volume = 0.0
+        min_volume = 1_000.0
+        if setup_volume >= 50_000:
+            min_volume = min(50_000.0, max(10_000.0, setup_volume * 0.25))
+        elif setup_volume >= 20_000:
+            min_volume = max(5_000.0, setup_volume * 0.20)
+        if latest_volume < min_volume:
+            return "HOD reclaim 10s volume {:.0f} below follow-through floor {:.0f}".format(
+                latest_volume,
+                min_volume,
+            )
         return None
 
     def _timed_entry_chase_anchor(self, signal: TradeSignal) -> float:
@@ -4645,6 +4869,13 @@ class AlpacaRunner:
         criteria = signal.scan_result.criteria if signal and signal.scan_result else {}
         scanner_name = signal.scan_result.scanner_name if signal and signal.scan_result else ""
         if signal is None:
+            inferred_pattern = str(criteria.get("pattern") or scanner_name or source or "")
+            inferred_criteria = {"pattern": inferred_pattern}
+            if source == "post_blowoff_micro_base_scout":
+                inferred_criteria.update({
+                    "entry_mode": "post_blowoff_micro_base_scout",
+                    "setup_tier": "A+ setup",
+                })
             signal = TradeSignal(
                 symbol=symbol,
                 action=SignalAction.ENTER_LONG,
@@ -4653,10 +4884,10 @@ class AlpacaRunner:
                 reason="shared entry quality",
                 scan_result=ScanResult(
                     symbol=symbol,
-                    scanner_name=scanner_name or "shared_entry_quality",
+                    scanner_name=scanner_name or source or "shared_entry_quality",
                     ts=datetime.now(timezone.utc),
                     score=0.0,
-                    criteria={"pattern": str(criteria.get("pattern") or scanner_name or "")},
+                    criteria=inferred_criteria,
                 ),
             )
         return executor.evaluate_quality(
@@ -4809,6 +5040,49 @@ class AlpacaRunner:
             logger.warning("TIMED ENTRY hot retry failed %s: %s", signal.symbol, exc)
             return None, first_status
 
+    def _current_equity(self) -> float:
+        """Live account equity, cached ~60s; falls back to configured equity.
+
+        Reading the broker account on every entry would be slow, so we cache it
+        and refresh at most once a minute.
+        """
+        now = time.monotonic()
+        cached = float(getattr(self, "_account_equity", 0.0) or 0.0)
+        last = float(getattr(self, "_account_equity_at", 0.0) or 0.0)
+        if cached > 0 and (now - last) < 60.0:
+            return cached
+        try:
+            eq = float((self._broker.get_account() or {}).get("equity") or 0.0)
+            if eq > 0:
+                self._account_equity = eq
+                self._account_equity_at = now
+                return eq
+        except Exception:
+            pass
+        return cached if cached > 0 else float(getattr(self, "_fallback_equity", 2000.0) or 2000.0)
+
+    def _capital_aware_quantity(self, price: float, stop_price: float) -> int:
+        """Shares so the trade risks ~risk_pct of equity and the position fits
+        buying power. Returns 0 when even a safe minimum can't be afforded so
+        the caller skips the trade rather than over-leveraging.
+        """
+        price = float(price or 0.0)
+        if price <= 0:
+            return 0
+        risk_pct = float(getattr(self, "_risk_pct_of_equity", 0.0) or 0.0)
+        equity = self._current_equity()
+        risk_per_share = price - float(stop_price or 0.0)
+        if risk_pct <= 0:
+            # Capital-aware sizing disabled — keep the legacy fixed-$ behavior.
+            risk_dollars = 50.0
+        else:
+            risk_dollars = max(float(getattr(self, "_min_risk_dollars", 5.0) or 0.0), equity * risk_pct)
+        qty_by_risk = int(risk_dollars / risk_per_share) if risk_per_share > 0 else 0
+        max_pos_value = equity * float(getattr(self, "_max_position_pct_of_equity", 1.0) or 1.0)
+        qty_by_capital = int(max_pos_value / price) if price > 0 else 0
+        qty = min(qty_by_risk, qty_by_capital) if qty_by_capital > 0 else qty_by_risk
+        return max(0, int(qty))
+
     def _process_breakout_scalps(self) -> None:
         """Process pending breakout scalps queued by HOD tick alerts.
 
@@ -4885,6 +5159,7 @@ class AlpacaRunner:
             recent_reject = self._quick_scalp_recent_normal_reject(
                 sym,
                 allow_fresh_hod_breakout=True,
+                require_clean_reclaim=True,
             )
             if recent_reject is not None:
                 logger.info("BREAKOUT SCALP reject %s: %s", sym, recent_reject)
@@ -4916,7 +5191,7 @@ class AlpacaRunner:
                 logger.info("BREAKOUT SCALP reject %s: shared entry quality %s", sym, quality_reject)
                 continue
 
-            ten_second_reject = self._quick_scalp_10s_reject(sym)
+            ten_second_reject = self._breakout_scalp_10s_reject(sym)
             if ten_second_reject is not None:
                 logger.info("BREAKOUT SCALP reject %s: %s", sym, ten_second_reject)
                 probe_signal = self._quick_scalp_probe_signal(sym, bars[-1].close, "breakout_scalp")
@@ -4944,9 +5219,10 @@ class AlpacaRunner:
             price, stop_price, target_price, rr_note = rr
             risk_per_share = price - stop_price
 
-            max_dollar_risk = 50.0
-            quantity = int(max_dollar_risk / risk_per_share) if risk_per_share > 0 else 0
-            quantity = max(1, min(quantity, 750))
+            quantity = self._capital_aware_quantity(price, stop_price)
+            if quantity < 1:
+                logger.info("BREAKOUT SCALP skip %s — position too large for buying power", sym)
+                continue
             spread_size_factor = float(
                 getattr(self, "_quick_scalp_spread_size_factors", {}).pop(sym, 1.0)
             )
@@ -5329,6 +5605,7 @@ class AlpacaRunner:
         symbol: str,
         *,
         allow_fresh_hod_breakout: bool = False,
+        require_clean_reclaim: bool = False,
     ) -> Optional[str]:
         """Block quick scalps when the regular entry path just saw a hard reject."""
         pipeline = getattr(self, "_pipeline", None)
@@ -5361,6 +5638,15 @@ class AlpacaRunner:
             and self._quick_scalp_can_ignore_recent_shape_reject(reason)
             and self._quick_scalp_has_tradeable_hod_alert(symbol)
         ):
+            if require_clean_reclaim:
+                continuation_ok, continuation_reason, _continuation_meta = (
+                    self._momentum_burst_continuation_base_ok(symbol)
+                )
+                if not continuation_ok:
+                    return (
+                        "fresh HOD breakout needs clean 10s reclaim after recent reject: "
+                        "{}".format(continuation_reason)
+                    )
             logger.info(
                 "BREAKOUT SCALP ignore stale normal reject %s: %s",
                 symbol,
@@ -5451,6 +5737,685 @@ class AlpacaRunner:
             ),
         )
 
+    def _maybe_arm_momentum_burst_scalp(self, hit: ScanResult) -> None:
+        """Arm a fixed monitor window from a momentum_burst scanner hit."""
+        if not (
+            getattr(self, "_momentum_burst_cycle_enabled", False)
+            or getattr(self, "_momentum_burst_hit_run_enabled", False)
+        ):
+            return
+        pattern = str((hit.criteria or {}).get("pattern") or hit.scanner_name or "")
+        if hit.scanner_name != "momentum_burst" and pattern != "momentum_burst":
+            return
+        sym = hit.symbol.upper()
+        high = 0.0
+        try:
+            if hit.bars:
+                high = max(float(bar.high or 0.0) for bar in hit.bars[-3:])
+        except Exception:
+            high = 0.0
+        if high <= 0:
+            try:
+                high = float((hit.criteria or {}).get("close") or 0.0)
+            except (TypeError, ValueError):
+                high = 0.0
+        if high <= 0:
+            return
+        if (
+            getattr(self, "_momentum_burst_hit_run_enabled", False)
+            and sym in getattr(self, "_momentum_burst_hit_run_day_blocked", {})
+        ):
+            logger.info(
+                "MOMENTUM BURST HIT-RUN not arming %s — %s",
+                sym,
+                self._momentum_burst_hit_run_day_blocked.get(sym),
+            )
+            return
+        now_mono = time.monotonic()
+        self._momentum_burst_armed[sym] = now_mono
+        self._momentum_burst_window_high[sym] = max(
+            high,
+            float(self._momentum_burst_window_high.get(sym, 0.0) or 0.0),
+        )
+        self._momentum_burst_session_anchor_high.setdefault(sym, high)
+        logger.info(
+            "MOMENTUM BURST SCALP armed %s for %.0fs above $%.4f",
+            sym,
+            self._momentum_burst_window_sec,
+            self._momentum_burst_window_high[sym],
+        )
+
+    def _process_momentum_burst_scalps(self) -> None:
+        """Monitor armed momentum_burst symbols and scalp fresh 10s highs.
+
+        This is intentionally a runner-side experiment: the momentum_burst
+        scanner arms a short window, but orders still go through the same quick
+        scalp shape, shared entry guard/ML, 10s confirmation, R:R, risk, broker,
+        and position-open bookkeeping as HOD breakout scalps.
+        """
+        cycle_enabled = bool(getattr(self, "_momentum_burst_cycle_enabled", False))
+        hit_run_enabled = bool(getattr(self, "_momentum_burst_hit_run_enabled", False))
+        if not (cycle_enabled or hit_run_enabled):
+            return
+        armed = getattr(self, "_momentum_burst_armed", None)
+        if not armed:
+            return
+        if self._new_entries_blocked(None, "MOMENTUM BURST SCALP"):
+            armed.clear()
+            self._momentum_burst_window_high.clear()
+            self._momentum_burst_pending.clear()
+            return
+
+        pending = self._momentum_burst_pending
+        now_mono = time.monotonic()
+        for sym, armed_at in list(armed.items()):
+            if now_mono - float(armed_at or 0.0) > self._momentum_burst_window_sec:
+                armed.pop(sym, None)
+                self._momentum_burst_window_high.pop(sym, None)
+                pending.pop(sym, None)
+                self._momentum_burst_hit_run_counts.pop(sym, None)
+                self._momentum_burst_hit_run_block_until.pop(sym, None)
+                continue
+
+            if self._breakout_scalp_active:
+                return
+            if hit_run_enabled:
+                day_block = self._momentum_burst_hit_run_day_blocked.get(sym)
+                if day_block:
+                    pending.pop(sym, None)
+                    logger.info("MOMENTUM BURST HIT-RUN %s blocked for day: %s", sym, day_block)
+                    continue
+                if (
+                    self._momentum_burst_hit_run_counts.get(sym, 0)
+                    >= self._momentum_burst_hit_run_max_entries
+                ):
+                    continue
+                if now_mono < self._momentum_burst_hit_run_block_until.get(sym, 0.0):
+                    continue
+            else:
+                cooldown_until = self._breakout_scalp_cooldown.get(sym, 0.0)
+                if now_mono < cooldown_until:
+                    continue
+            last_exit_ts = self._pipeline._exit_cooldowns.get(sym)
+            if last_exit_ts is not None and not hit_run_enabled:
+                try:
+                    elapsed = (datetime.now(timezone.utc) - last_exit_ts).total_seconds()
+                    if elapsed < self._pipeline._cooldown_seconds:
+                        continue
+                except Exception:
+                    continue
+            if (
+                not hit_run_enabled
+                and self._pipeline._symbol_entry_counts.get(sym, 0) >= self._pipeline._max_entries_per_symbol
+            ):
+                continue
+            pos = self._pipeline.portfolio.positions.get(sym)
+            if pos and not pos.is_flat:
+                continue
+
+            latest_10s = self._latest_momentum_burst_10s_bar(sym)
+            if latest_10s is None:
+                continue
+            if hit_run_enabled:
+                if not self._momentum_burst_hit_run_time_allowed(getattr(latest_10s, "ts", None)):
+                    armed.pop(sym, None)
+                    self._momentum_burst_window_high.pop(sym, None)
+                    pending.pop(sym, None)
+                    logger.info(
+                        "MOMENTUM BURST HIT-RUN %s outside time window ending %s ET",
+                        sym,
+                        self._momentum_burst_hit_run_end_et,
+                    )
+                    continue
+                reentry = self._momentum_burst_hit_run_counts.get(sym, 0) > 0
+                anchor_high = float(self._momentum_burst_session_anchor_high.get(sym, 0.0) or 0.0)
+                current_close = float(latest_10s.close or 0.0)
+                stop_reason = self._momentum_burst_stop_trading_reason(sym)
+                if stop_reason:
+                    continuation_ok, _continuation_reason, _continuation_meta = (
+                        self._momentum_burst_continuation_base_ok(sym)
+                    )
+                    if continuation_ok:
+                        stop_reason = ""
+                if stop_reason:
+                    pending.pop(sym, None)
+                    logger.info("MOMENTUM BURST HIT-RUN %s stop trading: %s", sym, stop_reason)
+                    continue
+                if anchor_high > 0 and current_close > anchor_high * 1.5:
+                    continuation_ok, continuation_reason, _continuation_meta = (
+                        self._momentum_burst_continuation_base_ok(sym)
+                    )
+                    if not continuation_ok:
+                        logger.info(
+                            "MOMENTUM BURST HIT-RUN %s extended without continuation base: %s",
+                            sym,
+                            continuation_reason,
+                        )
+                        continue
+                if reentry:
+                    continuation_ok, continuation_reason, _continuation_meta = (
+                        self._momentum_burst_continuation_base_ok(sym)
+                    )
+                    if not continuation_ok:
+                        logger.info(
+                            "MOMENTUM BURST HIT-RUN %s re-entry needs fresh micro-base: %s",
+                            sym,
+                            continuation_reason,
+                        )
+                        continue
+            bar_ts = getattr(latest_10s, "ts", None)
+            current_high = float(latest_10s.high or 0.0)
+            window_high = float(self._momentum_burst_window_high.get(sym, 0.0) or 0.0)
+
+            # A fresh 10s high arms a pending breakout; we do NOT buy that spike
+            # bar. Entry waits for the NEXT 10s bar to prove continuation: green,
+            # holding the breakout close, and trading through the breakout high.
+            # A sideways hold under the spike high is not enough for hit-run.
+            pend = pending.get(sym)
+            if pend is not None and bar_ts is not None and pend.get("ts") is not None:
+                try:
+                    gap = (bar_ts - pend["ts"]).total_seconds()
+                except Exception:
+                    gap = 999.0
+                if gap > 30.0:  # confirmation never arrived — drop stale breakout
+                    pending.pop(sym, None)
+                    pend = None
+
+            if pend is not None:
+                # Still inside the breakout bar itself — wait for the next bar.
+                if bar_ts is not None and pend.get("ts") is not None and bar_ts <= pend["ts"]:
+                    continue
+                confirmed = (
+                    float(latest_10s.close or 0.0) >= float(latest_10s.open or 0.0)
+                    and float(latest_10s.close or 0.0) >= float(pend.get("breakout_close") or 0.0)
+                )
+                breakout_high = float(
+                    pend.get("breakout_high")
+                    or pend.get("breakout_close")
+                    or 0.0
+                )
+                confirm_high = float(latest_10s.high or 0.0)
+                confirm_low = float(latest_10s.low or 0.0)
+                continuation_buffer = max(0.005, breakout_high * 0.001)
+                confirm_range = max(confirm_high - confirm_low, 0.0)
+                close_location = (
+                    (float(latest_10s.close or 0.0) - confirm_low) / confirm_range
+                    if confirm_range > 0 else 0.0
+                )
+                violent_ok, _violent_meta = self._momentum_burst_violent_liquid_ok(sym)
+                reentry = hit_run_enabled and self._momentum_burst_hit_run_counts.get(sym, 0) > 0
+                volume_ratio = 0.5 if reentry else (0.25 if hit_run_enabled and violent_ok else 0.5)
+                chase_cap = 0.03 if reentry else (0.08 if hit_run_enabled and violent_ok else 0.03)
+                reject_reason = None
+                if not confirmed:
+                    reject_reason = "breakout not confirmed by next 10s bar"
+                elif (
+                    hit_run_enabled
+                    and breakout_high > 0
+                    and confirm_high < breakout_high + continuation_buffer
+                ):
+                    reject_reason = (
+                        "confirm bar did not break continuation high "
+                        "({:.2f} <= {:.2f})"
+                    ).format(confirm_high, breakout_high)
+                elif hit_run_enabled and close_location < 0.65:
+                    reject_reason = "confirm bar did not close with strength"
+                elif float(latest_10s.volume or 0.0) < volume_ratio * float(pend.get("breakout_volume") or 0.0):
+                    reject_reason = "confirm-bar volume too light (no follow-through)"
+                elif (
+                    float(pend.get("breakout_close") or 0.0) > 0
+                    and float(latest_10s.close or 0.0)
+                    > float(pend.get("breakout_close") or 0.0) * (1.0 + chase_cap)
+                ):
+                    reject_reason = "chasing: confirm {:.2f} >{:.0%} above breakout {:.2f}".format(
+                        float(latest_10s.close or 0.0),
+                        chase_cap,
+                        float(pend.get("breakout_close") or 0.0),
+                    )
+                post_blowoff_micro_base = bool(hit_run_enabled and pend.get("reset_from_stale_high"))
+                pending.pop(sym, None)
+                if reject_reason is not None:
+                    logger.info("MOMENTUM BURST SCALP %s: %s - skip", sym, reject_reason)
+                    continue
+                fill = self._execute_momentum_burst_scalp(
+                    sym,
+                    latest_10s,
+                    hit_run=hit_run_enabled,
+                    violent_liquid=bool(hit_run_enabled and violent_ok),
+                    post_blowoff_micro_base=post_blowoff_micro_base,
+                )
+                if fill is not None:
+                    if not hit_run_enabled:
+                        armed.pop(sym, None)
+                        self._momentum_burst_window_high.pop(sym, None)
+                    break
+                continue
+
+            if current_high > 0 and window_high > 0 and current_high <= window_high:
+                if hit_run_enabled and window_high > current_high * 1.08:
+                    continuation_ok, _continuation_reason, continuation_meta = (
+                        self._momentum_burst_continuation_base_ok(sym)
+                    )
+                    if continuation_ok:
+                        self._momentum_burst_window_high[sym] = current_high
+                        pending[sym] = {
+                            "ts": bar_ts,
+                            "breakout_close": float(latest_10s.close or 0.0),
+                            "breakout_high": current_high,
+                            "breakout_volume": float(latest_10s.volume or 0.0),
+                            "reset_from_stale_high": round(window_high, 4),
+                            "base_high": continuation_meta.get("base_high"),
+                            "base_low": continuation_meta.get("base_low"),
+                        }
+                continue
+
+            if current_high > 0 and (window_high <= 0 or current_high > window_high):
+                self._momentum_burst_window_high[sym] = current_high
+                pending[sym] = {
+                    "ts": bar_ts,
+                    "breakout_close": float(latest_10s.close or 0.0),
+                    "breakout_high": current_high,
+                    "breakout_volume": float(latest_10s.volume or 0.0),
+                }
+
+    def _momentum_burst_hit_run_time_allowed(self, ts: Optional[datetime] = None) -> bool:
+        end_text = str(getattr(self, "_momentum_burst_hit_run_end_et", "") or "").strip()
+        if not end_text:
+            return True
+        try:
+            hour_text, minute_text = end_text.split(":", 1)
+            end_hour = int(hour_text)
+            end_minute = int(minute_text)
+        except Exception:
+            return True
+        try:
+            current = ts or datetime.now(timezone.utc)
+            if current.tzinfo is None:
+                current = current.replace(tzinfo=timezone.utc)
+            current_et = current.astimezone(ET).time()
+        except Exception:
+            return True
+        return current_et.hour < end_hour or (
+            current_et.hour == end_hour and current_et.minute <= end_minute
+        )
+
+    def _latest_momentum_burst_10s_bar(self, symbol: str) -> Optional[Bar]:
+        aggregator = getattr(self, "_bar_aggregator", None)
+        if aggregator is None:
+            return None
+        try:
+            bars_10s = aggregator.get_latest_10s(symbol, count=4)
+        except Exception:
+            return None
+        if not bars_10s:
+            return None
+        return bars_10s[-1]
+
+    def _momentum_burst_violent_liquid_ok(self, symbol: str) -> tuple[bool, Dict[str, float]]:
+        bars_10s = self._momentum_burst_recent_10s(symbol, count=12)
+        if not bars_10s or len(bars_10s) < 6:
+            return False, {}
+        recent = [b for b in bars_10s[-6:] if float(b.close or 0.0) > 0]
+        if len(recent) < 3:
+            return False, {}
+        ranges = sorted(
+            (float(b.high or 0.0) - float(b.low or 0.0)) / float(b.close or 1.0) * 100.0
+            for b in recent
+        )
+        median_range = float(ranges[len(ranges) // 2])
+        latest_volume = float(bars_10s[-1].volume or 0.0)
+        recent_volume = sum(float(b.volume or 0.0) for b in bars_10s[-3:])
+        day_proxy_volume = sum(float(b.volume or 0.0) for b in bars_10s)
+        ok = (
+            median_range <= 9.0
+            and latest_volume >= 50_000
+            and recent_volume >= 150_000
+            and day_proxy_volume >= 500_000
+        )
+        return ok, {
+            "median_10s_range_pct": round(median_range, 3),
+            "latest_10s_volume": round(latest_volume, 0),
+            "recent_10s_volume": round(recent_volume, 0),
+            "day_proxy_10s_volume": round(day_proxy_volume, 0),
+        }
+
+    def _momentum_burst_recent_10s(self, symbol: str, *, count: int = 12) -> List[Bar]:
+        aggregator = getattr(self, "_bar_aggregator", None)
+        if aggregator is None:
+            return []
+        try:
+            return list(aggregator.get_latest_10s(symbol, count=count) or [])
+        except Exception:
+            return []
+
+    def _momentum_burst_stop_trading_reason(self, symbol: str) -> str:
+        history = self._momentum_burst_recent_10s(symbol, count=12)
+        if len(history) < 6:
+            return ""
+        latest = history[-1]
+        rng = float(latest.high or 0.0) - float(latest.low or 0.0)
+        close = float(latest.close or 0.0)
+        if rng <= 0 or close <= 0:
+            return ""
+        range_pct = rng / close * 100.0
+        upper_wick = (float(latest.high or 0.0) - max(float(latest.open or 0.0), close)) / rng
+        prior_vol = [float(b.volume or 0.0) for b in history[-6:-1]]
+        avg_prior_vol = sum(prior_vol) / len(prior_vol) if prior_vol else 0.0
+        is_red = close < float(latest.open or 0.0)
+        if upper_wick >= 0.78 and range_pct >= 6.0 and float(latest.volume or 0.0) >= avg_prior_vol * 1.1:
+            return "big topping wick in 10s burst tape"
+        if is_red and range_pct >= 6.0 and float(latest.volume or 0.0) >= avg_prior_vol * 1.2:
+            return "heavy red dump candle in 10s burst tape"
+        if len(history) >= 10:
+            closes = [float(b.close or 0.0) for b in history[-9:]]
+            ema = closes[0]
+            alpha = 2.0 / 10.0
+            for value in closes[1:]:
+                ema = value * alpha + ema * (1.0 - alpha)
+            if close < ema * 0.985 and close < min(float(b.low or 0.0) for b in history[-5:-1]):
+                return "lost 10s trend support"
+        return ""
+
+    def _momentum_burst_continuation_base_ok(self, symbol: str) -> tuple[bool, str, Dict[str, float]]:
+        history = self._momentum_burst_recent_10s(symbol, count=12)
+        if len(history) < 8:
+            return False, "not enough 10s history", {}
+        latest = history[-1]
+        prior = history[-6:-1]
+        close = float(latest.close or 0.0)
+        if close <= float(latest.open or 0.0):
+            return False, "confirm bar is not green", {}
+        latest_volume = float(latest.volume or 0.0)
+        recent_volume = sum(float(b.volume or 0.0) for b in history[-3:])
+        if latest_volume < 50_000 or recent_volume < 150_000:
+            return False, "volume faded", {
+                "latest_10s_volume": round(latest_volume, 0),
+                "recent_10s_volume": round(recent_volume, 0),
+            }
+        base_high = max(float(b.high or 0.0) for b in prior)
+        base_low = min(float(b.low or 0.0) for b in prior)
+        base_range_pct = (base_high - base_low) / close * 100.0 if close > 0 else 999.0
+        pullback_pct = (base_high - base_low) / base_high * 100.0 if base_high > 0 else 999.0
+        fresh_high = float(latest.high or 0.0) >= base_high or close >= max(float(b.close or 0.0) for b in prior)
+        if not fresh_high:
+            return False, "no fresh 10s high/reclaim", {
+                "base_range_pct": round(base_range_pct, 2),
+                "pullback_pct": round(pullback_pct, 2),
+            }
+        if base_range_pct > 18.0 or pullback_pct > 18.0:
+            return False, "pullback/base too wide", {
+                "base_range_pct": round(base_range_pct, 2),
+                "pullback_pct": round(pullback_pct, 2),
+            }
+        red_dump = any(
+            float(b.close or 0.0) < float(b.open or 0.0)
+            and (float(b.open or 0.0) - float(b.close or 0.0)) / float(b.close or 1.0) * 100.0 > 5.0
+            for b in history[-4:-1]
+        )
+        if red_dump:
+            return False, "recent pullback had a dump candle", {}
+        return True, "fresh continuation base", {
+            "base_high": round(base_high, 4),
+            "base_low": round(base_low, 4),
+            "base_range_pct": round(base_range_pct, 2),
+            "pullback_pct": round(pullback_pct, 2),
+            "latest_10s_volume": round(latest_volume, 0),
+            "recent_10s_volume": round(recent_volume, 0),
+        }
+
+    def _execute_momentum_burst_scalp(
+        self,
+        sym: str,
+        latest_10s: Bar,
+        *,
+        hit_run: bool = False,
+        violent_liquid: bool = False,
+        post_blowoff_micro_base: bool = False,
+    ) -> Optional[Fill]:
+        strategy_label = (
+            "post_blowoff_micro_base_scout"
+            if post_blowoff_micro_base
+            else ("momentum_burst_hit_run" if hit_run else "momentum_burst_scalp")
+        )
+        log_label = "MOMENTUM BURST HIT-RUN" if hit_run else "MOMENTUM BURST SCALP"
+        stage_prefix = strategy_label
+        bars = list(self._bar_buffer.get(sym, deque()))
+        if len(bars) < 3:
+            return None
+
+        reject = self._check_quick_scalp_entry(sym, bars)
+        if reject is not None:
+            logger.info("%s reject %s: %s", log_label, sym, reject)
+            self._record_entry_reject(
+                self._quick_scalp_probe_signal(sym, bars[-1].close, strategy_label),
+                stage="{}_shape".format(stage_prefix),
+                reason=reject,
+                source=strategy_label,
+                price=bars[-1].close,
+            )
+            return None
+
+        quality_reject = self._shared_entry_quality_reject(
+            sym,
+            bars,
+            stage="{}_final_guard".format(stage_prefix),
+            source=strategy_label,
+        )
+        if quality_reject is not None:
+            logger.info("%s reject %s: shared entry quality %s", log_label, sym, quality_reject)
+            return None
+
+        ten_second_reject = self._quick_scalp_10s_reject(sym)
+        if ten_second_reject is not None:
+            logger.info("%s reject %s: %s", log_label, sym, ten_second_reject)
+            self._record_entry_reject(
+                self._quick_scalp_probe_signal(sym, bars[-1].close, strategy_label),
+                stage="{}_10s".format(stage_prefix),
+                reason=ten_second_reject,
+                source=strategy_label,
+                price=bars[-1].close,
+            )
+            return None
+
+        rr = self._quick_scalp_tick_rr(sym, bars, float(latest_10s.close or bars[-1].close))
+        if rr is None:
+            logger.info("%s reject %s: no usable tick R:R", log_label, sym)
+            self._record_entry_reject(
+                self._quick_scalp_probe_signal(sym, bars[-1].close, strategy_label),
+                stage="{}_rr".format(stage_prefix),
+                reason="no usable tick R:R",
+                source=strategy_label,
+                price=bars[-1].close,
+            )
+            return None
+        price, stop_price, target_price, rr_note = rr
+        risk_per_share = price - stop_price
+        if post_blowoff_micro_base:
+            risk_per_share = max(price * 0.015, 0.06)
+            stop_price = round(price - risk_per_share, 2)
+            target_price = round(price + risk_per_share, 2)
+            rr_note = "post-blowoff micro-base scout 1R risk={:.1f}% target={:.1f}%".format(
+                risk_per_share / price * 100.0 if price else 0.0,
+                (target_price - price) / price * 100.0 if price else 0.0,
+            )
+        elif hit_run and violent_liquid:
+            risk_per_share = max(price * 0.02, 0.06)
+            stop_price = round(price - risk_per_share, 2)
+            target_price = round(price + risk_per_share, 2)
+            rr_note = "violent-liquid hit-run 1R risk={:.1f}% target={:.1f}%".format(
+                risk_per_share / price * 100.0 if price else 0.0,
+                (target_price - price) / price * 100.0 if price else 0.0,
+            )
+        if hit_run and risk_per_share > 0:
+            target_price = round(
+                price + risk_per_share * max(0.1, float(self._momentum_burst_hit_run_reward_risk)),
+                2,
+            )
+            if not violent_liquid:
+                rr_note = "hit-run 1R risk={:.1f}% target={:.1f}%".format(
+                    risk_per_share / price * 100.0 if price else 0.0,
+                    (target_price - price) / price * 100.0 if price else 0.0,
+                )
+        if hit_run and float(latest_10s.low or 0.0) <= float(stop_price or 0.0):
+            reason = "confirm 10s bar already traded through planned stop"
+            logger.info(
+                "%s reject %s: %s (low %.2f <= stop %.2f)",
+                log_label,
+                sym,
+                reason,
+                float(latest_10s.low or 0.0),
+                float(stop_price or 0.0),
+            )
+            self._record_entry_reject(
+                self._quick_scalp_probe_signal(sym, bars[-1].close, strategy_label),
+                stage="{}_unstable_confirm".format(stage_prefix),
+                reason=reason,
+                source=strategy_label,
+                price=bars[-1].close,
+            )
+            return None
+        quantity = self._capital_aware_quantity(price, stop_price)
+        if quantity < 1:
+            logger.info("%s skip %s — position too large for buying power", log_label, sym)
+            return None
+        spread_size_factor = float(
+            getattr(self, "_quick_scalp_spread_size_factors", {}).pop(sym, 1.0)
+        )
+        if 0 < spread_size_factor < 1.0 and quantity > 1:
+            original_quantity = quantity
+            quantity = max(1, int(quantity * spread_size_factor))
+            logger.info(
+                "MOMENTUM BURST SCALP %s size down %d → %d for opportunity-scaled spread",
+                sym,
+                original_quantity,
+                quantity,
+            )
+        if post_blowoff_micro_base and quantity > 1:
+            original_quantity = quantity
+            quantity = max(1, int(quantity * 0.35))
+            logger.info(
+                "POST-BLOWOFF MICRO-BASE %s size down %d -> %d",
+                sym,
+                original_quantity,
+                quantity,
+            )
+        elif hit_run and violent_liquid and quantity > 1:
+            original_quantity = quantity
+            quantity = max(1, int(quantity * 0.35))
+            logger.info(
+                "MOMENTUM BURST HIT-RUN %s violent-liquid size down %d -> %d",
+                sym,
+                original_quantity,
+                quantity,
+            )
+
+        signal = TradeSignal(
+            symbol=sym,
+            action=SignalAction.ENTER_LONG,
+            quantity=quantity,
+            entry_price=price,
+            stop_loss=stop_price,
+            take_profit=target_price,
+            max_hold_seconds=(
+                self._momentum_burst_hit_run_max_hold_sec if hit_run else 90
+            ),
+            reason="{} {} ${:.2f}, stop=${:.2f}, target=${:.2f} ({})".format(
+                "Momentum Burst Hit-Run" if hit_run else "Momentum Burst Scalp",
+                sym, price, stop_price, target_price, rr_note),
+            scan_result=ScanResult(
+                symbol=sym,
+                scanner_name=strategy_label,
+                ts=datetime.now(timezone.utc),
+                score=0.0,
+                criteria={
+                    "pattern": strategy_label,
+                    "direction": "up",
+                    "entry_mode": strategy_label,
+                    "setup_tier": "A+ setup",
+                    "source_scanner": "momentum_burst",
+                    "max_hit_run_entries": self._momentum_burst_hit_run_max_entries if hit_run else None,
+                    "variant": (
+                        "post_blowoff_micro_base"
+                        if post_blowoff_micro_base
+                        else ("violent_liquid" if violent_liquid else "smooth_confirmed")
+                    ),
+                    "size_factor": 0.35 if (violent_liquid or post_blowoff_micro_base) else 1.0,
+                    **(
+                        {
+                            "spread_exception": "opportunity_scaled",
+                            "spread_size_factor": round(spread_size_factor, 2),
+                        }
+                        if 0 < spread_size_factor < 1.0 else {}
+                    ),
+                },
+            ),
+            trend_strength=0.8,
+        )
+        order = Order(symbol=sym, side=Side.BUY, quantity=quantity, limit_price=price)
+        bar = bars[-1]
+        fill, status = self._broker.submit(order, bar, self._pipeline.portfolio)
+        try:
+            from daytrading.ml.shadow_collector import log_execution_quality
+            log_execution_quality(
+                order=order, bar=bar, status=status, fill=fill,
+                source=strategy_label,
+            )
+        except Exception:
+            pass
+        if fill:
+            from daytrading.execution.broker import apply_fill
+            apply_fill(self._pipeline.portfolio, fill)
+            self._on_position_opened(
+                signal,
+                fill,
+                strategy=strategy_label,
+                execution_method="momentum_burst_hit_run" if hit_run else "momentum_burst_new_high",
+            )
+            self._breakout_scalp_active = True
+            if hit_run:
+                self._momentum_burst_hit_run_counts[sym] = (
+                    self._momentum_burst_hit_run_counts.get(sym, 0) + 1
+                )
+            else:
+                self._breakout_scalp_cooldown[sym] = (
+                    time.monotonic() + self._momentum_burst_scalp_cooldown_sec
+                )
+                self._pipeline._symbol_entry_counts[sym] = self._pipeline._symbol_entry_counts.get(sym, 0) + 1
+            logger.info(
+                "%s ENTRY %s %.0f @ $%.4f stop=$%.2f target=$%.2f %s",
+                log_label,
+                sym, fill.quantity, fill.price, stop_price, target_price, rr_note,
+            )
+            self._hub.on_fill(fill, "entry", strategy=strategy_label)
+            self._hub.add_log(
+                "INFO",
+                "{} {} {:.0f} @ ${:.2f}".format(log_label, sym, fill.quantity, fill.price),
+            )
+            self._journal.record("trade_fill", {
+                "symbol": sym,
+                "side": fill.side.value,
+                "quantity": fill.quantity,
+                "price": fill.price,
+                "ts": fill.ts,
+                "trade_type": "entry",
+                "strategy": strategy_label,
+                "execution_method": "momentum_burst_hit_run" if hit_run else "momentum_burst_new_high",
+                "market_context": {"phase": self._market_phase()},
+            }, ts=fill.ts)
+            self._seed_recent_order_ids()
+            return fill
+
+        logger.warning("%s order not filled %s (status=%s)", log_label, sym, status)
+        self._record_entry_reject(
+            signal,
+            stage="{}_order".format(stage_prefix),
+            reason="order_{}".format(status.value if status else "not_filled"),
+            source=strategy_label,
+            price=price,
+            metadata={"status": status.value if status else "not_filled"},
+        )
+        return None
+
     def _quick_scalp_10s_reject(self, symbol: str) -> Optional[str]:
         """Require fresh 10-second confirmation before instant breakout entry."""
         aggregator = getattr(self, "_bar_aggregator", None)
@@ -5479,6 +6444,69 @@ class AlpacaRunner:
             prev = bars_10s[-2]
             if prev.close > 0 and latest.high <= prev.high and latest.close < prev.close * 1.003:
                 return "10s confirmation no expansion"
+        return None
+
+    def _breakout_scalp_10s_reject(self, symbol: str) -> Optional[str]:
+        """Stricter 10s confirmation for instant HOD/breakout scalps."""
+        base_reject = self._quick_scalp_10s_reject(symbol)
+        if base_reject is not None:
+            return base_reject
+
+        aggregator = getattr(self, "_bar_aggregator", None)
+        if aggregator is None:
+            return "no 10s confirmation feed"
+        try:
+            bars_10s = aggregator.get_latest_10s(symbol, count=2)
+        except Exception:
+            return "no 10s confirmation feed"
+        if not bars_10s:
+            return "waiting for 10s confirmation"
+
+        latest = bars_10s[-1]
+        bar_range = float(latest.high or 0.0) - float(latest.low or 0.0)
+        if bar_range > 0:
+            close_location = (float(latest.close) - float(latest.low)) / bar_range
+            if close_location < 0.65:
+                return "10s confirmation weak close ({:.0%} location)".format(close_location)
+            price = float(latest.close or 0.0)
+            range_pct = (bar_range / price) if price > 0 else 0.0
+            if range_pct >= 0.06 and close_location < 0.75:
+                return "10s breakout candle too volatile without strong close ({:.0%} location, {:.1%} range)".format(
+                    close_location,
+                    range_pct,
+                )
+        if len(bars_10s) >= 2:
+            prev = bars_10s[-2]
+            if float(prev.close or 0.0) > 0 and latest.close < float(prev.close) * 0.998:
+                return "10s confirmation faded below prior close"
+            if float(prev.high or 0.0) > 0 and latest.high <= float(prev.high) * 1.001:
+                return "10s confirmation no expansion"
+            prev_volume = float(prev.volume or 0.0)
+            latest_volume = float(latest.volume or 0.0)
+            if prev_volume > 0 and latest_volume < prev_volume * 0.5:
+                return "10s confirmation volume faded {:.0f} < 50% prior {:.0f}".format(
+                    latest_volume, prev_volume)
+        for recent in bars_10s[-4:-1]:
+            recent_open = float(recent.open or 0.0)
+            recent_close = float(recent.close or 0.0)
+            recent_high = float(recent.high or 0.0)
+            recent_low = float(recent.low or 0.0)
+            if recent_open <= 0 or recent_close >= recent_open:
+                continue
+            recent_range = recent_high - recent_low
+            recent_range_pct = (recent_range / recent_open) if recent_open > 0 else 0.0
+            body_pct = ((recent_open - recent_close) / recent_open) if recent_open > 0 else 0.0
+            close_location = ((recent_close - recent_low) / recent_range) if recent_range > 0 else 1.0
+            if (
+                body_pct >= 0.025
+                and recent_range_pct >= 0.035
+                and close_location <= 0.25
+                and float(recent.volume or 0.0) >= 75_000
+            ):
+                return "recent 10s dump candle before breakout ({:.1%} body, {:.0%} close location)".format(
+                    body_pct,
+                    close_location,
+                )
         return None
 
     def _check_quick_scalp_entry(self, symbol: str, bars: Sequence[Bar]) -> Optional[str]:
@@ -5967,6 +6995,7 @@ class AlpacaRunner:
         for hit in result.scan_hits:
             is_verified = hit.symbol not in rejections
             reject_reason = rejections.get(hit.symbol)
+            self._maybe_arm_momentum_burst_scalp(hit)
             self._hub.on_scan_hit(hit, verified=is_verified, reject_reason=reject_reason)
             if self.is_hot_watch_active(hit.symbol):
                 self._journal.record("hot_watch", {

@@ -1605,3 +1605,56 @@ class TestOpportunityScaledSpread:
 
         assert reason is not None
         assert "spread" in reason.lower() or "liquidity" in reason.lower() or "volume" in reason.lower()
+
+    def test_post_blowoff_micro_base_scout_allows_a_plus_score_near_miss(self) -> None:
+        now = datetime.now(timezone.utc)
+        n = 25
+        bars = []
+        for i in range(n):
+            frac = i / (n - 1)
+            close = 3.00 + (3.45 - 3.00) * frac
+            volume = 100_000 if i < 20 else 70_000
+            open_ = close - 0.03
+            high = close + 0.03
+            low = close - 0.03
+            if i == n - 1:
+                open_ = close - 0.045
+                high = close + 0.005
+                low = close - 0.050
+            bars.append(_bar(
+                i,
+                close=close,
+                open_=open_,
+                high=high,
+                low=low,
+                volume=volume,
+                base_ts=now,
+                n=n,
+            ))
+        quotes = [
+            Quote(symbol="UBXG", ts=now, bid=3.44, ask=3.45, bid_size=2000, ask_size=2000)
+            for _ in range(5)
+        ]
+
+        normal_reason = eg.check_entry_quality(
+            bars,
+            symbol="UBXG",
+            quotes=quotes,
+            avg_daily_volume=2_000_000,
+            float_shares=8_000_000,
+            entry_pattern="momentum_burst_hit_run",
+            setup_tier="A+ setup",
+        )
+        scout_reason = eg.check_entry_quality(
+            bars,
+            symbol="UBXG",
+            quotes=quotes,
+            avg_daily_volume=2_000_000,
+            float_shares=8_000_000,
+            entry_pattern="post_blowoff_micro_base_scout",
+            setup_tier="A+ setup",
+        )
+
+        assert normal_reason is not None
+        assert "entry score too low (75/100" in normal_reason
+        assert scout_reason is None
