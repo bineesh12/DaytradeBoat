@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 from flask import Flask, Response, jsonify, request
 from werkzeug.exceptions import BadRequest
@@ -22,6 +23,23 @@ from daytrading.dashboard.hub import DashboardHub
 logger = logging.getLogger(__name__)
 
 _hub: Optional[DashboardHub] = None
+
+
+def _json_safe(value: Any) -> Any:
+    """Return a browser-safe JSON value.
+
+    Python's JSON encoder allows NaN/Infinity by default, but browser
+    JSON.parse rejects them. Analytics reports can legitimately produce
+    infinite ratios (for example a profit factor with no losses), so coerce
+    non-finite numbers to null at the API boundary.
+    """
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
 
 
 def _missed_a_plus_spread_summary(rows: list[dict]) -> dict:
@@ -244,13 +262,13 @@ def create_app(hub: DashboardHub) -> Flask:
                         report["setup_performance"] = analyst._analyze_setup_performance(day, [])
                 except Exception as exc:
                     logger.debug("Analytics report ML refresh skipped: %s", exc)
-            return jsonify({
+            return jsonify(_json_safe({
                 "ok": True,
                 "day": day,
                 "report": report,
                 "generated_at": report.get("generated_at"),
                 "loaded_at": datetime.now(timezone.utc).isoformat(),
-            })
+            }))
         except Exception as exc:
             logger.error("Failed to load analytics report: %s", exc)
             return jsonify({"ok": False, "error": str(exc)}), 500
