@@ -706,6 +706,8 @@ def _daily_scorecard(
         _s = strategy.lower()
         if "post_blowoff_micro_base_scout" in _s:
             mode = "post_blowoff_micro_base_scout"
+        elif "warrior_squeeze_playbook" in _s:
+            mode = "warrior_squeeze_playbook"
         elif "momentum_burst_hit_run" in _s:
             mode = "momentum_burst_hit_run"
         elif "momentum_burst_scalp" in _s:

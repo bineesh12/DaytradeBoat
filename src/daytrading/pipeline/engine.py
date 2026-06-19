@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence
@@ -719,6 +720,80 @@ class TradingPipeline:
         vwap = float(criteria.get("vwap") or 0.0)
         if vwap > 0 and latest.close < vwap * 1.003:
             return False
+        return True
+
+    @staticmethod
+    def _allow_warrior_starter_guard_exception(
+        signal: TradeSignal,
+        *,
+        bars: Optional[Sequence[Bar]],
+        reason: Optional[str],
+    ) -> bool:
+        """Clear only narrow final-guard false blocks for Warrior starters."""
+        text = str(reason or "").lower()
+        score_match = re.search(r"entry score too low \((\d+)/100", text)
+        score_near_miss = bool(score_match and int(score_match.group(1)) >= 75)
+        liquidity_watch_only = "watch-only liquidity score" in text
+        if "dead cat bounce" not in text and not score_near_miss and not liquidity_watch_only:
+            return False
+        sr = signal.scan_result
+        criteria = sr.criteria if sr is not None else {}
+        if str(criteria.get("entry_trigger") or "") not in {
+            "warrior_level_pullaway",
+            "warrior_curl_reclaim",
+            "warrior_second_leg_reclaim",
+            "warrior_news_continuation_pullback",
+            "warrior_trend_pullback_reclaim",
+            "warrior_equal_high_pullaway",
+        }:
+            return False
+        if str(criteria.get("entry_mode") or "") != "warrior_squeeze_playbook":
+            return False
+        if str(criteria.get("setup_tier") or "").lower() != "a+ setup":
+            return False
+
+        try:
+            size_factor = float(criteria.get("size_factor") or 1.0)
+        except (TypeError, ValueError):
+            size_factor = 1.0
+        if size_factor > 0.35:
+            return False
+
+        price = float(signal.entry_price or 0.0)
+        stop = float(signal.stop_loss or 0.0)
+        psych_level = float(criteria.get("psych_level") or 0.0)
+        if price <= 0 or stop <= 0 or stop >= price:
+            return False
+        if psych_level > 0 and price < psych_level:
+            return False
+        if (price - stop) / price > 0.09:
+            return False
+
+        if not bars or len(bars) < 3:
+            return False
+        latest = bars[-1]
+        if float(latest.close or 0.0) <= float(latest.open or 0.0):
+            return False
+        rng = float(latest.high or 0.0) - float(latest.low or 0.0)
+        if rng <= 0:
+            return False
+        close_location = (float(latest.close or 0.0) - float(latest.low or 0.0)) / rng
+        min_close_location = 0.30 if liquidity_watch_only else 0.55
+        if close_location < min_close_location:
+            return False
+
+        entry_trigger = str(criteria.get("entry_trigger") or "")
+        latest_volume = float(latest.volume or 0.0)
+        recent_volume = sum(float(b.volume or 0.0) for b in bars[-3:])
+        min_latest_volume = (
+            75_000
+            if liquidity_watch_only or entry_trigger == "warrior_news_continuation_pullback"
+            else 100_000
+        )
+        min_recent_volume = 150_000 if liquidity_watch_only else 250_000
+        if latest_volume < min_latest_volume or recent_volume < min_recent_volume:
+            return False
+
         return True
 
     @staticmethod
@@ -1801,9 +1876,34 @@ class TradingPipeline:
             min_day_change_pct=0.0,
             now=now,
         )
+        reject_reason = decision.reject_reason
+        if reject_reason and self._allow_warrior_starter_guard_exception(
+            signal,
+            bars=sym_bars,
+            reason=reject_reason,
+        ):
+            if result is not None:
+                result.entry_decisions.append(EntryDecision(
+                    symbol=decision.symbol,
+                    stage=decision.stage,
+                    passed=True,
+                    action=decision.action,
+                    pattern=decision.pattern,
+                    scanner=decision.scanner,
+                    setup_tier=decision.setup_tier,
+                    entry_tier=decision.entry_tier,
+                    price=decision.price,
+                    metadata={
+                        **dict(decision.metadata),
+                        "cleared_reason": reject_reason,
+                        "guard_exception": "warrior_squeeze_starter",
+                    },
+                    ts=decision.ts,
+                ).to_payload())
+            return None
         if result is not None:
             self._append_entry_decision(result, decision)
-        return decision.reject_reason
+        return reject_reason
 
     def _normal_entry_chase_reject(
         self,

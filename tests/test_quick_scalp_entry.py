@@ -28,12 +28,24 @@ class _QuickScalpRunner:
     _breakout_scalp_10s_reject = AlpacaRunner._breakout_scalp_10s_reject
     _quick_scalp_tick_rr = AlpacaRunner._quick_scalp_tick_rr
     _maybe_arm_momentum_burst_scalp = AlpacaRunner._maybe_arm_momentum_burst_scalp
+    _warrior_squeeze_should_arm = AlpacaRunner._warrior_squeeze_should_arm
     _process_momentum_burst_scalps = AlpacaRunner._process_momentum_burst_scalps
     _latest_momentum_burst_10s_bar = AlpacaRunner._latest_momentum_burst_10s_bar
     _momentum_burst_recent_10s = AlpacaRunner._momentum_burst_recent_10s
     _momentum_burst_violent_liquid_ok = AlpacaRunner._momentum_burst_violent_liquid_ok
     _momentum_burst_stop_trading_reason = AlpacaRunner._momentum_burst_stop_trading_reason
     _momentum_burst_continuation_base_ok = AlpacaRunner._momentum_burst_continuation_base_ok
+    _momentum_burst_level_context = staticmethod(AlpacaRunner._momentum_burst_level_context)
+    _maybe_arm_warrior_squeeze_from_10s = AlpacaRunner._maybe_arm_warrior_squeeze_from_10s
+    _warrior_squeeze_pullaway_context = AlpacaRunner._warrior_squeeze_pullaway_context
+    _warrior_squeeze_equal_high_pullaway_context = (
+        AlpacaRunner._warrior_squeeze_equal_high_pullaway_context
+    )
+    _warrior_squeeze_first_starter_has_proof_hold = (
+        AlpacaRunner._warrior_squeeze_first_starter_has_proof_hold
+    )
+    _warrior_squeeze_curl_reclaim_context = AlpacaRunner._warrior_squeeze_curl_reclaim_context
+    _momentum_burst_rebase_pending_after_reject = AlpacaRunner._momentum_burst_rebase_pending_after_reject
     _momentum_burst_hit_run_time_allowed = AlpacaRunner._momentum_burst_hit_run_time_allowed
     _record_momentum_burst_hit_run_pnl = AlpacaRunner._record_momentum_burst_hit_run_pnl
     _execute_momentum_burst_scalp = AlpacaRunner._execute_momentum_burst_scalp
@@ -52,6 +64,7 @@ class _QuickScalpRunner:
         self._hod_alert_store = None
         self._pipeline = SimpleNamespace(scan_rejections={})
         self._risk_pct_of_equity = 0.015
+        self._max_dollar_risk_per_trade = 50.0
         self._max_position_pct_of_equity = 1.0
         self._min_risk_dollars = 5.0
         self._fallback_equity = 25_000.0
@@ -79,9 +92,43 @@ class _QuickScalpRunner:
         self._momentum_burst_hit_run_symbol_pnl = {}
         self._momentum_burst_hit_run_symbol_peak_pnl = {}
         self._momentum_burst_hit_run_day_blocked = {}
+        self._warrior_squeeze_enabled = False
+        self._warrior_squeeze_min_reclaim_price = 2.0
+        self._warrior_squeeze_starter_size_factor = 0.35
+        self._warrior_squeeze_rejection_high = {}
+        self._warrior_squeeze_rejection_reason = {}
+        self._warrior_squeeze_target_wins = {}
         self._breakout_scalp_active = False
         self._breakout_scalp_cooldown = {}
         self._quick_scalp_spread_size_factors = {}
+
+
+def test_warrior_squeeze_live_a_plus_reclaim_stop_stays_inside_final_guard() -> None:
+    runner = _QuickScalpRunner()
+    runner._warrior_squeeze_enabled = True
+    runner._warrior_squeeze_min_reclaim_price = 3.50
+    runner._warrior_squeeze_rejection_high["MBUR"] = 4.00
+    bars = [
+        Bar("MBUR", TS, 7.90, 8.00, 7.86, 7.96, 120_000, Timeframe.SEC_10),
+        Bar("MBUR", TS + timedelta(seconds=10), 8.05, 8.20, 8.00, 8.15, 180_000, Timeframe.SEC_10),
+        Bar("MBUR", TS + timedelta(seconds=20), 8.55, 9.10, 8.35, 9.00, 220_000, Timeframe.SEC_10),
+    ]
+    runner._bar_aggregator = SimpleNamespace()
+    runner._momentum_burst_recent_10s = lambda symbol, count=6: bars[-count:]
+    pending = {
+        "ts": bars[-2].ts,
+        "breakout_close": 8.15,
+        "breakout_high": 8.25,
+        "breakout_volume": 180_000,
+        "entry_trigger": "warrior_a_plus_reclaim",
+    }
+
+    context = runner._warrior_squeeze_pullaway_context("MBUR", bars[-1], pending)
+
+    assert context is not None
+    entry = context["entry_price_override"]
+    stop = context["stop_price_override"]
+    assert (entry - stop) / entry <= 0.06
 
 
 def _bar(
@@ -127,6 +174,34 @@ def _add_clean_execution_context(runner: _QuickScalpRunner, symbol: str = "OLOX"
                 side=Side.BUY if i < 16 else Side.SELL,
             )
         )
+
+
+def test_capital_aware_quantity_uses_equity_risk_without_explicit_cap() -> None:
+    runner = _QuickScalpRunner()
+    runner._account_equity = 95_000.0
+    runner._account_equity_at = time.monotonic()
+    runner._risk_pct_of_equity = 0.015
+    runner._max_dollar_risk_per_trade = 50.0
+    runner._max_position_pct_of_equity = 1.0
+    runner._min_risk_dollars = 5.0
+
+    qty = runner._capital_aware_quantity(1.91, 1.85)
+
+    assert qty == 23750
+
+
+def test_capital_aware_quantity_can_cap_burst_to_exit_dollar_risk_budget() -> None:
+    runner = _QuickScalpRunner()
+    runner._account_equity = 95_000.0
+    runner._account_equity_at = time.monotonic()
+    runner._risk_pct_of_equity = 0.015
+    runner._max_position_pct_of_equity = 1.0
+    runner._min_risk_dollars = 5.0
+
+    qty = runner._capital_aware_quantity(1.91, 1.85, max_dollar_risk=50.0)
+
+    assert qty == 833
+    assert qty * (1.91 - 1.85) <= 50.0
 
 
 def test_quick_scalp_allows_recent_hod_push_when_session_open_is_misleading() -> None:
@@ -880,6 +955,82 @@ def test_momentum_burst_hit_run_arms_when_hit_run_enabled() -> None:
     assert runner._momentum_burst_window_high["MBUR"] == 2.40
 
 
+def test_warrior_squeeze_off_preserves_normal_hit_run_arming() -> None:
+    runner = _QuickScalpRunner()
+    runner._momentum_burst_hit_run_enabled = True
+    runner._warrior_squeeze_enabled = False
+    cheap_hit = _momentum_burst_hit(high=1.70)
+
+    runner._maybe_arm_momentum_burst_scalp(cheap_hit)
+
+    assert "MBUR" in runner._momentum_burst_armed
+    assert runner._momentum_burst_window_high["MBUR"] == 1.70
+    assert runner._warrior_squeeze_rejection_high == {}
+
+
+def test_warrior_squeeze_ignores_first_cheap_spike_then_arms_reclaim() -> None:
+    runner = _QuickScalpRunner()
+    runner._warrior_squeeze_enabled = True
+    runner._warrior_squeeze_min_reclaim_price = 2.0
+    cheap_hit = _momentum_burst_hit(high=1.70)
+
+    runner._maybe_arm_momentum_burst_scalp(cheap_hit)
+
+    assert runner._momentum_burst_armed == {}
+    assert runner._warrior_squeeze_rejection_high["MBUR"] == 1.70
+
+    reclaim_hit = _momentum_burst_hit(high=2.08)
+    runner._maybe_arm_momentum_burst_scalp(reclaim_hit)
+
+    assert "MBUR" in runner._momentum_burst_armed
+    assert runner._momentum_burst_window_high["MBUR"] == 2.08
+
+
+def test_warrior_squeeze_rejects_first_high_volume_shooting_star() -> None:
+    runner = _QuickScalpRunner()
+    runner._warrior_squeeze_enabled = True
+    runner._warrior_squeeze_min_reclaim_price = 2.0
+    base_hit = _momentum_burst_hit(high=2.60)
+    bars = [
+        Bar(
+            symbol=bar.symbol,
+            ts=bar.ts,
+            open=bar.open,
+            high=bar.high,
+            low=bar.low,
+            close=bar.close,
+            volume=60_000,
+            timeframe=bar.timeframe,
+        )
+        for bar in base_hit.bars[:-1]
+    ] + [
+        Bar(
+            symbol="MBUR",
+            ts=base_hit.bars[-1].ts,
+            open=2.35,
+            high=2.60,
+            low=2.30,
+            close=2.34,
+            volume=220_000,
+            timeframe=Timeframe.MIN_1,
+        )
+    ]
+    hit = ScanResult(
+        symbol="MBUR",
+        scanner_name="momentum_burst",
+        ts=bars[-1].ts,
+        score=base_hit.score,
+        criteria=base_hit.criteria,
+        bars=bars,
+    )
+
+    runner._maybe_arm_momentum_burst_scalp(hit)
+
+    assert runner._momentum_burst_armed == {}
+    assert runner._warrior_squeeze_rejection_high["MBUR"] == 2.60
+    assert runner._warrior_squeeze_rejection_reason["MBUR"] == "high-volume shooting-star rejection"
+
+
 def test_momentum_burst_cycle_expires_window() -> None:
     runner = _QuickScalpRunner()
     runner._momentum_burst_cycle_enabled = True
@@ -1028,6 +1179,265 @@ def test_momentum_burst_hit_run_keeps_window_after_confirmed_entry() -> None:
     )
 
 
+def test_warrior_squeeze_entry_is_tagged_and_reduced_starter_size() -> None:
+    runner = _momentum_burst_trade_runner()
+    runner._momentum_burst_cycle_enabled = False
+    runner._warrior_squeeze_enabled = True
+    runner._warrior_squeeze_starter_size_factor = 0.35
+    runner._warrior_squeeze_min_reclaim_price = 3.50
+    runner._warrior_squeeze_rejection_high["MBUR"] = 2.25
+    runner._warrior_squeeze_rejection_reason["MBUR"] = "high-volume shooting-star rejection"
+    now = runner._test_now
+
+    runner._momentum_burst_window_high["MBUR"] = 3.50
+    runner._momentum_burst_pending = {
+        "MBUR": {
+            "ts": now - timedelta(seconds=20),
+            "breakout_close": 3.16,
+            "breakout_high": 3.50,
+            "breakout_volume": 760_000,
+            "entry_trigger": "warrior_a_plus_reclaim",
+        }
+    }
+    runner._bar_aggregator = _Bars10([
+        Bar("MBUR", now - timedelta(seconds=10), 2.70, 3.50, 2.70, 3.16, 760_000, Timeframe.SEC_10),
+        Bar("MBUR", now, 3.17, 4.08, 3.10, 3.9674, 845_000, Timeframe.SEC_10),
+    ])
+    runner._process_momentum_burst_scalps()
+
+    assert runner._breakout_scalp_active is True
+    assert runner._momentum_burst_hit_run_counts["MBUR"] == 1
+    signal = runner._opened[0]
+    assert signal.scan_result.scanner_name == "warrior_squeeze_playbook"
+    assert signal.scan_result.criteria["entry_mode"] == "warrior_squeeze_playbook"
+    assert signal.scan_result.criteria["variant"] == "warrior_clwt_fast_pullaway"
+    assert signal.scan_result.criteria["size_factor"] == 0.35
+    assert signal.quantity < 750
+    assert signal.max_hold_seconds == 180.0
+
+
+def test_warrior_squeeze_size_factor_does_not_stack_with_violent_hit_run() -> None:
+    runner = _momentum_burst_trade_runner()
+    runner._momentum_burst_cycle_enabled = False
+    runner._momentum_burst_hit_run_enabled = True
+    runner._warrior_squeeze_enabled = True
+    runner._warrior_squeeze_starter_size_factor = 0.35
+    runner._warrior_squeeze_min_reclaim_price = 3.50
+    runner._warrior_squeeze_rejection_high["MBUR"] = 2.25
+    runner._warrior_squeeze_rejection_reason["MBUR"] = "high-volume shooting-star rejection"
+    runner._momentum_burst_violent_liquid_ok = lambda symbol: (
+        True,
+        {"median_10s_range_pct": 4.0},
+    )
+    now = runner._test_now
+
+    runner._momentum_burst_window_high["MBUR"] = 3.50
+    runner._momentum_burst_pending = {
+        "MBUR": {
+            "ts": now - timedelta(seconds=20),
+            "breakout_close": 3.16,
+            "breakout_high": 3.50,
+            "breakout_volume": 760_000,
+            "entry_trigger": "warrior_a_plus_reclaim",
+        }
+    }
+    runner._bar_aggregator = _Bars10([
+        Bar("MBUR", now - timedelta(seconds=10), 2.70, 3.50, 2.70, 3.16, 760_000, Timeframe.SEC_10),
+        Bar("MBUR", now, 3.17, 4.08, 3.10, 3.9674, 845_000, Timeframe.SEC_10),
+    ])
+    runner._process_momentum_burst_scalps()
+
+    signal = runner._opened[0]
+    assert signal.scan_result.scanner_name == "warrior_squeeze_playbook"
+    assert signal.scan_result.criteria["size_factor"] == 0.35
+    # If violent-liquid and warrior both applied 0.35, this would be about 12%.
+    assert signal.quantity > 70
+
+
+def test_warrior_squeeze_pullaway_starter_buys_capped_reclaim_level() -> None:
+    runner = _momentum_burst_trade_runner()
+    runner._momentum_burst_cycle_enabled = False
+    runner._warrior_squeeze_enabled = True
+    runner._warrior_squeeze_min_reclaim_price = 3.50
+    runner._warrior_squeeze_starter_size_factor = 0.35
+    runner._warrior_squeeze_rejection_high["MBUR"] = 2.25
+    now = runner._test_now
+    runner._momentum_burst_window_high = {"MBUR": 3.50}
+    runner._momentum_burst_pending = {
+        "MBUR": {
+            "ts": now - timedelta(seconds=10),
+            "breakout_close": 3.16,
+            "breakout_high": 3.50,
+            "breakout_volume": 760_000,
+        }
+    }
+    runner._bar_aggregator = _Bars10([
+        Bar("MBUR", now - timedelta(seconds=30), 3.46, 3.56, 3.45, 3.53, 260_000, Timeframe.SEC_10),
+        Bar("MBUR", now - timedelta(seconds=20), 3.54, 3.62, 3.49, 3.58, 320_000, Timeframe.SEC_10),
+        Bar("MBUR", now - timedelta(seconds=10), 3.58, 3.70, 3.50, 3.64, 760_000, Timeframe.SEC_10),
+        Bar("MBUR", now, 3.65, 4.08, 3.56, 3.97, 845_000, Timeframe.SEC_10),
+    ])
+
+    runner._process_momentum_burst_scalps()
+
+    signal = runner._opened[0]
+    assert signal.scan_result.scanner_name == "warrior_squeeze_playbook"
+    assert signal.scan_result.criteria["variant"] == "warrior_proof_pullback_hold"
+    assert signal.scan_result.criteria["entry_trigger"] == "warrior_level_pullaway"
+    assert signal.scan_result.criteria["pullaway_level"] == 3.5
+    assert signal.scan_result.criteria["max_pay"] == 3.71
+    assert signal.entry_price == 3.71
+    assert signal.entry_price < 3.97
+    assert signal.max_hold_seconds == 180.0
+    assert signal.quantity < 100
+
+
+def test_warrior_squeeze_clwt_fast_pullaway_does_not_need_slow_proof_hold() -> None:
+    runner = _momentum_burst_trade_runner()
+    runner._warrior_squeeze_enabled = True
+    runner._warrior_squeeze_min_reclaim_price = 3.50
+    runner._warrior_squeeze_rejection_high["MBUR"] = 2.25
+    runner._warrior_squeeze_rejection_reason["MBUR"] = "high-volume shooting-star rejection"
+    now = runner._test_now
+    bars = [
+        Bar("MBUR", now - timedelta(seconds=20), 2.70, 3.50, 2.70, 3.16, 760_000, Timeframe.SEC_10),
+        Bar("MBUR", now - timedelta(seconds=10), 3.17, 4.08, 3.10, 3.9674, 845_000, Timeframe.SEC_10),
+    ]
+    runner._bar_aggregator = _Bars10(bars)
+    pending = {
+        "ts": now - timedelta(seconds=20),
+        "breakout_close": 3.16,
+        "breakout_high": 3.50,
+        "breakout_volume": 760_000,
+        "entry_trigger": "warrior_a_plus_reclaim",
+    }
+
+    context = runner._warrior_squeeze_pullaway_context("MBUR", bars[-1], pending)
+
+    assert context is not None
+    assert context["entry_trigger"] == "warrior_level_pullaway"
+    assert context["variant_override"] == "warrior_clwt_fast_pullaway"
+    assert context["pullaway_level"] == 3.5
+    assert context["max_pay"] == 4.025
+    assert context["entry_price_override"] == 3.9674
+    assert context["target_price_override"] > context["entry_price_override"]
+
+
+def test_warrior_squeeze_rejects_high_price_generic_pullaway_starter() -> None:
+    runner = _momentum_burst_trade_runner()
+    runner._warrior_squeeze_enabled = True
+    runner._warrior_squeeze_min_reclaim_price = 3.50
+    runner._warrior_squeeze_rejection_high["PIII"] = 6.20
+    runner._warrior_squeeze_rejection_reason["PIII"] = "first explosive 10s spike"
+    now = runner._test_now
+    bars = [
+        Bar("PIII", now - timedelta(seconds=30), 6.80, 7.20, 6.70, 7.05, 260_000, Timeframe.SEC_10),
+        Bar("PIII", now - timedelta(seconds=20), 7.05, 7.35, 6.95, 7.28, 310_000, Timeframe.SEC_10),
+        Bar("PIII", now - timedelta(seconds=10), 7.30, 7.75, 7.25, 7.62, 380_000, Timeframe.SEC_10),
+    ]
+    runner._bar_aggregator = _Bars10(bars)
+    pending = {
+        "ts": now - timedelta(seconds=20),
+        "breakout_close": 7.05,
+        "breakout_high": 7.20,
+        "breakout_volume": 260_000,
+        "entry_trigger": "warrior_a_plus_reclaim",
+    }
+
+    context = runner._warrior_squeeze_pullaway_context("PIII", bars[-1], pending)
+
+    assert context is None
+
+
+def test_warrior_squeeze_equal_high_pullaway_allows_clwt_style_level_hold() -> None:
+    runner = _momentum_burst_trade_runner()
+    runner._warrior_squeeze_enabled = True
+    runner._warrior_squeeze_min_reclaim_price = 3.50
+    runner._warrior_squeeze_rejection_high["MBUR"] = 2.25
+    runner._warrior_squeeze_rejection_reason["MBUR"] = "high-volume shooting-star rejection"
+    now = runner._test_now
+    bars = [
+        Bar("MBUR", now - timedelta(seconds=40), 3.42, 3.50, 3.36, 3.47, 180_000, Timeframe.SEC_10),
+        Bar("MBUR", now - timedelta(seconds=30), 3.48, 3.54, 3.42, 3.52, 230_000, Timeframe.SEC_10),
+        Bar("MBUR", now - timedelta(seconds=20), 3.51, 3.58, 3.45, 3.55, 260_000, Timeframe.SEC_10),
+        Bar("MBUR", now - timedelta(seconds=10), 3.54, 3.59, 3.49, 3.57, 280_000, Timeframe.SEC_10),
+        Bar("MBUR", now, 3.56, 3.60, 3.50, 3.59, 310_000, Timeframe.SEC_10),
+    ]
+    runner._bar_aggregator = _Bars10(bars)
+    pending = {
+        "ts": now,
+        "breakout_close": 3.57,
+        "breakout_high": 3.60,
+        "breakout_volume": 280_000,
+    }
+
+    context = runner._warrior_squeeze_equal_high_pullaway_context(
+        "MBUR",
+        bars[-1],
+        pending,
+        window_high=3.60,
+    )
+
+    assert context is not None
+    assert context["entry_trigger"] == "warrior_equal_high_pullaway"
+    assert context["variant_override"] == "warrior_equal_high_pullaway"
+    assert context["pullaway_level"] == 3.5
+    assert context["entry_price_override"] == 3.59
+    assert context["target_price_override"] > context["entry_price_override"]
+
+
+def test_warrior_squeeze_curl_reclaim_rejects_high_price_first_starter() -> None:
+    runner = _momentum_burst_trade_runner()
+    runner._warrior_squeeze_enabled = True
+    runner._warrior_squeeze_min_reclaim_price = 3.50
+    now = runner._test_now
+    bars = [
+        Bar("PIII", now - timedelta(seconds=20), 7.10, 7.35, 7.05, 7.28, 260_000, Timeframe.SEC_10),
+        Bar("PIII", now - timedelta(seconds=10), 7.32, 7.72, 7.30, 7.65, 360_000, Timeframe.SEC_10),
+    ]
+    runner._bar_aggregator = _Bars10(bars)
+    pending = {
+        "ts": now - timedelta(seconds=20),
+        "breakout_close": 7.28,
+        "breakout_high": 7.35,
+        "breakout_volume": 260_000,
+    }
+
+    context = runner._warrior_squeeze_curl_reclaim_context(
+        "PIII",
+        bars[-1],
+        pending,
+        window_high=7.35,
+    )
+
+    assert context is None
+
+
+def test_warrior_squeeze_equal_high_pullaway_rejects_topping_tail() -> None:
+    runner = _momentum_burst_trade_runner()
+    runner._warrior_squeeze_enabled = True
+    runner._warrior_squeeze_min_reclaim_price = 3.50
+    runner._warrior_squeeze_rejection_high["MBUR"] = 2.25
+    runner._warrior_squeeze_rejection_reason["MBUR"] = "high-volume shooting-star rejection"
+    now = runner._test_now
+    bars = [
+        Bar("MBUR", now - timedelta(seconds=30), 3.48, 3.54, 3.42, 3.52, 230_000, Timeframe.SEC_10),
+        Bar("MBUR", now - timedelta(seconds=20), 3.51, 3.58, 3.45, 3.55, 260_000, Timeframe.SEC_10),
+        Bar("MBUR", now - timedelta(seconds=10), 3.54, 3.59, 3.49, 3.57, 280_000, Timeframe.SEC_10),
+        Bar("MBUR", now, 3.58, 3.82, 3.50, 3.60, 410_000, Timeframe.SEC_10),
+    ]
+    runner._bar_aggregator = _Bars10(bars)
+
+    context = runner._warrior_squeeze_equal_high_pullaway_context(
+        "MBUR",
+        bars[-1],
+        {"breakout_close": 3.57, "breakout_high": 3.60, "breakout_volume": 280_000},
+        window_high=3.82,
+    )
+
+    assert context is None
+
+
 def test_momentum_burst_hit_run_max_entries_blocks_extra_entries() -> None:
     runner = _momentum_burst_trade_runner()
     runner._momentum_burst_cycle_enabled = False
@@ -1148,6 +1558,136 @@ def test_momentum_burst_hit_run_requires_continuation_high() -> None:
     assert runner._breakout_scalp_active is False
     assert not getattr(runner, "_opened", None)
     assert "MBUR" not in runner._momentum_burst_pending
+
+
+def test_momentum_burst_level_context_marks_half_dollar_break() -> None:
+    assert _QuickScalpRunner._momentum_burst_level_context(2.43, 2.51) == {
+        "psych_level": 2.5,
+        "entry_trigger": "psych_level_break",
+    }
+    assert _QuickScalpRunner._momentum_burst_level_context(10.40, 11.05) == {
+        "psych_level": 11.0,
+        "entry_trigger": "psych_level_break",
+    }
+    assert _QuickScalpRunner._momentum_burst_level_context(2.51, 2.58) == {}
+
+
+def test_momentum_burst_hit_run_rejects_failed_half_dollar_hold() -> None:
+    runner = _momentum_burst_trade_runner()
+    runner._momentum_burst_cycle_enabled = False
+    runner._momentum_burst_hit_run_enabled = True
+    now = runner._test_now
+    runner._bar_aggregator = _Bars10([
+        Bar("MBUR", now - timedelta(seconds=10), 2.38, 2.40, 2.36, 2.39, 75_000, Timeframe.SEC_10),
+        # Spike crosses $2.50 but closes just below it. This only arms pending.
+        Bar("MBUR", now, 2.39, 2.501, 2.38, 2.49, 125_000, Timeframe.SEC_10),
+    ])
+
+    runner._process_momentum_burst_scalps()
+    assert runner._momentum_burst_pending["MBUR"]["psych_level"] == 2.5
+
+    # Next 10s bar is technically green and trades through the spike high, but
+    # it cannot hold the $2.50 level. Do not buy this failed level break.
+    runner._bar_aggregator.append(
+        Bar("MBUR", now + timedelta(seconds=10), 2.48, 2.507, 2.47, 2.496, 130_000, Timeframe.SEC_10)
+    )
+    runner._process_momentum_burst_scalps()
+
+    assert runner._breakout_scalp_active is False
+    assert not getattr(runner, "_opened", None)
+    assert "MBUR" not in runner._momentum_burst_pending
+
+
+def test_momentum_burst_hit_run_accepts_half_dollar_hold() -> None:
+    runner = _momentum_burst_trade_runner()
+    runner._momentum_burst_cycle_enabled = False
+    runner._momentum_burst_hit_run_enabled = True
+    now = runner._test_now
+    runner._bar_aggregator = _Bars10([
+        Bar("MBUR", now - timedelta(seconds=10), 2.38, 2.40, 2.36, 2.39, 75_000, Timeframe.SEC_10),
+        Bar("MBUR", now, 2.39, 2.501, 2.38, 2.49, 125_000, Timeframe.SEC_10),
+    ])
+
+    runner._process_momentum_burst_scalps()
+    runner._bar_aggregator.append(
+        Bar("MBUR", now + timedelta(seconds=10), 2.49, 2.56, 2.48, 2.55, 130_000, Timeframe.SEC_10)
+    )
+    runner._process_momentum_burst_scalps()
+
+    assert runner._breakout_scalp_active is True
+    signal = runner._opened[0]
+    assert signal.scan_result.scanner_name == "momentum_burst_hit_run"
+    assert signal.scan_result.criteria["psych_level"] == 2.5
+    assert signal.scan_result.criteria["entry_trigger"] == "psych_level_break"
+
+
+def test_momentum_burst_hit_run_rebases_after_clean_micro_base_pause() -> None:
+    runner = _momentum_burst_trade_runner()
+    runner._momentum_burst_cycle_enabled = False
+    runner._momentum_burst_hit_run_enabled = True
+    runner._momentum_burst_continuation_base_ok = (
+        lambda symbol: (True, "fresh micro-base reclaim", {"base_high": 2.55, "base_low": 2.50})
+    )
+    now = runner._test_now
+
+    runner._process_momentum_burst_scalps()
+    assert "MBUR" in runner._momentum_burst_pending
+
+    # The first confirm bar holds green but does not clear the spike high. This
+    # used to delete the setup; now it should rebase to the micro-base instead.
+    runner._bar_aggregator.append(
+        Bar("MBUR", now + timedelta(seconds=10), 2.52, 2.55, 2.50, 2.54, 130_000, Timeframe.SEC_10)
+    )
+    runner._process_momentum_burst_scalps()
+
+    assert runner._breakout_scalp_active is False
+    assert not getattr(runner, "_opened", None)
+    assert runner._momentum_burst_pending["MBUR"]["micro_base_reclaim"] is True
+    assert runner._momentum_burst_pending["MBUR"]["breakout_close"] == 2.54
+    assert runner._momentum_burst_pending["MBUR"]["original_ts"] == now
+    assert runner._momentum_burst_pending["MBUR"]["original_breakout_close"] == 2.52
+    assert runner._momentum_burst_pending["MBUR"]["rebase_count"] == 1
+
+    # The next 10s bar finally clears that micro-base high with a strong close.
+    runner._bar_aggregator.append(
+        Bar("MBUR", now + timedelta(seconds=20), 2.54, 2.60, 2.53, 2.59, 140_000, Timeframe.SEC_10)
+    )
+    runner._process_momentum_burst_scalps()
+
+    assert runner._breakout_scalp_active is True
+    assert runner._momentum_burst_hit_run_counts["MBUR"] == 1
+    assert runner._opened[0].scan_result.scanner_name == "momentum_burst_hit_run"
+
+
+def test_momentum_burst_hit_run_rebase_keeps_original_timeout_anchor() -> None:
+    runner = _momentum_burst_trade_runner()
+    runner._momentum_burst_cycle_enabled = False
+    runner._momentum_burst_hit_run_enabled = True
+    runner._momentum_burst_continuation_base_ok = (
+        lambda symbol: (True, "fresh micro-base reclaim", {"base_high": 2.55, "base_low": 2.50})
+    )
+    now = runner._test_now
+    runner._momentum_burst_pending = {
+        "MBUR": {
+            "ts": now + timedelta(seconds=20),
+            "original_ts": now - timedelta(seconds=20),
+            "breakout_close": 2.54,
+            "breakout_high": 2.55,
+            "original_breakout_close": 2.52,
+            "original_breakout_high": 2.55,
+            "breakout_volume": 130_000,
+            "rebase_count": 1,
+        }
+    }
+    runner._momentum_burst_window_high["MBUR"] = 2.60
+    runner._bar_aggregator.append(
+        Bar("MBUR", now + timedelta(seconds=20), 2.54, 2.55, 2.50, 2.54, 130_000, Timeframe.SEC_10)
+    )
+
+    runner._process_momentum_burst_scalps()
+
+    assert "MBUR" not in runner._momentum_burst_pending
+    assert not getattr(runner, "_opened", None)
 
 
 def test_momentum_burst_hit_run_time_window_allows_early_et() -> None:

@@ -46,6 +46,7 @@ RUNNER_TRAIL_PCT = 0.03         # protected runners trail 3% instead of 1%
 HIT_RUN_STRATEGIES = frozenset({
     "momentum_burst_hit_run",
     "post_blowoff_micro_base_scout",
+    "warrior_squeeze_playbook",
 })
 
 
@@ -894,6 +895,8 @@ class ExitManager:
                 pos.entry_pattern,
             )
         )
+        if "warrior_squeeze_playbook" in text:
+            return False
         return is_hit_run_strategy(text)
 
     @staticmethod

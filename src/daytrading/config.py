@@ -174,6 +174,22 @@ class StrategyConfig:
     # can cannibalize better standard runner entries and add small noisy scalps.
     # Empty string disables the cutoff.
     momentum_burst_hit_run_end_et: str = "11:30"
+    # EXPERIMENTAL (default OFF). Separate Warrior-style squeeze playbook:
+    # momentum_burst is attention only; ignore the first cheap/ugly spike, arm
+    # only after reclaim/proof, then take a reduced starter through the quick
+    # scalp shared-quality/risk/order path. It does not become a normal
+    # pipeline A+ signal or use the 80-point entry-score gate.
+    warrior_squeeze_enabled: bool = False
+    warrior_squeeze_min_reclaim_price: float = 3.5
+    warrior_squeeze_starter_size_factor: float = 0.35
+    warrior_squeeze_max_entries: int = 3
+    warrior_squeeze_win_cooldown_sec: float = 10.0
+    warrior_squeeze_reward_risk: float = 3.0
+    warrior_squeeze_add_reward_risk: float = 1.0
+    # Separate CUPR-style lane: prior runner/fresh-news continuation pullbacks.
+    # Keep off by default so base Warrior squeeze results do not get polluted by
+    # a different strategy family.
+    warrior_news_continuation_enabled: bool = False
     # Reject any long entry whose stop sits more than this fraction below the
     # entry — a wide stop turns a single fail into many small wins lost (EDHL:
     # an 8.3% vwap_pullback stop on a $10 name = one -$55 stop-out). Applies to
@@ -398,6 +414,38 @@ class StrategyConfig:
             momentum_burst_hit_run_end_et=_env(
                 "MOMENTUM_BURST_HIT_RUN_END_ET",
                 cls.momentum_burst_hit_run_end_et,
+            ),
+            warrior_squeeze_enabled=_env_bool(
+                "WARRIOR_SQUEEZE_ENABLED",
+                cls.warrior_squeeze_enabled,
+            ),
+            warrior_squeeze_min_reclaim_price=_env_float(
+                "WARRIOR_SQUEEZE_MIN_RECLAIM_PRICE",
+                cls.warrior_squeeze_min_reclaim_price,
+            ),
+            warrior_squeeze_starter_size_factor=_env_float(
+                "WARRIOR_SQUEEZE_STARTER_SIZE_FACTOR",
+                cls.warrior_squeeze_starter_size_factor,
+            ),
+            warrior_squeeze_max_entries=_env_int(
+                "WARRIOR_SQUEEZE_MAX_ENTRIES",
+                cls.warrior_squeeze_max_entries,
+            ),
+            warrior_squeeze_win_cooldown_sec=_env_float(
+                "WARRIOR_SQUEEZE_WIN_COOLDOWN_SEC",
+                cls.warrior_squeeze_win_cooldown_sec,
+            ),
+            warrior_squeeze_reward_risk=_env_float(
+                "WARRIOR_SQUEEZE_REWARD_RISK",
+                cls.warrior_squeeze_reward_risk,
+            ),
+            warrior_squeeze_add_reward_risk=_env_float(
+                "WARRIOR_SQUEEZE_ADD_REWARD_RISK",
+                cls.warrior_squeeze_add_reward_risk,
+            ),
+            warrior_news_continuation_enabled=_env_bool(
+                "WARRIOR_NEWS_CONTINUATION_ENABLED",
+                cls.warrior_news_continuation_enabled,
             ),
             max_entry_risk_pct=_env_float(
                 "MAX_ENTRY_RISK_PCT",

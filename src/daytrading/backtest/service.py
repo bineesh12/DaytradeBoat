@@ -37,6 +37,8 @@ SUPPORTED_FLAGS = {
     "breakout_scalp_replay",
     "momentum_burst_replay",
     "momentum_burst_hit_run",
+    "warrior_squeeze_playbook",
+    "warrior_news_continuation",
     "live_like_10s",
 }
 
@@ -272,6 +274,23 @@ DEFAULT_EXPERIMENTS: Dict[str, Dict[str, bool]] = {
         "momentum_burst_hit_run": True,
         "live_like_10s": True,
     },
+    "warrior_squeeze_playbook": {
+        "fresh_vwap_reclaim_scout": False,
+        "vwap_reclaim_scout": False,
+        "level_breakout_scout": False,
+        "elite_wide_spread": False,
+        "momentum_burst_live": False,
+        "level_capped_entry": False,
+        "execution_timer_10s": True,
+        "ten_second_breakout_scout": False,
+        "level_reclaim_10s_scout": False,
+        "breakout_scalp_replay": False,
+        "momentum_burst_replay": False,
+        "momentum_burst_hit_run": False,
+        "warrior_squeeze_playbook": True,
+        "warrior_news_continuation": False,
+        "live_like_10s": True,
+    },
 }
 
 
@@ -297,6 +316,8 @@ def normalize_flags(flags: Optional[Dict[str, Any]]) -> Dict[str, bool]:
         "breakout_scalp_replay": bool(raw.get("breakout_scalp_replay", False)),
         "momentum_burst_replay": bool(raw.get("momentum_burst_replay", False)),
         "momentum_burst_hit_run": bool(raw.get("momentum_burst_hit_run", False)),
+        "warrior_squeeze_playbook": bool(raw.get("warrior_squeeze_playbook", False)),
+        "warrior_news_continuation": bool(raw.get("warrior_news_continuation", False)),
         "live_like_10s": bool(raw.get("live_like_10s", False)),
     }
 
@@ -456,6 +477,9 @@ def _strategy_manifest(settings: Optional[Settings]) -> dict:
         "momentum_burst_hit_run_stop_after_giveback",
         "momentum_burst_hit_run_max_giveback",
         "momentum_burst_hit_run_daily_loss_stop",
+        "warrior_squeeze_enabled",
+        "warrior_squeeze_min_reclaim_price",
+        "warrior_squeeze_starter_size_factor",
         "momentum_burst_live_enabled",
         "momentum_burst_cycle_enabled",
         "runner_trail_pct",
@@ -634,6 +658,7 @@ def run_backtest(
                 use_breakout_scalp_replay=active_flags["breakout_scalp_replay"],
                 use_momentum_burst_replay=active_flags["momentum_burst_replay"],
                 use_momentum_burst_hit_run=active_flags["momentum_burst_hit_run"],
+                use_warrior_squeeze_playbook=active_flags["warrior_squeeze_playbook"],
                 momentum_burst_window_sec=(
                     settings.strategy.momentum_burst_window_sec if settings else 300.0
                 ),
@@ -667,6 +692,25 @@ def run_backtest(
                 momentum_burst_hit_run_end_et=(
                     settings.strategy.momentum_burst_hit_run_end_et if settings else "11:30"
                 ),
+                warrior_squeeze_min_reclaim_price=(
+                    settings.strategy.warrior_squeeze_min_reclaim_price if settings else 3.5
+                ),
+                warrior_squeeze_starter_size_factor=(
+                    settings.strategy.warrior_squeeze_starter_size_factor if settings else 0.35
+                ),
+                warrior_squeeze_max_entries=(
+                    settings.strategy.warrior_squeeze_max_entries if settings else 3
+                ),
+                warrior_squeeze_win_cooldown_sec=(
+                    settings.strategy.warrior_squeeze_win_cooldown_sec if settings else 10.0
+                ),
+                warrior_squeeze_reward_risk=(
+                    settings.strategy.warrior_squeeze_reward_risk if settings else 3.0
+                ),
+                warrior_squeeze_add_reward_risk=(
+                    settings.strategy.warrior_squeeze_add_reward_risk if settings else 1.0
+                ),
+                warrior_news_continuation_enabled=active_flags["warrior_news_continuation"],
                 live_like_10s=active_flags["live_like_10s"],
             ).run(start=start_dt)
 

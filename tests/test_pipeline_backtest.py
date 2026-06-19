@@ -9,8 +9,9 @@ import pytest
 from daytrading.backtest.broker import BacktestBroker, FillModel
 from daytrading.backtest.data_loader import load_bars_csv
 from daytrading.backtest.data_loader import fetch_alpaca_bars_for_day
-from daytrading.backtest.driver import PipelineBacktestDriver
+from daytrading.backtest.driver import PipelineBacktestDriver, PipelineBacktestResult
 from daytrading.backtest.report import BacktestLedger
+from daytrading.execution.broker import apply_fill
 from daytrading.backtest.service import (
     normalize_flags,
     normalize_session_date,
@@ -484,6 +485,389 @@ def test_momentum_burst_hit_run_signal_uses_1r_and_short_hold() -> None:
     )
 
 
+def test_warrior_squeeze_backtest_signal_is_tagged_and_starter_sized() -> None:
+    ten_sec = [_ten_bar(i * 10, 2.00 + i * 0.01, width_pct=0.006, volume=5_000) for i in range(12)]
+    driver = _momentum_burst_backtest_driver(ten_sec)
+    driver._use_warrior_squeeze_playbook = True
+    driver._warrior_squeeze_starter_size_factor = 0.35
+
+    baseline = driver._momentum_burst_replay_signal(
+        "MBUR",
+        ten_sec[-1],
+        driver._bars_by_symbol["MBUR"],
+        hit_run=True,
+    )
+    signal = driver._momentum_burst_replay_signal(
+        "MBUR",
+        ten_sec[-1],
+        driver._bars_by_symbol["MBUR"],
+        hit_run=True,
+        strategy_override="warrior_squeeze_playbook",
+        size_factor_override=0.35,
+    )
+
+    assert baseline is not None
+    assert signal is not None
+    assert signal.scan_result.scanner_name == "warrior_squeeze_playbook"
+    assert signal.scan_result.criteria["entry_mode"] == "warrior_squeeze_playbook"
+    assert signal.scan_result.criteria["variant"] == "warrior_reclaim_starter"
+    assert signal.scan_result.criteria["size_factor"] == 0.35
+    assert signal.quantity == max(1, int(baseline.quantity * 0.35))
+
+
+def test_warrior_squeeze_backtest_pullaway_uses_capped_level_price() -> None:
+    ten_sec = [_ten_bar(i * 10, 2.00 + i * 0.01, width_pct=0.006, volume=5_000) for i in range(10)]
+    ten_sec.extend([
+        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 3.46, 3.56, 3.45, 3.53, 260_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 3.54, 3.62, 3.49, 3.58, 320_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=120), 3.58, 3.70, 3.50, 3.64, 760_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=130), 3.65, 4.08, 3.56, 3.97, 845_000, Timeframe.SEC_10),
+    ])
+    driver = _momentum_burst_backtest_driver(ten_sec)
+    driver._use_warrior_squeeze_playbook = True
+    driver._warrior_squeeze_min_reclaim_price = 3.50
+    driver._warrior_squeeze_starter_size_factor = 0.35
+    driver._warrior_squeeze_rejection_high["MBUR"] = 2.25
+    pending = {
+        "ts": ten_sec[-2].ts,
+        "breakout_close": 3.64,
+        "breakout_high": 3.50,
+        "breakout_volume": 760_000,
+    }
+
+    context = driver._warrior_squeeze_pullaway_context("MBUR", ten_sec[-1], pending)
+    assert context is not None
+    signal = driver._momentum_burst_replay_signal(
+        "MBUR",
+        ten_sec[-1],
+        driver._bars_by_symbol["MBUR"],
+        hit_run=True,
+        entry_context={**pending, **context},
+        strategy_override="warrior_squeeze_playbook",
+        size_factor_override=0.35,
+    )
+
+    assert signal is not None
+    assert signal.scan_result.scanner_name == "warrior_squeeze_playbook"
+    assert signal.scan_result.criteria["variant"] == "warrior_proof_pullback_hold"
+    assert signal.scan_result.criteria["entry_trigger"] == "warrior_level_pullaway"
+    assert signal.scan_result.criteria["pullaway_level"] == 3.5
+    assert signal.scan_result.criteria["max_pay"] == 3.71
+    assert signal.entry_price == 3.71
+    assert signal.entry_price < 3.97
+    assert signal.take_profit > signal.entry_price + (signal.entry_price - signal.stop_loss) * 2.5
+    assert signal.max_hold_seconds == 180.0
+    assert signal.quantity < 100
+
+
+def test_warrior_squeeze_backtest_clwt_fast_pullaway_without_slow_proof_hold() -> None:
+    ten_sec = [_ten_bar(i * 10, 1.85 + i * 0.01, width_pct=0.006, volume=8_000) for i in range(10)]
+    ten_sec.extend([
+        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 1.20, 1.60, 1.18, 1.48, 320_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 2.00, 2.25, 1.84, 1.92, 900_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=120), 2.70, 3.50, 2.70, 3.16, 760_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=130), 3.17, 4.08, 3.10, 3.9674, 845_000, Timeframe.SEC_10),
+    ])
+    driver = _momentum_burst_backtest_driver(ten_sec)
+    driver._use_warrior_squeeze_playbook = True
+    driver._warrior_squeeze_min_reclaim_price = 3.50
+    driver._warrior_squeeze_rejection_high["MBUR"] = 2.25
+    driver._warrior_squeeze_rejection_reason["MBUR"] = "high-volume shooting-star rejection"
+    pending = {
+        "ts": ten_sec[-2].ts,
+        "breakout_close": 3.16,
+        "breakout_high": 3.50,
+        "breakout_volume": 760_000,
+        "entry_trigger": "warrior_a_plus_reclaim",
+    }
+
+    context = driver._warrior_squeeze_pullaway_context("MBUR", ten_sec[-1], pending)
+    assert context is not None
+    signal = driver._momentum_burst_replay_signal(
+        "MBUR",
+        ten_sec[-1],
+        driver._bars_by_symbol["MBUR"],
+        hit_run=True,
+        entry_context={**pending, **context},
+        strategy_override="warrior_squeeze_playbook",
+        size_factor_override=0.35,
+    )
+
+    assert signal is not None
+    assert signal.scan_result.criteria["entry_trigger"] == "warrior_level_pullaway"
+    assert signal.scan_result.criteria["variant"] == "warrior_clwt_fast_pullaway"
+    assert signal.scan_result.criteria["max_pay"] == 4.025
+    assert signal.entry_price == 3.9674
+    assert signal.take_profit > signal.entry_price
+
+
+def test_warrior_squeeze_backtest_equal_high_pullaway_allows_clwt_style_hold() -> None:
+    ten_sec = [_ten_bar(i * 10, 2.00 + i * 0.01, width_pct=0.006, volume=5_000) for i in range(10)]
+    ten_sec.extend([
+        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 3.42, 3.50, 3.36, 3.47, 180_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 3.48, 3.54, 3.42, 3.52, 230_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=120), 3.51, 3.58, 3.45, 3.55, 260_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=130), 3.54, 3.59, 3.49, 3.57, 280_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=140), 3.56, 3.60, 3.50, 3.59, 310_000, Timeframe.SEC_10),
+    ])
+    driver = _momentum_burst_backtest_driver(ten_sec)
+    driver._use_warrior_squeeze_playbook = True
+    driver._warrior_squeeze_min_reclaim_price = 3.50
+    driver._warrior_squeeze_rejection_high["MBUR"] = 2.25
+    driver._warrior_squeeze_rejection_reason["MBUR"] = "high-volume shooting-star rejection"
+    pending = {
+        "ts": ten_sec[-2].ts,
+        "breakout_close": 3.57,
+        "breakout_high": 3.60,
+        "breakout_volume": 280_000,
+    }
+
+    context = driver._warrior_squeeze_equal_high_pullaway_context(
+        "MBUR",
+        ten_sec[-1],
+        pending,
+        window_high=3.60,
+    )
+    assert context is not None
+    signal = driver._momentum_burst_replay_signal(
+        "MBUR",
+        ten_sec[-1],
+        driver._bars_by_symbol["MBUR"],
+        hit_run=True,
+        entry_context={**pending, **context},
+        strategy_override="warrior_squeeze_playbook",
+        size_factor_override=0.35,
+    )
+
+    assert signal is not None
+    assert signal.scan_result.criteria["entry_trigger"] == "warrior_equal_high_pullaway"
+    assert signal.scan_result.criteria["variant"] == "warrior_equal_high_pullaway"
+    assert signal.entry_price == 3.59
+    assert signal.take_profit > signal.entry_price
+    assert signal.quantity < 100
+
+
+def test_warrior_squeeze_backtest_equal_high_pullaway_rejects_above_five() -> None:
+    ten_sec = [_ten_bar(i * 10, 6.80 + i * 0.01, width_pct=0.006, volume=5_000) for i in range(10)]
+    ten_sec.extend([
+        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 7.10, 7.45, 7.00, 7.34, 250_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 7.33, 7.50, 7.18, 7.42, 320_000, Timeframe.SEC_10),
+    ])
+    driver = _momentum_burst_backtest_driver(ten_sec)
+    driver._use_warrior_squeeze_playbook = True
+    driver._warrior_squeeze_min_reclaim_price = 3.50
+    driver._warrior_squeeze_rejection_high["MBUR"] = 6.95
+    driver._warrior_squeeze_rejection_reason["MBUR"] = "high-volume shooting-star rejection"
+    pending = {
+        "ts": ten_sec[-2].ts,
+        "breakout_close": 7.34,
+        "breakout_high": 7.45,
+        "breakout_volume": 250_000,
+    }
+
+    context = driver._warrior_squeeze_equal_high_pullaway_context(
+        "MBUR",
+        ten_sec[-1],
+        pending,
+        window_high=7.50,
+    )
+
+    assert context is None
+
+
+def test_warrior_squeeze_backtest_curl_reclaim_allows_level_starter_without_new_high() -> None:
+    ten_sec = [_ten_bar(i * 10, 5.80 + i * 0.01, width_pct=0.006, volume=5_000) for i in range(10)]
+    ten_sec.extend([
+        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 6.30, 7.00, 6.24, 6.88, 900_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 6.28, 6.60, 6.20, 6.52, 450_000, Timeframe.SEC_10),
+    ])
+    driver = _momentum_burst_backtest_driver(ten_sec)
+    driver._use_warrior_squeeze_playbook = True
+    driver._warrior_squeeze_min_reclaim_price = 3.50
+    driver._warrior_squeeze_starter_size_factor = 0.35
+    pending = {
+        "ts": ten_sec[-2].ts,
+        "breakout_close": 6.88,
+        "breakout_high": 7.00,
+        "breakout_volume": 900_000,
+    }
+
+    context = driver._warrior_squeeze_curl_reclaim_context(
+        "MBUR",
+        ten_sec[-1],
+        pending,
+        window_high=7.00,
+    )
+    assert context is not None
+    signal = driver._momentum_burst_replay_signal(
+        "MBUR",
+        ten_sec[-1],
+        driver._bars_by_symbol["MBUR"],
+        hit_run=True,
+        entry_context={**pending, **context},
+        strategy_override="warrior_squeeze_playbook",
+        size_factor_override=0.35,
+    )
+
+    assert signal is not None
+    assert signal.scan_result.scanner_name == "warrior_squeeze_playbook"
+    assert signal.scan_result.criteria["variant"] == "warrior_curl_reclaim_starter"
+    assert signal.scan_result.criteria["entry_trigger"] == "warrior_curl_reclaim"
+    assert signal.scan_result.criteria["pullaway_level"] == 6.5
+    assert signal.entry_price == 6.52
+    assert signal.entry_price < pending["breakout_high"]
+    assert signal.take_profit > signal.entry_price
+    assert signal.quantity < 100
+
+
+def test_warrior_squeeze_backtest_reentry_uses_current_level_pullaway() -> None:
+    ten_sec = [_ten_bar(i * 10, 2.00 + i * 0.01, width_pct=0.006, volume=5_000) for i in range(10)]
+    ten_sec.extend([
+        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 3.96, 5.00, 3.94, 4.68, 792_000, Timeframe.SEC_10),
+    ])
+    driver = _momentum_burst_backtest_driver(ten_sec)
+    driver._use_warrior_squeeze_playbook = True
+    driver._warrior_squeeze_min_reclaim_price = 3.50
+    driver._warrior_squeeze_rejection_high["MBUR"] = 2.25
+    driver._mb_hit_run_counts["MBUR"] = 1
+    pending = {
+        "ts": ten_sec[-2].ts,
+        "breakout_close": 4.30,
+        "breakout_high": 4.50,
+        "breakout_volume": 600_000,
+    }
+
+    context = driver._warrior_squeeze_pullaway_context("MBUR", ten_sec[-1], pending)
+
+    assert context is not None
+    assert context["pullaway_level"] == 4.5
+    assert context["max_pay"] == 4.77
+    assert context["entry_price_override"] == 4.68
+    assert context["stop_price_override"] < 4.5
+    assert 4.99 <= context["target_price_override"] <= 5.0
+
+
+def test_warrior_squeeze_backtest_a_plus_reclaim_scout_does_not_arm_playbook() -> None:
+    ten_sec = [_ten_bar(i * 10, 2.00 + i * 0.01, width_pct=0.006, volume=5_000) for i in range(12)]
+    driver = _momentum_burst_backtest_driver(ten_sec)
+    driver._use_warrior_squeeze_playbook = True
+    driver._warrior_squeeze_min_reclaim_price = 3.50
+    driver._warrior_squeeze_rejection_high["MBUR"] = 2.25
+    hit = ScanResult(
+        symbol="MBUR",
+        scanner_name="vwap_pullback",
+        ts=ten_sec[-1].ts,
+        score=300.0,
+        criteria={
+            "pattern": "vwap_pullback",
+            "setup_tier": "A+ setup",
+            "entry_tier": "a_plus_reclaim_scout",
+            "close": 3.97,
+            "volume": 4_000_000,
+        },
+        bars=[
+            Bar("MBUR", _BASE_TS, 3.16, 3.50, 2.70, 3.16, 760_000, Timeframe.SEC_10),
+            Bar("MBUR", _BASE_TS + timedelta(seconds=10), 3.17, 4.08, 3.10, 3.97, 845_000, Timeframe.SEC_10),
+        ],
+    )
+
+    driver._arm_momentum_burst_from_cycle(PipelineResult(scan_hits=[hit]), ten_sec[-1].ts)
+
+    assert "MBUR" not in driver._momentum_burst_pending
+    assert "MBUR" not in driver._momentum_burst_armed
+
+
+def test_warrior_squeeze_backtest_generic_a_plus_does_not_arm_playbook() -> None:
+    ten_sec = [_ten_bar(i * 10, 2.00 + i * 0.01, width_pct=0.006, volume=5_000) for i in range(12)]
+    driver = _momentum_burst_backtest_driver(ten_sec)
+    driver._use_warrior_squeeze_playbook = True
+    hit = ScanResult(
+        symbol="MBUR",
+        scanner_name="vwap_pullback",
+        ts=ten_sec[-1].ts,
+        score=300.0,
+        criteria={
+            "pattern": "vwap_pullback",
+            "setup_tier": "A+ setup",
+            "entry_tier": "deep_runner_scout",
+            "close": 3.97,
+            "volume": 4_000_000,
+        },
+        bars=[
+            Bar("MBUR", _BASE_TS, 3.16, 3.50, 2.70, 3.16, 760_000, Timeframe.SEC_10),
+            Bar("MBUR", _BASE_TS + timedelta(seconds=10), 3.17, 4.08, 3.10, 3.97, 845_000, Timeframe.SEC_10),
+        ],
+    )
+
+    driver._arm_momentum_burst_from_cycle(PipelineResult(scan_hits=[hit]), ten_sec[-1].ts)
+
+    assert "MBUR" not in driver._momentum_burst_pending
+    assert "MBUR" not in driver._momentum_burst_armed
+
+
+def test_warrior_squeeze_backtest_near_hod_a_plus_does_not_seed_playbook() -> None:
+    ten_sec = [_ten_bar(i * 10, 2.00 + i * 0.01, width_pct=0.006, volume=5_000) for i in range(12)]
+    driver = _momentum_burst_backtest_driver(ten_sec)
+    driver._use_warrior_squeeze_playbook = True
+    hit = ScanResult(
+        symbol="MBUR",
+        scanner_name="vwap_pullback",
+        ts=ten_sec[-1].ts,
+        score=300.0,
+        criteria={
+            "pattern": "vwap_pullback",
+            "setup_tier": "A+ setup",
+            "close": 8.58,
+            "session_high": 9.99,
+            "volume": 900_000,
+        },
+        bars=[
+            Bar("MBUR", _BASE_TS, 7.60, 8.70, 7.60, 8.52, 290_000, Timeframe.SEC_10),
+            Bar("MBUR", _BASE_TS + timedelta(seconds=10), 8.50, 9.74, 8.21, 8.67, 291_000, Timeframe.SEC_10),
+        ],
+    )
+
+    driver._arm_momentum_burst_from_cycle(PipelineResult(scan_hits=[hit]), ten_sec[-1].ts)
+
+    assert "MBUR" not in driver._momentum_burst_pending
+    assert "MBUR" not in driver._momentum_burst_armed
+
+
+def test_warrior_squeeze_backtest_a_plus_reclaim_stop_stays_inside_final_guard() -> None:
+    ten_sec = [
+        _ten_bar(0, 7.90, width_pct=0.012, volume=120_000),
+        _ten_bar(10, 8.10, width_pct=0.012, volume=160_000),
+        Bar(
+            "MBUR",
+            _BASE_TS + timedelta(seconds=20),
+            8.55,
+            9.10,
+            8.35,
+            9.00,
+            220_000,
+            Timeframe.SEC_10,
+        ),
+    ]
+    driver = _momentum_burst_backtest_driver(ten_sec)
+    driver._use_warrior_squeeze_playbook = True
+    driver._warrior_squeeze_min_reclaim_price = 3.50
+    driver._warrior_squeeze_rejection_high["MBUR"] = 4.00
+    pending = {
+        "ts": ten_sec[-2].ts,
+        "breakout_close": 8.10,
+        "breakout_high": 8.25,
+        "breakout_volume": 180_000,
+        "entry_trigger": "warrior_a_plus_reclaim",
+    }
+
+    context = driver._warrior_squeeze_pullaway_context("MBUR", ten_sec[-1], pending)
+
+    assert context is not None
+    entry = context["entry_price_override"]
+    stop = context["stop_price_override"]
+    assert (entry - stop) / entry <= 0.06
+
+
 def test_momentum_burst_hit_run_backtest_defaults_to_one_entry() -> None:
     ten_sec = [_ten_bar(i * 10, 2.00 + i * 0.01, width_pct=0.006, volume=5_000) for i in range(12)]
     driver = _momentum_burst_backtest_driver(ten_sec)
@@ -524,6 +908,428 @@ def test_momentum_burst_hit_run_backtest_giveback_can_be_disabled() -> None:
     assert driver._record_mb_hit_run_pnl("MBUR", 55.0) == ""
     assert driver._record_mb_hit_run_pnl("MBUR", -25.0) == ""
     assert "MBUR" not in driver._mb_hit_run_day_blocked
+
+
+def test_backtest_momentum_burst_respects_global_active_scalp_latch() -> None:
+    ten_sec = [_ten_bar(i * 10, 2.00 + i * 0.01, width_pct=0.006, volume=80_000) for i in range(12)]
+    driver = _momentum_burst_backtest_driver(ten_sec)
+    driver._use_momentum_burst_hit_run = True
+    driver._momentum_burst_armed["MBUR"] = ten_sec[-1].ts
+    driver._momentum_burst_window_high["MBUR"] = 2.20
+    driver._mb_bracket["OTHER"] = {
+        "stop": 3.90,
+        "target": 4.30,
+        "qty": 10,
+        "entry": 4.10,
+        "ts": ten_sec[-1].ts,
+        "max_hold": 45,
+        "strategy": "warrior_squeeze_playbook",
+    }
+    result = PipelineBacktestResult()
+
+    driver._maybe_execute_momentum_burst_replay(
+        result,
+        BacktestLedger(),
+        universe=driver._bars_by_symbol,
+        quotes={},
+        now=ten_sec[-1].ts,
+    )
+
+    assert not result.fills
+    assert driver._has_active_replay_scalp() is True
+
+
+def test_warrior_backtest_ambiguous_green_bar_takes_target_before_stop() -> None:
+    ten_sec = [_ten_bar(i * 10, 8.50 + i * 0.01, width_pct=0.006, volume=80_000) for i in range(12)]
+    bar = Bar(
+        "MBUR",
+        ten_sec[-1].ts,
+        8.50,
+        9.75,
+        8.21,
+        8.67,
+        290_000,
+        Timeframe.SEC_10,
+    )
+    ten_sec[-1] = bar
+    driver = _momentum_burst_backtest_driver(ten_sec)
+    driver._mb_bracket["MBUR"] = {
+        "stop": 8.24,
+        "target": 9.35,
+        "qty": 63,
+        "entry": 8.58,
+        "ts": bar.ts - timedelta(seconds=10),
+        "max_hold": 45,
+        "strategy": "warrior_squeeze_playbook",
+    }
+    apply_fill(
+        driver._pipeline.portfolio,
+        Fill("MBUR", Side.BUY, 63, 8.58, bar.ts - timedelta(seconds=10)),
+    )
+    result = PipelineBacktestResult()
+    ledger = BacktestLedger()
+
+    driver._process_mb_brackets(result, ledger, bar.ts)
+
+    assert ledger.trades
+    assert ledger.trades[-1]["exit_reason"] == "mb_bracket_target: Warrior Squeeze"
+    assert ledger.trades[-1]["exit_price"] == pytest.approx(9.345)
+    assert ledger.trades[-1]["exit_price"] > 8.58
+    assert driver._mb_bracket["MBUR"]["partial_taken"] is True
+    assert driver._mb_bracket["MBUR"]["qty"] == 42
+
+
+def test_warrior_squeeze_profit_lock_blocks_reentry_until_fresh_high() -> None:
+    ten_sec = [_ten_bar(i * 10, 2.00 + i * 0.01, width_pct=0.006, volume=80_000) for i in range(12)]
+    driver = _momentum_burst_backtest_driver(ten_sec)
+    driver._use_warrior_squeeze_playbook = True
+    driver._warrior_squeeze_target_wins["MBUR"] = 2
+    driver._momentum_burst_armed["MBUR"] = ten_sec[-1].ts
+    driver._momentum_burst_window_high["MBUR"] = 3.00
+    result = PipelineBacktestResult()
+
+    driver._maybe_execute_momentum_burst_replay(
+        result,
+        BacktestLedger(),
+        universe=driver._bars_by_symbol,
+        quotes={},
+        now=ten_sec[-1].ts,
+    )
+
+    assert not result.fills
+    assert result.rejection_details
+    assert result.rejection_details[-1]["blocked_layer"] == "warrior_squeeze_playbook_profit_lock"
+    assert "target win banked" in result.rejection_details[-1]["reason"]
+
+
+def test_backtest_timed_release_chase_uses_queued_price_not_stale_anchor() -> None:
+    driver = _momentum_burst_backtest_driver([])
+    hit = ScanResult(
+        symbol="CAST",
+        scanner_name="shallow_stair_continuation",
+        ts=_BASE_TS,
+        score=95.0,
+        criteria={
+            "pattern": "shallow_stair_continuation",
+            "setup_tier": "A+ setup",
+            "setup_anchor": 3.12,
+            "queued_entry_price": 3.63,
+        },
+        bars=[],
+    )
+    signal = TradeSignal(
+        symbol="CAST",
+        action=SignalAction.ENTER_LONG,
+        quantity=100,
+        entry_price=3.63,
+        stop_loss=3.41,
+        take_profit=4.06,
+        reason="queued CAST stair scout",
+        scan_result=hit,
+    )
+    release = Bar(
+        symbol="CAST",
+        ts=_BASE_TS + timedelta(seconds=10),
+        open=3.62,
+        high=3.66,
+        low=3.60,
+        close=3.635,
+        volume=100_000,
+        timeframe=Timeframe.SEC_10,
+    )
+    assert driver._timed_release_chase_reject(signal, release) is None
+
+    chased = Bar(
+        symbol="CAST",
+        ts=_BASE_TS + timedelta(seconds=20),
+        open=3.80,
+        high=3.88,
+        low=3.79,
+        close=3.86,
+        volume=100_000,
+        timeframe=Timeframe.SEC_10,
+    )
+    reason = driver._timed_release_chase_reject(signal, chased)
+    assert reason is not None
+    assert "queued setup $3.6300" in reason
+
+
+def test_warrior_squeeze_second_leg_reclaim_after_deep_washout() -> None:
+    closes = [
+        3.90, 4.20, 6.50, 9.80, 12.40, 14.20, 13.70, 11.20,
+        9.30, 8.20, 7.80, 8.10, 8.25, 8.35, 8.20, 8.45,
+        8.70, 9.05, 9.60,
+    ]
+    volumes = [
+        50_000, 80_000, 220_000, 420_000, 650_000, 720_000, 500_000, 430_000,
+        260_000, 210_000, 180_000, 190_000, 170_000, 185_000, 160_000, 190_000,
+        220_000, 260_000, 420_000,
+    ]
+    ten_sec = [
+        _ten_bar(i * 10, close, width_pct=0.025, volume=volumes[i])
+        for i, close in enumerate(closes)
+    ]
+    ten_sec[-1] = Bar(
+        symbol="MBUR",
+        ts=ten_sec[-1].ts,
+        open=9.22,
+        high=9.72,
+        low=9.28,
+        close=9.62,
+        volume=420_000,
+        timeframe=Timeframe.SEC_10,
+    )
+    driver = _momentum_burst_backtest_driver(ten_sec)
+    driver._use_warrior_squeeze_playbook = True
+    driver._warrior_squeeze_target_wins["MBUR"] = 1
+    driver._mb_hit_run_counts["MBUR"] = 1
+
+    context = driver._warrior_squeeze_second_leg_reclaim_context(
+        "MBUR",
+        ten_sec[-1],
+        {
+            "breakout_close": ten_sec[-1].close,
+            "breakout_high": ten_sec[-1].high,
+            "breakout_volume": ten_sec[-1].volume,
+        },
+        window_high=14.78,
+    )
+
+    assert context is not None
+    assert context["entry_trigger"] == "warrior_second_leg_reclaim"
+    assert context["variant_override"] == "warrior_second_leg_reclaim"
+    assert context["washout_pct"] >= 25.0
+    assert context["entry_price_override"] <= context["max_pay"]
+
+
+def test_warrior_news_continuation_pullback_context_allows_controlled_reclaim() -> None:
+    ten_sec = [
+        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 6.10, 6.55, 6.05, 6.45, 120_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 6.45, 7.20, 6.40, 7.08, 210_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 7.05, 7.95, 7.00, 7.72, 340_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 7.70, 8.80, 7.65, 8.45, 520_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 8.42, 8.62, 8.08, 8.18, 260_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 8.10, 8.15, 7.78, 7.92, 190_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 7.92, 8.04, 7.72, 7.86, 160_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=70), 7.86, 7.98, 7.76, 7.90, 145_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=80), 7.90, 8.06, 7.82, 8.00, 150_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=90), 8.00, 8.10, 7.88, 8.04, 170_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 8.04, 8.12, 7.90, 8.06, 180_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 8.06, 8.20, 8.00, 8.14, 260_000, Timeframe.SEC_10),
+    ]
+    driver = _momentum_burst_backtest_driver(ten_sec)
+    driver._use_warrior_squeeze_playbook = True
+
+    context = driver._warrior_news_continuation_pullback_context(
+        "MBUR",
+        ten_sec[-1],
+        window_high=8.80,
+    )
+
+    assert context is not None
+    assert context["entry_trigger"] == "warrior_news_continuation_pullback"
+    assert context["variant_override"] == "warrior_news_continuation_pullback"
+    assert context["entry_price_override"] <= context["max_pay"]
+    assert context["stop_price_override"] < context["base_low"]
+    assert context["target_price_override"] > context["entry_price_override"]
+    assert 6.0 <= context["pullback_pct"] <= 28.0
+
+
+def test_warrior_news_continuation_pullback_rejects_dump_base() -> None:
+    ten_sec = [
+        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 6.10, 6.55, 6.05, 6.45, 120_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 6.45, 7.20, 6.40, 7.08, 210_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 7.05, 7.95, 7.00, 7.72, 340_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 7.70, 8.80, 7.65, 8.45, 520_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 8.42, 8.62, 8.08, 8.18, 260_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 8.10, 8.15, 7.78, 7.92, 190_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 7.92, 8.04, 7.72, 7.86, 160_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=70), 8.35, 8.42, 7.76, 7.70, 360_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=80), 7.70, 8.06, 7.82, 8.00, 150_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=90), 8.00, 8.10, 7.88, 8.04, 170_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 8.04, 8.12, 7.90, 8.06, 180_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 8.06, 8.20, 8.00, 8.14, 260_000, Timeframe.SEC_10),
+    ]
+    driver = _momentum_burst_backtest_driver(ten_sec)
+    driver._use_warrior_squeeze_playbook = True
+
+    context = driver._warrior_news_continuation_pullback_context(
+        "MBUR",
+        ten_sec[-1],
+        window_high=8.80,
+    )
+
+    assert context is None
+
+
+def test_warrior_news_continuation_pullback_rejects_weak_reclaim_volume() -> None:
+    ten_sec = [
+        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 6.10, 6.55, 6.05, 6.45, 120_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 6.45, 7.20, 6.40, 7.08, 210_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 7.05, 7.95, 7.00, 7.72, 340_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 7.70, 8.80, 7.65, 8.45, 520_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 8.42, 8.62, 8.08, 8.18, 260_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 8.10, 8.15, 7.78, 7.92, 190_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 7.92, 8.04, 7.72, 7.86, 160_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=70), 7.86, 7.98, 7.76, 7.90, 80_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=80), 7.90, 8.06, 7.82, 8.00, 45_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=90), 8.00, 8.10, 7.88, 8.04, 50_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 8.04, 8.12, 7.90, 8.06, 55_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 8.06, 8.20, 8.00, 8.14, 85_000, Timeframe.SEC_10),
+    ]
+    driver = _momentum_burst_backtest_driver(ten_sec)
+    driver._use_warrior_squeeze_playbook = True
+
+    context = driver._warrior_news_continuation_pullback_context(
+        "MBUR",
+        ten_sec[-1],
+        window_high=8.80,
+    )
+
+    assert context is None
+
+
+def test_warrior_trend_pullback_reclaim_context_allows_cast_style_base() -> None:
+    ten_sec = [
+        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 6.80, 7.30, 6.76, 7.22, 180_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 7.24, 7.85, 7.20, 7.78, 260_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 7.80, 8.55, 7.74, 8.42, 330_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 8.42, 9.35, 8.35, 9.12, 440_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 9.12, 10.20, 9.00, 9.82, 620_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 9.78, 10.34, 9.62, 9.90, 520_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 9.86, 9.98, 9.18, 9.30, 240_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=70), 9.30, 9.42, 8.82, 8.96, 170_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=80), 8.96, 9.10, 8.54, 8.76, 145_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=90), 8.76, 8.98, 8.46, 8.84, 135_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 8.84, 9.08, 8.58, 8.98, 150_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 8.98, 9.16, 8.70, 9.06, 165_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=120), 9.08, 9.24, 8.86, 9.18, 185_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=130), 9.18, 9.45, 9.05, 9.39, 320_000, Timeframe.SEC_10),
+    ]
+    driver = _momentum_burst_backtest_driver(ten_sec)
+    driver._use_warrior_squeeze_playbook = True
+
+    context = driver._warrior_trend_pullback_reclaim_context(
+        "MBUR",
+        ten_sec[-1],
+        window_high=10.34,
+    )
+
+    assert context is not None
+    assert context["entry_trigger"] == "warrior_trend_pullback_reclaim"
+    assert context["variant_override"] == "warrior_trend_pullback_reclaim"
+    assert context["entry_price_override"] <= context["max_pay"]
+    assert context["stop_price_override"] < context["entry_price_override"]
+    assert context["target_price_override"] > context["entry_price_override"]
+    assert 2.5 <= context["pullback_pct"] <= 22.0
+
+
+def test_warrior_trend_pullback_reclaim_rejects_dump_base() -> None:
+    ten_sec = [
+        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 6.80, 7.30, 6.76, 7.22, 180_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 7.24, 7.85, 7.20, 7.78, 260_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 7.80, 8.55, 7.74, 8.42, 330_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 8.42, 9.35, 8.35, 9.12, 440_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 9.12, 10.20, 9.00, 9.82, 620_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 9.78, 10.34, 9.62, 9.90, 520_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 9.86, 9.98, 9.18, 9.30, 240_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=70), 9.30, 9.42, 8.82, 8.96, 170_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=80), 9.30, 9.38, 8.42, 8.58, 390_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=90), 8.76, 8.98, 8.46, 8.84, 135_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 8.84, 9.08, 8.58, 8.98, 150_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 9.35, 9.42, 8.62, 8.78, 420_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=120), 9.08, 9.24, 8.86, 9.18, 185_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=130), 9.18, 9.45, 9.05, 9.39, 320_000, Timeframe.SEC_10),
+    ]
+    driver = _momentum_burst_backtest_driver(ten_sec)
+    driver._use_warrior_squeeze_playbook = True
+
+    context = driver._warrior_trend_pullback_reclaim_context(
+        "MBUR",
+        ten_sec[-1],
+        window_high=10.34,
+    )
+
+    assert context is None
+
+
+def test_warrior_squeeze_rejects_midrange_weak_close_above_five() -> None:
+    ten_sec = [
+        _ten_bar(0, 5.74, width_pct=0.04, volume=140_000),
+        _ten_bar(10, 5.90, width_pct=0.08, volume=185_000),
+        Bar(
+            symbol="MBUR",
+            ts=_BASE_TS + timedelta(seconds=20),
+            open=5.93,
+            high=6.19,
+            low=5.89,
+            close=6.08,
+            volume=104_000,
+            timeframe=Timeframe.SEC_10,
+        ),
+    ]
+    driver = _momentum_burst_backtest_driver(ten_sec)
+    driver._use_warrior_squeeze_playbook = True
+    driver._warrior_squeeze_min_reclaim_price = 3.50
+    driver._warrior_squeeze_rejection_high["MBUR"] = 3.85
+    pending = {
+        "breakout_close": 5.91,
+        "breakout_high": 6.19,
+        "breakout_volume": 185_000,
+        "entry_trigger": "warrior_a_plus_reclaim",
+    }
+
+    context = driver._warrior_squeeze_pullaway_context("MBUR", ten_sec[-1], pending)
+
+    assert context is None
+
+
+def test_warrior_squeeze_blocks_first_starter_without_proof_hold() -> None:
+    ten_sec = [
+        _ten_bar(0, 3.38, width_pct=0.04, volume=75_000),
+        _ten_bar(10, 3.46, width_pct=0.07, volume=260_000),
+        _ten_bar(20, 3.52, width_pct=0.05, volume=180_000),
+        _ten_bar(30, 3.53, width_pct=0.03, volume=125_000),
+    ]
+    driver = _momentum_burst_backtest_driver(ten_sec)
+    driver._use_warrior_squeeze_playbook = True
+    driver._warrior_squeeze_min_reclaim_price = 3.50
+    driver._warrior_squeeze_rejection_high["MBUR"] = 2.24
+    pending = {
+        "breakout_close": 3.52,
+        "breakout_high": 3.60,
+        "breakout_volume": 180_000,
+        "entry_trigger": "warrior_a_plus_reclaim",
+    }
+
+    context = driver._warrior_squeeze_pullaway_context("MBUR", ten_sec[-1], pending)
+
+    assert context is None
+
+
+def test_warrior_squeeze_allows_first_starter_after_proof_hold() -> None:
+    ten_sec = [
+        _ten_bar(0, 3.48, width_pct=0.012, volume=80_000),
+        _ten_bar(10, 3.53, width_pct=0.012, volume=150_000),
+        _ten_bar(20, 3.56, width_pct=0.012, volume=160_000),
+        _ten_bar(30, 3.62, width_pct=0.012, volume=180_000),
+    ]
+    driver = _momentum_burst_backtest_driver(ten_sec)
+    driver._use_warrior_squeeze_playbook = True
+    driver._warrior_squeeze_min_reclaim_price = 3.50
+    driver._warrior_squeeze_rejection_high["MBUR"] = 2.24
+    pending = {
+        "breakout_close": 3.56,
+        "breakout_high": 3.60,
+        "breakout_volume": 150_000,
+        "entry_trigger": "warrior_a_plus_reclaim",
+    }
+
+    context = driver._warrior_squeeze_pullaway_context("MBUR", ten_sec[-1], pending)
+
+    assert context is not None
+    assert context["entry_trigger"] == "warrior_level_pullaway"
+    assert context["pullaway_level"] == pytest.approx(3.5)
 
 
 def test_post_blowoff_micro_base_scout_signal_is_reduced_and_tagged() -> None:
@@ -604,6 +1410,68 @@ def test_momentum_burst_hit_run_backtest_time_window_blank_allows_all_day() -> N
     assert driver._momentum_burst_hit_run_time_allowed(
         datetime(2026, 6, 8, 18, 0, tzinfo=timezone.utc)
     ) is True
+
+
+def test_momentum_burst_hit_run_backtest_rebase_preserves_original_anchor() -> None:
+    ten_sec = [_ten_bar(i * 10, 2.00 + i * 0.01, width_pct=0.006, volume=80_000) for i in range(12)]
+    driver = _momentum_burst_backtest_driver(ten_sec)
+    driver._momentum_burst_continuation_base_ok = (
+        lambda symbol, now: (True, "fresh micro-base reclaim", {"base_high": 2.55, "base_low": 2.50})
+    )
+    now = ten_sec[-1].ts + timedelta(seconds=10)
+    pending = {
+        "ts": ten_sec[-2].ts,
+        "breakout_close": 2.50,
+        "breakout_high": 2.55,
+        "breakout_volume": 120_000,
+        "reset_from_stale_high": 2.90,
+    }
+
+    rebased = driver._momentum_burst_rebase_pending_after_reject(
+        "MBUR",
+        Bar("MBUR", now, 2.52, 2.55, 2.50, 2.54, 130_000, Timeframe.SEC_10),
+        pending,
+        "confirm bar did not break continuation high (2.55 <= 2.55)",
+        now,
+        hit_run=True,
+    )
+
+    assert rebased is True
+    assert driver._momentum_burst_pending["MBUR"]["original_ts"] == ten_sec[-2].ts
+    assert driver._momentum_burst_pending["MBUR"]["original_breakout_close"] == 2.50
+    assert driver._momentum_burst_pending["MBUR"]["reset_from_stale_high"] == 2.90
+    assert driver._momentum_burst_pending["MBUR"]["rebase_count"] == 1
+
+
+def test_momentum_burst_hit_run_backtest_rebase_is_capped() -> None:
+    ten_sec = [_ten_bar(i * 10, 2.00 + i * 0.01, width_pct=0.006, volume=80_000) for i in range(12)]
+    driver = _momentum_burst_backtest_driver(ten_sec)
+    driver._momentum_burst_continuation_base_ok = (
+        lambda symbol, now: (True, "fresh micro-base reclaim", {"base_high": 2.55, "base_low": 2.50})
+    )
+    now = ten_sec[-1].ts + timedelta(seconds=10)
+    pending = {
+        "ts": ten_sec[-1].ts,
+        "original_ts": ten_sec[-2].ts,
+        "breakout_close": 2.54,
+        "breakout_high": 2.55,
+        "original_breakout_close": 2.50,
+        "original_breakout_high": 2.55,
+        "breakout_volume": 120_000,
+        "rebase_count": 1,
+    }
+
+    rebased = driver._momentum_burst_rebase_pending_after_reject(
+        "MBUR",
+        Bar("MBUR", now, 2.54, 2.56, 2.52, 2.55, 130_000, Timeframe.SEC_10),
+        pending,
+        "confirm bar did not break continuation high (2.56 <= 2.56)",
+        now,
+        hit_run=True,
+    )
+
+    assert rebased is False
+    assert "MBUR" not in driver._momentum_burst_pending
 
 
 def test_momentum_burst_continuation_base_allows_extended_runner() -> None:
@@ -806,6 +1674,8 @@ def test_backtest_flags_default_experiments_off() -> None:
     assert flags["elite_wide_spread"] is False
     assert flags["momentum_burst_live"] is False
     assert flags["momentum_burst_hit_run"] is False
+    assert flags["warrior_squeeze_playbook"] is False
+    assert flags["warrior_news_continuation"] is False
     assert flags["level_capped_entry"] is False
     assert flags["execution_timer_10s"] is True
 
@@ -814,6 +1684,18 @@ def test_backtest_flags_accept_momentum_burst_hit_run() -> None:
     flags = normalize_flags({"momentum_burst_hit_run": True, "live_like_10s": True})
 
     assert flags["momentum_burst_hit_run"] is True
+    assert flags["live_like_10s"] is True
+
+
+def test_backtest_flags_accept_warrior_squeeze_playbook() -> None:
+    flags = normalize_flags({
+        "warrior_squeeze_playbook": True,
+        "warrior_news_continuation": True,
+        "live_like_10s": True,
+    })
+
+    assert flags["warrior_squeeze_playbook"] is True
+    assert flags["warrior_news_continuation"] is True
     assert flags["live_like_10s"] is True
 
 

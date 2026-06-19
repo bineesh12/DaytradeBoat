@@ -15,6 +15,7 @@ from daytrading.pipeline.engine import PipelineResult, TradingPipeline, _entry_s
 from daytrading.pipeline.factory import create_scalping_pipeline
 from daytrading.risk.manager import allow_order
 from daytrading.strategy.execution_timer import ExecutionTimer
+from daytrading.strategy import warrior_lanes
 
 
 @dataclass
@@ -73,6 +74,7 @@ class PipelineBacktestDriver:
         use_breakout_scalp_replay: bool = False,
         use_momentum_burst_replay: bool = False,
         use_momentum_burst_hit_run: bool = False,
+        use_warrior_squeeze_playbook: bool = False,
         momentum_burst_window_sec: float = 300.0,
         momentum_burst_cooldown_sec: float = 300.0,
         momentum_burst_hit_run_max_entries: int = 1,
@@ -84,6 +86,13 @@ class PipelineBacktestDriver:
         momentum_burst_hit_run_max_giveback: float = 50.0,
         momentum_burst_hit_run_daily_loss_stop: float = 50.0,
         momentum_burst_hit_run_end_et: str = "11:30",
+        warrior_squeeze_min_reclaim_price: float = 3.5,
+        warrior_squeeze_starter_size_factor: float = 0.35,
+        warrior_squeeze_max_entries: int = 3,
+        warrior_squeeze_win_cooldown_sec: float = 10.0,
+        warrior_squeeze_reward_risk: float = 3.0,
+        warrior_squeeze_add_reward_risk: float = 1.0,
+        warrior_news_continuation_enabled: bool = False,
         live_like_10s: bool = False,
     ) -> None:
         self._bars_by_symbol = {
@@ -114,6 +123,7 @@ class PipelineBacktestDriver:
         # Mirrors the live runner's _process_momentum_burst_scalps path.
         self._use_momentum_burst_replay = bool(use_momentum_burst_replay)
         self._use_momentum_burst_hit_run = bool(use_momentum_burst_hit_run)
+        self._use_warrior_squeeze_playbook = bool(use_warrior_squeeze_playbook)
         self._momentum_burst_window_sec = float(momentum_burst_window_sec)
         self._momentum_burst_cooldown_sec = float(momentum_burst_cooldown_sec)
         self._momentum_burst_armed: Dict[str, datetime] = {}
@@ -133,6 +143,16 @@ class PipelineBacktestDriver:
         self._mb_hit_run_symbol_pnl: Dict[str, float] = {}
         self._mb_hit_run_symbol_peak_pnl: Dict[str, float] = {}
         self._mb_hit_run_day_blocked: Dict[str, str] = {}
+        self._warrior_squeeze_min_reclaim_price = float(warrior_squeeze_min_reclaim_price)
+        self._warrior_squeeze_starter_size_factor = float(warrior_squeeze_starter_size_factor)
+        self._warrior_squeeze_max_entries = int(warrior_squeeze_max_entries)
+        self._warrior_squeeze_win_cooldown_sec = float(warrior_squeeze_win_cooldown_sec)
+        self._warrior_squeeze_reward_risk = float(warrior_squeeze_reward_risk)
+        self._warrior_squeeze_add_reward_risk = float(warrior_squeeze_add_reward_risk)
+        self._warrior_news_continuation_enabled = bool(warrior_news_continuation_enabled)
+        self._warrior_squeeze_rejection_high: Dict[str, float] = {}
+        self._warrior_squeeze_rejection_reason: Dict[str, str] = {}
+        self._warrior_squeeze_target_wins: Dict[str, int] = {}
         # symbol -> {ts, breakout_close} of a fresh 10s high awaiting next-bar
         # confirmation; we never buy the spike bar itself.
         self._momentum_burst_pending: Dict[str, Dict[str, Any]] = {}
@@ -188,6 +208,23 @@ class PipelineBacktestDriver:
         if self._timer is not None:
             self._pipeline._execution_timer = self._timer
         self._wire_bar_aggregator()
+
+    def _has_active_replay_scalp(self) -> bool:
+        """Mirror the live runner's single active breakout/burst scalp latch."""
+        if self._mb_bracket:
+            return True
+        try:
+            if any(
+                not position.is_flat
+                for position in self._portfolio.positions.values()
+            ):
+                return True
+        except Exception:
+            return True
+        try:
+            return bool(self._pipeline.exit_manager.tracked)
+        except Exception:
+            return True
 
     def _wire_bar_aggregator(self) -> None:
         """Give the backtest a 5-minute bar context, like the live runner.
@@ -356,7 +393,11 @@ class PipelineBacktestDriver:
                     quotes=quotes,
                     now=t10,
                 )
-            if self._use_momentum_burst_replay or self._use_momentum_burst_hit_run:
+            if (
+                self._use_momentum_burst_replay
+                or self._use_momentum_burst_hit_run
+                or self._use_warrior_squeeze_playbook
+            ):
                 self._process_mb_brackets(result, ledger, t10)
                 self._arm_momentum_burst_from_cycle(cycle, t10)
                 self._maybe_execute_momentum_burst_replay(
@@ -795,6 +836,8 @@ class PipelineBacktestDriver:
         final entry guard, risk/order checks, then normal exit manager handling.
         """
         for symbol, bars in universe.items():
+            if self._has_active_replay_scalp():
+                break
             if self._portfolio.positions.get(symbol) and not self._portfolio.positions[symbol].is_flat:
                 continue
             if self._pipeline.exit_manager.tracked.get(symbol) is not None:
@@ -1044,11 +1087,98 @@ class PipelineBacktestDriver:
                     high = 0.0
             if high <= 0:
                 continue
+            if self._use_warrior_squeeze_playbook:
+                should_arm, _reason = self._warrior_squeeze_should_arm(hit, high)
+                if not should_arm:
+                    continue
             self._momentum_burst_armed[sym] = now
             self._momentum_burst_window_high[sym] = max(
                 high, float(self._momentum_burst_window_high.get(sym, 0.0) or 0.0)
             )
             self._momentum_burst_session_anchor_high.setdefault(sym, high)
+
+    def _warrior_squeeze_should_arm(self, hit: ScanResult, high: float) -> tuple[bool, str]:
+        sym = hit.symbol.upper()
+        bars = list(hit.bars or [])
+        min_price = max(0.0, float(self._warrior_squeeze_min_reclaim_price or 0.0))
+        reject_high = float(self._warrior_squeeze_rejection_high.get(sym, 0.0) or 0.0)
+        if bars:
+            latest = bars[-1]
+            bar_high = float(latest.high or high or 0.0)
+            bar_open = float(latest.open or 0.0)
+            bar_close = float(latest.close or 0.0)
+            bar_low = float(latest.low or 0.0)
+            bar_range = max(bar_high - bar_low, 0.0)
+            upper_wick = (bar_high - max(bar_open, bar_close)) / bar_range if bar_range > 0 else 0.0
+            prior_vol = [float(b.volume or 0.0) for b in bars[-6:-1]]
+            avg_prior = sum(prior_vol) / len(prior_vol) if prior_vol else 0.0
+            high_volume_reject = (
+                bar_close < bar_open
+                and upper_wick >= 0.45
+                and float(latest.volume or 0.0) >= max(75_000.0, avg_prior * 1.2)
+            )
+            if high < min_price and reject_high <= 0:
+                self._warrior_squeeze_rejection_high[sym] = max(reject_high, bar_high)
+                self._warrior_squeeze_rejection_reason[sym] = "first cheap spike under ${:.2f}".format(min_price)
+                return False, self._warrior_squeeze_rejection_reason[sym]
+            if high_volume_reject:
+                self._warrior_squeeze_rejection_high[sym] = max(reject_high, bar_high)
+                self._warrior_squeeze_rejection_reason[sym] = "high-volume shooting-star rejection"
+                return False, self._warrior_squeeze_rejection_reason[sym]
+        if reject_high > 0:
+            reclaim_level = max(reject_high * 1.03, min_price)
+            if high < reclaim_level:
+                return False, "waiting for reclaim above rejected high ${:.2f}".format(reject_high)
+            return True, "reclaimed rejected high ${:.2f}".format(reject_high)
+        if high < min_price:
+            return False, "waiting for squeeze above ${:.2f}".format(min_price)
+        return True, "proved squeeze above ${:.2f}".format(min_price)
+
+    def _maybe_arm_warrior_squeeze_from_10s(
+        self,
+        symbol: str,
+        ten_sec: Bar,
+        now: datetime,
+    ) -> None:
+        """Arm Warrior mode from the 10s tape before 1m scanners catch up."""
+        sym = symbol.upper()
+        if sym in self._momentum_burst_armed:
+            return
+        if sym in self._mb_hit_run_day_blocked:
+            return
+        open_ = float(ten_sec.open or 0.0)
+        high = float(ten_sec.high or 0.0)
+        low = float(ten_sec.low or 0.0)
+        close = float(ten_sec.close or 0.0)
+        volume = float(ten_sec.volume or 0.0)
+        if open_ <= 0 or high <= 0 or close <= 0:
+            return
+        min_price = max(0.0, float(self._warrior_squeeze_min_reclaim_price or 0.0))
+        reject_high = float(self._warrior_squeeze_rejection_high.get(sym, 0.0) or 0.0)
+        if reject_high > 0:
+            reclaim_level = max(reject_high * 1.03, min_price)
+            if high < reclaim_level:
+                return
+            self._momentum_burst_armed[sym] = now
+            self._momentum_burst_window_high[sym] = max(high, reject_high)
+            self._momentum_burst_session_anchor_high.setdefault(sym, high)
+            self._momentum_burst_pending[sym] = {
+                "ts": now - timedelta(seconds=10),
+                "breakout_close": close,
+                "breakout_high": high,
+                "breakout_volume": volume,
+                "entry_trigger": "warrior_a_plus_reclaim",
+            }
+            return
+
+        if volume < 25_000:
+            return
+        impulse_pct = (close - open_) / open_
+        range_pct = (high - low) / close if close > 0 else 0.0
+        if impulse_pct < 0.08 and range_pct < 0.10:
+            return
+        self._warrior_squeeze_rejection_high[sym] = high
+        self._warrior_squeeze_rejection_reason[sym] = "first explosive 10s spike"
 
     def _process_mb_brackets(
         self,
@@ -1066,17 +1196,48 @@ class PipelineBacktestDriver:
         """
         for sym, br in list(self._mb_bracket.items()):
             bar = self._ten_sec_bar_at(sym, now)
+            strategy = str(br.get("strategy") or "momentum_burst_replay")
+            is_warrior = strategy == "warrior_squeeze_playbook"
+            if bar is not None and is_warrior:
+                br["highest"] = max(
+                    float(br.get("highest") or br.get("entry") or 0.0),
+                    float(bar.high or 0.0),
+                )
+                if br.get("partial_taken"):
+                    trail_pct = 0.08
+                    trail_stop = float(br["highest"]) * (1.0 - trail_pct)
+                    br["stop"] = max(float(br.get("stop") or 0.0), trail_stop)
             exit_price = None
             reason = None
-            if bar is not None and float(bar.low or 0.0) <= br["stop"]:
-                exit_price, reason = br["stop"], "mb_bracket_stop"
-            elif bar is not None and float(bar.high or 0.0) >= br["target"]:
+            hit_stop = bar is not None and float(bar.low or 0.0) <= br["stop"]
+            hit_target = (
+                bar is not None
+                and float(bar.high or 0.0) >= br["target"]
+                and not (is_warrior and br.get("partial_taken"))
+            )
+            if (
+                is_warrior
+                and hit_stop
+                and hit_target
+                and float(bar.close or 0.0) >= float(br.get("entry") or 0.0)
+                and float(bar.close or 0.0) >= float(bar.open or 0.0)
+            ):
                 exit_price, reason = br["target"], "mb_bracket_target"
-            elif (now - br["ts"]).total_seconds() >= br["max_hold"]:
+            elif hit_stop:
+                exit_price, reason = br["stop"], "mb_bracket_stop"
+            elif hit_target:
+                exit_price, reason = br["target"], "mb_bracket_target"
+            elif (
+                not (is_warrior and br.get("partial_taken"))
+                and (now - br["ts"]).total_seconds() >= br["max_hold"]
+            ):
                 exit_price = float(bar.close) if bar is not None else br["entry"]
                 reason = "mb_bracket_time"
             if exit_price is None:
                 continue
+            exit_qty = float(br["qty"])
+            if is_warrior and reason == "mb_bracket_target" and not br.get("partial_taken"):
+                exit_qty = max(1.0, float(int(float(br["qty"]) / 3.0)))
             price_bar = Bar(
                 symbol=sym,
                 ts=now,
@@ -1087,25 +1248,49 @@ class PipelineBacktestDriver:
                 volume=float(getattr(bar, "volume", 0.0) or 0.0),
                 timeframe=Timeframe.SEC_10,
             )
-            order = Order(symbol=sym, side=Side.SELL, quantity=br["qty"], limit_price=exit_price)
+            order = Order(symbol=sym, side=Side.SELL, quantity=exit_qty, limit_price=exit_price)
             fill, status = self._broker.submit(order, price_bar, self._pipeline.portfolio)
             if status is not OrderStatus.FILLED or fill is None:
                 continue
             apply_fill(self._pipeline.portfolio, fill)
             result.fills.append(fill)
-            self._mb_bracket.pop(sym, None)
+            if is_warrior and reason == "mb_bracket_target" and not br.get("partial_taken"):
+                remaining = max(0.0, float(br["qty"]) - float(fill.quantity))
+                if remaining > 0:
+                    br["qty"] = remaining
+                    br["partial_taken"] = True
+                    br["stop"] = max(float(br.get("stop") or 0.0), float(br.get("entry") or 0.0))
+                else:
+                    self._mb_bracket.pop(sym, None)
+            else:
+                self._mb_bracket.pop(sym, None)
             self._pipeline._exit_cooldowns[sym] = now
-            strategy = str(br.get("strategy") or "momentum_burst_replay")
-            label = "Momentum Burst Hit-Run" if is_hit_run_strategy(strategy) else "Momentum Burst Scalp"
+            label = (
+                "Warrior Squeeze"
+                if strategy == "warrior_squeeze_playbook"
+                else "Momentum Burst Hit-Run"
+                if is_hit_run_strategy(strategy)
+                else "Momentum Burst Scalp"
+            )
             ledger.record_exit(fill, reason="{}: {}".format(reason, label))
             if is_hit_run_strategy(strategy):
                 last_trade = ledger.trades[-1] if ledger.trades else {}
                 self._record_mb_hit_run_pnl(sym, float(last_trade.get("pnl") or 0.0))
-                cooldown = (
-                    self._mb_hit_run_win_cooldown_sec
-                    if reason == "mb_bracket_target"
-                    else self._mb_hit_run_loss_cooldown_sec
-                )
+                if reason == "mb_bracket_target" and strategy == "warrior_squeeze_playbook":
+                    self._warrior_squeeze_target_wins[sym] = (
+                        self._warrior_squeeze_target_wins.get(sym, 0) + 1
+                    )
+                    self._momentum_burst_pending.pop(sym, None)
+                    if bar is not None:
+                        self._momentum_burst_window_high[sym] = max(
+                            float(self._momentum_burst_window_high.get(sym, 0.0) or 0.0),
+                            float(bar.high or 0.0),
+                        )
+                    cooldown = self._warrior_squeeze_win_cooldown_sec
+                elif reason == "mb_bracket_target":
+                    cooldown = self._mb_hit_run_win_cooldown_sec
+                else:
+                    cooldown = self._mb_hit_run_loss_cooldown_sec
                 self._mb_hit_run_block_until[sym] = now + timedelta(seconds=cooldown)
 
     def _record_mb_hit_run_pnl(self, symbol: str, pnl: float) -> str:
@@ -1134,6 +1319,68 @@ class PipelineBacktestDriver:
             return reason
         return ""
 
+    def _maybe_warrior_same_bar_target(
+        self,
+        result: PipelineBacktestResult,
+        ledger: BacktestLedger,
+        symbol: str,
+        bar: Bar,
+    ) -> bool:
+        """Model a Warrior stop-limit entry whose bracket target hits in-bar."""
+        sym = symbol.upper()
+        bracket = self._mb_bracket.get(sym)
+        if not bracket or bracket.get("strategy") != "warrior_squeeze_playbook":
+            return False
+        target = float(bracket.get("target") or 0.0)
+        qty = float(bracket.get("qty") or 0.0)
+        if (
+            target <= 0
+            or qty <= 0
+            or float(bar.high or 0.0) < target
+            or bool(bracket.get("partial_taken"))
+        ):
+            return False
+        exit_qty = max(1.0, float(int(qty / 3.0)))
+        price_bar = Bar(
+            symbol=sym,
+            ts=bar.ts,
+            open=target,
+            high=target,
+            low=target,
+            close=target,
+            volume=float(getattr(bar, "volume", 0.0) or 0.0),
+            timeframe=Timeframe.SEC_10,
+        )
+        order = Order(symbol=sym, side=Side.SELL, quantity=exit_qty, limit_price=target)
+        fill, status = self._broker.submit(order, price_bar, self._pipeline.portfolio)
+        if status is not OrderStatus.FILLED or fill is None:
+            return False
+        apply_fill(self._pipeline.portfolio, fill)
+        result.fills.append(fill)
+        remaining = max(0.0, qty - float(fill.quantity))
+        if remaining > 0:
+            bracket["qty"] = remaining
+            bracket["partial_taken"] = True
+            bracket["stop"] = max(float(bracket.get("stop") or 0.0), float(bracket.get("entry") or 0.0))
+            bracket["highest"] = max(
+                float(bracket.get("highest") or bracket.get("entry") or 0.0),
+                float(bar.high or 0.0),
+            )
+        else:
+            self._mb_bracket.pop(sym, None)
+        self._pipeline._exit_cooldowns[sym] = bar.ts
+        ledger.record_exit(fill, reason="mb_bracket_target: Warrior Squeeze")
+        last_trade = ledger.trades[-1] if ledger.trades else {}
+        self._record_mb_hit_run_pnl(sym, float(last_trade.get("pnl") or 0.0))
+        self._warrior_squeeze_target_wins[sym] = (
+            self._warrior_squeeze_target_wins.get(sym, 0) + 1
+        )
+        self._momentum_burst_pending.pop(sym, None)
+        self._mb_hit_run_block_until[sym] = bar.ts + timedelta(
+            seconds=self._warrior_squeeze_win_cooldown_sec
+        )
+        return True
+
     def _maybe_execute_momentum_burst_replay(
         self,
         result: PipelineBacktestResult,
@@ -1149,9 +1396,19 @@ class PipelineBacktestDriver:
         the trigger differs — a new high inside the scanner-armed window rather
         than a +30% runner HOD expansion.
         """
-        hit_run = bool(self._use_momentum_burst_hit_run)
-        strategy_label = "momentum_burst_hit_run" if hit_run else "momentum_burst_replay"
-        pattern_label = "momentum_burst_hit_run" if hit_run else "momentum_burst_scalp"
+        warrior = bool(self._use_warrior_squeeze_playbook)
+        hit_run = bool(self._use_momentum_burst_hit_run or warrior)
+        strategy_label = (
+            "warrior_squeeze_playbook"
+            if warrior
+            else ("momentum_burst_hit_run" if hit_run else "momentum_burst_replay")
+        )
+        pattern_label = strategy_label if hit_run else "momentum_burst_scalp"
+        if warrior:
+            for sym in list(self._timer_bars_by_symbol.keys()):
+                ten_sec = self._ten_sec_bar_at(sym, now)
+                if ten_sec is not None:
+                    self._maybe_arm_warrior_squeeze_from_10s(sym, ten_sec, now)
         for sym in list(self._momentum_burst_armed.keys()):
             armed_at = self._momentum_burst_armed.get(sym)
             if armed_at is None:
@@ -1162,6 +1419,8 @@ class PipelineBacktestDriver:
                 self._momentum_burst_pending.pop(sym, None)
                 self._mb_hit_run_counts.pop(sym, None)
                 self._mb_hit_run_block_until.pop(sym, None)
+                continue
+            if self._has_active_replay_scalp():
                 continue
             if self._portfolio.positions.get(sym) and not self._portfolio.positions[sym].is_flat:
                 continue
@@ -1178,12 +1437,16 @@ class PipelineBacktestDriver:
                         "reason": day_block,
                     })
                     continue
-                if self._mb_hit_run_counts.get(sym, 0) >= self._mb_hit_run_max_entries:
+                effective_max_entries = (
+                    self._warrior_squeeze_max_entries
+                    if warrior else self._mb_hit_run_max_entries
+                )
+                if self._mb_hit_run_counts.get(sym, 0) >= effective_max_entries:
                     self._append_rejection(result, {
                         "ts": now.isoformat(),
                         "symbol": sym,
                         "blocked_layer": "{}_max_entries".format(strategy_label),
-                        "reason": "max hit-run entries reached ({})".format(self._mb_hit_run_max_entries),
+                        "reason": "max hit-run entries reached ({})".format(effective_max_entries),
                     })
                     continue
                 block_until = self._mb_hit_run_block_until.get(sym)
@@ -1225,7 +1488,7 @@ class PipelineBacktestDriver:
                     )
                     if continuation_ok:
                         stop_reason = ""
-                if stop_reason:
+                if stop_reason and not warrior:
                     self._momentum_burst_pending.pop(sym, None)
                     self._append_rejection(result, {
                         "ts": now.isoformat(),
@@ -1234,7 +1497,7 @@ class PipelineBacktestDriver:
                         "reason": stop_reason,
                     })
                     continue
-                if anchor_high > 0 and current_close > anchor_high * 1.5:
+                if not warrior and anchor_high > 0 and current_close > anchor_high * 1.5:
                     continuation_ok, continuation_reason, continuation_meta = (
                         self._momentum_burst_continuation_base_ok(sym, now)
                     )
@@ -1249,7 +1512,7 @@ class PipelineBacktestDriver:
                             "metadata": continuation_meta,
                         })
                         continue
-                if reentry:
+                if reentry and not warrior:
                     continuation_ok, continuation_reason, continuation_meta = (
                         self._momentum_burst_continuation_base_ok(sym, now)
                     )
@@ -1266,6 +1529,98 @@ class PipelineBacktestDriver:
                         continue
             current_high = float(ten_sec.high or 0.0)
             window_high = float(self._momentum_burst_window_high.get(sym, 0.0) or 0.0)
+            warrior_target_wins = (
+                int(self._warrior_squeeze_target_wins.get(sym, 0) or 0)
+                if warrior else 0
+            )
+            if (
+                warrior
+                and warrior_target_wins >= 1
+                and window_high > 0
+                and current_high <= window_high * 1.001
+            ):
+                armed_news_pullback = False
+                if self._warrior_news_continuation_enabled:
+                    news_pullback_context = self._warrior_news_continuation_pullback_context(
+                        sym,
+                        ten_sec,
+                        window_high=window_high,
+                    )
+                    if news_pullback_context is not None:
+                        self._momentum_burst_pending[sym] = {
+                            "ts": now - timedelta(seconds=10),
+                            "breakout_close": float(ten_sec.close or 0.0),
+                            "breakout_high": current_high,
+                            "breakout_volume": float(ten_sec.volume or 0.0),
+                            **news_pullback_context,
+                        }
+                        self._append_rejection(result, {
+                            "ts": now.isoformat(),
+                            "symbol": sym,
+                            "blocked_layer": "{}_news_pullback_wait".format(strategy_label),
+                            "reason": "warrior news-continuation pullback executing on reclaim bar",
+                        })
+                        armed_news_pullback = True
+                if not armed_news_pullback:
+                    trend_pullback_context = self._warrior_trend_pullback_reclaim_context(
+                        sym,
+                        ten_sec,
+                        window_high=window_high,
+                    )
+                    if trend_pullback_context is not None:
+                        self._momentum_burst_pending[sym] = {
+                            "ts": now - timedelta(seconds=10),
+                            "breakout_close": float(ten_sec.close or 0.0),
+                            "breakout_high": current_high,
+                            "breakout_volume": float(ten_sec.volume or 0.0),
+                            **trend_pullback_context,
+                        }
+                        self._append_rejection(result, {
+                            "ts": now.isoformat(),
+                            "symbol": sym,
+                            "blocked_layer": "{}_trend_pullback_wait".format(strategy_label),
+                            "reason": "warrior trend pullback reclaim executing on reclaim bar",
+                        })
+                        armed_news_pullback = True
+                if not armed_news_pullback:
+                    second_leg_context = self._warrior_squeeze_second_leg_reclaim_context(
+                        sym,
+                        ten_sec,
+                        {
+                            "ts": now,
+                            "breakout_close": float(ten_sec.close or 0.0),
+                            "breakout_high": current_high,
+                            "breakout_volume": float(ten_sec.volume or 0.0),
+                        },
+                        window_high=window_high,
+                    )
+                    if second_leg_context is not None:
+                        self._momentum_burst_window_high[sym] = current_high
+                        self._momentum_burst_pending[sym] = {
+                            "ts": now,
+                            "breakout_close": float(ten_sec.close or 0.0),
+                            "breakout_high": current_high,
+                            "breakout_volume": float(ten_sec.volume or 0.0),
+                            **second_leg_context,
+                        }
+                        self._append_rejection(result, {
+                            "ts": now.isoformat(),
+                            "symbol": sym,
+                            "blocked_layer": "{}_second_leg_wait".format(strategy_label),
+                            "reason": "warrior second-leg reclaim armed after deep washout",
+                        })
+                        continue
+                    self._momentum_burst_pending.pop(sym, None)
+                    self._append_rejection(result, {
+                        "ts": now.isoformat(),
+                        "symbol": sym,
+                        "blocked_layer": "{}_profit_lock".format(strategy_label),
+                        "reason": (
+                            "warrior profit lock: target win banked; "
+                            "needs fresh high above {:.2f}"
+                        ).format(window_high),
+                    })
+                    continue
 
             # Confirmation-bar rule: a fresh 10s high arms a pending breakout but
             # we never buy that spike bar. Entry waits for the NEXT 10s bar to
@@ -1274,13 +1629,16 @@ class PipelineBacktestDriver:
             # not enough for a hit-and-run entry.
             pend = self._momentum_burst_pending.get(sym)
             post_blowoff_micro_base = False
-            if pend is not None and (now - pend["ts"]).total_seconds() > 30.0:
+            if pend is not None and (now - (pend.get("original_ts") or pend["ts"])).total_seconds() > 30.0:
                 self._momentum_burst_pending.pop(sym, None)
                 pend = None
             if pend is not None:
                 if now <= pend["ts"]:  # still the breakout bar — wait for next
                     continue
                 breakout_close = float(pend["breakout_close"])
+                original_breakout_close = float(
+                    pend.get("original_breakout_close") or breakout_close
+                )
                 breakout_high = float(pend.get("breakout_high") or breakout_close)
                 confirm_close = float(ten_sec.close or 0.0)
                 confirm_high = float(ten_sec.high or 0.0)
@@ -1301,10 +1659,36 @@ class PipelineBacktestDriver:
                     ).format(confirm_high, breakout_high)
                 elif hit_run and close_location < 0.65:
                     reject_reason = "confirm bar did not close with strength"
+                elif (
+                    hit_run
+                    and float(pend.get("psych_level") or 0.0) > 0
+                    and confirm_close < float(pend.get("psych_level") or 0.0)
+                ):
+                    reject_reason = "confirm bar failed to hold ${:.2f} level".format(
+                        float(pend.get("psych_level") or 0.0)
+                    )
                 violent_ok, _violent_meta = self._momentum_burst_violent_liquid_ok(
                     sym, now, median_range=None,
                 )
                 reentry = hit_run and self._mb_hit_run_counts.get(sym, 0) > 0
+                if (
+                    warrior
+                    and warrior_target_wins >= 1
+                    and pend.get("entry_trigger") not in {
+                        "warrior_second_leg_reclaim",
+                        "warrior_news_continuation_pullback",
+                        "warrior_trend_pullback_reclaim",
+                        "warrior_equal_high_pullaway",
+                    }
+                ):
+                    self._momentum_burst_pending.pop(sym, None)
+                    self._append_rejection(result, {
+                        "ts": now.isoformat(),
+                        "symbol": sym,
+                        "blocked_layer": "{}_profit_lock".format(strategy_label),
+                        "reason": "warrior profit lock: discard pending generic add after target win",
+                    })
+                    continue
                 volume_ratio = (
                     self._mb_confirm_min_vol_ratio
                     if reentry
@@ -1315,10 +1699,60 @@ class PipelineBacktestDriver:
                     if reentry
                     else (self._mb_violent_chase_cap_pct if hit_run and violent_ok else self._mb_chase_cap_pct)
                 )
+                if warrior and (
+                    pend.get("entry_trigger") in {
+                        "warrior_second_leg_reclaim",
+                        "warrior_news_continuation_pullback",
+                        "warrior_trend_pullback_reclaim",
+                        "warrior_equal_high_pullaway",
+                    }
+                    or pend.get("variant_override") == "warrior_clwt_fast_pullaway"
+                ):
+                    pullaway_context = dict(pend)
+                else:
+                    pullaway_context = (
+                        self._warrior_squeeze_pullaway_context(sym, ten_sec, pend)
+                        if warrior else None
+                    )
+                curl_context = (
+                    self._warrior_squeeze_curl_reclaim_context(
+                        sym,
+                        ten_sec,
+                        pend,
+                        window_high=window_high,
+                    )
+                    if warrior and pullaway_context is None else None
+                )
+                equal_high_context = (
+                    self._warrior_squeeze_equal_high_pullaway_context(
+                        sym,
+                        ten_sec,
+                        pend,
+                        window_high=max(window_high, breakout_high),
+                    )
+                    if warrior
+                    and pullaway_context is None
+                    and curl_context is None
+                    else None
+                )
+                if pullaway_context is not None:
+                    pend = {**pend, **pullaway_context}
+                    reject_reason = None
+                elif curl_context is not None:
+                    pend = {**pend, **curl_context}
+                    reject_reason = None
+                elif equal_high_context is not None:
+                    pend = {**pend, **equal_high_context}
+                    reject_reason = None
+                elif warrior:
+                    reject_reason = "warrior setup not confirmed by playbook pattern"
                 # (A) Confirmation volume — the next bar must show real demand,
                 # not a quiet drift up, or the move has no follow-through.
                 if (
                     reject_reason is None
+                    and pullaway_context is None
+                    and curl_context is None
+                    and equal_high_context is None
                     and float(ten_sec.volume or 0.0) < volume_ratio * float(pend.get("breakout_volume") or 0.0)
                 ):
                     reject_reason = "confirm-bar volume too light (no follow-through)"
@@ -1326,14 +1760,31 @@ class PipelineBacktestDriver:
                 # above the breakout; that is buying the extension.
                 if (
                     reject_reason is None
-                    and breakout_close > 0
-                    and confirm_close > breakout_close * (1.0 + chase_cap)
+                    and pullaway_context is None
+                    and curl_context is None
+                    and equal_high_context is None
+                    and original_breakout_close > 0
+                    and confirm_close > original_breakout_close * (1.0 + chase_cap)
                 ):
                     reject_reason = "chasing: confirm {:.2f} >{:.0%} above breakout {:.2f}".format(
-                        confirm_close, chase_cap, breakout_close)
-                post_blowoff_micro_base = bool(hit_run and pend.get("reset_from_stale_high"))
-                self._momentum_burst_pending.pop(sym, None)
+                        confirm_close, chase_cap, original_breakout_close)
                 if reject_reason is not None:
+                    if self._momentum_burst_rebase_pending_after_reject(
+                        sym,
+                        ten_sec,
+                        pend,
+                        reject_reason,
+                        now,
+                        hit_run=hit_run,
+                    ):
+                        self._append_rejection(result, {
+                            "ts": now.isoformat(),
+                            "symbol": sym,
+                            "blocked_layer": "{}_micro_base_wait".format(strategy_label),
+                            "reason": "rebased pending trigger after {}".format(reject_reason),
+                        })
+                        continue
+                    self._momentum_burst_pending.pop(sym, None)
                     self._append_rejection(result, {
                         "ts": now.isoformat(),
                         "symbol": sym,
@@ -1342,10 +1793,324 @@ class PipelineBacktestDriver:
                     })
                     continue
                 # confirmed — fall through to build/execute the scalp on this bar
+                post_blowoff_micro_base = bool(hit_run and pend.get("reset_from_stale_high"))
+                self._momentum_burst_pending.pop(sym, None)
             else:
                 if current_high <= 0:
                     continue
                 if current_high <= window_high:
+                    if (
+                        warrior
+                        and self._mb_hit_run_counts.get(sym, 0) == 0
+                    ):
+                        equal_high_context = self._warrior_squeeze_equal_high_pullaway_context(
+                            sym,
+                            ten_sec,
+                            {
+                                "ts": now,
+                                "breakout_close": float(ten_sec.close or 0.0),
+                                "breakout_high": current_high,
+                                "breakout_volume": float(ten_sec.volume or 0.0),
+                                **self._momentum_burst_level_context(window_high, max(current_high, window_high)),
+                            },
+                            window_high=window_high,
+                        )
+                        if equal_high_context is not None:
+                            bars = universe.get(sym)
+                            if not bars:
+                                continue
+                            signal = self._momentum_burst_replay_signal(
+                                sym,
+                                ten_sec,
+                                list(bars),
+                                hit_run=True,
+                                violent_liquid=False,
+                                entry_context=equal_high_context,
+                                strategy_override="warrior_squeeze_playbook",
+                                size_factor_override=self._warrior_squeeze_starter_size_factor,
+                            )
+                            if signal is not None:
+                                minute_start = now.replace(second=0, microsecond=0)
+                                guard_bars = [b for b in list(bars) if b.ts < minute_start] or list(bars)
+                                guard_bars = list(guard_bars) + [ten_sec]
+                                final_reject = self._pipeline._final_entry_quality_reject(
+                                    signal,
+                                    universe={sym: guard_bars},
+                                    quotes=quotes,
+                                    stage="{}_final_guard".format(strategy_label),
+                                    now=now,
+                                )
+                                if final_reject:
+                                    self._append_rejection(result, {
+                                        "ts": now.isoformat(),
+                                        "symbol": sym,
+                                        "blocked_layer": "{}_final_guard".format(strategy_label),
+                                        "reason": "final entry guard: {}".format(final_reject),
+                                    })
+                                else:
+                                    order = self._pipeline._signal_to_order(signal)
+                                    if order is not None and allow_order(
+                                        order,
+                                        ten_sec,
+                                        self._pipeline.portfolio,
+                                        max_position_shares=self._pipeline._max_position_shares,
+                                        max_order_shares=self._pipeline._max_order_shares,
+                                    ):
+                                        fill, status = self._broker.submit(
+                                            order,
+                                            ten_sec,
+                                            self._pipeline.portfolio,
+                                        )
+                                        if status is OrderStatus.FILLED and fill is not None:
+                                            apply_fill(self._pipeline.portfolio, fill)
+                                            result.fills.append(fill)
+                                            self._pipeline._symbol_entry_counts[sym] = (
+                                                self._pipeline._symbol_entry_counts.get(sym, 0) + 1
+                                            )
+                                            self._mb_bracket[sym] = {
+                                                "stop": float(signal.stop_loss),
+                                                "target": float(signal.take_profit),
+                                                "qty": float(fill.quantity),
+                                                "entry": float(fill.price),
+                                                "ts": now,
+                                                "max_hold": float(signal.max_hold_seconds or 90),
+                                                "strategy": strategy_label,
+                                            }
+                                            self._mb_hit_run_counts[sym] = (
+                                                self._mb_hit_run_counts.get(sym, 0) + 1
+                                            )
+                                            ledger.record_entry(fill, strategy=strategy_label)
+                                            self._maybe_warrior_same_bar_target(
+                                                result,
+                                                ledger,
+                                                sym,
+                                                ten_sec,
+                                            )
+                                            result.entry_decisions.append({
+                                                "ts": now.isoformat(),
+                                                "symbol": sym,
+                                                "stage": strategy_label,
+                                                "passed": True,
+                                                "price": fill.price,
+                                                "pattern": pattern_label,
+                                            })
+                                            continue
+                    if warrior and self._warrior_news_continuation_enabled:
+                        news_pullback_context = self._warrior_news_continuation_pullback_context(
+                            sym,
+                            ten_sec,
+                            window_high=window_high,
+                        )
+                        if news_pullback_context is not None:
+                            self._momentum_burst_pending[sym] = {
+                                "ts": now - timedelta(seconds=10),
+                                "breakout_close": float(ten_sec.close or 0.0),
+                                "breakout_high": current_high,
+                                "breakout_volume": float(ten_sec.volume or 0.0),
+                                **news_pullback_context,
+                            }
+                            self._append_rejection(result, {
+                                "ts": now.isoformat(),
+                                "symbol": sym,
+                                "blocked_layer": "{}_news_pullback_wait".format(strategy_label),
+                                "reason": "warrior news-continuation pullback armed",
+                            })
+                            continue
+                    if warrior:
+                        trend_pullback_context = self._warrior_trend_pullback_reclaim_context(
+                            sym,
+                            ten_sec,
+                            window_high=window_high,
+                        )
+                        if trend_pullback_context is not None:
+                            self._momentum_burst_pending[sym] = {
+                                "ts": now - timedelta(seconds=10),
+                                "breakout_close": float(ten_sec.close or 0.0),
+                                "breakout_high": current_high,
+                                "breakout_volume": float(ten_sec.volume or 0.0),
+                                **trend_pullback_context,
+                            }
+                            self._append_rejection(result, {
+                                "ts": now.isoformat(),
+                                "symbol": sym,
+                                "blocked_layer": "{}_trend_pullback_wait".format(strategy_label),
+                                "reason": "warrior trend pullback reclaim armed",
+                            })
+                            continue
+                    if warrior and warrior_target_wins >= 1:
+                        second_leg_context = self._warrior_squeeze_second_leg_reclaim_context(
+                            sym,
+                            ten_sec,
+                            {
+                                "ts": now,
+                                "breakout_close": float(ten_sec.close or 0.0),
+                                "breakout_high": current_high,
+                                "breakout_volume": float(ten_sec.volume or 0.0),
+                            },
+                            window_high=window_high,
+                        )
+                        if second_leg_context is not None:
+                            self._momentum_burst_window_high[sym] = current_high
+                            self._momentum_burst_pending[sym] = {
+                                "ts": now,
+                                "breakout_close": float(ten_sec.close or 0.0),
+                                "breakout_high": current_high,
+                                "breakout_volume": float(ten_sec.volume or 0.0),
+                                **second_leg_context,
+                            }
+                            self._append_rejection(result, {
+                                "ts": now.isoformat(),
+                                "symbol": sym,
+                                "blocked_layer": "{}_second_leg_wait".format(strategy_label),
+                                "reason": "warrior second-leg reclaim armed after deep washout",
+                            })
+                            continue
+                        self._momentum_burst_pending.pop(sym, None)
+                        self._append_rejection(result, {
+                            "ts": now.isoformat(),
+                            "symbol": sym,
+                            "blocked_layer": "{}_profit_lock".format(strategy_label),
+                            "reason": "warrior profit lock: target win banked; needs controlled continuation pullback",
+                        })
+                        continue
+                    if warrior and self._mb_hit_run_counts.get(sym, 0) > 0:
+                        second_leg_context = self._warrior_squeeze_second_leg_reclaim_context(
+                            sym,
+                            ten_sec,
+                            {
+                                "ts": now,
+                                "breakout_close": float(ten_sec.close or 0.0),
+                                "breakout_high": current_high,
+                                "breakout_volume": float(ten_sec.volume or 0.0),
+                            },
+                            window_high=window_high,
+                        )
+                        if second_leg_context is not None:
+                            self._momentum_burst_window_high[sym] = current_high
+                            self._momentum_burst_pending[sym] = {
+                                "ts": now,
+                                "breakout_close": float(ten_sec.close or 0.0),
+                                "breakout_high": current_high,
+                                "breakout_volume": float(ten_sec.volume or 0.0),
+                                **second_leg_context,
+                            }
+                            self._append_rejection(result, {
+                                "ts": now.isoformat(),
+                                "symbol": sym,
+                                "blocked_layer": "{}_second_leg_wait".format(strategy_label),
+                                "reason": "warrior second-leg reclaim armed after deep washout",
+                            })
+                            continue
+                    if (
+                        warrior
+                        and self._mb_hit_run_counts.get(sym, 0) > 0
+                        and current_high >= window_high * 0.995
+                    ):
+                        add_pending = {
+                            "ts": now,
+                            "breakout_close": float(ten_sec.close or 0.0),
+                            "breakout_high": current_high,
+                            "breakout_volume": float(ten_sec.volume or 0.0),
+                            **self._momentum_burst_level_context(window_high * 0.99, current_high),
+                        }
+                        pullaway_context = self._warrior_squeeze_pullaway_context(
+                            sym,
+                            ten_sec,
+                            add_pending,
+                        )
+                        if pullaway_context is not None:
+                            add_context = {**add_pending, **pullaway_context}
+                            bars = universe.get(sym)
+                            if not bars:
+                                continue
+                            signal = self._momentum_burst_replay_signal(
+                                sym,
+                                ten_sec,
+                                list(bars),
+                                hit_run=True,
+                                violent_liquid=False,
+                                entry_context=add_context,
+                                strategy_override="warrior_squeeze_playbook",
+                                size_factor_override=self._warrior_squeeze_starter_size_factor,
+                            )
+                            if signal is not None:
+                                minute_start = now.replace(second=0, microsecond=0)
+                                guard_bars = [b for b in list(bars) if b.ts < minute_start] or list(bars)
+                                if (
+                                    signal.scan_result
+                                    and (signal.scan_result.criteria or {}).get("entry_trigger")
+                                    in {
+                                        "warrior_level_pullaway",
+                                        "warrior_curl_reclaim",
+                                        "warrior_second_leg_reclaim",
+                                        "warrior_news_continuation_pullback",
+                                        "warrior_trend_pullback_reclaim",
+                                        "warrior_equal_high_pullaway",
+                                    }
+                                ):
+                                    guard_bars = list(guard_bars) + [ten_sec]
+                                final_reject = self._pipeline._final_entry_quality_reject(
+                                    signal,
+                                    universe={sym: guard_bars},
+                                    quotes=quotes,
+                                    stage="{}_final_guard".format(strategy_label),
+                                    now=now,
+                                )
+                                if final_reject:
+                                    self._append_rejection(result, {
+                                        "ts": now.isoformat(),
+                                        "symbol": sym,
+                                        "blocked_layer": "{}_final_guard".format(strategy_label),
+                                        "reason": "final entry guard: {}".format(final_reject),
+                                    })
+                                else:
+                                    order = self._pipeline._signal_to_order(signal)
+                                    if order is not None and allow_order(
+                                        order,
+                                        ten_sec,
+                                        self._pipeline.portfolio,
+                                        max_position_shares=self._pipeline._max_position_shares,
+                                        max_order_shares=self._pipeline._max_order_shares,
+                                    ):
+                                        fill, status = self._broker.submit(
+                                            order,
+                                            ten_sec,
+                                            self._pipeline.portfolio,
+                                        )
+                                        if status is OrderStatus.FILLED and fill is not None:
+                                            apply_fill(self._pipeline.portfolio, fill)
+                                            result.fills.append(fill)
+                                            self._pipeline._symbol_entry_counts[sym] = (
+                                                self._pipeline._symbol_entry_counts.get(sym, 0) + 1
+                                            )
+                                            self._mb_bracket[sym] = {
+                                                "stop": float(signal.stop_loss),
+                                                "target": float(signal.take_profit),
+                                                "qty": float(fill.quantity),
+                                                "entry": float(fill.price),
+                                                "ts": now,
+                                                "max_hold": float(signal.max_hold_seconds or 90),
+                                                "strategy": strategy_label,
+                                            }
+                                            self._mb_hit_run_counts[sym] = (
+                                                self._mb_hit_run_counts.get(sym, 0) + 1
+                                            )
+                                            ledger.record_entry(fill, strategy=strategy_label)
+                                            self._maybe_warrior_same_bar_target(
+                                                result,
+                                                ledger,
+                                                sym,
+                                                ten_sec,
+                                            )
+                                            result.entry_decisions.append({
+                                                "ts": now.isoformat(),
+                                                "symbol": sym,
+                                                "stage": strategy_label,
+                                                "passed": True,
+                                                "price": fill.price,
+                                                "pattern": pattern_label,
+                                            })
+                                            continue
                     if hit_run and window_high > current_high * 1.08:
                         continuation_ok, _continuation_reason, continuation_meta = (
                             self._momentum_burst_continuation_base_ok(sym, now)
@@ -1360,16 +2125,246 @@ class PipelineBacktestDriver:
                                 "reset_from_stale_high": round(window_high, 4),
                                 "base_high": continuation_meta.get("base_high"),
                                 "base_low": continuation_meta.get("base_low"),
+                                **self._momentum_burst_level_context(window_high, current_high),
                             }
                     continue
                 # Fresh high — arm pending, update window high, do not buy yet.
+                first_clwt_context = None
+                if warrior and self._mb_hit_run_counts.get(sym, 0) == 0:
+                    first_pending = {
+                        "ts": now,
+                        "breakout_close": float(ten_sec.close or 0.0),
+                        "breakout_high": current_high,
+                        "breakout_volume": float(ten_sec.volume or 0.0),
+                        **self._momentum_burst_level_context(window_high, current_high),
+                    }
+                    candidate = self._warrior_squeeze_pullaway_context(
+                        sym,
+                        ten_sec,
+                        first_pending,
+                    )
+                    if (
+                        candidate is not None
+                        and candidate.get("variant_override") == "warrior_clwt_fast_pullaway"
+                    ):
+                        first_clwt_context = {**first_pending, **candidate}
+                if warrior and warrior_target_wins >= 1:
+                    add_pending = {
+                        "ts": now,
+                        "breakout_close": float(ten_sec.close or 0.0),
+                        "breakout_high": current_high,
+                        "breakout_volume": float(ten_sec.volume or 0.0),
+                        **self._momentum_burst_level_context(window_high, current_high),
+                    }
+                    if self._warrior_news_continuation_enabled:
+                        news_pullback_context = self._warrior_news_continuation_pullback_context(
+                            sym,
+                            ten_sec,
+                            window_high=window_high,
+                        )
+                        if news_pullback_context is not None:
+                            self._momentum_burst_pending[sym] = {
+                                **add_pending,
+                                **news_pullback_context,
+                            }
+                            self._append_rejection(result, {
+                                "ts": now.isoformat(),
+                                "symbol": sym,
+                                "blocked_layer": "{}_news_pullback_wait".format(strategy_label),
+                                "reason": "warrior news-continuation pullback armed on fresh reclaim",
+                            })
+                            continue
+                    trend_pullback_context = self._warrior_trend_pullback_reclaim_context(
+                        sym,
+                        ten_sec,
+                        window_high=window_high,
+                    )
+                    if trend_pullback_context is not None:
+                        self._momentum_burst_pending[sym] = {
+                            **add_pending,
+                            "ts": now - timedelta(seconds=10),
+                            **trend_pullback_context,
+                        }
+                        self._append_rejection(result, {
+                            "ts": now.isoformat(),
+                            "symbol": sym,
+                            "blocked_layer": "{}_trend_pullback_wait".format(strategy_label),
+                            "reason": "warrior trend pullback reclaim armed on fresh reclaim",
+                        })
+                        continue
+                    self._momentum_burst_pending.pop(sym, None)
+                    self._append_rejection(result, {
+                        "ts": now.isoformat(),
+                        "symbol": sym,
+                        "blocked_layer": "{}_profit_lock".format(strategy_label),
+                        "reason": "warrior profit lock: target win banked; blocks generic fresh-high add",
+                    })
+                    self._momentum_burst_window_high[sym] = current_high
+                    continue
+                if warrior and self._mb_hit_run_counts.get(sym, 0) > 0:
+                    target_wins = self._warrior_squeeze_target_wins.get(sym, 0)
+                    add_pending = {
+                        "ts": now,
+                        "breakout_close": float(ten_sec.close or 0.0),
+                        "breakout_high": current_high,
+                        "breakout_volume": float(ten_sec.volume or 0.0),
+                        **self._momentum_burst_level_context(window_high, current_high),
+                    }
+                    if target_wins >= 1:
+                        if self._warrior_news_continuation_enabled:
+                            news_pullback_context = self._warrior_news_continuation_pullback_context(
+                                sym,
+                                ten_sec,
+                                window_high=window_high,
+                            )
+                            if news_pullback_context is not None:
+                                self._momentum_burst_pending[sym] = {
+                                    **add_pending,
+                                    **news_pullback_context,
+                                }
+                                self._append_rejection(result, {
+                                    "ts": now.isoformat(),
+                                    "symbol": sym,
+                                    "blocked_layer": "{}_news_pullback_wait".format(strategy_label),
+                                    "reason": "warrior news-continuation pullback armed on fresh reclaim",
+                                })
+                                continue
+                        trend_pullback_context = self._warrior_trend_pullback_reclaim_context(
+                            sym,
+                            ten_sec,
+                            window_high=window_high,
+                        )
+                        if trend_pullback_context is not None:
+                            self._momentum_burst_pending[sym] = {
+                                **add_pending,
+                                "ts": now - timedelta(seconds=10),
+                                **trend_pullback_context,
+                            }
+                            self._append_rejection(result, {
+                                "ts": now.isoformat(),
+                                "symbol": sym,
+                                "blocked_layer": "{}_trend_pullback_wait".format(strategy_label),
+                                "reason": "warrior trend pullback reclaim armed on fresh reclaim",
+                            })
+                            continue
+                        self._append_rejection(result, {
+                            "ts": now.isoformat(),
+                            "symbol": sym,
+                            "blocked_layer": "{}_profit_lock".format(strategy_label),
+                            "reason": "warrior profit lock: target win banked; needs controlled continuation pullback",
+                        })
+                        self._momentum_burst_pending.pop(sym, None)
+                        self._momentum_burst_window_high[sym] = current_high
+                        continue
+                    pullaway_context = self._warrior_squeeze_pullaway_context(
+                        sym,
+                        ten_sec,
+                        add_pending,
+                    )
+                    if pullaway_context is not None:
+                        add_context = {**add_pending, **pullaway_context}
+                        bars = universe.get(sym)
+                        if not bars:
+                            continue
+                        signal = self._momentum_burst_replay_signal(
+                            sym,
+                            ten_sec,
+                            list(bars),
+                            hit_run=True,
+                            violent_liquid=False,
+                            entry_context=add_context,
+                            strategy_override="warrior_squeeze_playbook",
+                            size_factor_override=self._warrior_squeeze_starter_size_factor,
+                        )
+                        if signal is not None:
+                            minute_start = now.replace(second=0, microsecond=0)
+                            guard_bars = [b for b in list(bars) if b.ts < minute_start] or list(bars)
+                            if (
+                                signal.scan_result
+                                and (signal.scan_result.criteria or {}).get("entry_trigger")
+                                    in {
+                                        "warrior_level_pullaway",
+                                        "warrior_curl_reclaim",
+                                        "warrior_second_leg_reclaim",
+                                        "warrior_news_continuation_pullback",
+                                        "warrior_trend_pullback_reclaim",
+                                        "warrior_equal_high_pullaway",
+                                    }
+                            ):
+                                guard_bars = list(guard_bars) + [ten_sec]
+                            final_reject = self._pipeline._final_entry_quality_reject(
+                                signal,
+                                universe={sym: guard_bars},
+                                quotes=quotes,
+                                stage="{}_final_guard".format(strategy_label),
+                                now=now,
+                            )
+                            if final_reject:
+                                self._append_rejection(result, {
+                                    "ts": now.isoformat(),
+                                    "symbol": sym,
+                                    "blocked_layer": "{}_final_guard".format(strategy_label),
+                                    "reason": "final entry guard: {}".format(final_reject),
+                                })
+                            else:
+                                order = self._pipeline._signal_to_order(signal)
+                                if order is not None and allow_order(
+                                    order,
+                                    ten_sec,
+                                    self._pipeline.portfolio,
+                                    max_position_shares=self._pipeline._max_position_shares,
+                                    max_order_shares=self._pipeline._max_order_shares,
+                                ):
+                                    fill, status = self._broker.submit(
+                                        order,
+                                        ten_sec,
+                                        self._pipeline.portfolio,
+                                    )
+                                    if status is OrderStatus.FILLED and fill is not None:
+                                        apply_fill(self._pipeline.portfolio, fill)
+                                        result.fills.append(fill)
+                                        self._pipeline._symbol_entry_counts[sym] = (
+                                            self._pipeline._symbol_entry_counts.get(sym, 0) + 1
+                                        )
+                                        self._mb_bracket[sym] = {
+                                            "stop": float(signal.stop_loss),
+                                            "target": float(signal.take_profit),
+                                            "qty": float(fill.quantity),
+                                            "entry": float(fill.price),
+                                            "ts": now,
+                                            "max_hold": float(signal.max_hold_seconds or 90),
+                                            "strategy": strategy_label,
+                                        }
+                                        self._mb_hit_run_counts[sym] = (
+                                            self._mb_hit_run_counts.get(sym, 0) + 1
+                                        )
+                                        ledger.record_entry(fill, strategy=strategy_label)
+                                        self._maybe_warrior_same_bar_target(
+                                            result,
+                                            ledger,
+                                            sym,
+                                            ten_sec,
+                                        )
+                                        result.entry_decisions.append({
+                                            "ts": now.isoformat(),
+                                            "symbol": sym,
+                                            "stage": strategy_label,
+                                            "passed": True,
+                                            "price": fill.price,
+                                            "pattern": pattern_label,
+                                        })
+                                        self._momentum_burst_window_high[sym] = current_high
+                                        continue
                 self._momentum_burst_window_high[sym] = current_high
                 self._momentum_burst_pending[sym] = {
                     "ts": now,
                     "breakout_close": float(ten_sec.close or 0.0),
                     "breakout_high": current_high,
                     "breakout_volume": float(ten_sec.volume or 0.0),
+                    **self._momentum_burst_level_context(window_high, current_high),
                 }
+                if first_clwt_context is not None:
+                    self._momentum_burst_pending[sym].update(first_clwt_context)
                 continue
             bars = universe.get(sym)
             if not bars:
@@ -1378,7 +2373,18 @@ class PipelineBacktestDriver:
             violent_ok, violent_meta = self._momentum_burst_violent_liquid_ok(
                 sym, now, median_range=median_range,
             )
-            if not smooth and not (hit_run and violent_ok):
+            is_warrior_override = bool(
+                pend
+                and pend.get("entry_trigger") in {
+                "warrior_level_pullaway",
+                "warrior_curl_reclaim",
+                "warrior_second_leg_reclaim",
+                "warrior_news_continuation_pullback",
+                "warrior_trend_pullback_reclaim",
+                "warrior_equal_high_pullaway",
+            }
+        )
+            if not is_warrior_override and not smooth and not (hit_run and violent_ok):
                 self._append_rejection(result, {
                     "ts": now.isoformat(),
                     "symbol": sym,
@@ -1396,11 +2402,29 @@ class PipelineBacktestDriver:
                 hit_run=hit_run,
                 violent_liquid=bool(hit_run and violent_ok),
                 post_blowoff_micro_base=post_blowoff_micro_base,
+                entry_context=pend,
+                strategy_override=("warrior_squeeze_playbook" if warrior else None),
+                size_factor_override=(
+                    self._warrior_squeeze_starter_size_factor if warrior else None
+                ),
             )
             if signal is None:
                 continue
             minute_start = now.replace(second=0, microsecond=0)
             guard_bars = [b for b in list(bars) if b.ts < minute_start] or list(bars)
+            if (
+                signal.scan_result
+                and (signal.scan_result.criteria or {}).get("entry_trigger")
+                in {
+                    "warrior_level_pullaway",
+                    "warrior_curl_reclaim",
+                    "warrior_second_leg_reclaim",
+                    "warrior_news_continuation_pullback",
+                    "warrior_trend_pullback_reclaim",
+                    "warrior_equal_high_pullaway",
+                }
+            ):
+                guard_bars = list(guard_bars) + [ten_sec]
             final_reject = self._pipeline._final_entry_quality_reject(
                 signal,
                 universe={sym: guard_bars},
@@ -1450,7 +2474,7 @@ class PipelineBacktestDriver:
             # registering with exit_manager means run_cycle won't touch it.
             stop_price = float(signal.stop_loss)
             target_price = float(signal.take_profit)
-            if hit_run:
+            if hit_run and strategy_label != "warrior_squeeze_playbook":
                 fill_price = float(fill.price)
                 risk = max(fill_price - stop_price, fill_price * 0.02, 0.06)
                 stop_price = round(fill_price - risk, 4)
@@ -1469,6 +2493,7 @@ class PipelineBacktestDriver:
             else:
                 self._momentum_burst_last_entry[sym] = now
             ledger.record_entry(fill, strategy=strategy_label)
+            self._maybe_warrior_same_bar_target(result, ledger, sym, ten_sec)
             result.entry_decisions.append({
                 "ts": now.isoformat(),
                 "symbol": sym,
@@ -1489,6 +2514,195 @@ class PipelineBacktestDriver:
                 },
             })
             break
+
+    @staticmethod
+    def _momentum_burst_level_context(previous_high: float, current_high: float) -> Dict[str, Any]:
+        return warrior_lanes.momentum_burst_level_context(previous_high, current_high)
+
+    def _warrior_history_until(self, symbol: str, ten_sec: Bar, *, count: Optional[int] = None) -> List[Bar]:
+        current_ts = getattr(ten_sec, "ts", None)
+        history = list(self._timer_bars_by_symbol.get(symbol.upper()) or [])
+        if current_ts is not None:
+            history = [bar for bar in history if bar.ts <= current_ts]
+        history = [bar for bar in history if float(bar.close or 0.0) > 0]
+        return history[-count:] if count is not None else history
+
+    def _warrior_squeeze_pullaway_context(
+        self,
+        symbol: str,
+        ten_sec: Bar,
+        pending_breakout: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        sym = symbol.upper()
+        return warrior_lanes.warrior_squeeze_pullaway_context(
+            ten_sec,
+            pending_breakout,
+            history=self._warrior_history_until(sym, ten_sec, count=6),
+            reject_high=float(self._warrior_squeeze_rejection_high.get(sym, 0.0) or 0.0),
+            rejection_reason=self._warrior_squeeze_rejection_reason.get(sym),
+            reentry_count=int(self._mb_hit_run_counts.get(sym, 0) or 0),
+            min_reclaim_price=float(self._warrior_squeeze_min_reclaim_price or 0.0),
+            reward_risk_value=float(getattr(self, "_warrior_squeeze_reward_risk", 3.0) or 3.0),
+            add_reward_risk_value=float(getattr(self, "_warrior_squeeze_add_reward_risk", 1.0) or 1.0),
+        )
+
+    def _warrior_squeeze_first_starter_has_proof_hold(
+        self,
+        symbol: str,
+        ten_sec: Bar,
+        proof_level: float,
+    ) -> bool:
+        return warrior_lanes.first_starter_has_proof_hold(
+            self._warrior_history_until(symbol, ten_sec, count=6),
+            proof_level,
+        )
+
+    def _warrior_squeeze_equal_high_pullaway_context(
+        self,
+        symbol: str,
+        ten_sec: Bar,
+        pending_breakout: Dict[str, Any],
+        *,
+        window_high: float,
+    ) -> Optional[Dict[str, Any]]:
+        sym = symbol.upper()
+        return warrior_lanes.warrior_squeeze_equal_high_pullaway_context(
+            ten_sec,
+            pending_breakout,
+            history=self._warrior_history_until(sym, ten_sec),
+            window_high=window_high,
+            reject_high=float(self._warrior_squeeze_rejection_high.get(sym, 0.0) or 0.0),
+            rejection_reason=self._warrior_squeeze_rejection_reason.get(sym),
+            reentry_count=int(self._mb_hit_run_counts.get(sym, 0) or 0),
+            min_reclaim_price=float(self._warrior_squeeze_min_reclaim_price or 0.0),
+        )
+
+    def _warrior_squeeze_second_leg_reclaim_context(
+        self,
+        symbol: str,
+        ten_sec: Bar,
+        pending_breakout: Dict[str, Any],
+        *,
+        window_high: float,
+    ) -> Optional[Dict[str, Any]]:
+        return warrior_lanes.warrior_squeeze_second_leg_reclaim_context(
+            ten_sec,
+            history=self._warrior_history_until(symbol, ten_sec),
+            window_high=window_high,
+        )
+
+    def _warrior_squeeze_curl_reclaim_context(
+        self,
+        symbol: str,
+        ten_sec: Bar,
+        pending_breakout: Dict[str, Any],
+        *,
+        window_high: float,
+    ) -> Optional[Dict[str, Any]]:
+        sym = symbol.upper()
+        return warrior_lanes.warrior_squeeze_curl_reclaim_context(
+            ten_sec,
+            pending_breakout,
+            history=self._warrior_history_until(sym, ten_sec, count=6),
+            window_high=window_high,
+            reentry_count=int(self._mb_hit_run_counts.get(sym, 0) or 0),
+            min_reclaim_price=float(self._warrior_squeeze_min_reclaim_price or 0.0),
+        )
+
+    def _warrior_trend_pullback_reclaim_context(
+        self,
+        symbol: str,
+        ten_sec: Bar,
+        *,
+        window_high: float,
+    ) -> Optional[Dict[str, Any]]:
+        return warrior_lanes.warrior_trend_pullback_reclaim_context(
+            ten_sec,
+            history=self._warrior_history_until(symbol, ten_sec, count=30),
+            window_high=window_high,
+        )
+
+    def _warrior_news_continuation_pullback_context(
+        self,
+        symbol: str,
+        ten_sec: Bar,
+        *,
+        window_high: float,
+    ) -> Optional[Dict[str, Any]]:
+        return warrior_lanes.warrior_news_continuation_pullback_context(
+            ten_sec,
+            history=self._warrior_history_until(symbol, ten_sec, count=36),
+            window_high=window_high,
+        )
+
+    def _momentum_burst_rebase_pending_after_reject(
+        self,
+        symbol: str,
+        ten_sec: Bar,
+        pending_breakout: Dict[str, Any],
+        reject_reason: str,
+        now: datetime,
+        *,
+        hit_run: bool,
+    ) -> bool:
+        if not hit_run:
+            return False
+        if int(pending_breakout.get("rebase_count") or 0) >= 1:
+            return False
+        reason = (reject_reason or "").lower()
+        if "chasing:" in reason:
+            return False
+        if not any(
+            token in reason
+            for token in (
+                "breakout not confirmed",
+                "did not break continuation high",
+                "did not close with strength",
+                "volume too light",
+            )
+        ):
+            return False
+        continuation_ok, _continuation_reason, continuation_meta = (
+            self._momentum_burst_continuation_base_ok(symbol, now)
+        )
+        if not continuation_ok:
+            return False
+        current_high = float(ten_sec.high or 0.0)
+        current_close = float(ten_sec.close or 0.0)
+        current_volume = float(ten_sec.volume or 0.0)
+        if current_high <= 0 or current_close <= 0:
+            return False
+        self._momentum_burst_pending[symbol] = {
+            "ts": now,
+            "original_ts": pending_breakout.get("original_ts") or pending_breakout.get("ts"),
+            "breakout_close": current_close,
+            "breakout_high": current_high,
+            "original_breakout_close": pending_breakout.get("original_breakout_close")
+            or pending_breakout.get("breakout_close"),
+            "original_breakout_high": pending_breakout.get("original_breakout_high")
+            or pending_breakout.get("breakout_high"),
+            "breakout_volume": current_volume,
+            "micro_base_reclaim": True,
+            "base_high": continuation_meta.get("base_high"),
+            "base_low": continuation_meta.get("base_low"),
+            "prior_reject": reject_reason,
+            "rebase_count": int(pending_breakout.get("rebase_count") or 0) + 1,
+            **self._momentum_burst_level_context(
+                float(pending_breakout.get("breakout_high") or 0.0),
+                current_high,
+            ),
+        }
+        if "psych_level" in pending_breakout and "psych_level" not in self._momentum_burst_pending[symbol]:
+            self._momentum_burst_pending[symbol]["psych_level"] = pending_breakout.get("psych_level")
+            self._momentum_burst_pending[symbol]["entry_trigger"] = pending_breakout.get(
+                "entry_trigger", "psych_level_break"
+            )
+        if "reset_from_stale_high" in pending_breakout:
+            self._momentum_burst_pending[symbol]["reset_from_stale_high"] = pending_breakout.get(
+                "reset_from_stale_high"
+            )
+        self._momentum_burst_window_high[symbol] = current_high
+        return True
 
     def _momentum_burst_hit_run_time_allowed(self, ts: datetime) -> bool:
         end_text = str(getattr(self, "_mb_hit_run_end_et", "") or "").strip()
@@ -1658,14 +2872,35 @@ class PipelineBacktestDriver:
         hit_run: bool = False,
         violent_liquid: bool = False,
         post_blowoff_micro_base: bool = False,
+        entry_context: Optional[Dict[str, Any]] = None,
+        strategy_override: Optional[str] = None,
+        size_factor_override: Optional[float] = None,
     ) -> Optional[TradeSignal]:
         strategy_label = (
-            "post_blowoff_micro_base_scout"
-            if post_blowoff_micro_base
-            else ("momentum_burst_hit_run" if hit_run else "momentum_burst_replay")
+            strategy_override
+            or (
+                "post_blowoff_micro_base_scout"
+                if post_blowoff_micro_base
+                else ("momentum_burst_hit_run" if hit_run else "momentum_burst_replay")
+            )
         )
         pattern_label = strategy_label if hit_run else "momentum_burst_scalp"
-        price = float(bar.close or 0.0)
+        warrior_override = bool(
+            entry_context
+            and entry_context.get("entry_trigger") in {
+                "warrior_level_pullaway",
+                "warrior_curl_reclaim",
+                "warrior_second_leg_reclaim",
+                "warrior_news_continuation_pullback",
+                "warrior_trend_pullback_reclaim",
+                "warrior_equal_high_pullaway",
+            }
+        )
+        price = float(
+            entry_context.get("entry_price_override")
+            if warrior_override and entry_context is not None
+            else (bar.close or 0.0)
+        )
         if price < 1.5 or price > 20.0:
             return None
         ten_history = [
@@ -1691,7 +2926,13 @@ class PipelineBacktestDriver:
         # the R:R is bad rather than buy with a too-tight noise stop.
         lookback = max(2, int(self._mb_structure_stop_lookback))
         swing_low = min((float(b.low or 0.0) for b in ten_history[-lookback:]), default=0.0)
-        if post_blowoff_micro_base:
+        if warrior_override:
+            stop_price = float(entry_context.get("stop_price_override") or 0.0)
+            target_price = float(entry_context.get("target_price_override") or 0.0)
+            risk = price - stop_price
+            if price <= 0 or stop_price <= 0 or target_price <= price or risk <= 0:
+                return None
+        elif post_blowoff_micro_base:
             risk = max(price * 0.015, 0.06)
         elif hit_run and violent_liquid:
             # This lane is deliberately a Warrior-style hit-and-run: take reduced
@@ -1711,21 +2952,30 @@ class PipelineBacktestDriver:
                 return None  # swing low too far — bad R:R, don't chase with a tight stop
             else:
                 risk = min_risk  # structure tighter than noise floor — use the floor
-        stop_price = round(price - risk, 2)
-        # Symmetric 1:1 (or configured R): reward = reward_risk × risk. Full
-        # position exits at this target or the stop — no partial scale-outs.
-        reward_risk = self._mb_hit_run_reward_risk if hit_run else self._mb_reward_risk
-        target_price = round(price + reward_risk * risk, 2)
+        if not warrior_override:
+            stop_price = round(price - risk, 2)
+            # Symmetric 1:1 (or configured R): reward = reward_risk × risk. Full
+            # position exits at this target or the stop — no partial scale-outs.
+            reward_risk = self._mb_hit_run_reward_risk if hit_run else self._mb_reward_risk
+            target_price = round(price + reward_risk * risk, 2)
         if stop_price <= 0 or stop_price >= price:
             return None
-        if hit_run and float(bar.low or 0.0) <= stop_price:
+        if (
+            hit_run
+            and not bool(entry_context and entry_context.get("skip_unstable_confirm_stop_check"))
+            and float(bar.low or 0.0) <= stop_price
+        ):
             return None
         max_order = int(getattr(self._pipeline, "_max_order_shares", 750) or 750)
         quantity = max(1, min(750, max_order, int(50.0 / (price - stop_price))))
         if post_blowoff_micro_base:
             quantity = max(1, int(quantity * 0.35))
-        elif hit_run and violent_liquid:
+        elif hit_run and violent_liquid and size_factor_override is None:
             quantity = max(1, int(quantity * self._mb_violent_size_factor))
+        if size_factor_override is not None:
+            factor = max(0.01, min(1.0, float(size_factor_override or 1.0)))
+            if factor < 1.0:
+                quantity = max(1, int(quantity * factor))
         closed_bars = [b for b in bars if b.ts <= bar.ts.replace(second=0, microsecond=0)]
         hit = ScanResult(
             symbol=symbol,
@@ -1747,15 +2997,53 @@ class PipelineBacktestDriver:
                 ),
                 "stop_price": stop_price,
                 "size_factor": (
-                    0.35
-                    if post_blowoff_micro_base
-                    else (self._mb_violent_size_factor if violent_liquid else 1.0)
+                    round(max(0.01, min(1.0, float(size_factor_override))), 2)
+                    if size_factor_override is not None
+                    else (
+                        0.35
+                        if post_blowoff_micro_base
+                        else (self._mb_violent_size_factor if violent_liquid else 1.0)
+                    )
                 ),
                 "variant": (
-                    "post_blowoff_micro_base"
-                    if post_blowoff_micro_base
-                    else ("violent_liquid" if violent_liquid else "smooth_confirmed")
+                    entry_context.get("variant_override")
+                    if entry_context and entry_context.get("variant_override")
+                    else (
+                    "warrior_curl_reclaim_starter"
+                    if entry_context
+                    and entry_context.get("entry_trigger") == "warrior_curl_reclaim"
+                    else "warrior_second_leg_reclaim"
+                    if entry_context
+                    and entry_context.get("entry_trigger") == "warrior_second_leg_reclaim"
+                    else "warrior_news_continuation_pullback"
+                    if entry_context
+                    and entry_context.get("entry_trigger") == "warrior_news_continuation_pullback"
+                    else "warrior_trend_pullback_reclaim"
+                    if entry_context
+                    and entry_context.get("entry_trigger") == "warrior_trend_pullback_reclaim"
+                    else "warrior_equal_high_pullaway"
+                    if entry_context
+                    and entry_context.get("entry_trigger") == "warrior_equal_high_pullaway"
+                    else "warrior_level_pullaway_starter"
+                    if warrior_override
+                    else "warrior_reclaim_starter"
+                    if strategy_label == "warrior_squeeze_playbook"
+                    else (
+                        "post_blowoff_micro_base"
+                        if post_blowoff_micro_base
+                        else ("violent_liquid" if violent_liquid else "smooth_confirmed")
+                    )
+                    )
                 ),
+                **(
+                        {
+                            "psych_level": entry_context.get("psych_level"),
+                            "entry_trigger": entry_context.get("entry_trigger"),
+                            "pullaway_level": entry_context.get("pullaway_level"),
+                            "max_pay": entry_context.get("max_pay"),
+                        }
+                        if entry_context and entry_context.get("psych_level") else {}
+                    ),
             },
             bars=list(closed_bars[-30:]) + [bar],
         )
@@ -1766,9 +3054,14 @@ class PipelineBacktestDriver:
             entry_price=price,
             stop_loss=stop_price,
             take_profit=target_price,
-            max_hold_seconds=self._mb_hit_run_max_hold_sec if hit_run else 90,
+            max_hold_seconds=(
+                float(entry_context.get("max_hold_seconds_override"))
+                if entry_context and entry_context.get("max_hold_seconds_override")
+                else (self._mb_hit_run_max_hold_sec if hit_run else 90)
+            ),
             reason="{} {} ${:.2f}, stop=${:.2f}, target=${:.2f} (10s replay)".format(
-                "Momentum Burst Hit-Run" if hit_run else "Momentum Burst Scalp",
+                "Warrior Squeeze" if strategy_label == "warrior_squeeze_playbook"
+                else ("Momentum Burst Hit-Run" if hit_run else "Momentum Burst Scalp"),
                 symbol,
                 price,
                 stop_price,
@@ -1887,11 +3180,7 @@ class PipelineBacktestDriver:
                 "reason": "final entry guard: {}".format(final_reject),
             })
             return
-        chase_reject = self._pipeline._normal_entry_chase_reject(
-            signal,
-            universe={signal.symbol: [bar]},
-            now=bar.ts,
-        )
+        chase_reject = self._timed_release_chase_reject(signal, bar)
         if chase_reject:
             self._append_rejection(result, {
                 "ts": bar.ts.isoformat(),
@@ -1947,6 +3236,48 @@ class PipelineBacktestDriver:
         )
         self._pipeline.exit_manager.register_from_signal(signal, bar.ts, fill_price=fill.price)
         ledger.record_entry(fill, strategy=_entry_strategy_label(signal))
+
+    def _timed_release_chase_reject(
+        self,
+        signal: TradeSignal,
+        bar: Bar,
+    ) -> Optional[str]:
+        """Reject only true timed-release chases in the backtest.
+
+        Direct entries should consult missed-A+ memory. A timed entry is
+        different: the setup already passed and was queued at a concrete price,
+        so release-time chase is measured from that queued entry, not from an
+        older blocked A+ memory anchor.
+        """
+        if signal.action not in (SignalAction.ENTER_LONG, SignalAction.REENTER_LONG):
+            return None
+        criteria = signal.scan_result.criteria if signal.scan_result is not None else {}
+        try:
+            anchor = float(criteria.get("queued_entry_price") or signal.entry_price or 0.0)
+        except (TypeError, ValueError):
+            anchor = 0.0
+        if anchor <= 0:
+            return None
+        try:
+            live = float(bar.close or signal.entry_price or anchor)
+        except (TypeError, ValueError):
+            live = anchor
+        max_chase_pct = (
+            self._pipeline._entry_chase_pct_high
+            if anchor >= self._pipeline._entry_chase_price_tier
+            else self._pipeline._entry_chase_pct_low
+        )
+        if live <= anchor * (1.0 + max_chase_pct):
+            return None
+        return (
+            "late timed release: ${:.4f} is {:.1f}% above queued setup ${:.4f} "
+            "(max {:.1f}%)"
+        ).format(
+            live,
+            (live - anchor) / anchor * 100.0,
+            anchor,
+            max_chase_pct * 100.0,
+        )
 
     def _record_cycle(
         self,

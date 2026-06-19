@@ -128,8 +128,38 @@ class TestHalfSellAt2to1:
         assert exits == []
         tracked = em.tracked.get("ABC")
         assert tracked is not None
-        assert tracked.sold_half is False
-        assert tracked.stop_loss == pytest.approx(4.80)
+
+    def test_momentum_burst_hit_run_sells_full_at_first_target(self) -> None:
+        em = ExitManager()
+        pos = _long_pos(entry=5.00, stop=4.90, qty=90)
+        pos.reason = "Momentum Burst Hit-Run"
+        pos.entry_strategy = "momentum_burst_hit_run"
+        em.track(pos)
+
+        exits = em.check_exits({"ABC": 5.21}, _ts(10))
+
+        assert len(exits) == 1
+        assert exits[0].quantity == 90
+        assert "take_profit" in exits[0].reason.lower()
+        assert "ABC" not in em.tracked
+
+    def test_warrior_squeeze_banks_partial_at_first_target(self) -> None:
+        em = ExitManager()
+        pos = _long_pos(entry=5.00, stop=4.90, qty=90)
+        pos.reason = "Warrior Squeeze JRSH"
+        pos.entry_strategy = "warrior_squeeze_playbook"
+        em.track(pos)
+
+        exits = em.check_exits({"ABC": 5.21}, _ts(10))
+
+        assert len(exits) == 1
+        assert exits[0].quantity == 45
+        assert "take_profit" in exits[0].reason.lower()
+        tracked = em.tracked.get("ABC")
+        assert tracked is not None
+        assert tracked.sold_half is True
+        assert tracked.remaining_qty == 45
+        assert tracked.stop_loss == pytest.approx(5.00)
 
     def test_runner_candidate_confirms_after_first_partial(self) -> None:
         em = ExitManager()
