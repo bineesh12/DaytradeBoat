@@ -506,6 +506,32 @@ class TestEarlyVWAPReclaimScoutScanner:
 
         assert scanner.scan({"TST": bars}) == []
 
+    def test_rejects_weak_wick_reclaim_candle(self) -> None:
+        now = datetime.now(timezone.utc)
+        prices = [
+            (6.80, 6.95, 6.76, 6.90, 45_000),
+            (6.90, 7.10, 6.86, 7.02, 55_000),
+            (7.02, 7.34, 6.98, 7.28, 80_000),
+            (7.28, 8.25, 7.20, 8.05, 180_000),
+            (8.05, 8.48, 7.92, 8.28, 210_000),
+            (8.28, 8.46, 7.68, 7.82, 140_000),
+            (7.82, 7.94, 7.34, 7.46, 95_000),
+            (7.46, 7.62, 7.04, 7.18, 88_000),
+            (7.18, 7.20, 7.13, 7.17, 11_208),
+            (7.17, 7.17, 6.9213, 7.00, 9_707),
+            (7.01, 7.30, 6.98, 7.30, 48_050),
+            # OLOX-style failed reclaim: volume appears, but the candle rejects
+            # hard from the high and closes in the lower part of its range.
+            (7.30, 7.75, 7.2941, 7.37, 102_426),
+        ]
+        bars = [
+            _bar(i, open_=o, high=h, low=l, close=c, volume=v, base_ts=now, n=len(prices))
+            for i, (o, h, l, c, v) in enumerate(prices)
+        ]
+        scanner = EarlyVWAPReclaimScoutScanner(min_price=1.0, max_price=20.0)
+
+        assert scanner.scan({"TST": bars}) == []
+
     def test_rejects_late_chase_far_above_vwap(self) -> None:
         now = datetime.now(timezone.utc)
         prices = [
@@ -693,10 +719,29 @@ class TestShallowStairContinuationScanner:
         assert hit.criteria["entry_tier"] == "stair_scout"
         assert hit.criteria["runner_profile"] == "fast_stair_runner"
         assert hit.criteria["pullback_from_hod_pct"] > 4.0
-        assert hit.criteria["allowed_hod_pullback_pct"] == pytest.approx(16.0)
+        assert hit.criteria["allowed_hod_pullback_pct"] == pytest.approx(12.0)
         assert hit.criteria["base_range_pct"] > 7.0
-        assert hit.criteria["allowed_base_range_pct"] == pytest.approx(22.0)
+        assert hit.criteria["allowed_base_range_pct"] == pytest.approx(13.0)
         assert hit.score >= 80.0
+
+    def test_rejects_deep_wide_reclaim_as_not_shallow_stair(self) -> None:
+        bars = _make_fast_runner_stair_bars()
+        base_ts = bars[-1].ts
+        # CAST-style failed re-entry: the name is still strong overall, but the
+        # setup is a deep/wide reclaim, not a shallow stair-step base.
+        bars[4] = _bar(4, close=9.85, open_=9.25, high=10.0, low=8.90, volume=420_000, base_ts=base_ts, n=20)
+        bars[-5:] = [
+            _bar(7, close=7.70, open_=8.05, high=8.10, low=7.09, volume=120_000, base_ts=base_ts, n=20),
+            _bar(8, close=7.82, open_=7.70, high=7.94, low=7.28, volume=130_000, base_ts=base_ts, n=20),
+            _bar(9, close=8.00, open_=7.82, high=8.04, low=7.50, volume=160_000, base_ts=base_ts, n=20),
+            _bar(10, close=8.10, open_=8.00, high=8.10, low=7.76, volume=185_000, base_ts=base_ts, n=20),
+            _bar(11, close=8.59, open_=8.12, high=8.68, low=8.08, volume=260_000, base_ts=base_ts, n=20),
+        ]
+        scanner = ShallowStairContinuationScanner(min_price=1.0, max_price=20.0)
+
+        hits = scanner.scan({"TST": bars})
+
+        assert hits == []
 
     def test_rejects_shallow_stair_without_volume(self) -> None:
         bars = _make_shallow_stair_bars()

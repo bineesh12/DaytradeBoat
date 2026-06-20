@@ -34,6 +34,7 @@ from daytrading.scanner.base import Scanner
 from daytrading.strategy.entry_guard import check_entry_quality
 from daytrading.strategy.entry_policy import EntryDecision, EntryPolicy
 from daytrading.strategy.verifier import StrategyVerifier
+from daytrading.strategy import warrior_lanes
 from daytrading.models import (
     Bar,
     Fill,
@@ -736,16 +737,7 @@ class TradingPipeline:
         sr = signal.scan_result
         criteria = sr.criteria if sr is not None else {}
         entry_trigger = str(criteria.get("entry_trigger") or "")
-        if entry_trigger not in {
-            "warrior_level_pullaway",
-            "warrior_curl_reclaim",
-            "warrior_second_leg_reclaim",
-            "warrior_prior_runner_continuation_pullback",
-            "warrior_high_base_reclaim",
-            "warrior_stair_step_runner",
-            "warrior_trend_pullback_reclaim",
-            "warrior_equal_high_pullaway",
-        }:
+        if not warrior_lanes.is_warrior_entry_trigger(entry_trigger):
             return False
         score_floor = 70 if entry_trigger == "warrior_high_base_reclaim" else 75
         score_near_miss = bool(score_match and int(score_match.group(1)) >= score_floor)

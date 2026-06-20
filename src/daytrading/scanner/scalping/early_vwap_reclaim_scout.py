@@ -31,6 +31,8 @@ class EarlyVWAPReclaimScoutScanner:
         min_active_recent_bars: int = 2,
         active_bar_volume: float = 20_000,
         max_single_bar_volume_share: float = 0.70,
+        min_reclaim_close_location: float = 0.55,
+        max_reclaim_upper_wick: float = 0.45,
     ) -> None:
         self._min_price = min_price
         self._max_price = max_price
@@ -45,6 +47,8 @@ class EarlyVWAPReclaimScoutScanner:
         self._min_active_recent_bars = min_active_recent_bars
         self._active_bar_volume = active_bar_volume
         self._max_single_bar_volume_share = max_single_bar_volume_share
+        self._min_reclaim_close_location = min_reclaim_close_location
+        self._max_reclaim_upper_wick = max_reclaim_upper_wick
 
     @property
     def name(self) -> str:
@@ -75,6 +79,15 @@ class EarlyVWAPReclaimScoutScanner:
         latest = bars[-1]
         prev = bars[-2]
         if latest.close <= latest.open:
+            return None
+        latest_range = float(latest.high or 0.0) - float(latest.low or 0.0)
+        if latest_range <= 0:
+            return None
+        close_location = (float(latest.close or 0.0) - float(latest.low or 0.0)) / latest_range
+        upper_wick = (float(latest.high or 0.0) - max(float(latest.open or 0.0), float(latest.close or 0.0))) / latest_range
+        if close_location < self._min_reclaim_close_location:
+            return None
+        if upper_wick > self._max_reclaim_upper_wick:
             return None
         if latest.volume < self._min_latest_volume:
             return None
@@ -211,6 +224,8 @@ class EarlyVWAPReclaimScoutScanner:
                 "recent_volume": round(recent_volume, 0),
                 "active_recent_bars": active_recent_bars,
                 "max_recent_volume_share": round(max_recent_volume_share, 2),
+                "close_location": round(close_location, 3),
+                "upper_wick": round(upper_wick, 3),
                 "stop_price": round(max(reclaim_low - 0.02, current_vwap * 0.97), 4),
                 "close": latest.close,
                 "volume": latest.volume,

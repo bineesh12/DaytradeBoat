@@ -151,6 +151,8 @@ class PipelineBacktestDriver:
         self._warrior_squeeze_rejection_high: Dict[str, float] = {}
         self._warrior_squeeze_rejection_reason: Dict[str, str] = {}
         self._warrior_squeeze_target_wins: Dict[str, int] = {}
+        self._warrior_squeeze_failed_burst: Dict[str, str] = {}
+        self._warrior_squeeze_failed_burst_high: Dict[str, float] = {}
         # symbol -> {ts, breakout_close} of a fresh 10s high awaiting next-bar
         # confirmation; we never buy the spike bar itself.
         self._momentum_burst_pending: Dict[str, Dict[str, Any]] = {}
@@ -1151,6 +1153,32 @@ class PipelineBacktestDriver:
         volume = float(ten_sec.volume or 0.0)
         if open_ <= 0 or high <= 0 or close <= 0:
             return
+        first_pullback_context = self._warrior_trend_pullback_reclaim_context(
+            sym,
+            ten_sec,
+            window_high=max(
+                high,
+                float(self._warrior_squeeze_rejection_high.get(sym, 0.0) or 0.0),
+            ),
+        )
+        if (
+            first_pullback_context is not None
+            and first_pullback_context.get("entry_trigger") == "warrior_first_pullback_reclaim"
+        ):
+            self._momentum_burst_armed[sym] = now
+            self._momentum_burst_window_high[sym] = max(
+                high,
+                float(self._warrior_squeeze_rejection_high.get(sym, 0.0) or 0.0),
+            )
+            self._momentum_burst_session_anchor_high.setdefault(sym, high)
+            self._momentum_burst_pending[sym] = {
+                "ts": now - timedelta(seconds=10),
+                "breakout_close": close,
+                "breakout_high": high,
+                "breakout_volume": volume,
+                **first_pullback_context,
+            }
+            return
         min_price = max(0.0, float(self._warrior_squeeze_min_reclaim_price or 0.0))
         reject_high = float(self._warrior_squeeze_rejection_high.get(sym, 0.0) or 0.0)
         if reject_high > 0:
@@ -1296,9 +1324,20 @@ class PipelineBacktestDriver:
                 last_trade = ledger.trades[-1] if ledger.trades else {}
                 self._record_mb_hit_run_pnl(sym, float(last_trade.get("pnl") or 0.0))
                 if reason == "mb_bracket_target" and strategy == "warrior_squeeze_playbook":
-                    self._warrior_squeeze_target_wins[sym] = (
-                        self._warrior_squeeze_target_wins.get(sym, 0) + 1
-                    )
+                    symbol_pnl = float(self._mb_hit_run_symbol_pnl.get(sym, 0.0) or 0.0)
+                    if symbol_pnl > 0:
+                        self._warrior_squeeze_target_wins[sym] = (
+                            self._warrior_squeeze_target_wins.get(sym, 0) + 1
+                        )
+                        self._pipeline._symbol_entry_counts[sym] = self._pipeline._max_entries_per_symbol
+                        self._warrior_squeeze_failed_burst.pop(sym, None)
+                        self._warrior_squeeze_failed_burst_high.pop(sym, None)
+                    else:
+                        self._mb_hit_run_day_blocked[sym] = (
+                            "Warrior recovery target did not restore positive symbol P&L "
+                            "(${:.2f}); stop trading symbol for day".format(symbol_pnl)
+                        )
+                        self._pipeline._symbol_entry_counts[sym] = self._pipeline._max_entries_per_symbol
                     self._momentum_burst_pending.pop(sym, None)
                     if bar is not None:
                         self._momentum_burst_window_high[sym] = max(
@@ -1310,6 +1349,29 @@ class PipelineBacktestDriver:
                     cooldown = self._mb_hit_run_win_cooldown_sec
                 else:
                     cooldown = self._mb_hit_run_loss_cooldown_sec
+                    if (
+                        strategy == "warrior_squeeze_playbook"
+                        and self._warrior_squeeze_target_wins.get(sym, 0) <= 0
+                    ):
+                        self._warrior_squeeze_failed_burst[sym] = (
+                            "first Warrior burst failed via {}; require a fresh new window".format(reason)
+                        )
+                        self._warrior_squeeze_failed_burst_high[sym] = max(
+                            float(br.get("highest") or 0.0),
+                            float(br.get("entry") or 0.0),
+                            float(getattr(bar, "high", 0.0) or 0.0),
+                        )
+                    elif (
+                        strategy == "warrior_squeeze_playbook"
+                        and self._warrior_squeeze_target_wins.get(sym, 0) > 0
+                        and float(last_trade.get("pnl") or 0.0) < 0.0
+                    ):
+                        self._mb_hit_run_day_blocked[sym] = (
+                            "Warrior post-target loss ${:.2f}; stop trading symbol for day".format(
+                                abs(float(last_trade.get("pnl") or 0.0))
+                            )
+                        )
+                        self._pipeline._symbol_entry_counts[sym] = self._pipeline._max_entries_per_symbol
                 self._mb_hit_run_block_until[sym] = now + timedelta(seconds=cooldown)
 
     def _record_mb_hit_run_pnl(self, symbol: str, pnl: float) -> str:
@@ -1438,6 +1500,8 @@ class PipelineBacktestDriver:
                 self._momentum_burst_pending.pop(sym, None)
                 self._mb_hit_run_counts.pop(sym, None)
                 self._mb_hit_run_block_until.pop(sym, None)
+                self._warrior_squeeze_failed_burst.pop(sym, None)
+                self._warrior_squeeze_failed_burst_high.pop(sym, None)
                 continue
             if self._has_active_replay_scalp():
                 continue
@@ -1454,6 +1518,52 @@ class PipelineBacktestDriver:
                         "symbol": sym,
                         "blocked_layer": "{}_daily_stop".format(strategy_label),
                         "reason": day_block,
+                    })
+                    continue
+                failed_burst = self._warrior_squeeze_failed_burst.get(sym) if warrior else None
+                if failed_burst and self._warrior_squeeze_target_wins.get(sym, 0) <= 0:
+                    ten_sec = self._ten_sec_bar_at(sym, now)
+                    recovery_context = (
+                        self._warrior_failed_burst_recovery_context(
+                            sym,
+                            ten_sec,
+                            failed_high=float(
+                                self._warrior_squeeze_failed_burst_high.get(sym, 0.0) or 0.0
+                            ),
+                            window_high=float(self._momentum_burst_window_high.get(sym, 0.0) or 0.0),
+                        )
+                        if ten_sec is not None
+                        else None
+                    )
+                    if recovery_context is None:
+                        self._momentum_burst_pending.pop(sym, None)
+                        self._append_rejection(result, {
+                            "ts": now.isoformat(),
+                            "symbol": sym,
+                            "blocked_layer": "{}_failed_burst".format(strategy_label),
+                            "reason": failed_burst,
+                        })
+                        continue
+                    self._warrior_squeeze_failed_burst.pop(sym, None)
+                    self._warrior_squeeze_failed_burst_high.pop(sym, None)
+                    self._mb_hit_run_block_until.pop(sym, None)
+                    current_high = float(ten_sec.high or 0.0)
+                    self._momentum_burst_window_high[sym] = max(
+                        float(self._momentum_burst_window_high.get(sym, 0.0) or 0.0),
+                        current_high,
+                    )
+                    self._momentum_burst_pending[sym] = {
+                        "ts": now - timedelta(seconds=10),
+                        "breakout_close": float(ten_sec.close or 0.0),
+                        "breakout_high": current_high,
+                        "breakout_volume": float(ten_sec.volume or 0.0),
+                        **recovery_context,
+                    }
+                    self._append_rejection(result, {
+                        "ts": now.isoformat(),
+                        "symbol": sym,
+                        "blocked_layer": "{}_failed_burst_recovery_wait".format(strategy_label),
+                        "reason": "failed Warrior burst recovered on fresh high",
                     })
                     continue
                 effective_max_entries = (
@@ -1556,7 +1666,6 @@ class PipelineBacktestDriver:
                 warrior
                 and warrior_target_wins >= 1
                 and window_high > 0
-                and current_high <= window_high * 1.001
             ):
                 armed_prior_runner_pullback = False
                 prior_runner_context = self._warrior_prior_runner_continuation_pullback_context(
@@ -1579,27 +1688,6 @@ class PipelineBacktestDriver:
                         "reason": "warrior prior-runner continuation pullback executing on reclaim bar",
                     })
                     armed_prior_runner_pullback = True
-                if not armed_prior_runner_pullback:
-                    trend_pullback_context = self._warrior_trend_pullback_reclaim_context(
-                        sym,
-                        ten_sec,
-                        window_high=window_high,
-                    )
-                    if trend_pullback_context is not None:
-                        self._momentum_burst_pending[sym] = {
-                            "ts": now - timedelta(seconds=10),
-                            "breakout_close": float(ten_sec.close or 0.0),
-                            "breakout_high": current_high,
-                            "breakout_volume": float(ten_sec.volume or 0.0),
-                            **trend_pullback_context,
-                        }
-                        self._append_rejection(result, {
-                            "ts": now.isoformat(),
-                            "symbol": sym,
-                            "blocked_layer": "{}_trend_pullback_wait".format(strategy_label),
-                            "reason": "warrior trend pullback reclaim executing on reclaim bar",
-                        })
-                        armed_prior_runner_pullback = True
                 if not armed_prior_runner_pullback:
                     second_leg_context = self._warrior_squeeze_second_leg_reclaim_context(
                         sym,
@@ -1629,14 +1717,20 @@ class PipelineBacktestDriver:
                         })
                         continue
                     self._momentum_burst_pending.pop(sym, None)
+                    lock_reason = (
+                        "warrior profit lock: target win banked; "
+                        "needs fresh high above {:.2f}"
+                    ).format(window_high)
+                    if current_high > window_high * 1.001:
+                        lock_reason = (
+                            "warrior profit lock: target win banked; "
+                            "fresh high alone is not enough after first win"
+                        )
                     self._append_rejection(result, {
                         "ts": now.isoformat(),
                         "symbol": sym,
                         "blocked_layer": "{}_profit_lock".format(strategy_label),
-                        "reason": (
-                            "warrior profit lock: target win banked; "
-                            "needs fresh high above {:.2f}"
-                        ).format(window_high),
+                        "reason": lock_reason,
                     })
                     continue
 
@@ -1646,21 +1740,29 @@ class PipelineBacktestDriver:
             # through the breakout high. A sideways hold under the spike high is
             # not enough for a hit-and-run entry.
             if warrior and self._mb_hit_run_counts.get(sym, 0) == 0:
+                level_break_context = self._warrior_level_break_starter_context(
+                    sym,
+                    ten_sec,
+                    window_high=window_high,
+                )
                 high_base_context = self._warrior_trend_pullback_reclaim_context(
                     sym,
                     ten_sec,
                     window_high=window_high,
                 )
+                starter_context = level_break_context or high_base_context
                 if (
-                    high_base_context is not None
-                    and high_base_context.get("entry_trigger") == "warrior_high_base_reclaim"
+                    starter_context is not None
+                    and warrior_lanes.is_warrior_initial_starter_trigger(
+                        starter_context.get("entry_trigger")
+                    )
                 ):
                     self._momentum_burst_pending[sym] = {
                         "ts": now - timedelta(seconds=10),
                         "breakout_close": float(ten_sec.close or 0.0),
                         "breakout_high": current_high,
                         "breakout_volume": float(ten_sec.volume or 0.0),
-                        **high_base_context,
+                        **starter_context,
                     }
             pend = self._momentum_burst_pending.get(sym)
             post_blowoff_micro_base = False
@@ -1709,14 +1811,9 @@ class PipelineBacktestDriver:
                 if (
                     warrior
                     and warrior_target_wins >= 1
-                    and pend.get("entry_trigger") not in {
-                        "warrior_second_leg_reclaim",
-                        "warrior_prior_runner_continuation_pullback",
-                        "warrior_high_base_reclaim",
-                        "warrior_stair_step_runner",
-                        "warrior_trend_pullback_reclaim",
-                        "warrior_equal_high_pullaway",
-                    }
+                    and not warrior_lanes.is_warrior_entry_trigger(
+                        pend.get("entry_trigger")
+                    )
                 ):
                     self._momentum_burst_pending.pop(sym, None)
                     self._append_rejection(result, {
@@ -1736,15 +1833,23 @@ class PipelineBacktestDriver:
                     if reentry
                     else (self._mb_violent_chase_cap_pct if hit_run and violent_ok else self._mb_chase_cap_pct)
                 )
-                if warrior and (
-                    pend.get("entry_trigger") in {
-                        "warrior_second_leg_reclaim",
-                        "warrior_prior_runner_continuation_pullback",
-                        "warrior_high_base_reclaim",
-                        "warrior_stair_step_runner",
-                        "warrior_trend_pullback_reclaim",
-                        "warrior_equal_high_pullaway",
-                    }
+                first_pullback_context = None
+                if warrior:
+                    first_pullback_candidate = self._warrior_trend_pullback_reclaim_context(
+                        sym,
+                        ten_sec,
+                        window_high=window_high,
+                    )
+                    if (
+                        first_pullback_candidate is not None
+                        and first_pullback_candidate.get("entry_trigger")
+                        == "warrior_first_pullback_reclaim"
+                    ):
+                        first_pullback_context = first_pullback_candidate
+                if first_pullback_context is not None:
+                    pullaway_context = first_pullback_context
+                elif warrior and (
+                    warrior_lanes.is_warrior_entry_trigger(pend.get("entry_trigger"))
                     or pend.get("variant_override") == "warrior_clwt_fast_pullaway"
                 ):
                     pullaway_context = dict(pend)
@@ -1788,7 +1893,9 @@ class PipelineBacktestDriver:
                 )
                 if (
                     high_base_context is not None
-                    and high_base_context.get("entry_trigger") != "warrior_high_base_reclaim"
+                    and not warrior_lanes.is_warrior_high_base_confirm_trigger(
+                        high_base_context.get("entry_trigger")
+                    )
                 ):
                     high_base_context = None
                 if pullaway_context is not None:
@@ -1937,6 +2044,7 @@ class PipelineBacktestDriver:
                                                 "ts": now,
                                                 "max_hold": float(signal.max_hold_seconds or 90),
                                                 "strategy": strategy_label,
+                                                "entry_trigger": ((signal.scan_result.criteria or {}).get("entry_trigger") if signal.scan_result else ""),
                                             }
                                             self._mb_hit_run_counts[sym] = (
                                                 self._mb_hit_run_counts.get(sym, 0) + 1
@@ -2101,17 +2209,9 @@ class PipelineBacktestDriver:
                                 guard_bars = [b for b in list(bars) if b.ts < minute_start] or list(bars)
                                 if (
                                     signal.scan_result
-                                    and (signal.scan_result.criteria or {}).get("entry_trigger")
-                                    in {
-                                        "warrior_level_pullaway",
-                                        "warrior_curl_reclaim",
-                                        "warrior_second_leg_reclaim",
-                                        "warrior_prior_runner_continuation_pullback",
-                                        "warrior_high_base_reclaim",
-                                        "warrior_stair_step_runner",
-                                        "warrior_trend_pullback_reclaim",
-                                        "warrior_equal_high_pullaway",
-                                    }
+                                    and warrior_lanes.is_warrior_entry_trigger(
+                                        (signal.scan_result.criteria or {}).get("entry_trigger")
+                                    )
                                 ):
                                     guard_bars = list(guard_bars) + [ten_sec]
                                 final_reject = self._pipeline._final_entry_quality_reject(
@@ -2156,6 +2256,7 @@ class PipelineBacktestDriver:
                                                 "ts": now,
                                                 "max_hold": float(signal.max_hold_seconds or 90),
                                                 "strategy": strategy_label,
+                                                "entry_trigger": ((signal.scan_result.criteria or {}).get("entry_trigger") if signal.scan_result else ""),
                                             }
                                             self._mb_hit_run_counts[sym] = (
                                                 self._mb_hit_run_counts.get(sym, 0) + 1
@@ -2221,10 +2322,9 @@ class PipelineBacktestDriver:
                     )
                     if (
                         reclaim_candidate is not None
-                        and reclaim_candidate.get("entry_trigger") in {
-                            "warrior_high_base_reclaim",
-                            "warrior_stair_step_runner",
-                        }
+                        and warrior_lanes.is_warrior_fresh_reclaim_trigger(
+                            reclaim_candidate.get("entry_trigger")
+                        )
                     ):
                         first_reclaim_context = {**first_pending, **reclaim_candidate}
                 if warrior and warrior_target_wins >= 1:
@@ -2250,24 +2350,6 @@ class PipelineBacktestDriver:
                             "symbol": sym,
                             "blocked_layer": "{}_prior_runner_pullback_wait".format(strategy_label),
                             "reason": "warrior prior-runner continuation pullback armed on fresh reclaim",
-                        })
-                        continue
-                    trend_pullback_context = self._warrior_trend_pullback_reclaim_context(
-                        sym,
-                        ten_sec,
-                        window_high=window_high,
-                    )
-                    if trend_pullback_context is not None:
-                        self._momentum_burst_pending[sym] = {
-                            **add_pending,
-                            "ts": now - timedelta(seconds=10),
-                            **trend_pullback_context,
-                        }
-                        self._append_rejection(result, {
-                            "ts": now.isoformat(),
-                            "symbol": sym,
-                            "blocked_layer": "{}_trend_pullback_wait".format(strategy_label),
-                            "reason": "warrior trend pullback reclaim armed on fresh reclaim",
                         })
                         continue
                     self._momentum_burst_pending.pop(sym, None)
@@ -2306,24 +2388,6 @@ class PipelineBacktestDriver:
                                 "reason": "warrior prior-runner continuation pullback armed on fresh reclaim",
                             })
                             continue
-                        trend_pullback_context = self._warrior_trend_pullback_reclaim_context(
-                            sym,
-                            ten_sec,
-                            window_high=window_high,
-                        )
-                        if trend_pullback_context is not None:
-                            self._momentum_burst_pending[sym] = {
-                                **add_pending,
-                                "ts": now - timedelta(seconds=10),
-                                **trend_pullback_context,
-                            }
-                            self._append_rejection(result, {
-                                "ts": now.isoformat(),
-                                "symbol": sym,
-                                "blocked_layer": "{}_trend_pullback_wait".format(strategy_label),
-                                "reason": "warrior trend pullback reclaim armed on fresh reclaim",
-                            })
-                            continue
                         self._append_rejection(result, {
                             "ts": now.isoformat(),
                             "symbol": sym,
@@ -2359,17 +2423,9 @@ class PipelineBacktestDriver:
                             guard_bars = [b for b in list(bars) if b.ts < minute_start] or list(bars)
                             if (
                                 signal.scan_result
-                                and (signal.scan_result.criteria or {}).get("entry_trigger")
-                                    in {
-                                        "warrior_level_pullaway",
-                                        "warrior_curl_reclaim",
-                                        "warrior_second_leg_reclaim",
-                                        "warrior_prior_runner_continuation_pullback",
-                                        "warrior_high_base_reclaim",
-                                        "warrior_stair_step_runner",
-                                        "warrior_trend_pullback_reclaim",
-                                        "warrior_equal_high_pullaway",
-                                    }
+                                and warrior_lanes.is_warrior_entry_trigger(
+                                    (signal.scan_result.criteria or {}).get("entry_trigger")
+                                )
                             ):
                                 guard_bars = list(guard_bars) + [ten_sec]
                             final_reject = self._pipeline._final_entry_quality_reject(
@@ -2428,6 +2484,7 @@ class PipelineBacktestDriver:
                                             "ts": now,
                                             "max_hold": float(signal.max_hold_seconds or 90),
                                             "strategy": strategy_label,
+                                                "entry_trigger": ((signal.scan_result.criteria or {}).get("entry_trigger") if signal.scan_result else ""),
                                         }
                                         self._mb_hit_run_counts[sym] = (
                                             self._mb_hit_run_counts.get(sym, 0) + 1
@@ -2477,17 +2534,20 @@ class PipelineBacktestDriver:
             )
             is_warrior_override = bool(
                 pend
-                and pend.get("entry_trigger") in {
-                "warrior_level_pullaway",
-                "warrior_curl_reclaim",
-                "warrior_second_leg_reclaim",
-                "warrior_prior_runner_continuation_pullback",
-                "warrior_high_base_reclaim",
-                "warrior_stair_step_runner",
-                "warrior_trend_pullback_reclaim",
-                "warrior_equal_high_pullaway",
-            }
-        )
+                and warrior_lanes.is_warrior_entry_trigger(pend.get("entry_trigger"))
+            )
+            if warrior and not is_warrior_override:
+                self._momentum_burst_pending.pop(sym, None)
+                self._append_rejection(result, {
+                    "ts": now.isoformat(),
+                    "symbol": sym,
+                    "blocked_layer": "{}_setup".format(strategy_label),
+                    "reason": (
+                        "warrior setup required: generic momentum/violent-liquid "
+                        "fallback is not a playbook lane"
+                    ),
+                })
+                continue
             if not is_warrior_override and not smooth and not (hit_run and violent_ok):
                 self._append_rejection(result, {
                     "ts": now.isoformat(),
@@ -2519,17 +2579,9 @@ class PipelineBacktestDriver:
             guard_bars = [b for b in list(bars) if b.ts < minute_start] or list(bars)
             if (
                 signal.scan_result
-                and (signal.scan_result.criteria or {}).get("entry_trigger")
-                in {
-                    "warrior_level_pullaway",
-                    "warrior_curl_reclaim",
-                    "warrior_second_leg_reclaim",
-                    "warrior_prior_runner_continuation_pullback",
-                    "warrior_high_base_reclaim",
-                    "warrior_stair_step_runner",
-                    "warrior_trend_pullback_reclaim",
-                    "warrior_equal_high_pullaway",
-                }
+                and warrior_lanes.is_warrior_entry_trigger(
+                    (signal.scan_result.criteria or {}).get("entry_trigger")
+                )
             ):
                 guard_bars = list(guard_bars) + [ten_sec]
             final_reject = self._pipeline._final_entry_quality_reject(
@@ -2594,6 +2646,7 @@ class PipelineBacktestDriver:
                 "ts": now,
                 "max_hold": float(signal.max_hold_seconds or 90),
                 "strategy": strategy_label,
+                                                "entry_trigger": ((signal.scan_result.criteria or {}).get("entry_trigger") if signal.scan_result else ""),
             }
             if hit_run:
                 self._mb_hit_run_counts[sym] = self._mb_hit_run_counts.get(sym, 0) + 1
@@ -2617,6 +2670,8 @@ class PipelineBacktestDriver:
                 "metadata": {
                     "source": "real_trades_10s_live_like",
                     "violent_liquid": bool(hit_run and violent_ok),
+                    "entry_trigger": (signal.scan_result.criteria or {}).get("entry_trigger") if signal.scan_result else "",
+                    "variant": (signal.scan_result.criteria or {}).get("variant") if signal.scan_result else "",
                     **(violent_meta if hit_run and violent_ok else {}),
                 },
             })
@@ -2724,21 +2779,7 @@ class PipelineBacktestDriver:
         window_high: float,
     ) -> Optional[Dict[str, Any]]:
         history = self._warrior_history_until(symbol, ten_sec, count=30)
-        stair_context = warrior_lanes.warrior_stair_step_runner_context(
-            ten_sec,
-            history=history,
-            window_high=window_high,
-        )
-        if stair_context is not None:
-            return stair_context
-        high_base_context = warrior_lanes.warrior_high_base_reclaim_context(
-            ten_sec,
-            history=history,
-            window_high=window_high,
-        )
-        if high_base_context is not None:
-            return high_base_context
-        return warrior_lanes.warrior_trend_pullback_reclaim_context(
+        return warrior_lanes.warrior_trend_playbook_context(
             ten_sec,
             history=history,
             window_high=window_high,
@@ -2755,6 +2796,35 @@ class PipelineBacktestDriver:
             ten_sec,
             history=self._warrior_history_until(symbol, ten_sec, count=36),
             window_high=window_high,
+        )
+
+    def _warrior_failed_burst_recovery_context(
+        self,
+        symbol: str,
+        ten_sec: Bar,
+        *,
+        failed_high: float,
+        window_high: float,
+    ) -> Optional[Dict[str, Any]]:
+        return warrior_lanes.warrior_failed_burst_recovery_context(
+            ten_sec,
+            history=self._warrior_history_until(symbol, ten_sec, count=10),
+            failed_high=failed_high,
+            window_high=window_high,
+        )
+
+    def _warrior_level_break_starter_context(
+        self,
+        symbol: str,
+        ten_sec: Bar,
+        *,
+        window_high: float,
+    ) -> Optional[Dict[str, Any]]:
+        return warrior_lanes.warrior_level_break_starter_context(
+            ten_sec,
+            history=self._warrior_history_until(symbol, ten_sec, count=1000),
+            window_high=window_high,
+            min_reclaim_price=float(self._warrior_squeeze_min_reclaim_price or 0.0),
         )
 
     def _momentum_burst_rebase_pending_after_reject(
@@ -3010,17 +3080,12 @@ class PipelineBacktestDriver:
         pattern_label = strategy_label if hit_run else "momentum_burst_scalp"
         warrior_override = bool(
             entry_context
-            and entry_context.get("entry_trigger") in {
-                "warrior_level_pullaway",
-                "warrior_curl_reclaim",
-                "warrior_second_leg_reclaim",
-                "warrior_prior_runner_continuation_pullback",
-                "warrior_high_base_reclaim",
-                "warrior_stair_step_runner",
-                "warrior_trend_pullback_reclaim",
-                "warrior_equal_high_pullaway",
-            }
+            and warrior_lanes.is_warrior_entry_trigger(
+                entry_context.get("entry_trigger")
+            )
         )
+        if strategy_label == "warrior_squeeze_playbook" and not warrior_override:
+            return None
         price = float(
             entry_context.get("entry_price_override")
             if warrior_override and entry_context is not None
@@ -3158,44 +3223,33 @@ class PipelineBacktestDriver:
                     entry_context.get("variant_override")
                     if entry_context and entry_context.get("variant_override")
                     else (
-                    "warrior_curl_reclaim_starter"
-                    if entry_context
-                    and entry_context.get("entry_trigger") == "warrior_curl_reclaim"
-                    else "warrior_second_leg_reclaim"
-                    if entry_context
-                    and entry_context.get("entry_trigger") == "warrior_second_leg_reclaim"
-                    else "warrior_prior_runner_continuation_pullback"
-                    if entry_context
-                    and entry_context.get("entry_trigger") == "warrior_prior_runner_continuation_pullback"
-                    else "warrior_high_base_reclaim"
-                    if entry_context
-                    and entry_context.get("entry_trigger") == "warrior_high_base_reclaim"
-                    else "warrior_trend_pullback_reclaim"
-                    if entry_context
-                    and entry_context.get("entry_trigger") == "warrior_trend_pullback_reclaim"
-                    else "warrior_equal_high_pullaway"
-                    if entry_context
-                    and entry_context.get("entry_trigger") == "warrior_equal_high_pullaway"
-                    else "warrior_level_pullaway_starter"
-                    if warrior_override
-                    else "warrior_reclaim_starter"
-                    if strategy_label == "warrior_squeeze_playbook"
-                    else (
-                        "post_blowoff_micro_base"
-                        if post_blowoff_micro_base
-                        else ("violent_liquid" if violent_liquid else "smooth_confirmed")
-                    )
+                        warrior_lanes.warrior_variant_for_entry_trigger(
+                            entry_context.get("entry_trigger") if entry_context else ""
+                        )
+                        if warrior_override
+                        else "warrior_reclaim_starter"
+                        if strategy_label == "warrior_squeeze_playbook"
+                        else (
+                            "post_blowoff_micro_base"
+                            if post_blowoff_micro_base
+                            else ("violent_liquid" if violent_liquid else "smooth_confirmed")
+                        )
                     )
                 ),
                 **(
-                        {
-                            "psych_level": entry_context.get("psych_level"),
-                            "entry_trigger": entry_context.get("entry_trigger"),
-                            "pullaway_level": entry_context.get("pullaway_level"),
-                            "max_pay": entry_context.get("max_pay"),
-                        }
-                        if entry_context and entry_context.get("psych_level") else {}
-                    ),
+                    {
+                        key: entry_context.get(key)
+                        for key in (
+                            "psych_level",
+                            "entry_trigger",
+                            "variant_override",
+                            "pullaway_level",
+                            "max_pay",
+                        )
+                        if entry_context.get(key) is not None
+                    }
+                    if entry_context else {}
+                ),
             },
             bars=list(closed_bars[-30:]) + [bar],
         )
@@ -3317,6 +3371,17 @@ class PipelineBacktestDriver:
     ) -> None:
         if signal.action not in (SignalAction.ENTER_LONG, SignalAction.REENTER_LONG):
             return
+        if (
+            self._pipeline._symbol_entry_counts.get(signal.symbol, 0)
+            >= self._pipeline._max_entries_per_symbol
+        ):
+            self._append_rejection(result, {
+                "ts": bar.ts.isoformat(),
+                "symbol": signal.symbol,
+                "blocked_layer": "timed_entry_risk",
+                "reason": "max entries reached",
+            })
+            return
         final_reject = self._pipeline._final_entry_quality_reject(
             signal,
             universe=universe,
@@ -3414,6 +3479,18 @@ class PipelineBacktestDriver:
             live = float(bar.close or signal.entry_price or anchor)
         except (TypeError, ValueError):
             live = anchor
+        pattern = ""
+        scanner = ""
+        if signal.scan_result is not None:
+            pattern = str(criteria.get("pattern") or "")
+            scanner = str(signal.scan_result.scanner_name or "")
+        if pattern == "vwap_pullback" or scanner == "vwap_pullback":
+            vwap_anchor = self._vwap_pullback_extension_anchor(criteria)
+            if vwap_anchor > 0 and live > vwap_anchor * 1.025:
+                return "late VWAP pullback release: ${:.4f} too extended from base ${:.4f} (max 2.5%)".format(
+                    live,
+                    vwap_anchor,
+                )
         max_chase_pct = (
             self._pipeline._entry_chase_pct_high
             if anchor >= self._pipeline._entry_chase_price_tier
@@ -3430,6 +3507,26 @@ class PipelineBacktestDriver:
             anchor,
             max_chase_pct * 100.0,
         )
+
+    @staticmethod
+    def _vwap_pullback_extension_anchor(criteria: dict) -> float:
+        anchors = []
+        for key in (
+            "setup_anchor",
+            "base_high",
+            "reclaim_level",
+            "breakout_level",
+            "vwap",
+            "reclaim_vwap",
+            "fresh_base_high",
+        ):
+            try:
+                value = float(criteria.get(key) or 0.0)
+            except (TypeError, ValueError):
+                value = 0.0
+            if value > 0:
+                anchors.append(value)
+        return max(anchors) if anchors else 0.0
 
     def _record_cycle(
         self,

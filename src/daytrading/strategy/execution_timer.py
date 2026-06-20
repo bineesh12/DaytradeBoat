@@ -451,6 +451,22 @@ class ExecutionTimer:
 
         pattern = str(criteria.get("pattern", ""))
         scanner = str(hit.scanner_name or "") if hit is not None else ""
+        if pattern == "early_vwap_reclaim_scout" or scanner == "early_vwap_reclaim_scout":
+            open_ = float(bar.open or 0.0)
+            high = float(bar.high or 0.0)
+            rng = high - low
+            if rng <= 0:
+                return "early VWAP reclaim 10s bar has no range"
+            close_location = (close - low) / rng
+            upper_wick = (high - max(open_, close)) / rng
+            if close_location < 0.55:
+                return "early VWAP reclaim weak 10s close ({:.0%} location)".format(
+                    close_location,
+                )
+            if upper_wick > 0.45:
+                return "early VWAP reclaim upper wick too large ({:.0%} of range)".format(
+                    upper_wick,
+                )
         if pattern == "opening_range_breakout" or scanner == "opening_range_breakout":
             setup_price = ExecutionTimer._criteria_float(criteria, "close")
             if setup_price is None or setup_price <= 0:

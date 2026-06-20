@@ -117,6 +117,31 @@ def _hod_reclaim_signal(symbol: str = "SUGP", price: float = 2.87) -> TradeSigna
     )
 
 
+def _vwap_pullback_signal(symbol: str = "VWAP", price: float = 4.08) -> TradeSignal:
+    return TradeSignal(
+        symbol=symbol,
+        action=SignalAction.ENTER_LONG,
+        quantity=100,
+        entry_price=price,
+        stop_loss=3.88,
+        reason="VWAP Pullback",
+        scan_result=ScanResult(
+            symbol=symbol,
+            scanner_name="vwap_pullback",
+            ts=datetime.now(timezone.utc),
+            score=90.0,
+            criteria={
+                "pattern": "vwap_pullback",
+                "close": price,
+                "vwap": 4.00,
+                "base_high": 4.05,
+                "pullback_low": 3.90,
+                "stop_price": 3.88,
+            },
+        ),
+    )
+
+
 def _runner(live_price: float) -> AlpacaRunner:
     runner = AlpacaRunner.__new__(AlpacaRunner)
     runner._live_prices = lambda symbols: {symbols[0]: live_price}
@@ -190,6 +215,28 @@ def test_timed_entry_chase_guard_rejects_late_subfive_hod_reclaim() -> None:
     assert reason is not None
     assert "ran 3.4%" in reason
     assert "max 2.5%" in reason
+
+
+def test_timed_entry_chase_guard_rejects_vwap_pullback_extended_from_base() -> None:
+    runner = _runner(4.18)
+
+    reason = runner._timed_entry_chase_reject(
+        _vwap_pullback_signal(price=4.08),
+        _bar(symbol="VWAP", close=4.18),
+    )
+
+    assert reason == "live price 4.1800 too extended from VWAP pullback base 4.0500 (max 2.5%)"
+
+
+def test_timed_entry_chase_guard_allows_vwap_pullback_near_base() -> None:
+    runner = _runner(4.14)
+
+    reason = runner._timed_entry_chase_reject(
+        _vwap_pullback_signal(price=4.08),
+        _bar(symbol="VWAP", close=4.14),
+    )
+
+    assert reason is None
 
 
 def test_shared_entry_quality_records_structured_decision(monkeypatch) -> None:

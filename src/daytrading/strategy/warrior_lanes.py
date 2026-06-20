@@ -5,16 +5,195 @@ from typing import Any, Dict, Optional, Sequence
 from daytrading.models import Bar
 
 
+WARRIOR_ENTRY_TRIGGERS = {
+    "warrior_level_pullaway",
+    "warrior_curl_reclaim",
+    "warrior_second_leg_reclaim",
+    "warrior_prior_runner_continuation_pullback",
+    "warrior_first_pullback_reclaim",
+    "warrior_first_impulse_scalp",
+    "warrior_high_base_reclaim",
+    "warrior_stair_step_runner",
+    "warrior_smooth_hod_reclaim",
+    "warrior_trend_pullback_reclaim",
+    "warrior_equal_high_pullaway",
+    "warrior_level_break_starter",
+    "warrior_failed_burst_recovery",
+}
+
+
 WARRIOR_LATE_REENTRY_TRIGGERS = {
     "warrior_level_pullaway",
     "warrior_curl_reclaim",
     "warrior_second_leg_reclaim",
     "warrior_prior_runner_continuation_pullback",
+    "warrior_first_pullback_reclaim",
+    "warrior_first_impulse_scalp",
     "warrior_high_base_reclaim",
     "warrior_stair_step_runner",
+    "warrior_smooth_hod_reclaim",
     "warrior_trend_pullback_reclaim",
     "warrior_equal_high_pullaway",
 }
+
+
+WARRIOR_INITIAL_STARTER_TRIGGERS = {
+    "warrior_level_break_starter",
+    "warrior_first_pullback_reclaim",
+    "warrior_high_base_reclaim",
+    "warrior_smooth_hod_reclaim",
+}
+
+WARRIOR_HIGH_BASE_CONFIRM_TRIGGERS = {
+    "warrior_first_pullback_reclaim",
+    "warrior_high_base_reclaim",
+    "warrior_smooth_hod_reclaim",
+}
+
+WARRIOR_FRESH_RECLAIM_TRIGGERS = {
+    "warrior_first_pullback_reclaim",
+    "warrior_first_impulse_scalp",
+    "warrior_high_base_reclaim",
+    "warrior_stair_step_runner",
+    "warrior_smooth_hod_reclaim",
+}
+
+
+def is_warrior_entry_trigger(value: object) -> bool:
+    return str(value or "") in WARRIOR_ENTRY_TRIGGERS
+
+
+def is_warrior_initial_starter_trigger(value: object) -> bool:
+    return str(value or "") in WARRIOR_INITIAL_STARTER_TRIGGERS
+
+
+def is_warrior_high_base_confirm_trigger(value: object) -> bool:
+    return str(value or "") in WARRIOR_HIGH_BASE_CONFIRM_TRIGGERS
+
+
+def is_warrior_fresh_reclaim_trigger(value: object) -> bool:
+    return str(value or "") in WARRIOR_FRESH_RECLAIM_TRIGGERS
+
+
+def warrior_variant_for_entry_trigger(value: object) -> str:
+    trigger = str(value or "")
+    if trigger == "warrior_level_pullaway":
+        return "warrior_level_pullaway_starter"
+    if trigger == "warrior_curl_reclaim":
+        return "warrior_curl_reclaim_starter"
+    if trigger in WARRIOR_ENTRY_TRIGGERS:
+        return trigger
+    return "warrior_reclaim_starter"
+
+
+def classify_warrior_trend_lane(
+    latest_bar: Bar,
+    *,
+    history: Sequence[Bar],
+    window_high: float,
+) -> str:
+    """Pick exactly one trend/pullback Warrior lane for the current 10s bar.
+
+    The individual lane functions still own the detailed safety checks. This
+    classifier is intentionally coarse: it prevents a setup from silently falling
+    through several unrelated lane families and makes the playbook easier to
+    reason about when we tune symbols such as CLWT, BJDX, SPRC, or LABT.
+    """
+    bars = [bar for bar in history if float(bar.close or 0.0) > 0][-30:]
+    if len(bars) < 6:
+        return ""
+    high = float(latest_bar.high or 0.0)
+    low = float(latest_bar.low or 0.0)
+    open_ = float(latest_bar.open or 0.0)
+    close = float(latest_bar.close or 0.0)
+    if close <= open_ or close <= 0 or high <= 0 or low <= 0:
+        return ""
+
+    prior = bars[:-1]
+    prior_high = max((float(bar.high or 0.0) for bar in prior), default=0.0)
+    local_low = min((float(bar.low or 0.0) for bar in bars), default=0.0)
+    runner_high = max(float(window_high or 0.0), prior_high, high)
+    if prior_high <= 0 or local_low <= 0 or runner_high <= 0:
+        return ""
+
+    local_move = runner_high / local_low - 1.0
+    near_hod = close >= runner_high * 0.86
+    tight_near_hod = close >= runner_high * 0.94
+    price = close
+
+    if price >= 3.25 and high >= 4.0 and local_move >= 0.45 and tight_near_hod:
+        return "warrior_first_impulse_scalp"
+    if price >= 8.0 and local_move >= 0.08 and tight_near_hod:
+        return "warrior_stair_step_runner"
+    if 1.50 <= price <= 3.50 and local_move >= 0.25 and near_hod:
+        return "warrior_first_pullback_reclaim"
+    if price >= 7.0 and tight_near_hod:
+        return "warrior_high_base_reclaim"
+    if 3.0 <= price <= 7.25 and near_hod:
+        return "warrior_smooth_hod_reclaim"
+    if price >= 4.0:
+        return "warrior_trend_pullback_reclaim"
+    return ""
+
+
+def warrior_trend_playbook_context(
+    latest_bar: Bar,
+    *,
+    history: Sequence[Bar],
+    window_high: float,
+) -> Optional[Dict[str, Any]]:
+    """Dispatch a trend/pullback Warrior setup through compatible lanes.
+
+    The classifier picks the primary lane first, but some fast runners can look
+    like one lane before the detailed checks prove a different, compatible lane.
+    Keep cheap first-pullback isolated; allow higher-price runner lanes to fall
+    through only within the same continuation family.
+    """
+    bars = [bar for bar in history if float(bar.close or 0.0) > 0][-30:]
+    lane = classify_warrior_trend_lane(
+        latest_bar,
+        history=bars,
+        window_high=window_high,
+    )
+    detectors = {
+        "warrior_high_base_reclaim": warrior_high_base_reclaim_context,
+        "warrior_stair_step_runner": warrior_stair_step_runner_context,
+        "warrior_smooth_hod_reclaim": warrior_smooth_hod_reclaim_context,
+        "warrior_first_impulse_scalp": warrior_first_impulse_scalp_context,
+        "warrior_first_pullback_reclaim": warrior_first_pullback_reclaim_context,
+        "warrior_trend_pullback_reclaim": warrior_trend_pullback_reclaim_context,
+    }
+    fallback_order = {
+        "warrior_first_pullback_reclaim": ("warrior_first_pullback_reclaim",),
+        "warrior_first_impulse_scalp": (
+            "warrior_first_impulse_scalp",
+            "warrior_smooth_hod_reclaim",
+            "warrior_stair_step_runner",
+            "warrior_high_base_reclaim",
+            "warrior_trend_pullback_reclaim",
+        ),
+        "warrior_high_base_reclaim": (
+            "warrior_high_base_reclaim",
+            "warrior_stair_step_runner",
+            "warrior_trend_pullback_reclaim",
+        ),
+        "warrior_stair_step_runner": (
+            "warrior_stair_step_runner",
+            "warrior_high_base_reclaim",
+            "warrior_trend_pullback_reclaim",
+        ),
+        "warrior_smooth_hod_reclaim": (
+            "warrior_smooth_hod_reclaim",
+            "warrior_trend_pullback_reclaim",
+        ),
+        "warrior_trend_pullback_reclaim": ("warrior_trend_pullback_reclaim",),
+    }
+    for candidate in fallback_order.get(lane, ()):
+        detector = detectors[candidate]
+        context = detector(latest_bar, history=bars, window_high=window_high)
+        if context is not None:
+            return context
+    return None
 
 
 def warrior_late_reentry_reject(
@@ -248,6 +427,227 @@ def first_starter_has_proof_hold(history: Sequence[Bar], proof_level: float) -> 
     return len(hold_bars) >= 2
 
 
+def recent_wide_red_fakeout(history: Sequence[Bar]) -> bool:
+    bars = [bar for bar in history if float(bar.close or 0.0) > 0]
+    if len(bars) < 4:
+        return False
+    prior = bars[:-1]
+    start = max(0, len(prior) - 4)
+    for idx in range(start, len(prior)):
+        bar = prior[idx]
+        bar_close = float(bar.close or 0.0)
+        bar_open = float(bar.open or 0.0)
+        if bar_close <= 0 or bar_close >= bar_open:
+            continue
+        preceding = prior[max(0, idx - 3):idx]
+        preceding_volumes = [float(prev.volume or 0.0) for prev in preceding]
+        avg_prior_volume = (
+            sum(preceding_volumes) / len(preceding_volumes)
+            if preceding_volumes else 0.0
+        )
+        bar_range = float(bar.high or 0.0) - float(bar.low or 0.0)
+        if bar_range <= 0:
+            continue
+        body_pct = (bar_open - bar_close) / bar_close
+        range_pct = bar_range / bar_close
+        close_loc = (bar_close - float(bar.low or 0.0)) / bar_range
+        volume_gate = max(1.0, avg_prior_volume * 1.20)
+        if (
+            body_pct > 0.045
+            and range_pct > 0.12
+            and close_loc < 0.35
+            and float(bar.volume or 0.0) >= volume_gate
+        ):
+            return True
+    return False
+
+
+def warrior_failed_burst_recovery_context(
+    latest_bar: Bar,
+    *,
+    history: Sequence[Bar],
+    failed_high: float,
+    window_high: float,
+) -> Optional[Dict[str, Any]]:
+    """Allow one reduced Warrior retry only after a stopped burst proves strength again."""
+    failed_high = float(failed_high or 0.0)
+    if failed_high <= 0:
+        return None
+    open_ = float(latest_bar.open or 0.0)
+    high = float(latest_bar.high or 0.0)
+    low = float(latest_bar.low or 0.0)
+    close = float(latest_bar.close or 0.0)
+    volume = float(latest_bar.volume or 0.0)
+    if open_ <= 0 or high <= 0 or close <= 0:
+        return None
+    if close <= open_:
+        return None
+    rng = high - low
+    if rng <= 0:
+        return None
+    close_location = (close - low) / rng
+    if close_location < 0.72:
+        return None
+    recovery_level = max(failed_high * 1.035, float(window_high or 0.0) * 1.002)
+    if high < recovery_level or close < failed_high * 1.01:
+        return None
+    history = [bar for bar in history if float(bar.close or 0.0) > 0]
+    if len(history) < 6:
+        return None
+    if recent_wide_red_fakeout(history[-6:]):
+        return None
+    prior = history[-7:-1]
+    avg_prior_volume = (
+        sum(float(bar.volume or 0.0) for bar in prior) / len(prior)
+        if prior else 0.0
+    )
+    if volume < max(90_000.0, avg_prior_volume * 0.85):
+        return None
+    recent_lows = [float(bar.low or 0.0) for bar in history[-5:-1] if float(bar.low or 0.0) > 0]
+    structural_low = min(recent_lows, default=low)
+    entry_price = close
+    max_pay = round(recovery_level * 1.035, 4)
+    if low > max_pay:
+        return None
+    entry_price = min(entry_price, max_pay)
+    raw_risk = max(entry_price - structural_low, entry_price * 0.018, 0.08)
+    risk = min(raw_risk, entry_price * 0.055)
+    if risk <= 0 or risk > entry_price * 0.06:
+        return None
+    stop_price = round(entry_price - risk, 4)
+    target_price = round(entry_price + risk * 1.35, 4)
+    return {
+        "entry_trigger": "warrior_failed_burst_recovery",
+        "variant_override": "warrior_failed_burst_recovery",
+        "psych_level": round(recovery_level, 4),
+        "pullaway_level": round(recovery_level, 4),
+        "failed_high": round(failed_high, 4),
+        "max_pay": max_pay,
+        "entry_price_override": round(entry_price, 4),
+        "stop_price_override": stop_price,
+        "target_price_override": target_price,
+        "max_hold_seconds_override": 90.0,
+        "reward_risk": 1.35,
+        "rr_note_override": (
+            "warrior failed-burst recovery fresh high=${:.2f} "
+            "failed_high=${:.2f} risk={:.1f}% target=${:.2f}"
+        ).format(
+            recovery_level,
+            failed_high,
+            risk / entry_price * 100.0 if entry_price else 0.0,
+            target_price,
+        ),
+        "skip_unstable_confirm_stop_check": True,
+    }
+
+
+def warrior_level_break_starter_context(
+    latest_bar: Bar,
+    *,
+    history: Sequence[Bar],
+    window_high: float,
+    min_reclaim_price: float,
+) -> Optional[Dict[str, Any]]:
+    """Starter for the first clean Warrior break through a major level.
+
+    This catches the Warrior-style $3.50/$4.00 break early, but only after a
+    strong 10s close and real volume. It is intentionally separate from the
+    generic pending-confirm path, which can enter one 10s bar late.
+    """
+    open_ = float(latest_bar.open or 0.0)
+    high = float(latest_bar.high or 0.0)
+    low = float(latest_bar.low or 0.0)
+    close = float(latest_bar.close or 0.0)
+    volume = float(latest_bar.volume or 0.0)
+    if open_ <= 0 or high <= 0 or close <= 0:
+        return None
+    if close <= open_:
+        return None
+    rng = high - low
+    if rng <= 0:
+        return None
+    close_location = (close - low) / rng
+    if close_location < 0.64:
+        return None
+    if volume < 100_000:
+        return None
+    step = 0.5 if close < 10.0 else 1.0
+    min_level = float(min_reclaim_price or 0.0)
+    level_reclaim = (
+        min_level > 0
+        and float(window_high or 0.0) <= min_level * 1.01
+        and high >= min_level
+    )
+    if level_reclaim:
+        crossed_level = min_level
+    else:
+        crossed_level = (int(float(window_high or 0.0) / step) + 1) * step
+        crossed_level = max(crossed_level, min_level)
+    if crossed_level <= 0:
+        return None
+    if not level_reclaim and float(window_high or 0.0) >= crossed_level:
+        return None
+    if high < crossed_level or close < crossed_level * 0.995:
+        return None
+    history = [bar for bar in history if float(bar.close or 0.0) > 0]
+    if len(history) < 6:
+        return None
+    if recent_wide_red_fakeout(history[-6:]):
+        return None
+    prior = history[-7:-1]
+    avg_prior_volume = (
+        sum(float(bar.volume or 0.0) for bar in prior) / len(prior)
+        if prior else 0.0
+    )
+    if volume < max(100_000.0, avg_prior_volume * 0.75):
+        return None
+    session_lows = [
+        float(bar.low or 0.0)
+        for bar in history
+        if float(bar.low or 0.0) > 0
+    ]
+    session_low = min(session_lows, default=low)
+    extended_from_session_low = (
+        close / session_low - 1.0 if session_low > 0 else 0.0
+    )
+    if extended_from_session_low > 0.75 and volume < 300_000:
+        return None
+    recent_lows = [float(bar.low or 0.0) for bar in history[-5:-1] if float(bar.low or 0.0) > 0]
+    structural_low = min(recent_lows, default=low)
+    max_pay = round(crossed_level * 1.035, 4)
+    if low > max_pay:
+        return None
+    entry_price = min(close, max_pay)
+    raw_risk = max(entry_price - structural_low, entry_price * 0.018, 0.08)
+    risk = min(raw_risk, entry_price * 0.055)
+    if risk <= 0 or risk > entry_price * 0.06:
+        return None
+    stop_price = round(entry_price - risk, 4)
+    target_price = round(entry_price + risk * 1.35, 4)
+    return {
+        "entry_trigger": "warrior_level_break_starter",
+        "variant_override": "warrior_level_break_starter",
+        "psych_level": round(crossed_level, 4),
+        "pullaway_level": round(crossed_level, 4),
+        "max_pay": max_pay,
+        "entry_price_override": round(entry_price, 4),
+        "stop_price_override": stop_price,
+        "target_price_override": target_price,
+        "max_hold_seconds_override": 90.0,
+        "reward_risk": 1.35,
+        "rr_note_override": (
+            "warrior level-break starter level=${:.2f} "
+            "cap=${:.2f} risk={:.1f}% target=${:.2f}"
+        ).format(
+            crossed_level,
+            max_pay,
+            risk / entry_price * 100.0 if entry_price else 0.0,
+            target_price,
+        ),
+        "skip_unstable_confirm_stop_check": True,
+    }
+
+
 def warrior_squeeze_pullaway_context(
     latest_bar: Bar,
     pending_breakout: Dict[str, Any],
@@ -306,6 +706,12 @@ def warrior_squeeze_pullaway_context(
         and close >= proof_level * 1.08
         and close_location >= 0.62
     )
+    if (
+        clwt_fast_pullaway
+        and rejection_reason == "first explosive 10s spike"
+        and recent_wide_red_fakeout(history)
+    ):
+        return None
     if proof_level >= 5.0 and range_pct < 0.15 and close_location < 0.72:
         return None
     warrior_reclaim_trigger = pending_breakout.get("entry_trigger") in {
@@ -781,6 +1187,265 @@ def warrior_trend_pullback_reclaim_context(
     }
 
 
+def warrior_first_impulse_scalp_context(
+    latest_bar: Bar,
+    *,
+    history: Sequence[Bar],
+    window_high: float,
+) -> Optional[Dict[str, Any]]:
+    """Detect NCT-style first impulse scalps.
+
+    This is intentionally not a pullback/reclaim lane. It is for the first
+    explosive momentum burst after a stock is no longer too cheap, with a
+    reduced-size stop-limit style starter and a fast 1R target. The entry still
+    waits for the existing next-10s confirmation path before execution.
+    """
+    history = [bar for bar in history if float(bar.close or 0.0) > 0][-16:]
+    if len(history) < 6:
+        return None
+
+    high = float(latest_bar.high or 0.0)
+    low = float(latest_bar.low or 0.0)
+    open_ = float(latest_bar.open or 0.0)
+    close = float(latest_bar.close or 0.0)
+    volume = float(latest_bar.volume or 0.0)
+    if close <= 0 or high <= 0 or low <= 0 or close <= open_:
+        return None
+    if close < 3.25 or high < 4.0:
+        return None
+
+    prior = history[:-1]
+    prior_high = max((float(bar.high or 0.0) for bar in prior[-8:]), default=0.0)
+    prior_low = min((float(bar.low or 0.0) for bar in prior[-8:]), default=0.0)
+    prior_close = float(prior[-1].close or 0.0) if prior else 0.0
+    if prior_high <= 0 or prior_low <= 0 or prior_close <= 0:
+        return None
+    if float(window_high or 0.0) > 0 and high <= float(window_high or 0.0) * 1.003:
+        return None
+
+    impulse_from_prior = (high - prior_high) / prior_high
+    close_thrust = (close - prior_close) / prior_close
+    day_move = (close - prior_low) / prior_low
+    first_spike = impulse_from_prior >= 0.12 and close_thrust >= 0.10 and day_move >= 0.35
+    second_push = impulse_from_prior >= 0.05 and close_thrust >= 0.02 and day_move >= 0.65
+    if not (first_spike or second_push):
+        return None
+
+    rng = high - low
+    if rng <= 0:
+        return None
+    range_pct = rng / close
+    close_location = (close - low) / rng
+    min_close_location = 0.62 if first_spike else 0.42
+    if range_pct > 0.32 or close_location < min_close_location:
+        return None
+
+    prior_volumes = [float(bar.volume or 0.0) for bar in prior[-6:]]
+    avg_prior_volume = sum(prior_volumes) / len(prior_volumes) if prior_volumes else 0.0
+    recent_volume = sum(float(bar.volume or 0.0) for bar in history[-3:])
+    volume_floor = avg_prior_volume * (2.2 if first_spike else 1.1)
+    recent_floor = avg_prior_volume * (3.0 if first_spike else 3.0)
+    if volume < max(85_000.0, volume_floor):
+        return None
+    if recent_volume < max(175_000.0, recent_floor):
+        return None
+
+    # Do not arm if the stock already printed a heavy red rejection before the
+    # impulse; that is the cheap/choppy warning the Warrior playbook avoids.
+    # Look beyond the immediate pause so a dump-then-ramp sequence cannot sneak
+    # in just because the last few bars curled.
+    for bar in prior[-6:]:
+        bar_close = float(bar.close or 0.0)
+        bar_open = float(bar.open or 0.0)
+        if bar_close <= 0 or bar_close >= bar_open:
+            continue
+        bar_range = float(bar.high or 0.0) - float(bar.low or 0.0)
+        body_pct = (bar_open - bar_close) / bar_close
+        range_pct = bar_range / bar_close if bar_close > 0 else 0.0
+        close_loc = (
+            (bar_close - float(bar.low or 0.0)) / bar_range
+            if bar_range > 0 else 0.0
+        )
+        volume_gate = max(20_000.0, avg_prior_volume * 0.45)
+        if body_pct > 0.055 and close_loc < 0.45 and float(bar.volume or 0.0) >= volume_gate:
+            return None
+        if (
+            body_pct > 0.045
+            and range_pct > 0.12
+            and close_loc < 0.35
+            and float(bar.volume or 0.0) >= avg_prior_volume * 1.20
+        ):
+            return None
+
+    entry_price = round(close, 4)
+    risk = max(entry_price * 0.026, 0.12)
+    # If the impulse bar itself is too stretched for a tactical starter, skip.
+    if risk > entry_price * 0.04:
+        return None
+    stop_price = round(entry_price - risk, 4)
+    target_price = round(entry_price + risk, 4)
+    return {
+        "entry_trigger": "warrior_first_impulse_scalp",
+        "variant_override": "warrior_first_impulse_scalp",
+        "psych_level": round(max(prior_high, entry_price), 4),
+        "pullaway_level": round(prior_high, 4),
+        "impulse_high": round(high, 4),
+        "impulse_from_prior_pct": round(impulse_from_prior * 100.0, 2),
+        "day_move_pct": round(day_move * 100.0, 2),
+        "max_pay": round(entry_price * 1.03, 4),
+        "entry_price_override": entry_price,
+        "stop_price_override": stop_price,
+        "target_price_override": target_price,
+        "max_hold_seconds_override": 45.0,
+        "reward_risk": 1.0,
+        "size_factor": 0.20,
+        "rr_note_override": (
+            "warrior first-impulse scalp prior_high=${:.2f} "
+            "impulse={:.1f}% cap=${:.2f} target=${:.2f}"
+        ).format(prior_high, impulse_from_prior * 100.0, entry_price * 1.03, target_price),
+        "skip_unstable_confirm_stop_check": True,
+    }
+
+
+def warrior_first_pullback_reclaim_context(
+    latest_bar: Bar,
+    *,
+    history: Sequence[Bar],
+    window_high: float,
+) -> Optional[Dict[str, Any]]:
+    """Detect the first controlled pullback/reclaim after a cheap-name burst.
+
+    This is not a "cheap stock" strategy. It is the Warrior first-pullback
+    pattern with stricter risk/liquidity guardrails for $1.50-$3.50 names:
+    ignore the first spike, require a real burst, then buy only when the first
+    10s base reclaims on returning volume while still holding VWAP/EMA support.
+    """
+    history = [bar for bar in history if float(bar.close or 0.0) > 0][-24:]
+    if len(history) < 10:
+        return None
+
+    high = float(latest_bar.high or 0.0)
+    low = float(latest_bar.low or 0.0)
+    open_ = float(latest_bar.open or 0.0)
+    close = float(latest_bar.close or 0.0)
+    volume = float(latest_bar.volume or 0.0)
+    if close <= 0 or high <= 0 or low <= 0 or close <= open_:
+        return None
+    if close < 1.50 or close > 3.50:
+        return None
+
+    prior = history[:-1]
+    prior_high = max((float(bar.high or 0.0) for bar in prior), default=0.0)
+    day_low = min((float(bar.low or 0.0) for bar in history), default=0.0)
+    burst_high = max(float(window_high or 0.0), prior_high, high)
+    if prior_high <= 0 or day_low <= 0 or burst_high <= 0:
+        return None
+    # Keep CLWT-style cheap first legs out of this lane. Sub-$2.20 entries
+    # need proof that the tape already reclaimed a stronger $2.25-ish area.
+    if close < 2.20 and burst_high < 2.25:
+        return None
+
+    burst_move = burst_high / day_low - 1.0
+    if burst_move < 0.35:
+        return None
+
+    base_bars = history[-7:-1]
+    if len(base_bars) < 5:
+        return None
+    base_high = max(float(bar.high or 0.0) for bar in base_bars)
+    base_low = min(float(bar.low or 0.0) for bar in base_bars)
+    if base_high <= 0 or base_low <= 0:
+        return None
+
+    pullback_pct = (burst_high - base_low) / burst_high
+    if pullback_pct < 0.045 or pullback_pct > 0.32:
+        return None
+    base_range_pct = (base_high - base_low) / close
+    if base_range_pct > 0.22:
+        return None
+    if high < base_high or close < base_high * 0.995:
+        return None
+
+    rng = high - low
+    if rng <= 0:
+        return None
+    close_location = (close - low) / rng
+    range_pct = rng / close
+    if close_location < 0.58 or range_pct > 0.16:
+        return None
+
+    total_volume = sum(float(bar.volume or 0.0) for bar in history)
+    if total_volume <= 0:
+        return None
+    vwap = sum(
+        ((float(bar.high or 0.0) + float(bar.low or 0.0) + float(bar.close or 0.0)) / 3.0)
+        * float(bar.volume or 0.0)
+        for bar in history
+    ) / total_volume
+    ema = float(history[0].close or 0.0)
+    alpha = 2.0 / 10.0
+    for bar in history[1:]:
+        ema = float(bar.close or 0.0) * alpha + ema * (1.0 - alpha)
+    if close < max(vwap * 0.99, ema * 0.985):
+        return None
+    if base_low < vwap * 0.88:
+        return None
+
+    avg_base_volume = sum(float(bar.volume or 0.0) for bar in base_bars) / len(base_bars)
+    recent_volume = sum(float(bar.volume or 0.0) for bar in history[-3:])
+    if volume < max(55_000.0, avg_base_volume * 0.75):
+        return None
+    if recent_volume < max(150_000.0, avg_base_volume * 1.25):
+        return None
+
+    heavy_red = any(
+        float(bar.close or 0.0) < float(bar.open or 0.0)
+        and (float(bar.open or 0.0) - float(bar.close or 0.0)) / float(bar.close or 1.0) > 0.065
+        and float(bar.volume or 0.0) >= avg_base_volume * 1.25
+        for bar in history[-6:-1]
+    )
+    if heavy_red:
+        return None
+
+    reclaim_level = base_high
+    max_pay = round(reclaim_level * 1.025, 4)
+    if low > max_pay:
+        return None
+    entry_price = round(min(close, max_pay), 4)
+    stop_anchor = max(base_low, vwap * 0.94, ema * 0.94)
+    risk = max(entry_price - (stop_anchor - max(0.025, entry_price * 0.006)), entry_price * 0.022, 0.07)
+    risk = min(risk, entry_price * 0.058)
+    if risk <= 0:
+        return None
+    stop_price = round(entry_price - risk, 4)
+    target_price = round(entry_price + risk * 1.35, 4)
+    return {
+        "entry_trigger": "warrior_first_pullback_reclaim",
+        "variant_override": "warrior_first_pullback_reclaim",
+        "psych_level": round(reclaim_level, 4),
+        "pullaway_level": round(reclaim_level, 4),
+        "base_high": round(base_high, 4),
+        "base_low": round(base_low, 4),
+        "burst_high": round(burst_high, 4),
+        "burst_move_pct": round(burst_move * 100.0, 2),
+        "pullback_pct": round(pullback_pct * 100.0, 2),
+        "vwap": round(vwap, 4),
+        "ema9": round(ema, 4),
+        "max_pay": max_pay,
+        "entry_price_override": entry_price,
+        "stop_price_override": stop_price,
+        "target_price_override": target_price,
+        "max_hold_seconds_override": 90.0,
+        "reward_risk": 1.35,
+        "size_factor": 0.20,
+        "rr_note_override": (
+            "warrior first pullback reclaim base=${:.2f}-${:.2f} "
+            "burst={:.1f}% pullback={:.1f}% cap=${:.2f} target=${:.2f}"
+        ).format(base_low, base_high, burst_move * 100.0, pullback_pct * 100.0, max_pay, target_price),
+        "skip_unstable_confirm_stop_check": True,
+    }
+
+
 def warrior_high_base_reclaim_context(
     latest_bar: Bar,
     *,
@@ -1058,6 +1723,136 @@ def warrior_stair_step_runner_context(
             "warrior stair-step runner base=${:.2f}-${:.2f} "
             "pullback={:.1f}% vwap=${:.2f} cap=${:.2f} target=${:.2f}"
         ).format(base_low, base_high, pullback_pct * 100.0, vwap, max_pay, target_price),
+        "skip_unstable_confirm_stop_check": True,
+    }
+
+
+def warrior_smooth_hod_reclaim_context(
+    latest_bar: Bar,
+    *,
+    history: Sequence[Bar],
+    window_high: float,
+) -> Optional[Dict[str, Any]]:
+    """Detect BJDX-style smooth HOD reclaims.
+
+    This lane is for a steady premarket grinder that holds above VWAP/EMA-like
+    support and reclaims HOD after controlled pullbacks. It is intentionally
+    less violent than the CLWT/UTSI squeeze lanes and should not trade a topping
+    wick or wide dump.
+    """
+    history = [bar for bar in history if float(bar.close or 0.0) > 0][-30:]
+    if len(history) < 14:
+        return None
+    high = float(latest_bar.high or 0.0)
+    low = float(latest_bar.low or 0.0)
+    open_ = float(latest_bar.open or 0.0)
+    close = float(latest_bar.close or 0.0)
+    volume = float(latest_bar.volume or 0.0)
+    if close <= open_ or close <= 0 or high <= 0:
+        return None
+
+    prior = history[:-1]
+    prior_high = max((float(bar.high or 0.0) for bar in prior[-18:]), default=0.0)
+    day_low = min((float(bar.low or 0.0) for bar in history), default=0.0)
+    hod = max(float(window_high or 0.0), prior_high)
+    if prior_high <= 0 or day_low <= 0 or hod <= 0:
+        return None
+    # Keep this lane scoped to lower-price smooth grinders. Higher-priced
+    # squeezes such as CAST have their own Warrior paths; using this gentler
+    # HOD-reclaim lane there over-trades the trend and gives back profit.
+    if close < 3.0 or close > 7.25:
+        return None
+    # The first impulse can be older than the 30-bar context on smooth grinders.
+    # Require a meaningful local trend, but do not demand that the full initial
+    # launch is still inside this short confirmation window.
+    if hod < day_low * 1.12:
+        return None
+
+    base_bars = history[-9:-1]
+    if len(base_bars) < 6:
+        return None
+    base_high = max(float(bar.high or 0.0) for bar in base_bars)
+    base_low = min(float(bar.low or 0.0) for bar in base_bars)
+    if base_high <= 0 or base_low <= 0:
+        return None
+
+    # Smooth HOD reclaim means the stock has been digesting near its highs, not
+    # buying the first vertical print or a deep washout bounce.
+    if base_low < hod * 0.86:
+        return None
+    base_range_pct = (base_high - base_low) / close if close > 0 else 999.0
+    if base_range_pct > 0.115:
+        return None
+    if high < prior_high * 0.998 or close < base_high * 0.995:
+        return None
+
+    rng = high - low
+    if rng <= 0:
+        return None
+    close_location = (close - low) / rng
+    range_pct = rng / close
+    if close_location < 0.58 or range_pct > 0.085:
+        return None
+
+    total_volume = sum(float(bar.volume or 0.0) for bar in history)
+    if total_volume <= 0:
+        return None
+    vwap = sum(
+        ((float(bar.high or 0.0) + float(bar.low or 0.0) + float(bar.close or 0.0)) / 3.0)
+        * float(bar.volume or 0.0)
+        for bar in history
+    ) / total_volume
+    if close < vwap * 1.01 or base_low < vwap * 0.96:
+        return None
+
+    avg_base_volume = sum(float(bar.volume or 0.0) for bar in base_bars) / len(base_bars)
+    recent_volume = sum(float(bar.volume or 0.0) for bar in history[-3:])
+    if volume < max(45_000.0, avg_base_volume * 0.70):
+        return None
+    if recent_volume < max(150_000.0, avg_base_volume * 1.35):
+        return None
+
+    red_distribution = any(
+        float(bar.close or 0.0) < float(bar.open or 0.0)
+        and (float(bar.open or 0.0) - float(bar.close or 0.0)) / float(bar.close or 1.0) > 0.045
+        and (float(bar.high or 0.0) - float(bar.low or 0.0)) / float(bar.close or 1.0) > 0.055
+        and float(bar.volume or 0.0) >= avg_base_volume * 1.25
+        for bar in history[-5:-1]
+    )
+    if red_distribution:
+        return None
+
+    reclaim_level = max(prior_high, base_high)
+    max_pay = round(reclaim_level * 1.025, 4)
+    if low > max_pay:
+        return None
+    entry_price = min(close, max_pay)
+    stop_anchor = max(base_low, vwap * 0.975)
+    risk = max(entry_price - (stop_anchor - max(0.025, entry_price * 0.003)), entry_price * 0.016, 0.08)
+    risk = min(risk, entry_price * 0.058)
+    if risk <= 0:
+        return None
+    stop_price = round(entry_price - risk, 4)
+    target_price = round(entry_price + risk * 1.35, 4)
+    return {
+        "entry_trigger": "warrior_smooth_hod_reclaim",
+        "variant_override": "warrior_smooth_hod_reclaim",
+        "psych_level": round(reclaim_level, 4),
+        "pullaway_level": round(reclaim_level, 4),
+        "base_high": round(base_high, 4),
+        "base_low": round(base_low, 4),
+        "vwap": round(vwap, 4),
+        "max_pay": max_pay,
+        "entry_price_override": round(entry_price, 4),
+        "stop_price_override": stop_price,
+        "target_price_override": target_price,
+        "max_hold_seconds_override": 180.0,
+        "reward_risk": 1.35,
+        "size_factor": 0.35,
+        "rr_note_override": (
+            "warrior smooth HOD reclaim base=${:.2f}-${:.2f} "
+            "hod=${:.2f} vwap=${:.2f} cap=${:.2f} target=${:.2f}"
+        ).format(base_low, base_high, hod, vwap, max_pay, target_price),
         "skip_unstable_confirm_stop_check": True,
     }
 

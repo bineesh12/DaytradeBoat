@@ -693,6 +693,7 @@ def test_warrior_guard_exception_includes_second_leg_and_prior_runner_continuati
         "warrior_second_leg_reclaim",
         "warrior_prior_runner_continuation_pullback",
         "warrior_stair_step_runner",
+        "warrior_smooth_hod_reclaim",
         "warrior_trend_pullback_reclaim",
     ):
         hit = ScanResult(

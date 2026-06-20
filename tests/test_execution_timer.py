@@ -747,6 +747,35 @@ class TestExecutionTimerTriggers:
         assert released is None
         assert "AIIO" in timer.pending_symbols
 
+    def test_early_vwap_reclaim_scout_cancels_weak_wick_release_bar(self) -> None:
+        timer = ExecutionTimer(max_wait_bars=2, enabled=True)
+        signal = _vwap_reclaim_scout_signal(symbol="OLOX", price=7.592)
+        criteria = dict(signal.scan_result.criteria)
+        criteria.update({
+            "pattern": "early_vwap_reclaim_scout",
+            "vwap": 7.30,
+            "base_low": 7.29,
+            "stop_price": 7.17,
+        })
+        signal = replace(
+            signal,
+            scan_result=replace(
+                signal.scan_result,
+                scanner_name="early_vwap_reclaim_scout",
+                criteria=criteria,
+            ),
+            stop_loss=7.17,
+        )
+        timer.queue(signal)
+        base = datetime(2026, 5, 29, 11, 1, 20, tzinfo=timezone.utc)
+
+        released = timer.on_10s_bar(
+            _10s_bar("OLOX", base, 7.50, 7.37, h=7.75, l=7.2941, volume=102_426)
+        )
+
+        assert released is None
+        assert "OLOX" not in timer.pending_symbols
+
     def test_sub_two_runner_does_not_release_on_dead_10s_tape(self) -> None:
         timer = ExecutionTimer(max_wait_bars=2, enabled=True)
         signal = _bgms_vwap_signal(symbol="PALI", price=1.80)
