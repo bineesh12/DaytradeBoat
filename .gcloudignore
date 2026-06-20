@@ -1,0 +1,20 @@
+.git/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.idea/
+*.egg-info/
+dist/
+build/
+.env
+*.csv
+*.parquet
+.claude/
+
+# Runtime/cache data should not be uploaded, but keep the source package
+# src/daytrading/data included in the Docker build context.
+/data/

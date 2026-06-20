@@ -24,11 +24,13 @@ class _RunnerStub:
     _parse_hod_alert_time = staticmethod(AlpacaRunner._parse_hod_alert_time)
     _publish_trading_watchlist = AlpacaRunner._publish_trading_watchlist
     _prune_hot_watch = AlpacaRunner._prune_hot_watch
+    _hot_watch_setup_refresh_reason = AlpacaRunner._hot_watch_setup_refresh_reason
     _hot_watch_snapshot = AlpacaRunner._hot_watch_snapshot
     _hot_watch_live_metrics = AlpacaRunner._hot_watch_live_metrics
     _publish_hot_watch = AlpacaRunner._publish_hot_watch
     _promote_hot_watch = AlpacaRunner._promote_hot_watch
     _hot_watch_reject_reason = AlpacaRunner._hot_watch_reject_reason
+    _hot_watch_level_breakout_scout_candidate = AlpacaRunner._hot_watch_level_breakout_scout_candidate
     _hot_watch_mode = AlpacaRunner._hot_watch_mode
     is_hot_watch_active = AlpacaRunner.is_hot_watch_active
     _watchlist_pinned = {"SPY"}
@@ -61,6 +63,9 @@ class _RunnerStub:
         self._hot_watch_min_day_volume = 200_000
         self._hot_watch_min_score = 0.30
         self._hot_watch_sub5_min_day_volume = 500_000
+        self._hot_watch_setup_refresh_enabled = True
+        self._hot_watch_setup_refresh_max_pullback_pct = 4.0
+        self._hot_watch_setup_refresh_min_recent_volume = 100_000
         self._news_checker = None
         self._news_pinned = set()
         self._skip_counts = defaultdict(int)
@@ -436,6 +441,45 @@ class TestHotWatchTTL:
         assert not runner.is_hot_watch_active("NORM")
         assert "NORM" not in runner._hot_watch
 
+    def test_expired_hot_watch_refreshes_when_basing_near_hod(self) -> None:
+        runner = _make_runner(["SPY"])
+        old_added = datetime.now(timezone.utc) - timedelta(minutes=9)
+        runner._hot_watch["CONL"] = {
+            "added_at": old_added,
+            "ttl_minutes": 8.0,
+            "mode": "watch",
+            "reason": "fast scan mover",
+        }
+        ts = datetime.now(timezone.utc) - timedelta(minutes=8)
+        closes = [5.20, 5.30, 5.38, 5.42, 5.44, 5.43]
+        vols = [80_000, 90_000, 95_000, 45_000, 42_000, 40_000]
+        runner._bar_buffer["CONL"] = [
+            Bar("CONL", ts + timedelta(minutes=i), c - 0.02, c + 0.03, c - 0.03, c, vols[i])
+            for i, c in enumerate(closes)
+        ]
+
+        assert runner.is_hot_watch_active("CONL")
+        assert "CONL" in runner._hot_watch
+        assert runner._hot_watch["CONL"]["added_at"] > old_added
+        assert runner._hot_watch["CONL"]["reason"].startswith("setup refresh:")
+
+    def test_expired_hot_watch_still_drops_deep_or_quiet_pullback(self) -> None:
+        runner = _make_runner(["SPY"])
+        runner._hot_watch["QUIET"] = {
+            "added_at": datetime.now(timezone.utc) - timedelta(minutes=9),
+            "ttl_minutes": 8.0,
+            "mode": "watch",
+        }
+        ts = datetime.now(timezone.utc) - timedelta(minutes=8)
+        closes = [5.20, 5.35, 5.50, 5.42, 5.30, 5.20]
+        runner._bar_buffer["QUIET"] = [
+            Bar("QUIET", ts + timedelta(minutes=i), c - 0.02, c + 0.03, c - 0.03, c, 8_000)
+            for i, c in enumerate(closes)
+        ]
+
+        assert not runner.is_hot_watch_active("QUIET")
+        assert "QUIET" not in runner._hot_watch
+
     def test_strong_hot_watch_stays_longer_than_normal(self) -> None:
         runner = _make_runner(["SPY"])
         runner._hot_watch["STRONG"] = {
@@ -505,6 +549,34 @@ class TestHotWatchTTL:
         }, flt=5_000_000)
 
         assert reason == "volume 51430 < 500000"
+
+    def test_hot_watch_allows_liquid_level_breakout_scout_before_five_pct(self) -> None:
+        runner = _make_runner(["SPY"])
+        runner._phase = "OPEN"
+
+        reason = runner._hot_watch_reject_reason({
+            "symbol": "CONL",
+            "price": 5.44,
+            "abs_change_pct": 3.6,
+            "volume": 9_500_000,
+            "score": 0.44,
+        }, flt=10_000_000)
+
+        assert reason is None
+
+    def test_hot_watch_still_rejects_low_volume_sub_five_pct_mover(self) -> None:
+        runner = _make_runner(["SPY"])
+        runner._phase = "OPEN"
+
+        reason = runner._hot_watch_reject_reason({
+            "symbol": "THIN",
+            "price": 5.44,
+            "abs_change_pct": 3.6,
+            "volume": 300_000,
+            "score": 0.44,
+        }, flt=10_000_000)
+
+        assert reason.startswith("change 3.6%")
 
     def test_expired_symbol_can_be_added_again(self) -> None:
         runner = _make_runner(["SPY"])

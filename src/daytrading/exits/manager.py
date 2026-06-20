@@ -22,6 +22,7 @@ Exit Indicators (Warrior Trading Momentum Strategy):
 from __future__ import annotations
 
 import logging
+import statistics
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
@@ -37,6 +38,55 @@ MOMENTUM_THRESHOLD = 7  # ticks moved from entry to be considered "high momentum
 QUICK_SCALP_PARTIAL_PCT = 0.01  # harvest first quick scalp pop before it fades
 RUNNER_MIN_CONFIRM_PCT = 0.018  # prove strength before giving the back half room
 RUNNER_TRAIL_PCT = 0.03         # protected runners trail 3% instead of 1%
+EMERGENCY_DUMP_BODY_PCT = 0.035
+EMERGENCY_DUMP_RANGE_PCT = 0.045
+EMERGENCY_DUMP_CLOSE_LOCATION = 0.30
+EMERGENCY_DUMP_MIN_VOLUME = 50_000
+EMERGENCY_DUMP_VOLUME_RATIO = 0.75
+
+# Strategy labels that share the hit-run lifecycle: full 1R first-target exit,
+# per-symbol give-back/daily-stop P&L tracking, and win/loss cooldowns. The
+# post-blowoff micro-base scout is a hit-run re-entry under a different label,
+# so it must be treated the same everywhere or it escapes those controls.
+HIT_RUN_STRATEGIES = frozenset({
+    "momentum_burst_hit_run",
+    "post_blowoff_micro_base_scout",
+    "warrior_squeeze_playbook",
+})
+
+
+def is_hit_run_strategy(label: Optional[str]) -> bool:
+    """True if a strategy/reason label belongs to the hit-run lifecycle."""
+    text = (label or "").lower()
+    return any(name in text for name in HIT_RUN_STRATEGIES)
+
+
+def is_emergency_dump_bar(
+    open_price: float,
+    high_price: float,
+    low_price: float,
+    close_price: float,
+    volume: float = 0.0,
+    avg_volume: float = 0.0,
+) -> bool:
+    """Return True for a large red distribution candle that should flatten hit-runs."""
+    if open_price <= 0 or high_price <= 0 or low_price <= 0 or close_price <= 0:
+        return False
+    if high_price <= low_price or close_price >= open_price:
+        return False
+
+    body_pct = (open_price - close_price) / open_price
+    range_pct = (high_price - low_price) / close_price
+    close_location = (close_price - low_price) / (high_price - low_price)
+    volume_floor = max(EMERGENCY_DUMP_MIN_VOLUME, avg_volume * EMERGENCY_DUMP_VOLUME_RATIO)
+    volume_ok = volume <= 0 or volume >= volume_floor
+
+    return (
+        body_pct >= EMERGENCY_DUMP_BODY_PCT
+        and range_pct >= EMERGENCY_DUMP_RANGE_PCT
+        and close_location <= EMERGENCY_DUMP_CLOSE_LOCATION
+        and volume_ok
+    )
 
 
 @dataclass
@@ -88,6 +138,9 @@ class TrackedPosition:
     trend_strength: float = 0.5           # 0-1, from classifier (higher = stronger trend)
     consecutive_red: int = 0              # count of consecutive red candles
     prev_bar_open: float = 0.0           # previous bar open for red candle check
+    last_bar_open: float = 0.0           # most recent completed bar open
+    last_bar_high: float = 0.0           # most recent completed bar high
+    last_bar_low: float = 0.0            # most recent completed bar low
     _first_pullback_done: bool = False   # True after first red candle (grace period)
 
     # Runner handling.  These stay false for ordinary scalps.  A position only
@@ -117,6 +170,25 @@ class TrackedPosition:
 
     _recent_prices: List[float] = field(default_factory=list)
     _max_recent: int = 10
+
+    # Recent per-bar range % (high-low)/close, for the volatility-adaptive runner
+    # trail. A wider-swinging name earns a wider trail so normal noise does not
+    # stop it; a smooth name trails tight.
+    _recent_ranges: List[float] = field(default_factory=list)
+    _max_ranges: int = 10
+
+    def record_bar_range(self, range_pct: float) -> None:
+        if range_pct <= 0:
+            return
+        self._recent_ranges.append(float(range_pct))
+        if len(self._recent_ranges) > self._max_ranges:
+            self._recent_ranges.pop(0)
+
+    def recent_range_pct(self) -> float:
+        """Median recent per-bar range as a fraction (e.g. 0.027 = 2.7%)."""
+        if not self._recent_ranges:
+            return 0.0
+        return statistics.median(self._recent_ranges)
 
     def __post_init__(self) -> None:
         self.remaining_qty = self.remaining_qty or self.quantity
@@ -174,21 +246,84 @@ class ExitManager:
     The stop ratchets up every time price gains another 10 ticks.
     """
 
-    def __init__(self, *, max_unrealized_loss: float = 50.0) -> None:
+    def __init__(
+        self,
+        *,
+        max_unrealized_loss: float = 50.0,
+        runner_trail_pct: float = RUNNER_TRAIL_PCT,
+        runner_min_confirm_pct: float = RUNNER_MIN_CONFIRM_PCT,
+        runner_trail_adaptive: bool = False,
+        runner_trail_atr_mult: float = 2.5,
+        runner_trail_cap: float = 0.10,
+        runner_give_room_after_partial: bool = False,
+        step_trail_exit_enabled: bool = False,
+        step_trail_pct: float = 0.025,
+    ) -> None:
         self._positions: Dict[str, TrackedPosition] = {}
         self._max_unrealized_loss = max_unrealized_loss
+        # Step-trail exit (default off): ride a long while it keeps clearing
+        # step_trail_pct-sized steps up; cut the moment it stalls back below the
+        # last step. Overrides the partial/breakeven/runner-trail logic when on.
+        self._step_trail_exit = bool(step_trail_exit_enabled)
+        self._step_trail_pct = max(0.001, float(step_trail_pct))
+        # How wide the back half of a confirmed runner trails behind the high, and
+        # how far it must run past the partial before it earns that wider trail.
+        # Tunable: a wider trail rides continuation runners (CUPR) further but
+        # gives back more on top-and-fade names (EDHL). Default stays tight.
+        self._runner_trail_pct = max(0.0, float(runner_trail_pct))
+        self._runner_min_confirm_pct = max(0.0, float(runner_min_confirm_pct))
+        # Adaptive trail: scale the trail to the name's own recent volatility, so
+        # a wide-swinging runner (CUPR) breathes while a smooth one (EDHL) trails
+        # tight. trail = clamp(atr_mult * median recent bar range, _pct floor, cap).
+        # Off by default -> flat _runner_trail_pct (current behavior).
+        self._runner_trail_adaptive = bool(runner_trail_adaptive)
+        self._runner_trail_atr_mult = max(0.0, float(runner_trail_atr_mult))
+        self._runner_trail_cap = max(0.0, float(runner_trail_cap))
+        # Give runner candidates room: after the first partial, keep the wider
+        # entry stop through the first pullback instead of snapping to breakeven
+        # (breakeven shakes a runner out on a normal dip right before it
+        # continues). Off by default. Trade-off: bigger give-back on the ones
+        # that break down after the partial.
+        self._runner_give_room = bool(runner_give_room_after_partial)
+
+    def _apply_post_partial_stop(self, pos: "TrackedPosition") -> None:
+        """Stop to set after the first partial: breakeven, or keep the wider
+        original stop for a give-room runner candidate."""
+        pos.breakeven_locked = True
+        if (
+            self._runner_give_room
+            and pos.runner_candidate
+            and pos.stop_loss is not None
+            and 0 < pos.stop_loss < pos.entry_price
+        ):
+            return  # keep the original (wider) stop — give the runner room
+        pos.stop_loss = pos.entry_price
+
+    def _runner_trail_for(self, pos: "TrackedPosition") -> float:
+        """Trail width for a confirmed runner: flat, or volatility-adaptive."""
+        if not self._runner_trail_adaptive:
+            return pos.runner_trail_pct
+        vol = pos.recent_range_pct()
+        if vol <= 0:
+            return pos.runner_trail_pct
+        adaptive = self._runner_trail_atr_mult * vol
+        return min(self._runner_trail_cap, max(self._runner_trail_pct, adaptive))
 
     @property
     def tracked(self) -> Dict[str, TrackedPosition]:
         return dict(self._positions)
 
     def track(self, pos: TrackedPosition) -> None:
+        entry_time = pos.entry_ts or datetime.now(timezone.utc)
+        if entry_time.tzinfo is None:
+            entry_time = entry_time.replace(tzinfo=timezone.utc)
+        pos.entry_ts = entry_time
         if pos.entry_time is None:
-            pos.entry_time = datetime.now(timezone.utc)
+            pos.entry_time = entry_time
         # Initialize range tracking from entry
         pos._range_high = pos.entry_price
         pos._range_low = pos.entry_price
-        pos._range_start_ts = datetime.now(timezone.utc)
+        pos._range_start_ts = entry_time
         self._positions[pos.symbol] = pos
         target = pos.first_target_price if pos.first_target_price > 0 else pos.entry_price + 0.20
         logger.info(
@@ -200,7 +335,15 @@ class ExitManager:
     def untrack(self, symbol: str) -> None:
         self._positions.pop(symbol, None)
 
-    def update_bar_close(self, symbol: str, close_price: float, open_price: float = 0.0, volume: int = 0) -> None:
+    def update_bar_close(
+        self,
+        symbol: str,
+        close_price: float,
+        open_price: float = 0.0,
+        volume: int = 0,
+        high_price: float = 0.0,
+        low_price: float = 0.0,
+    ) -> None:
         """Called when a new 1-min bar closes. Updates red candle + volume tracking."""
         pos = self._positions.get(symbol)
         if pos is not None:
@@ -209,9 +352,19 @@ class ExitManager:
             else:
                 pos.consecutive_red = 0
             pos.prev_bar_open = open_price if open_price > 0 else pos.last_bar_close
+            pos.last_bar_open = open_price if open_price > 0 else pos.last_bar_close
+            pos.last_bar_high = high_price
+            pos.last_bar_low = low_price
             pos.prev_bar_volume = pos.last_bar_volume
             pos.last_bar_volume = volume
             pos.last_bar_close = close_price
+            # Volatility sample for the adaptive runner trail: true range when
+            # high/low are supplied, else fall back to the candle body.
+            if close_price > 0:
+                if high_price > 0 and low_price > 0 and high_price >= low_price:
+                    pos.record_bar_range((high_price - low_price) / close_price)
+                elif open_price > 0:
+                    pos.record_bar_range(abs(close_price - open_price) / close_price)
 
             # Track green bars with declining volume (exhaustion detection)
             is_green = close_price > open_price if open_price > 0 else close_price > pos.prev_bar_open
@@ -330,6 +483,10 @@ class ExitManager:
         now: datetime,
     ) -> List[TradeSignal]:
         """Check all tracked positions for stop loss or step-up."""
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        else:
+            now = now.astimezone(timezone.utc)
         exits: List[TradeSignal] = []
 
         for symbol, pos in list(self._positions.items()):
@@ -358,6 +515,25 @@ class ExitManager:
         now: datetime,
     ) -> List[TradeSignal]:
         is_long = pos.side is Side.BUY
+
+        # --- step-trail exit (overrides the rest when enabled) ---
+        # Ride while price keeps clearing step_trail_pct steps up; cut the moment
+        # it stalls back below the last cleared step. No partial — full position
+        # rides, so winners run and faders are cut on the first stall.
+        if self._step_trail_exit and is_long and pos.entry_price > 0:
+            steps = int(max(0.0, pos.highest_price / pos.entry_price - 1.0) / self._step_trail_pct)
+            if steps <= 0:
+                trail_stop = pos.entry_price * (1.0 - self._step_trail_pct)
+            else:
+                trail_stop = pos.entry_price * (1.0 + (steps - 1) * self._step_trail_pct)
+            if pos.stop_loss is None or trail_stop > pos.stop_loss:
+                pos.stop_loss = round(trail_stop, 4)
+            if price <= pos.stop_loss:
+                reason = ExitReason.TRAILING_STOP if steps > 0 else ExitReason.STOP_LOSS
+                sig = self._make_exit(pos, pos.remaining_qty, price, reason)
+                pos.remaining_qty = 0
+                return [sig]
+            return []
 
         # --- dynamic step sizing based on momentum and trend strength ---
         if not pos._step_adjusted and pos.current_step == 0:
@@ -394,6 +570,41 @@ class ExitManager:
                 sig = self._make_exit(pos, pos.remaining_qty, price, ExitReason.STOP_LOSS)
                 pos.remaining_qty = 0
                 return [sig]
+
+        # --- emergency dump candle: flatten hit-run / Warrior positions.
+        # Warrior entries can intentionally give a runner some room after a
+        # partial. That is good on normal pullbacks, but dangerous on a large
+        # high-volume red candle closing near its low. This circuit applies to
+        # every strategy in HIT_RUN_STRATEGIES, including all Warrior lanes.
+        if (
+            is_long
+            and pos.remaining_qty > 0
+            and is_hit_run_strategy(self._position_text(pos))
+            and is_emergency_dump_bar(
+                pos.last_bar_open,
+                pos.last_bar_high,
+                pos.last_bar_low,
+                pos.last_bar_close,
+                pos.last_bar_volume,
+                pos.avg_bar_volume,
+            )
+        ):
+            logger.info(
+                "EMERGENCY DUMP EXIT %s @ %.4f | red bar %.4f→%.4f "
+                "(range %.4f–%.4f, vol=%d, avg_vol=%.0f, entry=%.4f)",
+                pos.symbol,
+                price,
+                pos.last_bar_open,
+                pos.last_bar_close,
+                pos.last_bar_low,
+                pos.last_bar_high,
+                pos.last_bar_volume,
+                pos.avg_bar_volume,
+                pos.entry_price,
+            )
+            sig = self._make_exit(pos, pos.remaining_qty, price, ExitReason.STOP_LOSS)
+            pos.remaining_qty = 0
+            return [sig]
 
         # --- hard stop loss: exit all shares ---
         if pos.stop_loss is not None:
@@ -439,15 +650,22 @@ class ExitManager:
                 )
                 pos.sold_half = True
                 pos.remaining_qty -= partial_qty
-                pos.stop_loss = pos.entry_price
-                pos.breakeven_locked = True
                 self._maybe_confirm_runner(pos, price)
+                self._apply_post_partial_stop(pos)
                 sig = self._make_exit(pos, partial_qty, price, ExitReason.TAKE_PROFIT)
                 return [sig]
 
         # --- Exit #1: Sell half at first profit target (1:1 R:R) ---
         if is_long and not pos.sold_half and pos.first_target_price > 0:
             if price >= pos.first_target_price:
+                if self._uses_full_first_target(pos):
+                    logger.info(
+                        "FULL TARGET %s @ %.4f | hit 1:1 target %.4f | selling all %.0f shares",
+                        pos.symbol, price, pos.first_target_price, pos.remaining_qty,
+                    )
+                    sig = self._make_exit(pos, pos.remaining_qty, price, ExitReason.TAKE_PROFIT)
+                    pos.remaining_qty = 0
+                    return [sig]
                 partial_qty = self._first_partial_qty(pos)
                 logger.info(
                     "HALF SELL %s @ %.4f | hit 1:1 target %.4f | selling %d of %d shares, moving stop to breakeven %.4f",
@@ -455,9 +673,8 @@ class ExitManager:
                 )
                 pos.sold_half = True
                 pos.remaining_qty -= partial_qty
-                pos.stop_loss = pos.entry_price  # breakeven stop on remaining
-                pos.breakeven_locked = True
                 self._maybe_confirm_runner(pos, price)
+                self._apply_post_partial_stop(pos)
                 sig = self._make_exit(pos, partial_qty, price, ExitReason.TAKE_PROFIT)
                 return [sig]
 
@@ -532,7 +749,7 @@ class ExitManager:
         # AFTER selling half: use wider steps (4%) and let the winner run.
         if not pos.sold_half:
             # Pre-half: only move stop to breakeven once price moves 2% above entry
-            if is_long and not pos.breakeven_locked:
+            if is_long and not pos.breakeven_locked and not self._is_vwap_pullback(pos):
                 breakeven_trigger = pos.entry_price * (1 + STEP_PCT)
                 if price >= breakeven_trigger:
                     pos.stop_loss = pos.entry_price
@@ -556,6 +773,20 @@ class ExitManager:
                     trail_stop = round(pos.lowest_price + trail_offset, 4)
                     if trail_stop < (pos.stop_loss or float("inf")):
                         pos.stop_loss = trail_stop
+        elif pos.runner_confirmed and pos.runner_trail_pct > 0:
+            # Post-half on a CONFIRMED runner: trail behind the high so a normal
+            # pullback does not shake us out of the move. Width is flat or, when
+            # adaptive is on, scaled to the name's own recent volatility. The stop
+            # only ever ratchets up, never down.
+            trail = self._runner_trail_for(pos)
+            if is_long:
+                trail_stop = round(pos.highest_price * (1 - trail), 4)
+                if trail_stop > (pos.stop_loss or 0):
+                    pos.stop_loss = trail_stop
+            else:
+                trail_stop = round(pos.lowest_price * (1 + trail), 4)
+                if trail_stop < (pos.stop_loss or float("inf")):
+                    pos.stop_loss = trail_stop
         else:
             # Post-half: step up in 4% increments of entry price to let winner run
             step_amount = pos.entry_price * STEP_PCT_AFTER_HALF
@@ -694,9 +925,13 @@ class ExitManager:
 
     @staticmethod
     def _uses_quick_scalp_partial(pos: TrackedPosition) -> bool:
-        reason = (pos.reason or "").lower()
+        if ExitManager._uses_full_first_target(pos):
+            return False
+        if ExitManager._is_vwap_pullback(pos):
+            return False
+        text = ExitManager._position_text(pos)
         return any(
-            key in reason
+            key in text
             for key in (
                 "momentum",
                 "quick",
@@ -707,6 +942,36 @@ class ExitManager:
                 "breakout",
             )
         )
+
+    @staticmethod
+    def _is_vwap_pullback(pos: TrackedPosition) -> bool:
+        text = ExitManager._position_text(pos)
+        return "vwap_pullback" in text or "vwap pullback" in text
+
+    @staticmethod
+    def _position_text(pos: TrackedPosition) -> str:
+        return " ".join(
+            str(part or "").lower()
+            for part in (
+                pos.reason,
+                pos.entry_strategy,
+                pos.entry_pattern,
+            )
+        )
+
+    @staticmethod
+    def _uses_full_first_target(pos: TrackedPosition) -> bool:
+        text = " ".join(
+            str(part or "").lower()
+            for part in (
+                pos.reason,
+                pos.entry_strategy,
+                pos.entry_pattern,
+            )
+        )
+        if "warrior_squeeze_playbook" in text:
+            return False
+        return is_hit_run_strategy(text)
 
     @staticmethod
     def _first_partial_qty(pos: TrackedPosition) -> int:
@@ -772,15 +1037,14 @@ class ExitManager:
             volume = 0.0
         return day_change >= 20.0 and volume >= 1_000_000
 
-    @staticmethod
-    def _maybe_confirm_runner(pos: TrackedPosition, price: float) -> None:
+    def _maybe_confirm_runner(self, pos: TrackedPosition, price: float) -> None:
         if not pos.runner_candidate or pos.runner_confirmed or pos.entry_price <= 0:
             return
         max_run_pct = (max(pos.highest_price, price) - pos.entry_price) / pos.entry_price
-        if max_run_pct < RUNNER_MIN_CONFIRM_PCT:
+        if max_run_pct < self._runner_min_confirm_pct:
             return
         pos.runner_confirmed = True
-        pos.runner_trail_pct = RUNNER_TRAIL_PCT
+        pos.runner_trail_pct = self._runner_trail_pct
         logger.info(
             "RUNNER CONFIRMED %s | first partial paid, max run %.1f%% — "
             "back half uses %.1f%% trail",

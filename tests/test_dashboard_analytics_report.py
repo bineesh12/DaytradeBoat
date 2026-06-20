@@ -126,6 +126,42 @@ def test_dashboard_analytics_report_handles_missing_report_dir(tmp_path):
     assert "No nightly analytics report" in payload["message"]
 
 
+def test_dashboard_analytics_report_serializes_non_finite_metrics_as_null(tmp_path):
+    data_dir = tmp_path / "data"
+    journal_dir = data_dir / "journal"
+    report_dir = data_dir / "reports"
+    journal_dir.mkdir(parents=True)
+    report_dir.mkdir()
+    (report_dir / "2026-06-05.json").write_text(json.dumps({
+        "day": "2026-06-05",
+        "ml_learning": {
+            "entry_model": {
+                "trained": True,
+                "t_factor": float("inf"),
+                "negative_t_factor": float("-inf"),
+                "bad_score": float("nan"),
+            }
+        },
+    }))
+
+    hub = DashboardHub()
+    hub.journal = SimpleNamespace(base_dir=str(journal_dir))
+    app = create_app(hub)
+
+    resp = app.test_client().get("/api/analytics-report")
+
+    assert resp.status_code == 200
+    raw = resp.get_data(as_text=True)
+    assert "Infinity" not in raw
+    assert "NaN" not in raw
+    payload = resp.get_json()
+    model = payload["report"]["ml_learning"]["entry_model"]
+    assert model["trained"] is True
+    assert model["t_factor"] is None
+    assert model["negative_t_factor"] is None
+    assert model["bad_score"] is None
+
+
 def test_dashboard_generates_current_report_when_missing(tmp_path, monkeypatch):
     data_dir = tmp_path / "data"
     journal_dir = data_dir / "journal"

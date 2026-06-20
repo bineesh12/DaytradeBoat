@@ -14,3 +14,5 @@ build/
 *.parquet
 .claude/
 data/journal/
+data/backtest_cache/
+data/

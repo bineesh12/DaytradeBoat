@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from daytrading.models import Bar, ScanResult, SignalAction, Timeframe, TradeSignal
+from daytrading.models import Bar, ScanResult, Side, SignalAction, Tick, Timeframe, TradeSignal
 from daytrading.strategy.execution_timer import ExecutionTimer
 
 
@@ -92,6 +93,34 @@ def _bgms_vwap_signal(symbol: str = "BGMS", price: float = 2.93) -> TradeSignal:
                 "stop_price": 2.72,
                 "rally_pct": 9.7,
                 "volume": 402_530,
+            },
+        ),
+    )
+
+
+def _vwap_reclaim_scout_signal(symbol: str = "AIIO", price: float = 2.67) -> TradeSignal:
+    return TradeSignal(
+        symbol=symbol,
+        action=SignalAction.ENTER_LONG,
+        quantity=107,
+        entry_price=price,
+        stop_loss=2.53,
+        reason="vwap reclaim scout",
+        scan_result=ScanResult(
+            symbol=symbol,
+            scanner_name="vwap_pullback",
+            ts=datetime.now(timezone.utc),
+            score=77.0,
+            criteria={
+                "pattern": "vwap_pullback",
+                "setup_tier": "A+ setup",
+                "entry_tier": "vwap_reclaim_scout",
+                "direction": "up",
+                "close": price,
+                "vwap": 2.60,
+                "base_low": 2.55,
+                "stop_price": 2.53,
+                "volume": 3_700_000,
             },
         ),
     )
@@ -674,6 +703,122 @@ class TestExecutionTimerTriggers:
             pending,
             latest_bar=_10s_bar("SUBT", base, 1.87, 1.88, h=1.89, l=1.85, volume=20_000),
         )
+
+    def test_vwap_reclaim_scout_can_release_after_clean_vwap_hold_even_after_dip(self) -> None:
+        timer = ExecutionTimer(max_wait_bars=2, enabled=True)
+        signal = _vwap_reclaim_scout_signal()
+        timer.queue(signal)
+        base = datetime(2026, 6, 1, 10, 15, 0, tzinfo=timezone.utc)
+
+        assert timer.on_10s_bar(
+            _10s_bar("AIIO", base, 2.67, 2.64, h=2.68, l=2.58, volume=18_000)
+        ) is None
+        released = timer.on_10s_bar(
+            _10s_bar("AIIO", base + timedelta(seconds=10), 2.64, 2.69, h=2.70, l=2.62, volume=22_000)
+        )
+
+        assert released is not None
+        assert released.symbol == "AIIO"
+        assert released.scan_result.criteria["entry_tier"] == "vwap_reclaim_scout"
+
+    def test_vwap_reclaim_scout_can_release_on_first_clean_10s_hold(self) -> None:
+        timer = ExecutionTimer(max_wait_bars=3, enabled=True)
+        signal = _vwap_reclaim_scout_signal()
+        timer.queue(signal)
+        base = datetime(2026, 6, 1, 10, 16, 0, tzinfo=timezone.utc)
+
+        released = timer.on_10s_bar(
+            _10s_bar("AIIO", base, 2.672, 2.75, h=2.78, l=2.665, volume=40_342)
+        )
+
+        assert released is not None
+        assert released.symbol == "AIIO"
+
+    def test_vwap_reclaim_scout_still_waits_on_dead_10s_tape(self) -> None:
+        timer = ExecutionTimer(max_wait_bars=2, enabled=True)
+        signal = _vwap_reclaim_scout_signal()
+        timer.queue(signal)
+        base = datetime(2026, 6, 1, 10, 15, 0, tzinfo=timezone.utc)
+
+        released = timer.on_10s_bar(
+            _10s_bar("AIIO", base, 2.67, 2.68, h=2.69, l=2.65, volume=300)
+        )
+
+        assert released is None
+        assert "AIIO" in timer.pending_symbols
+
+    def test_early_vwap_reclaim_scout_cancels_weak_wick_release_bar(self) -> None:
+        timer = ExecutionTimer(max_wait_bars=2, enabled=True)
+        signal = _vwap_reclaim_scout_signal(symbol="OLOX", price=7.592)
+        criteria = dict(signal.scan_result.criteria)
+        criteria.update({
+            "pattern": "early_vwap_reclaim_scout",
+            "vwap": 7.30,
+            "base_low": 7.29,
+            "stop_price": 7.17,
+        })
+        signal = replace(
+            signal,
+            scan_result=replace(
+                signal.scan_result,
+                scanner_name="early_vwap_reclaim_scout",
+                criteria=criteria,
+            ),
+            stop_loss=7.17,
+        )
+        timer.queue(signal)
+        base = datetime(2026, 5, 29, 11, 1, 20, tzinfo=timezone.utc)
+
+        released = timer.on_10s_bar(
+            _10s_bar("OLOX", base, 7.50, 7.37, h=7.75, l=7.2941, volume=102_426)
+        )
+
+        assert released is None
+        assert "OLOX" not in timer.pending_symbols
+
+    def test_sub_two_runner_does_not_release_on_dead_10s_tape(self) -> None:
+        timer = ExecutionTimer(max_wait_bars=2, enabled=True)
+        signal = _bgms_vwap_signal(symbol="PALI", price=1.80)
+        signal.scan_result.criteria.update({
+            "pattern": "first_pullback_reclaim",
+            "setup_tier": "A+ setup",
+            "vwap": 1.78,
+            "pullback_low": 1.76,
+            "stop_price": 1.70,
+            "volume": 905_000,
+        })
+        signal = replace(signal, stop_loss=1.70)
+        timer.queue(signal)
+        base = datetime(2026, 6, 11, 15, 17, 0, tzinfo=timezone.utc)
+
+        released = timer.on_10s_bar(
+            _10s_bar("PALI", base, 1.79, 1.80, h=1.81, l=1.79, volume=900),
+        )
+
+        assert released is None
+        assert "PALI" in timer.pending_symbols
+
+    def test_sub_two_runner_releases_when_10s_tape_is_active(self) -> None:
+        timer = ExecutionTimer(max_wait_bars=2, enabled=True)
+        signal = _bgms_vwap_signal(symbol="PALI", price=1.80)
+        signal.scan_result.criteria.update({
+            "pattern": "first_pullback_reclaim",
+            "setup_tier": "A+ setup",
+            "vwap": 1.78,
+            "pullback_low": 1.76,
+            "stop_price": 1.70,
+            "volume": 905_000,
+        })
+        signal = replace(signal, stop_loss=1.70)
+        timer.queue(signal)
+        base = datetime(2026, 6, 11, 15, 17, 0, tzinfo=timezone.utc)
+
+        released = timer.on_10s_bar(
+            _10s_bar("PALI", base, 1.79, 1.80, h=1.81, l=1.79, volume=12_000),
+        )
+
+        assert released is not None
+        assert released.symbol == "PALI"
 
     def test_vwap_pullback_does_not_release_after_price_chases_too_far(self) -> None:
         timer = ExecutionTimer(max_wait_bars=2, enabled=True)
@@ -1409,3 +1554,94 @@ class TestExecutionTimerTimeouts:
         timer.queue(_signal())
         timer.cancel("TST")
         assert timer.pending_symbols == []
+
+
+# ---------------------------------------------------------------------------
+# Tick-based early entry trigger
+# ---------------------------------------------------------------------------
+
+def _tick(symbol: str = "TCK", price: float = 2.0) -> Tick:
+    return Tick(
+        symbol=symbol,
+        ts=datetime.now(timezone.utc),
+        price=price,
+        size=100,
+        side=Side.BUY,
+    )
+
+
+def _tick_signal(symbol: str = "TCK", price: float = 2.0, vwap: float = 1.98) -> TradeSignal:
+    return TradeSignal(
+        symbol=symbol,
+        action=SignalAction.ENTER_LONG,
+        quantity=100,
+        entry_price=price,
+        reason="tick entry test",
+        scan_result=ScanResult(
+            symbol=symbol,
+            scanner_name="vwap_pullback",
+            ts=datetime.now(timezone.utc),
+            score=40.0,
+            criteria={
+                "pattern": "vwap_pullback",
+                "close": price,
+                "setup_anchor": price,
+                "vwap": vwap,
+            },
+        ),
+    )
+
+
+def _tick_timer(confirm: int = 2) -> ExecutionTimer:
+    return ExecutionTimer(
+        max_wait_bars=3,
+        enabled=True,
+        tick_entry_enabled=True,
+        tick_entry_confirm_count=confirm,
+    )
+
+
+def test_tick_entry_releases_after_confirm_count():
+    timer = _tick_timer(confirm=2)
+    timer.queue(_tick_signal(price=2.00, vwap=1.98))  # anchor=2.00
+    assert timer.on_tick(_tick("TCK", 2.01)) is None       # confirm=1
+    released = timer.on_tick(_tick("TCK", 2.02))           # confirm=2 -> release
+    assert released is not None
+    assert released.symbol == "TCK"
+    assert "TCK" not in timer.pending_symbols              # popped on release
+
+
+def test_tick_entry_no_release_when_extended():
+    timer = _tick_timer(confirm=2)
+    timer.queue(_tick_signal(price=2.00, vwap=1.98))       # ceiling = 2.00 * 1.02 = 2.04
+    assert timer.on_tick(_tick("TCK", 2.10)) is None
+    assert timer.on_tick(_tick("TCK", 2.10)) is None       # never confirms while extended
+
+
+def test_tick_entry_no_release_below_vwap():
+    timer = _tick_timer(confirm=2)
+    timer.queue(_tick_signal(price=2.00, vwap=2.05))       # vwap above price
+    assert timer.on_tick(_tick("TCK", 2.00)) is None
+    assert timer.on_tick(_tick("TCK", 2.00)) is None
+
+
+def test_tick_entry_confirmation_resets_on_bad_tick():
+    timer = _tick_timer(confirm=2)
+    timer.queue(_tick_signal(price=2.00, vwap=1.98))
+    assert timer.on_tick(_tick("TCK", 2.01)) is None       # confirm=1
+    assert timer.on_tick(_tick("TCK", 2.10)) is None       # extended -> reset to 0
+    assert timer.on_tick(_tick("TCK", 2.01)) is None       # confirm=1 again, not 2 -> no release
+    assert "TCK" in timer.pending_symbols
+
+
+def test_tick_entry_disabled_returns_none():
+    timer = ExecutionTimer(max_wait_bars=3, enabled=True, tick_entry_enabled=False)
+    timer.queue(_tick_signal(price=2.00, vwap=1.98))
+    assert timer.on_tick(_tick("TCK", 2.01)) is None
+    assert timer.on_tick(_tick("TCK", 2.01)) is None       # still none with flag off
+    assert "TCK" in timer.pending_symbols
+
+
+def test_tick_entry_ignores_unqueued_symbol():
+    timer = _tick_timer(confirm=1)
+    assert timer.on_tick(_tick("NOPE", 2.0)) is None

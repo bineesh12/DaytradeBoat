@@ -25,6 +25,8 @@ class ABCContinuationScanner:
         min_b_bars: int = 2,
         max_b_bars: int = 8,
         c_volume_surge: float = 1.10,
+        max_c_breakout_pct: float = 5.0,
+        max_c_bar_range_pct: float = 12.0,
         min_price: float = 1.0,
         max_price: float = 20.0,
     ) -> None:
@@ -34,6 +36,8 @@ class ABCContinuationScanner:
         self._min_b_bars = min_b_bars
         self._max_b_bars = max_b_bars
         self._c_volume_surge = c_volume_surge
+        self._max_c_breakout_pct = max_c_breakout_pct
+        self._max_c_bar_range_pct = max_c_bar_range_pct
         self._min_price = min_price
         self._max_price = max_price
 
@@ -124,6 +128,14 @@ class ABCContinuationScanner:
                     continue
 
                 c_breakout_pct = (c_bar.close - b_high) / b_high * 100.0
+                c_bar_range_pct = (
+                    (c_bar.high - c_bar.low) / c_bar.close * 100.0
+                    if c_bar.close > 0 else 0.0
+                )
+                if c_breakout_pct > self._max_c_breakout_pct:
+                    continue
+                if c_bar_range_pct > self._max_c_bar_range_pct:
+                    continue
                 risk_to_b_low_pct = (c_bar.close - b_low) / c_bar.close * 100.0
                 score = a_leg_pct * (1.0 - retrace) + c_breakout_pct * 2.0
 
@@ -144,6 +156,7 @@ class ABCContinuationScanner:
                         "b_low": round(b_low, 4),
                         "b_retrace_pct": round(retrace * 100.0, 1),
                         "c_breakout_pct": round(c_breakout_pct, 2),
+                        "c_bar_range_pct": round(c_bar_range_pct, 2),
                         "c_volume_surge": round(c_bar.volume / avg_b_vol, 2) if avg_b_vol > 0 else 0.0,
                         "risk_to_b_low_pct": round(risk_to_b_low_pct, 2),
                         "close": c_bar.close,

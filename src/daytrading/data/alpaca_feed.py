@@ -60,7 +60,7 @@ def configure_alpaca_stream_logging() -> None:
 try:
     from alpaca.data.historical.stock import StockHistoricalDataClient
     from alpaca.data.live.stock import StockDataStream
-    from alpaca.data.requests import StockBarsRequest, StockLatestBarRequest
+    from alpaca.data.requests import StockBarsRequest, StockLatestBarRequest, StockTradesRequest
     from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
     from alpaca.data.enums import DataFeed
     _HAS_ALPACA = True
@@ -437,6 +437,54 @@ class AlpacaHistoricalFeed:
                 volume=float(getattr(b, 'volume', 0)),
             )
 
+        return result
+
+    def get_trades(
+        self,
+        symbols: Sequence[str],
+        *,
+        limit: int = 50_000,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+    ) -> Dict[str, List[Tick]]:
+        """Fetch historical trade prints for one or more symbols."""
+        start, end = _normalize_bar_window(start, end)
+        sym_list = [s for s in symbols if s]
+        if not sym_list:
+            return {}
+        try:
+            request = StockTradesRequest(
+                symbol_or_symbols=list(sym_list),
+                start=start,
+                end=end,
+                limit=limit,
+                feed=self._feed,
+            )
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(self._client.get_stock_trades, request)
+                raw = future.result(timeout=20)
+            raw_data = dict(getattr(raw, "data", {}) or {})
+        except Exception as exc:
+            logger.warning("Failed to fetch historical trades for %s: %s", sym_list, exc)
+            return {}
+
+        result: Dict[str, List[Tick]] = {}
+        for symbol in sym_list:
+            ticks: List[Tick] = []
+            for trade in raw_data.get(symbol) or []:
+                price = float(getattr(trade, "price", 0.0) or 0.0)
+                size = float(getattr(trade, "size", 0.0) or 0.0)
+                if price <= 0 or size <= 0:
+                    continue
+                ticks.append(Tick(
+                    symbol=symbol,
+                    ts=getattr(trade, "timestamp", datetime.now(timezone.utc)),
+                    price=price,
+                    size=size,
+                    side=Side.BUY,
+                ))
+            if ticks:
+                result[symbol] = sorted(ticks, key=lambda t: t.ts)
         return result
 
 

@@ -19,7 +19,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
-from daytrading.models import Bar, SignalAction, TradeSignal
+from daytrading.models import Bar, SignalAction, Tick, TradeSignal
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +37,7 @@ class PendingEntry:
     require_pullback_reclaim: bool = False
     require_micro_signal: bool = False
     last_bar: Optional[Bar] = None
+    tick_confirm: int = 0   # consecutive qualifying ticks (for tick entry trigger)
 
 
 class ExecutionTimer:
@@ -52,10 +53,21 @@ class ExecutionTimer:
     are released. Structured pullback/reclaim signals are cancelled.
     """
 
-    def __init__(self, max_wait_bars: int = 1, enabled: bool = True) -> None:
+    def __init__(
+        self,
+        max_wait_bars: int = 1,
+        enabled: bool = True,
+        *,
+        tick_entry_enabled: bool = False,
+        tick_entry_confirm_count: int = 2,
+        tick_entry_max_above_anchor: float = 0.02,
+    ) -> None:
         self._max_wait = max_wait_bars
         self._enabled = enabled
         self._pending: Dict[str, PendingEntry] = {}
+        self._tick_entry_enabled = bool(tick_entry_enabled)
+        self._tick_entry_confirm_count = max(1, int(tick_entry_confirm_count))
+        self._tick_entry_max_above_anchor = float(tick_entry_max_above_anchor)
 
     @property
     def pending_symbols(self) -> List[str]:
@@ -117,6 +129,50 @@ class ExecutionTimer:
             )
         return True
 
+    def on_tick(self, tick: Tick) -> Optional[TradeSignal]:
+        """Release a pending entry off a live tick when price holds the base.
+
+        Mirrors ``_allows_early_strength_release`` but on tick granularity, so
+        fast movers are caught near the anchor before a 10s bar can confirm. The
+        execute-path chase/spread guards still run on release, so this can never
+        cause a chase — it only catches an early entry that is still near base.
+        """
+        if not self._tick_entry_enabled:
+            return None
+        sym = tick.symbol
+        pending = self._pending.get(sym)
+        if pending is None or not pending.require_micro_signal:
+            return None
+
+        price = float(getattr(tick, "price", 0) or 0.0)
+        if price <= 0:
+            return None
+
+        hit = pending.signal.scan_result
+        crit = hit.criteria if hit is not None else {}
+        anchor = (
+            ExecutionTimer._criteria_float(crit, "setup_anchor")
+            or ExecutionTimer._criteria_float(crit, "queued_entry_price")
+            or float(pending.signal.entry_price or 0.0)
+        )
+        if anchor <= 0:
+            return None
+        vwap = ExecutionTimer._criteria_float(crit, "vwap")
+
+        qualifies = (
+            price <= anchor * (1.0 + self._tick_entry_max_above_anchor)  # still near base
+            and price >= anchor * 0.985                                  # not broken down
+            and (vwap is None or vwap <= 0 or price >= vwap * 1.003)      # holding VWAP
+        )
+        pending.tick_confirm = pending.tick_confirm + 1 if qualifies else 0
+        if pending.tick_confirm >= self._tick_entry_confirm_count:
+            logger.info(
+                "EXEC_TIMER: %s — tick early entry confirmed (%d ticks @ %.4f, anchor=%.4f), executing",
+                sym, pending.tick_confirm, price, anchor,
+            )
+            return self._release(sym)
+        return None
+
     def on_10s_bar(self, bar: Bar) -> Optional[TradeSignal]:
         """Feed a 10-sec bar. Returns a signal if it's time to execute."""
         sym = bar.symbol
@@ -153,6 +209,16 @@ class ExecutionTimer:
             )
             return self._release(sym)
 
+        if self._is_vwap_reclaim_scout_signal(pending.signal) and self._allows_vwap_reclaim_release(
+            pending,
+            latest_bar=bar,
+        ):
+            logger.info(
+                "EXEC_TIMER: %s — VWAP reclaim scout released on clean 10s hold (bar %d)",
+                sym, pending.bars_seen,
+            )
+            return self._release(sym)
+
         # Trigger 1: Micro-pullback bounce — red bar followed by green bar
         if pending.saw_red and is_green:
             if not self._passes_pullback_reclaim_confirmation(pending, bar):
@@ -161,6 +227,12 @@ class ExecutionTimer:
                     sym,
                 )
             else:
+                if not self._has_active_10s_tape(pending.signal, bar):
+                    logger.info(
+                        "EXEC_TIMER: %s — green 10s bounce volume too light, waiting",
+                        sym,
+                    )
+                    return None
                 logger.info(
                     "EXEC_TIMER: %s — micro-pullback bounce confirmed (bar %d), executing",
                     sym, pending.bars_seen,
@@ -179,6 +251,12 @@ class ExecutionTimer:
                     and self._passes_pullback_reclaim_confirmation(pending, bar)
                 )
             ):
+                if not self._has_active_10s_tape(pending.signal, bar):
+                    logger.info(
+                        "EXEC_TIMER: %s — strong green 10s bar volume too light, waiting",
+                        sym,
+                    )
+                    return None
                 logger.info(
                     "EXEC_TIMER: %s — strong green 10s bar (bar %d), executing",
                     sym, pending.bars_seen,
@@ -373,6 +451,22 @@ class ExecutionTimer:
 
         pattern = str(criteria.get("pattern", ""))
         scanner = str(hit.scanner_name or "") if hit is not None else ""
+        if pattern == "early_vwap_reclaim_scout" or scanner == "early_vwap_reclaim_scout":
+            open_ = float(bar.open or 0.0)
+            high = float(bar.high or 0.0)
+            rng = high - low
+            if rng <= 0:
+                return "early VWAP reclaim 10s bar has no range"
+            close_location = (close - low) / rng
+            upper_wick = (high - max(open_, close)) / rng
+            if close_location < 0.55:
+                return "early VWAP reclaim weak 10s close ({:.0%} location)".format(
+                    close_location,
+                )
+            if upper_wick > 0.45:
+                return "early VWAP reclaim upper wick too large ({:.0%} of range)".format(
+                    upper_wick,
+                )
         if pattern == "opening_range_breakout" or scanner == "opening_range_breakout":
             setup_price = ExecutionTimer._criteria_float(criteria, "close")
             if setup_price is None or setup_price <= 0:
@@ -482,6 +576,7 @@ class ExecutionTimer:
                 "deep_runner_scout",
                 "level_scout",
                 "stair_scout",
+                "vwap_reclaim_scout",
             }
             or pattern in {
                 "level_breakout_reclaim",
@@ -512,8 +607,33 @@ class ExecutionTimer:
             return False
         if bar.close < vwap_level * 1.003:
             return False
+        if not ExecutionTimer._has_active_10s_tape(pending.signal, bar):
+            return False
 
         return True
+
+    @staticmethod
+    def _has_active_10s_tape(signal: TradeSignal, bar: Bar) -> bool:
+        """Require real 10s participation before releasing a queued entry.
+
+        Day/1m volume can make a setup look liquid, but names like PALI can go
+        dead right at the entry point. This blocks price-only holds on inactive
+        tape while keeping the floor scaled to cheap runners.
+        """
+        bar_volume = float(bar.volume or 0.0)
+        if bar_volume <= 0:
+            return False
+        hit = signal.scan_result
+        criteria = hit.criteria if hit is not None else {}
+        setup_volume = ExecutionTimer._criteria_float(criteria, "volume") or 0.0
+        price = float(bar.close or signal.entry_price or 0.0)
+        if price < 2.0 and setup_volume >= 500_000:
+            min_volume = max(5_000.0, setup_volume * 0.01)
+        elif price < 5.0 and setup_volume >= 250_000:
+            min_volume = 1_000.0
+        else:
+            min_volume = 500.0
+        return bar_volume >= min_volume
 
     @staticmethod
     def _is_level_breakout_signal(signal: TradeSignal) -> bool:
@@ -835,7 +955,9 @@ class ExecutionTimer:
         if pattern != "vwap_pullback" and scanner != "vwap_pullback":
             return False
 
-        if pending.saw_red:
+        entry_tier = str(hit.criteria.get("entry_tier") or "").lower()
+        is_reduced_scout = entry_tier == "vwap_reclaim_scout"
+        if pending.saw_red and not is_reduced_scout:
             return False
         if latest_bar is None:
             return False
@@ -850,9 +972,11 @@ class ExecutionTimer:
             return False
         if close < open_ * 0.998:
             return False
-        if close < price * 0.995:
+        min_hold = 0.990 if is_reduced_scout else 0.995
+        max_extension = 1.030 if is_reduced_scout else 1.015
+        if close < price * min_hold:
             return False
-        if close > price * 1.015:
+        if close > price * max_extension:
             return False
 
         vwap_level = ExecutionTimer._criteria_float(hit.criteria, "vwap")
@@ -862,11 +986,31 @@ class ExecutionTimer:
             return False
 
         pullback_low = ExecutionTimer._criteria_float(hit.criteria, "pullback_low")
+        if pullback_low is None:
+            pullback_low = ExecutionTimer._criteria_float(hit.criteria, "base_low")
         if pullback_low is not None and pullback_low > 0 and close < pullback_low:
+            return False
+
+        stop = ExecutionTimer._criteria_float(hit.criteria, "stop_price")
+        if stop is None and signal.stop_loss is not None:
+            stop = float(signal.stop_loss)
+        if (
+            stop is not None
+            and stop > 0
+            and stop < price
+            and float(latest_bar.low or 0.0) <= stop
+        ):
             return False
 
         score = float(hit.score or 0.0)
         volume = float(hit.criteria.get("volume") or 0.0)
+        if is_reduced_scout:
+            if not ExecutionTimer._has_active_10s_tape(signal, latest_bar):
+                return False
+            if score < 6.0 and volume < 250_000:
+                return False
+            return True
+
         if score < 12.0 and volume < 100_000:
             return False
 
@@ -995,6 +1139,19 @@ class ExecutionTimer:
         if hit is None:
             return False
         return str(hit.criteria.get("entry_tier", "")) == "pullback_scout"
+
+    @staticmethod
+    def _is_vwap_reclaim_scout_signal(signal: TradeSignal) -> bool:
+        hit = signal.scan_result
+        if hit is None:
+            return False
+        criteria = hit.criteria
+        pattern = str(criteria.get("pattern") or "")
+        scanner = str(hit.scanner_name or "")
+        return (
+            str(criteria.get("entry_tier") or "").lower() == "vwap_reclaim_scout"
+            and (pattern == "vwap_pullback" or scanner == "vwap_pullback")
+        )
 
     @staticmethod
     def _pullback_volume_profile_score(signal: TradeSignal) -> float:

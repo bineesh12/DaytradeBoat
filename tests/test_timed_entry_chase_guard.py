@@ -94,6 +94,54 @@ def _level_breakout_signal(symbol: str = "DAIC", price: float = 4.32) -> TradeSi
     )
 
 
+def _hod_reclaim_signal(symbol: str = "SUGP", price: float = 2.87) -> TradeSignal:
+    return TradeSignal(
+        symbol=symbol,
+        action=SignalAction.ENTER_LONG,
+        quantity=290,
+        entry_price=price,
+        stop_loss=2.70,
+        reason="HOD Reclaim",
+        scan_result=ScanResult(
+            symbol=symbol,
+            scanner_name="hod_reclaim",
+            ts=datetime.now(timezone.utc),
+            score=90.0,
+            criteria={
+                "pattern": "hod_reclaim",
+                "close": price,
+                "hod": 2.82,
+                "stop_price": 2.70,
+            },
+        ),
+    )
+
+
+def _vwap_pullback_signal(symbol: str = "VWAP", price: float = 4.08) -> TradeSignal:
+    return TradeSignal(
+        symbol=symbol,
+        action=SignalAction.ENTER_LONG,
+        quantity=100,
+        entry_price=price,
+        stop_loss=3.88,
+        reason="VWAP Pullback",
+        scan_result=ScanResult(
+            symbol=symbol,
+            scanner_name="vwap_pullback",
+            ts=datetime.now(timezone.utc),
+            score=90.0,
+            criteria={
+                "pattern": "vwap_pullback",
+                "close": price,
+                "vwap": 4.00,
+                "base_high": 4.05,
+                "pullback_low": 3.90,
+                "stop_price": 3.88,
+            },
+        ),
+    )
+
+
 def _runner(live_price: float) -> AlpacaRunner:
     runner = AlpacaRunner.__new__(AlpacaRunner)
     runner._live_prices = lambda symbols: {symbols[0]: live_price}
@@ -109,6 +157,23 @@ class _Journal:
 
     def record(self, event_type, payload, ts=None):
         self.records.append((event_type, payload, ts))
+
+
+class _FloatChecker:
+    def __init__(self, cached=None, fetched=None) -> None:
+        self.cached = cached
+        self.fetched = fetched
+        self.cached_calls = 0
+        self.fetch_calls = 0
+        self._avg_vol_cache = {}
+
+    def get_float_cached(self, symbol: str):
+        self.cached_calls += 1
+        return self.cached
+
+    def get_float(self, symbol: str):
+        self.fetch_calls += 1
+        return self.fetched
 
 
 def _policy_runner() -> AlpacaRunner:
@@ -139,6 +204,41 @@ def test_timed_entry_chase_guard_allows_near_signal_price() -> None:
     assert reason is None
 
 
+def test_timed_entry_chase_guard_rejects_late_subfive_hod_reclaim() -> None:
+    runner = _runner(2.969)
+
+    reason = runner._timed_entry_chase_reject(
+        _hod_reclaim_signal(price=2.87),
+        _bar(symbol="SUGP", close=2.969),
+    )
+
+    assert reason is not None
+    assert "ran 3.4%" in reason
+    assert "max 2.5%" in reason
+
+
+def test_timed_entry_chase_guard_rejects_vwap_pullback_extended_from_base() -> None:
+    runner = _runner(4.18)
+
+    reason = runner._timed_entry_chase_reject(
+        _vwap_pullback_signal(price=4.08),
+        _bar(symbol="VWAP", close=4.18),
+    )
+
+    assert reason == "live price 4.1800 too extended from VWAP pullback base 4.0500 (max 2.5%)"
+
+
+def test_timed_entry_chase_guard_allows_vwap_pullback_near_base() -> None:
+    runner = _runner(4.14)
+
+    reason = runner._timed_entry_chase_reject(
+        _vwap_pullback_signal(price=4.08),
+        _bar(symbol="VWAP", close=4.14),
+    )
+
+    assert reason is None
+
+
 def test_shared_entry_quality_records_structured_decision(monkeypatch) -> None:
     monkeypatch.setattr(
         "daytrading.strategy.entry_policy.check_entry_quality",
@@ -164,6 +264,61 @@ def test_shared_entry_quality_records_structured_decision(monkeypatch) -> None:
     assert payload["passed"] is False
 
 
+def test_shared_entry_quality_uses_cached_or_stored_float_without_network(monkeypatch) -> None:
+    monkeypatch.setattr("daytrading.strategy.entry_guard.ENTRY_MAX_FLOAT_SHARES", 20_000_000)
+    monkeypatch.setattr("daytrading.strategy.entry_guard._xgb_model", None)
+    runner = _policy_runner()
+    runner._float_checker = _FloatChecker(cached=120_000_000, fetched=5_000_000)
+    now = datetime.now(timezone.utc)
+    bars = [
+        Bar(
+            symbol="SPCE",
+            ts=now,
+            open=4.8 + i * 0.01,
+            high=5.05,
+            low=4.75 + i * 0.01,
+            close=4.9 + i * 0.01,
+            volume=100_000,
+            timeframe=Timeframe.MIN_1,
+        )
+        for i in range(25)
+    ]
+    bars[-1] = Bar(
+        symbol="SPCE",
+        ts=now,
+        open=5.00,
+        high=5.04,
+        low=4.98,
+        close=5.02,
+        volume=250_000,
+        timeframe=Timeframe.MIN_1,
+    )
+    runner._quote_buffer = {
+        "SPCE": [
+            Quote(symbol="SPCE", ts=now, bid=5.01, ask=5.02, bid_size=2000, ask_size=2000)
+            for _ in range(3)
+        ]
+    }
+    signal = _signal(symbol="SPCE", price=5.02)
+    signal.scan_result.criteria.update({
+        "pattern": "first_pullback_reclaim",
+        "setup_tier": "A+ setup",
+    })
+
+    reason = runner._shared_entry_quality_reject(
+        "SPCE",
+        bars,
+        signal=signal,
+        stage="timed_entry_final_guard",
+        source="timed_entry",
+    )
+
+    assert runner._float_checker.cached_calls == 1
+    assert runner._float_checker.fetch_calls == 0
+    assert reason is not None
+    assert "float too large" in reason.lower()
+
+
 def test_timed_entry_chase_guard_allows_one_tick_sub_two_spread() -> None:
     runner = _runner(1.66)
     now = datetime.now(timezone.utc)
@@ -177,6 +332,44 @@ def test_timed_entry_chase_guard_allows_one_tick_sub_two_spread() -> None:
     reason = runner._timed_entry_chase_reject(_signal(symbol="BATL", price=1.66), _bar(symbol="BATL", close=1.66))
 
     assert reason is None
+
+
+def test_timed_entry_chase_guard_uses_opportunity_scaled_spread_policy() -> None:
+    runner = _runner(2.13)
+    now = datetime.now(timezone.utc)
+    runner._quote_buffer = {
+        "RGNT": [
+            Quote(symbol="RGNT", ts=now, bid=2.121, ask=2.139, bid_size=1500, ask_size=1400)
+            for _ in range(3)
+        ]
+    }
+    runner._bar_buffer = {
+        "RGNT": [
+            Bar(
+                symbol="RGNT",
+                ts=now,
+                open=1.95 + i * 0.01,
+                high=2.14,
+                low=1.93 + i * 0.01,
+                close=2.00 + i * 0.0068,
+                volume=90_000,
+                timeframe=Timeframe.MIN_1,
+            )
+            for i in range(20)
+        ]
+    }
+    signal = _signal(symbol="RGNT", price=2.13)
+    signal.scan_result.criteria.update({
+        "pattern": "first_pullback_reclaim",
+        "setup_tier": "A+ setup",
+        "entry_tier": "a_plus_reclaim_scout",
+    })
+
+    reason = runner._timed_entry_chase_reject(signal, _bar(symbol="RGNT", close=2.13))
+
+    assert reason is None
+    assert signal.scan_result.criteria["spread_exception"] == "opportunity_scaled"
+    assert signal.scan_result.criteria["spread_size_factor"] < 1.0
 
 
 def test_timed_entry_chase_guard_uses_queued_base_not_late_signal_price() -> None:
@@ -245,6 +438,102 @@ def test_timed_entry_chase_guard_rejects_red_10s_release() -> None:
     reason = runner._timed_entry_chase_reject(_signal(price=5.00), _bar(close=5.05))
 
     assert reason == "latest 10s candle turned red during entry wait"
+
+
+def test_timed_hod_reclaim_rejects_10s_release_without_expansion() -> None:
+    runner = _runner(4.08)
+    signal = _hod_reclaim_signal(symbol="CAST", price=4.07)
+    signal.scan_result.criteria["hod"] = 4.07
+    signal.scan_result.criteria["volume"] = 77_979
+    prev_10s = Bar(
+        symbol="CAST",
+        open=4.06,
+        high=4.09,
+        low=4.04,
+        close=4.08,
+        volume=30_000,
+        ts=datetime.now(timezone.utc),
+        timeframe=Timeframe.SEC_10,
+    )
+    flat_10s = Bar(
+        symbol="CAST",
+        open=4.07,
+        high=4.09,
+        low=4.05,
+        close=4.08,
+        volume=30_000,
+        ts=datetime.now(timezone.utc),
+        timeframe=Timeframe.SEC_10,
+    )
+    runner._bar_aggregator = _Agg([prev_10s, flat_10s])
+
+    reason = runner._timed_entry_chase_reject(signal, _bar(symbol="CAST", close=4.08))
+
+    assert reason == "HOD reclaim 10s confirmation no expansion"
+
+
+def test_timed_hod_reclaim_rejects_10s_release_with_weak_volume() -> None:
+    runner = _runner(4.09)
+    signal = _hod_reclaim_signal(symbol="CAST", price=4.07)
+    signal.scan_result.criteria["hod"] = 4.07
+    signal.scan_result.criteria["volume"] = 77_979
+    prev_10s = Bar(
+        symbol="CAST",
+        open=4.04,
+        high=4.06,
+        low=4.03,
+        close=4.05,
+        volume=28_000,
+        ts=datetime.now(timezone.utc),
+        timeframe=Timeframe.SEC_10,
+    )
+    light_10s = Bar(
+        symbol="CAST",
+        open=4.07,
+        high=4.10,
+        low=4.06,
+        close=4.095,
+        volume=5_000,
+        ts=datetime.now(timezone.utc),
+        timeframe=Timeframe.SEC_10,
+    )
+    runner._bar_aggregator = _Agg([prev_10s, light_10s])
+
+    reason = runner._timed_entry_chase_reject(signal, _bar(symbol="CAST", close=4.09))
+
+    assert reason == "HOD reclaim 10s volume 5000 below follow-through floor 19495"
+
+
+def test_timed_hod_reclaim_allows_clean_10s_expansion() -> None:
+    runner = _runner(4.09)
+    signal = _hod_reclaim_signal(symbol="CAST", price=4.07)
+    signal.scan_result.criteria["hod"] = 4.07
+    signal.scan_result.criteria["volume"] = 77_979
+    prev_10s = Bar(
+        symbol="CAST",
+        open=4.04,
+        high=4.06,
+        low=4.03,
+        close=4.05,
+        volume=28_000,
+        ts=datetime.now(timezone.utc),
+        timeframe=Timeframe.SEC_10,
+    )
+    clean_10s = Bar(
+        symbol="CAST",
+        open=4.07,
+        high=4.10,
+        low=4.06,
+        close=4.095,
+        volume=25_000,
+        ts=datetime.now(timezone.utc),
+        timeframe=Timeframe.SEC_10,
+    )
+    runner._bar_aggregator = _Agg([prev_10s, clean_10s])
+
+    reason = runner._timed_entry_chase_reject(signal, _bar(symbol="CAST", close=4.09))
+
+    assert reason is None
 
 
 def test_timed_entry_chase_guard_rejects_failed_opening_range_reclaim() -> None:

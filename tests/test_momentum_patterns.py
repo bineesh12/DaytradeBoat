@@ -360,6 +360,26 @@ class TestABCContinuationScanner:
         hits = scanner.scan({"TST": bars})
         assert hits == []
 
+    def test_rejects_extended_c_trigger_climax_bar(self) -> None:
+        bars = _make_abc_bars()
+        # CUPR-style C candle: valid reclaim shape, but already extended and
+        # too wide to buy at the close as an ABC scalp.
+        bars[-1] = _bar(
+            11,
+            close=4.70,
+            open_=4.08,
+            high=4.85,
+            low=4.06,
+            volume=1_210_055,
+            base_ts=bars[-1].ts,
+            n=30,
+        )
+        scanner = ABCContinuationScanner(min_a_leg_pct=5.0, min_price=1.0, max_price=20.0)
+
+        hits = scanner.scan({"TST": bars})
+
+        assert hits == []
+
 
 class TestFirstPullbackReclaimScanner:
     def test_detects_svco_style_first_pullback_reclaim(self) -> None:
@@ -458,6 +478,59 @@ class TestEarlyVWAPReclaimScoutScanner:
         assert hit.criteria["washout_low"] == 2.71
         assert hit.criteria["reclaim_above_vwap_pct"] > 0
         assert hit.criteria["distance_from_hod_pct"] <= 12.0
+        assert hit.criteria["active_recent_bars"] >= 2
+        assert hit.criteria["max_recent_volume_share"] <= 0.70
+
+    def test_rejects_one_spike_premarket_reclaim_without_sustained_volume(self) -> None:
+        now = datetime.now(timezone.utc)
+        prices = [
+            (2.00, 2.03, 1.99, 2.01, 4_000),
+            (2.01, 2.05, 2.00, 2.03, 5_000),
+            (2.03, 2.08, 2.02, 2.06, 7_000),
+            (2.06, 2.14, 2.04, 2.12, 9_000),
+            (2.12, 2.18, 2.09, 2.15, 8_000),
+            (2.15, 2.42, 2.13, 2.36, 108_000),
+            (2.36, 2.39, 2.20, 2.24, 5_000),
+            (2.24, 2.27, 2.14, 2.18, 4_000),
+            (2.18, 2.23, 2.15, 2.20, 6_000),
+            (2.20, 2.25, 2.17, 2.22, 2_000),
+            (2.22, 2.27, 2.19, 2.24, 4_000),
+            (2.24, 2.29, 2.21, 2.26, 5_000),
+            (2.26, 2.32, 2.25, 2.31, 32_406),
+        ]
+        bars = [
+            _bar(i, open_=o, high=h, low=l, close=c, volume=v, base_ts=now, n=len(prices))
+            for i, (o, h, l, c, v) in enumerate(prices)
+        ]
+        scanner = EarlyVWAPReclaimScoutScanner(min_price=1.0, max_price=20.0)
+
+        assert scanner.scan({"TST": bars}) == []
+
+    def test_rejects_weak_wick_reclaim_candle(self) -> None:
+        now = datetime.now(timezone.utc)
+        prices = [
+            (6.80, 6.95, 6.76, 6.90, 45_000),
+            (6.90, 7.10, 6.86, 7.02, 55_000),
+            (7.02, 7.34, 6.98, 7.28, 80_000),
+            (7.28, 8.25, 7.20, 8.05, 180_000),
+            (8.05, 8.48, 7.92, 8.28, 210_000),
+            (8.28, 8.46, 7.68, 7.82, 140_000),
+            (7.82, 7.94, 7.34, 7.46, 95_000),
+            (7.46, 7.62, 7.04, 7.18, 88_000),
+            (7.18, 7.20, 7.13, 7.17, 11_208),
+            (7.17, 7.17, 6.9213, 7.00, 9_707),
+            (7.01, 7.30, 6.98, 7.30, 48_050),
+            # OLOX-style failed reclaim: volume appears, but the candle rejects
+            # hard from the high and closes in the lower part of its range.
+            (7.30, 7.75, 7.2941, 7.37, 102_426),
+        ]
+        bars = [
+            _bar(i, open_=o, high=h, low=l, close=c, volume=v, base_ts=now, n=len(prices))
+            for i, (o, h, l, c, v) in enumerate(prices)
+        ]
+        scanner = EarlyVWAPReclaimScoutScanner(min_price=1.0, max_price=20.0)
+
+        assert scanner.scan({"TST": bars}) == []
 
     def test_rejects_late_chase_far_above_vwap(self) -> None:
         now = datetime.now(timezone.utc)
@@ -530,8 +603,47 @@ class TestLevelBreakoutWatchScanner:
         assert hit.criteria["pattern"] == "level_breakout_reclaim"
         assert hit.criteria["setup_tier"] == "A+ setup"
         assert hit.criteria["entry_tier"] == "level_scout"
-        assert hit.criteria["size_factor"] == pytest.approx(0.45)
+        assert hit.criteria["entry_mode"] == "level_breakout_scout"
+        assert hit.criteria["size_factor"] == pytest.approx(0.35)
         assert hit.criteria["stop_price"] < hit.criteria["close"]
+
+    def test_conl_style_smooth_level_break_promotes_before_five_pct_move(self) -> None:
+        base_ts = datetime(2026, 6, 12, 14, 52, tzinfo=timezone.utc)
+        bars = []
+        closes = [5.21, 5.24, 5.26, 5.30, 5.34, 5.38, 5.40, 5.41, 5.42]
+        for i, close in enumerate(closes):
+            bars.append(_bar(
+                i,
+                close=close,
+                open_=close - 0.015,
+                high=close + 0.015,
+                low=close - 0.025,
+                volume=65_000,
+                base_ts=base_ts,
+                n=20,
+            ))
+        bars.append(_bar(
+            9,
+            close=5.45,
+            open_=5.42,
+            high=5.46,
+            low=5.415,
+            volume=125_000,
+            base_ts=base_ts,
+            n=20,
+        ))
+        scanner = LevelBreakoutWatchScanner(min_price=1.0, max_price=20.0)
+
+        hits = scanner.scan({"CONL": bars})
+
+        assert len(hits) == 1
+        hit = hits[0]
+        assert hit.criteria["pattern"] == "level_breakout_reclaim"
+        assert hit.criteria["entry_tier"] == "level_scout"
+        assert hit.criteria["entry_mode"] == "level_breakout_scout"
+        assert hit.criteria["size_factor"] == pytest.approx(0.35)
+        assert hit.criteria["session_move_pct"] < 5.0
+        assert hit.criteria["breakout_level"] < hit.criteria["close"]
 
     def test_watches_near_resistance_before_clean_break(self) -> None:
         bars = _make_level_breakout_bars()
@@ -607,10 +719,29 @@ class TestShallowStairContinuationScanner:
         assert hit.criteria["entry_tier"] == "stair_scout"
         assert hit.criteria["runner_profile"] == "fast_stair_runner"
         assert hit.criteria["pullback_from_hod_pct"] > 4.0
-        assert hit.criteria["allowed_hod_pullback_pct"] == pytest.approx(16.0)
+        assert hit.criteria["allowed_hod_pullback_pct"] == pytest.approx(12.0)
         assert hit.criteria["base_range_pct"] > 7.0
-        assert hit.criteria["allowed_base_range_pct"] == pytest.approx(22.0)
+        assert hit.criteria["allowed_base_range_pct"] == pytest.approx(13.0)
         assert hit.score >= 80.0
+
+    def test_rejects_deep_wide_reclaim_as_not_shallow_stair(self) -> None:
+        bars = _make_fast_runner_stair_bars()
+        base_ts = bars[-1].ts
+        # CAST-style failed re-entry: the name is still strong overall, but the
+        # setup is a deep/wide reclaim, not a shallow stair-step base.
+        bars[4] = _bar(4, close=9.85, open_=9.25, high=10.0, low=8.90, volume=420_000, base_ts=base_ts, n=20)
+        bars[-5:] = [
+            _bar(7, close=7.70, open_=8.05, high=8.10, low=7.09, volume=120_000, base_ts=base_ts, n=20),
+            _bar(8, close=7.82, open_=7.70, high=7.94, low=7.28, volume=130_000, base_ts=base_ts, n=20),
+            _bar(9, close=8.00, open_=7.82, high=8.04, low=7.50, volume=160_000, base_ts=base_ts, n=20),
+            _bar(10, close=8.10, open_=8.00, high=8.10, low=7.76, volume=185_000, base_ts=base_ts, n=20),
+            _bar(11, close=8.59, open_=8.12, high=8.68, low=8.08, volume=260_000, base_ts=base_ts, n=20),
+        ]
+        scanner = ShallowStairContinuationScanner(min_price=1.0, max_price=20.0)
+
+        hits = scanner.scan({"TST": bars})
+
+        assert hits == []
 
     def test_rejects_shallow_stair_without_volume(self) -> None:
         bars = _make_shallow_stair_bars()
@@ -844,6 +975,29 @@ class TestMomentumPatternVerifier:
         signal = verifier.verify(hit, PortfolioState(cash=100_000))
         assert signal is None
         assert "too far from HOD" in verifier._last_reject
+
+    def test_vwap_pullback_hod_threshold_loosened_to_twelve(self) -> None:
+        # A ~11%-from-HOD vwap_pullback (DTSS/KMRK-style) was rejected at the old
+        # 8% cap. The loosened 12% cap no longer rejects it for HOD distance.
+        now = datetime.now(timezone.utc)
+        bars = []
+        for i in range(8):
+            c = 5.00 + i * 0.128  # rally to ~5.90 HOD (day move ~20%, below 25% reclaim trigger)
+            bars.append(_bar(i, close=c, open_=c - 0.05, high=c + 0.04, low=c - 0.08,
+                             volume=120_000, base_ts=now, n=12))
+        for j, (o, c, h, l) in enumerate([
+            (5.85, 5.60, 5.88, 5.55), (5.60, 5.40, 5.62, 5.36),
+            (5.40, 5.26, 5.44, 5.22), (5.26, 5.28, 5.34, 5.22),
+        ]):
+            bars.append(_bar(8 + j, close=c, open_=o, high=h, low=l,
+                             volume=90_000, base_ts=now, n=12))
+        # distance_from_hod ~ 11%  (between the old 8% and new 12% caps)
+        reject_old = MomentumPatternVerifier._late_pullback_reject(
+            "vwap_pullback", bars, max_hod_pct=8.0)
+        assert reject_old is not None and "too far from HOD" in reject_old
+        reject_new = MomentumPatternVerifier._late_pullback_reject(
+            "vwap_pullback", bars, max_hod_pct=12.0)
+        assert reject_new is None or "too far from HOD" not in reject_new
 
     @patch("daytrading.strategy.scalping.momentum_pattern.check_entry_quality", return_value=None)
     def test_allows_a_plus_vwap_retry_watch_after_fresh_late_reclaim(self, _mock_guard: object) -> None:
@@ -1736,6 +1890,53 @@ class TestMomentumPatternVerifier:
         assert "A+ ABC scout" in signal.reason
 
     @patch("daytrading.strategy.scalping.momentum_pattern.check_entry_quality", return_value=None)
+    def test_a_plus_abc_scout_rejects_tactical_stop_inside_climax_bar_noise(
+        self,
+        _mock_guard: object,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        rows = [
+            (3.20, 3.34, 3.40, 3.18, 280_000),
+            (3.34, 3.84, 3.91, 3.21, 563_000),
+            (3.78, 4.00, 4.24, 3.76, 1_122_000),
+            (4.02, 4.17, 4.45, 3.98, 806_000),
+            (4.17, 4.12, 4.25, 4.00, 411_000),
+            (4.08, 4.70, 4.85, 4.06, 1_210_055),
+        ]
+        bars = [
+            _bar(i, close=c, open_=o, high=h, low=l, volume=v, base_ts=now, n=20)
+            for i, (o, c, h, l, v) in enumerate(rows)
+        ]
+        hit = ScanResult(
+            symbol="CUPR",
+            scanner_name="abc_continuation",
+            ts=bars[-1].ts,
+            score=40.0,
+            criteria={
+                "pattern": "abc_continuation",
+                "direction": "up",
+                "a_leg_pct": 35.0,
+                "a_high": 4.45,
+                "a_low": 3.18,
+                "b_high": 4.25,
+                "b_low": 4.00,
+                "b_retrace_pct": 35.0,
+                "c_breakout_pct": 10.6,
+                "c_bar_range_pct": 16.8,
+                "c_volume_surge": 2.2,
+                "close": 4.70,
+                "setup_tier": "A+ setup",
+                "volume": 1_210_055,
+            },
+            bars=bars,
+        )
+        verifier = MomentumPatternVerifier(max_dollar_risk=100.0)
+
+        signal = verifier.verify(hit, PortfolioState(cash=100_000))
+
+        assert signal is None
+
+    @patch("daytrading.strategy.scalping.momentum_pattern.check_entry_quality", return_value=None)
     def test_generates_reduced_size_signal_for_shallow_stair_continuation(
         self,
         _mock_guard: object,
@@ -1796,9 +1997,10 @@ class TestMomentumPatternVerifier:
 
         assert signal is not None
         assert signal.action == SignalAction.ENTER_LONG
-        assert signal.quantity == int(45.0 / (hit.criteria["close"] - hit.criteria["stop_price"]))
+        assert signal.quantity == int(35.0 / (hit.criteria["close"] - hit.criteria["stop_price"]))
         assert hit.criteria["setup_quality"] == "level breakout scout"
-        assert hit.criteria["size_factor"] == pytest.approx(0.45)
+        assert hit.criteria["entry_mode"] == "level_breakout_scout"
+        assert hit.criteria["size_factor"] == pytest.approx(0.35)
 
     @patch("daytrading.strategy.scalping.momentum_pattern.check_entry_quality", return_value=None)
     def test_verifier_rejects_level_breakout_without_level_volume(self, _mock_guard: object) -> None:
@@ -1975,3 +2177,192 @@ class TestMomentumPatternVerifier:
         assert signal.action == SignalAction.ENTER_LONG
         assert signal.stop_loss is not None
         assert (signal.entry_price - signal.stop_loss) / signal.entry_price <= 0.08
+
+
+def _aplus_hit() -> ScanResult:
+    return ScanResult(
+        symbol="TST", scanner_name="vwap_pullback",
+        ts=datetime.now(timezone.utc), score=90.0,
+        criteria={"setup_tier": "A+ setup", "pattern": "vwap_pullback"},
+    )
+
+
+def _fresh_scout_dsy_bars(n: int = 10) -> list:
+    # low-price heavy volume early (VWAP anchor low), then a fresh green base
+    # rebuilt above VWAP on RISING volume — the DSY profile
+    return [
+        _bar(0, close=3.0, open_=2.9, high=3.05, low=2.85, volume=400_000, n=n),
+        _bar(1, close=3.1, open_=3.0, high=3.15, low=2.98, volume=300_000, n=n),
+        _bar(2, close=3.3, open_=3.1, high=3.35, low=3.08, volume=200_000, n=n),
+        _bar(3, close=3.6, open_=3.3, high=3.65, low=3.28, volume=200_000, n=n),
+        _bar(4, close=4.0, open_=3.6, high=4.05, low=3.58, volume=200_000, n=n),
+        _bar(5, close=4.3, open_=4.0, high=4.35, low=3.98, volume=150_000, n=n),
+        _bar(6, close=4.30, open_=4.35, high=4.40, low=4.28, volume=170_000, n=n),
+        _bar(7, close=4.33, open_=4.30, high=4.38, low=4.29, volume=180_000, n=n),
+        _bar(8, close=4.32, open_=4.33, high=4.40, low=4.30, volume=190_000, n=n),
+        _bar(9, close=4.45, open_=4.32, high=4.48, low=4.31, volume=200_000, n=n),
+    ]
+
+
+def test_fresh_vwap_reclaim_scout_allows_dsy_profile() -> None:
+    hit = _aplus_hit()
+    allowed = MomentumPatternVerifier._allows_fresh_vwap_reclaim_scout(
+        "vwap_pullback", _fresh_scout_dsy_bars(),
+        scan_result=hit, float_shares=8_000_000, max_float=20_000_000,
+        red_body_pct=4.0, red_range_pct=7.0,
+    )
+    assert allowed is True
+    assert hit.criteria["entry_tier"] == "fresh_vwap_reclaim_scout"
+
+
+def test_fresh_vwap_reclaim_scout_rejects_gmm_failed_reclaim() -> None:
+    # GMM profile: green bar but still BELOW VWAP (reclaim never held)
+    bars = [
+        _bar(0, close=4.3, open_=4.0, high=4.4, low=3.95, volume=400_000, n=10),
+        _bar(1, close=4.4, open_=4.3, high=4.5, low=4.25, volume=350_000, n=10),
+        _bar(2, close=4.2, open_=4.4, high=4.45, low=4.10, volume=300_000, n=10),
+        _bar(3, close=4.0, open_=4.2, high=4.25, low=3.95, volume=250_000, n=10),
+        _bar(4, close=3.9, open_=4.0, high=4.05, low=3.80, volume=200_000, n=10),
+        _bar(5, close=3.8, open_=3.9, high=3.95, low=3.70, volume=180_000, n=10),
+        _bar(6, close=3.7, open_=3.8, high=3.85, low=3.65, volume=150_000, n=10),
+        _bar(7, close=3.65, open_=3.7, high=3.75, low=3.60, volume=120_000, n=10),
+        _bar(8, close=3.62, open_=3.65, high=3.70, low=3.58, volume=110_000, n=10),
+        _bar(9, close=3.68, open_=3.62, high=3.72, low=3.60, volume=130_000, n=10),
+    ]
+    allowed = MomentumPatternVerifier._allows_fresh_vwap_reclaim_scout(
+        "vwap_pullback", bars,
+        scan_result=_aplus_hit(), float_shares=8_000_000, max_float=20_000_000,
+        red_body_pct=4.0, red_range_pct=7.0,
+    )
+    assert allowed is False
+
+
+def test_fresh_vwap_reclaim_scout_rejects_high_float() -> None:
+    allowed = MomentumPatternVerifier._allows_fresh_vwap_reclaim_scout(
+        "vwap_pullback", _fresh_scout_dsy_bars(),
+        scan_result=_aplus_hit(), float_shares=100_000_000, max_float=20_000_000,
+        red_body_pct=4.0, red_range_pct=7.0,
+    )
+    assert allowed is False
+
+
+def test_fresh_vwap_reclaim_scout_rejects_without_a_plus_tier() -> None:
+    hit = ScanResult(
+        symbol="TST", scanner_name="vwap_pullback",
+        ts=datetime.now(timezone.utc), score=70.0,
+        criteria={"pattern": "vwap_pullback"},
+    )
+    allowed = MomentumPatternVerifier._allows_fresh_vwap_reclaim_scout(
+        "vwap_pullback", _fresh_scout_dsy_bars(),
+        scan_result=hit, float_shares=8_000_000, max_float=20_000_000,
+        red_body_pct=4.0, red_range_pct=7.0,
+    )
+    assert allowed is False
+
+
+def test_fresh_vwap_reclaim_scout_gets_reduced_size_factor() -> None:
+    hit = _aplus_hit()
+    hit.criteria["entry_tier"] = "fresh_vwap_reclaim_scout"
+    factor, label = MomentumPatternVerifier._setup_quality_factor(
+        "vwap_pullback", hit, _fresh_scout_dsy_bars(),
+    )
+    assert factor == 0.35
+    assert "fresh VWAP reclaim" in label
+
+
+@patch("daytrading.strategy.scalping.momentum_pattern.check_entry_quality", return_value=None)
+def test_fresh_vwap_reclaim_scout_verify_uses_new_base_stop_and_reduced_size(
+    _mock_guard: object,
+) -> None:
+    bars = _fresh_scout_dsy_bars()
+    bars[5] = _bar(5, close=4.30, open_=4.65, high=4.72, low=4.15, volume=300_000, n=10)
+    bars[7] = _bar(7, close=4.33, open_=4.30, high=4.38, low=4.29, volume=300_000, n=10)
+    bars[8] = _bar(8, close=4.34, open_=4.32, high=4.40, low=4.30, volume=320_000, n=10)
+    bars[9] = _bar(9, close=4.45, open_=4.32, high=4.48, low=4.31, volume=340_000, n=10)
+    hit = ScanResult(
+        symbol="DSY",
+        scanner_name="vwap_pullback",
+        ts=datetime.now(timezone.utc),
+        score=90.0,
+        criteria={
+            "setup_tier": "A+ setup",
+            "pattern": "vwap_pullback",
+            "direction": "up",
+            "close": bars[-1].close,
+            "pullback_low": 3.98,
+            "stop_price": 3.96,
+            "volume": bars[-1].volume,
+        },
+        bars=bars,
+    )
+    verifier = MomentumPatternVerifier(
+        max_dollar_risk=100.0,
+        fresh_vwap_reclaim_scout_enabled=True,
+    )
+
+    signal = verifier.verify(hit, PortfolioState(cash=100_000))
+
+    assert signal is not None
+    assert hit.criteria["entry_tier"] == "fresh_vwap_reclaim_scout"
+    assert hit.criteria["base_low"] == pytest.approx(4.28)
+    assert hit.criteria["stop_price"] == pytest.approx(4.26)
+    assert signal.stop_loss == pytest.approx(hit.criteria["stop_price"])
+    assert signal.stop_loss > 3.98
+    assert hit.criteria["size_factor"] == pytest.approx(0.35)
+    assert "fresh VWAP reclaim scout" in signal.reason
+    assert signal.quantity == int(35.0 / (signal.entry_price - signal.stop_loss))
+
+
+def test_vwap_reclaim_scout_retries_near_miss_score_as_reduced_size() -> None:
+    now = datetime.now(timezone.utc)
+    bars = [
+        _bar(0, close=2.20, open_=2.20, high=2.24, low=2.16, volume=60_000, base_ts=now, n=12),
+        _bar(1, close=2.32, open_=2.20, high=2.36, low=2.19, volume=70_000, base_ts=now, n=12),
+        _bar(2, close=2.46, open_=2.32, high=2.50, low=2.31, volume=80_000, base_ts=now, n=12),
+        _bar(3, close=2.62, open_=2.46, high=2.68, low=2.44, volume=90_000, base_ts=now, n=12),
+        _bar(4, close=2.56, open_=2.62, high=2.66, low=2.50, volume=60_000, base_ts=now, n=12),
+        _bar(5, close=2.58, open_=2.56, high=2.64, low=2.52, volume=58_000, base_ts=now, n=12),
+        _bar(6, close=2.60, open_=2.58, high=2.66, low=2.54, volume=62_000, base_ts=now, n=12),
+        _bar(7, close=2.63, open_=2.60, high=2.69, low=2.58, volume=64_000, base_ts=now, n=12),
+        _bar(8, close=2.66, open_=2.63, high=2.70, low=2.60, volume=72_000, base_ts=now, n=12),
+        _bar(9, close=2.67, open_=2.63, high=2.69, low=2.58, volume=58_000, base_ts=now, n=12),
+    ]
+    hit = ScanResult(
+        symbol="AIIO",
+        scanner_name="vwap_pullback",
+        ts=now,
+        score=100.0,
+        criteria={
+            "setup_tier": "A+ setup",
+            "pattern": "vwap_pullback",
+            "direction": "up",
+            "close": bars[-1].close,
+            "pullback_low": 2.50,
+            "volume": bars[-1].volume,
+        },
+        bars=bars,
+    )
+    calls = []
+
+    def fake_guard(*args, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return "entry score too low (77/100, need 80+) [test]"
+        return None
+
+    verifier = MomentumPatternVerifier(
+        max_dollar_risk=100.0,
+        vwap_reclaim_scout_enabled=True,
+    )
+
+    with patch("daytrading.strategy.scalping.momentum_pattern.check_entry_quality", side_effect=fake_guard):
+        signal = verifier.verify(hit, PortfolioState(cash=100_000))
+
+    assert signal is not None
+    assert len(calls) == 2
+    assert calls[0]["entry_tier"] == ""
+    assert calls[1]["entry_tier"] == "vwap_reclaim_scout"
+    assert hit.criteria["entry_tier"] == "vwap_reclaim_scout"
+    assert hit.criteria["entry_score_at_signal"] == 77
+    assert hit.criteria["size_factor"] == pytest.approx(0.30)
+    assert "VWAP reclaim scout" in signal.reason

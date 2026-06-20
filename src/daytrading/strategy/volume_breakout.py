@@ -9,6 +9,7 @@ Works with: VolumeSpikeScanner
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Optional
 
 from daytrading.indicators.core import atr
@@ -40,6 +41,8 @@ class VolumeBreakoutVerifier:
         self,
         scan_result: ScanResult,
         portfolio: PortfolioState,
+        *,
+        now: Optional[datetime] = None,
     ) -> Optional[TradeSignal]:
         bars = scan_result.bars
         if len(bars) < self._lookback + 1:
@@ -61,7 +64,7 @@ class VolumeBreakoutVerifier:
         recent_low = min(b.low for b in prior)
 
         if latest.close > recent_high and latest.close > latest.open:
-            reject = check_entry_quality(bars, symbol=scan_result.symbol)
+            reject = check_entry_quality(bars, symbol=scan_result.symbol, now=now)
             if reject is not None:
                 return None
             stop = latest.close - current_atr * self._risk_atr_mult

@@ -504,3 +504,17 @@ class TestTimedEntryChaseGuard:
         )
 
         assert reject is None
+
+
+def test_watch_only_decisions_excluded_from_funnel():
+    """Shadow-scanner 'collecting data' rows must not enter the entry_decision funnel."""
+    is_wo = AlpacaRunner._is_watch_only_decision
+    # Watch-only monitoring rows → filtered
+    assert is_wo({"reason": "watch only: momentum_burst collecting data, not live A+ setup"})
+    assert is_wo({"reason": "", "blocked_layer": "scanner", "setup_tier": "watch only"})
+    assert is_wo({"reason": "level breakout has not reclaimed", "blocked_layer": "verifier",
+                  "setup_tier": "watch only"})
+    # Real entry decisions → kept
+    assert not is_wo({"reason": "entry score too low (75/100, need 80+)", "blocked_layer": "entry_guard"})
+    assert not is_wo({"reason": "spread too wide (1.00c = 0.62% of $1.60)", "blocked_layer": "verifier"})
+    assert not is_wo({"passed": True, "reason": "", "blocked_layer": "", "setup_tier": "A+ setup"})

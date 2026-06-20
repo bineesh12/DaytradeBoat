@@ -27,8 +27,8 @@ class ShallowStairContinuationScanner:
         min_recent_volume: float = 150_000,
         min_volume_surge: float = 0.85,
         elite_min_day_move_pct: float = 50.0,
-        elite_max_pullback_from_hod_pct: float = 16.0,
-        elite_max_base_range_pct: float = 22.0,
+        elite_max_pullback_from_hod_pct: float = 12.0,
+        elite_max_base_range_pct: float = 13.0,
         elite_min_recent_volume: float = 250_000,
         elite_min_volume_surge: float = 0.65,
     ) -> None:

@@ -10,6 +10,7 @@ Uses tick-based stops/targets (1 tick = $0.01) with 1:2 risk-reward.
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Optional
 
 from daytrading.models import PortfolioState, ScanResult, SignalAction, TradeSignal
@@ -52,6 +53,8 @@ class TapeScalpVerifier:
         self,
         scan_result: ScanResult,
         portfolio: PortfolioState,
+        *,
+        now: Optional[datetime] = None,
     ) -> Optional[TradeSignal]:
         if scan_result.score < self._min_score:
             return None
@@ -79,7 +82,7 @@ class TapeScalpVerifier:
             self._last_reject = "no bar data for tape signal"
             return None
 
-        reject = check_entry_quality(bars, symbol=scan_result.symbol)
+        reject = check_entry_quality(bars, symbol=scan_result.symbol, now=now)
         if reject is not None:
             logger.info("ENTRY GUARD REJECT %s: %s", scan_result.symbol, reject)
             self._last_reject = reject

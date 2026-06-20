@@ -9,6 +9,7 @@ Works with: VWAPDeviationScanner
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Optional
 
 from daytrading.indicators.core import atr, vwap
@@ -38,6 +39,8 @@ class VWAPBounceVerifier:
         self,
         scan_result: ScanResult,
         portfolio: PortfolioState,
+        *,
+        now: Optional[datetime] = None,
     ) -> Optional[TradeSignal]:
         bars = scan_result.bars
         if len(bars) < 3:
@@ -65,7 +68,7 @@ class VWAPBounceVerifier:
             touched_vwap = prev.low <= current_vwap * 1.002
             bounced = latest.close > latest.open and latest.close > current_vwap
             if touched_vwap and bounced:
-                reject = check_entry_quality(bars, symbol=scan_result.symbol)
+                reject = check_entry_quality(bars, symbol=scan_result.symbol, now=now)
                 if reject is not None:
                     return None
                 stop = current_vwap - current_atr * self._risk_atr_mult

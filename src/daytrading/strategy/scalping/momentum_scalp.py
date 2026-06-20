@@ -11,6 +11,7 @@ Uses tick-based stops/targets (1 tick = $0.01).
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Optional
 
 from daytrading.models import PortfolioState, ScanResult, SignalAction, TradeSignal
@@ -51,6 +52,8 @@ class MomentumScalpVerifier:
         self,
         scan_result: ScanResult,
         portfolio: PortfolioState,
+        *,
+        now: Optional[datetime] = None,
     ) -> Optional[TradeSignal]:
         bars = scan_result.bars
         if len(bars) < 3:
@@ -82,7 +85,7 @@ class MomentumScalpVerifier:
                 self._last_reject = "burst {:.2f}% < 0.80%".format(burst_pct)
                 return None
 
-            reject = check_entry_quality(bars, symbol=scan_result.symbol)
+            reject = check_entry_quality(bars, symbol=scan_result.symbol, now=now)
             if reject is not None:
                 logger.info("ENTRY GUARD REJECT %s: %s", scan_result.symbol, reject)
                 self._last_reject = reject

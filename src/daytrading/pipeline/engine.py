@@ -14,7 +14,9 @@ Supports swing trading, day trading, and scalping through a single pipeline.
 
 from __future__ import annotations
 
+import inspect
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence
@@ -32,6 +34,7 @@ from daytrading.scanner.base import Scanner
 from daytrading.strategy.entry_guard import check_entry_quality
 from daytrading.strategy.entry_policy import EntryDecision, EntryPolicy
 from daytrading.strategy.verifier import StrategyVerifier
+from daytrading.strategy import warrior_lanes
 from daytrading.models import (
     Bar,
     Fill,
@@ -101,6 +104,25 @@ class PipelineResult:
     entry_decisions: List[Dict[str, Any]] = field(default_factory=list)
 
 
+def _entry_strategy_label(signal: TradeSignal) -> str:
+    """Strategy label for a fill — distinct for experimental scout tiers so the
+    scorecard can measure their standalone expectancy."""
+    sr = getattr(signal, "scan_result", None)
+    if sr is not None:
+        criteria = sr.criteria or {}
+        entry_mode = str(criteria.get("entry_mode") or "")
+        if entry_mode:
+            return entry_mode
+        tier = str(criteria.get("entry_tier") or "")
+        if tier == "fresh_vwap_reclaim_scout":
+            return "fresh_vwap_reclaim_scout"
+        if tier == "vwap_reclaim_scout":
+            return "vwap_reclaim_scout"
+        if sr.scanner_name:
+            return sr.scanner_name
+    return signal.reason or "unknown"
+
+
 class TradingPipeline:
     """Orchestrates: classify → exits → scan → verify → risk → execute."""
 
@@ -120,6 +142,9 @@ class TradingPipeline:
         max_order_shares: float = 200,
         max_dollar_risk_per_trade: float = 50.0,
         enable_daily_loser_blacklist: bool = False,
+        daily_loser_blacklist_min_loss: float = 50.0,
+        daily_loser_blacklist_max_losses: int = 2,
+        level_capped_entry_enabled: bool = False,
     ) -> None:
         self._scanners = list(scanners)
         self._verifiers = verifiers
@@ -149,8 +174,12 @@ class TradingPipeline:
         self._enable_daily_loser_blacklist = enable_daily_loser_blacklist
         self._daily_losers: set = set()  # symbols blocked from re-entry today
         self._daily_loss_counts: Dict[str, int] = {}
-        self._daily_loser_blacklist_min_loss: float = 10.0
-        self._daily_loser_blacklist_max_losses: int = 2
+        # A single normal scalp loss shouldn't ban a name for the day — a name
+        # that loses a small morning scalp can set up a clean afternoon re-entry
+        # (the GLXG case: −$20 morning loss blocked a +$100 afternoon reclaim).
+        # Ban only on a real blowout (>= min_loss) OR after max_losses losses.
+        self._daily_loser_blacklist_min_loss: float = max(0.0, float(daily_loser_blacklist_min_loss))
+        self._daily_loser_blacklist_max_losses: int = max(1, int(daily_loser_blacklist_max_losses))
         self._symbol_entry_counts: Dict[str, int] = {}  # per-symbol entries this session
         self._max_entries_per_symbol: int = 3
         self._daily_pnl: float = 0.0  # running realized P&L for the day
@@ -161,6 +190,19 @@ class TradingPipeline:
         self._require_hod_alert_for_entry: bool = False
         self._hod_active_checker = None  # Callable[[str], bool] set by runner
         self._hod_entry_bypass_checker = None
+        self._missed_a_plus_chase_window_sec: float = 1800.0
+        self._missed_a_plus_chase_pct_sub5: float = 0.035
+        self._missed_a_plus_chase_pct_5plus: float = 0.025
+        self._missed_a_plus_fresh_base_reset: bool = False
+        self._missed_a_plus_fresh_base_pct: float = 0.08
+        # Normal anti-chase cap (see configure_entry_chase_guard / StrategyConfig).
+        self._entry_chase_pct_low: float = 0.05
+        self._entry_chase_pct_high: float = 0.025
+        self._entry_chase_price_tier: float = 10.0
+        # Max stop distance (fraction below entry) allowed before rejecting a
+        # long entry as too-wide-risk. 0 disables. Set from StrategyConfig.
+        self._max_entry_risk_pct: float = 0.0
+        self._level_capped_entry_enabled = bool(level_capped_entry_enabled)
 
     def _append_entry_decision(
         self,
@@ -216,6 +258,32 @@ class TradingPipeline:
         self._require_hod_alert_for_entry = require
         self._hod_entry_bypass_checker = bypass_checker
 
+    def configure_missed_a_plus_chase_guard(
+        self,
+        *,
+        window_sec: float,
+        pct_sub5: float,
+        pct_5plus: float,
+        fresh_base_reset: bool = False,
+        fresh_base_pct: float = 0.08,
+    ) -> None:
+        self._missed_a_plus_chase_window_sec = max(0.0, float(window_sec))
+        self._missed_a_plus_chase_pct_sub5 = max(0.0, float(pct_sub5))
+        self._missed_a_plus_chase_pct_5plus = max(0.0, float(pct_5plus))
+        self._missed_a_plus_fresh_base_reset = bool(fresh_base_reset)
+        self._missed_a_plus_fresh_base_pct = max(0.0, float(fresh_base_pct))
+
+    def configure_entry_chase_guard(
+        self,
+        *,
+        pct_low: float,
+        pct_high: float,
+        price_tier: float,
+    ) -> None:
+        self._entry_chase_pct_low = max(0.0, float(pct_low))
+        self._entry_chase_pct_high = max(0.0, float(pct_high))
+        self._entry_chase_price_tier = max(0.0, float(price_tier))
+
     @staticmethod
     def _setup_tier(hit: ScanResult) -> str:
         scanner = hit.scanner_name
@@ -258,6 +326,46 @@ class TradingPipeline:
 
     def missed_a_plus_report(self, limit: int = 30) -> List[Dict[str, Any]]:
         return self._missed_a_plus.report(limit=limit)
+
+    def missed_a_plus_spread_summary(self) -> Dict[str, Any]:
+        return self._missed_a_plus.spread_summary()
+
+    def missed_a_plus_risk_summary(self) -> Dict[str, Any]:
+        return self._missed_a_plus.risk_summary()
+
+    def scanner_near_miss_summary(self) -> Dict[str, Any]:
+        return self._missed_a_plus.scanner_near_miss_summary()
+
+    def _scanner_float_shares(self, symbol: str) -> Optional[float]:
+        for verifier in self._verifiers.values():
+            getter = getattr(verifier, "_get_float_shares", None)
+            if callable(getter):
+                try:
+                    return getter(symbol)
+                except Exception:
+                    return None
+        return None
+
+    def _record_scanner_near_misses(
+        self,
+        universe: Dict[str, Sequence[Bar]],
+        now: Optional[datetime],
+    ) -> None:
+        """Report-only: log low-float, high-volume names that died at the scanner
+        stage (no clean A+ pattern) so the scanner-gap report can later separate
+        a real missed setup from a gappy washout. Changes nothing the bot trades.
+        """
+        for symbol, reason in list(self._scan_rejections.items()):
+            try:
+                self._missed_a_plus.record_scanner_near_miss(
+                    symbol=symbol,
+                    reason=reason,
+                    universe=universe,
+                    float_shares=self._scanner_float_shares(symbol),
+                    now=now,
+                )
+            except Exception:
+                continue
 
     @staticmethod
     def _get_last_reject(symbol: str, verifier: Any) -> Optional[str]:
@@ -366,9 +474,9 @@ class TradingPipeline:
     def _clear_reject_cooldown(self, hit: ScanResult) -> None:
         self._reject_cooldowns.pop(self._cooldown_key(hit), None)
 
-    def set_cooldown(self, symbol: str) -> None:
+    def set_cooldown(self, symbol: str, now: Optional[datetime] = None) -> None:
         """Record an exit time for cooldown enforcement."""
-        self._exit_cooldowns[symbol] = datetime.now(timezone.utc)
+        self._exit_cooldowns[symbol] = now or datetime.now(timezone.utc)
 
     def record_realized_exit(
         self,
@@ -376,6 +484,8 @@ class TradingPipeline:
         entry_price: float,
         exit_price: float,
         quantity: float,
+        *,
+        now: Optional[datetime] = None,
     ) -> float:
         """Update daily P&L, loser blacklist, and circuit breaker (any exit path)."""
         if entry_price <= 0 or quantity <= 0:
@@ -384,6 +494,8 @@ class TradingPipeline:
         self._daily_pnl += trade_pnl
         if trade_pnl < 0 and self._enable_daily_loser_blacklist:
             loss_amount = abs(trade_pnl)
+            # CONSECUTIVE losses (reset on a win below) — a name that loses a
+            # normal scalp then wins shouldn't carry that loss toward a ban.
             loss_count = self._daily_loss_counts.get(symbol, 0) + 1
             self._daily_loss_counts[symbol] = loss_count
             if (
@@ -392,17 +504,19 @@ class TradingPipeline:
             ):
                 self._daily_losers.add(symbol)
                 logger.info(
-                    "DAILY BLACKLIST %s: loss #%d, lost $%.2f - no re-entry today",
+                    "DAILY BLACKLIST %s: %d consecutive loss(es), lost $%.2f - no re-entry today",
                     symbol, loss_count, loss_amount,
                 )
             else:
                 logger.info(
-                    "DAILY LOSS %s: loss #%d, lost $%.2f - not blacklisted yet",
+                    "DAILY LOSS %s: %d consecutive loss(es), lost $%.2f - not blacklisted yet",
                     symbol, loss_count, loss_amount,
                 )
         # Shorter cooldown for profitable exits to allow pullback re-entry
         if trade_pnl > 0:
-            self._exit_cooldowns[symbol] = datetime.now(timezone.utc) - timedelta(
+            # A win resets the consecutive-loss counter for this symbol.
+            self._daily_loss_counts[symbol] = 0
+            self._exit_cooldowns[symbol] = (now or datetime.now(timezone.utc)) - timedelta(
                 seconds=self._cooldown_seconds - 120
             )
         if self._daily_pnl <= self._max_daily_loss and not self._circuit_breaker_tripped:
@@ -555,6 +669,129 @@ class TradingPipeline:
             pass
 
     @staticmethod
+    def _allow_vwap_reclaim_scout_trade_guard_exception(
+        signal: TradeSignal,
+        *,
+        bars: Optional[Sequence[Bar]],
+        quotes: Optional[Sequence[Quote]],
+        reason: Optional[str],
+    ) -> bool:
+        """Let a reduced VWAP reclaim scout pass the duplicate liquidity-trap check.
+
+        The main entry guard already scored this as a near-miss A+ VWAP reclaim.
+        This exception is intentionally narrow: it only clears the trade guard's
+        spread/weak-volume trap when the scout is tagged and the recent tape is
+        still active enough. Spike-and-fade and gap-up trap rejects remain hard.
+        """
+        text = str(reason or "").lower()
+        if "liquidity trap: spread" not in text:
+            return False
+        sr = signal.scan_result
+        criteria = sr.criteria if sr is not None else {}
+        if str(criteria.get("entry_tier") or "") != "vwap_reclaim_scout":
+            return False
+        if not bars or len(bars) < 6 or not quotes:
+            return False
+
+        latest = bars[-1]
+        quote = quotes[-1]
+        if latest.close <= 0 or latest.close <= latest.open:
+            return False
+        if quote.spread_pct > 1.0:
+            return False
+
+        day_volume = sum(max(0.0, float(b.volume or 0.0)) for b in bars)
+        recent_volume = sum(max(0.0, float(b.volume or 0.0)) for b in bars[-3:])
+        prior_5 = list(bars[-6:-1])
+        avg_prior = (
+            sum(max(0.0, float(b.volume or 0.0)) for b in prior_5) / len(prior_5)
+            if prior_5 else 0.0
+        )
+        latest_volume = max(0.0, float(latest.volume or 0.0))
+        if day_volume < 500_000 or recent_volume < 150_000 or latest_volume < 40_000:
+            return False
+        if avg_prior > 0 and latest_volume < avg_prior * 0.75:
+            return False
+
+        body = abs(latest.close - latest.open)
+        upper_wick = latest.high - max(latest.open, latest.close)
+        if body > 0 and upper_wick > body * 2.0:
+            return False
+
+        vwap = float(criteria.get("vwap") or 0.0)
+        if vwap > 0 and latest.close < vwap * 1.003:
+            return False
+        return True
+
+    @staticmethod
+    def _allow_warrior_starter_guard_exception(
+        signal: TradeSignal,
+        *,
+        bars: Optional[Sequence[Bar]],
+        reason: Optional[str],
+    ) -> bool:
+        """Clear only narrow final-guard false blocks for Warrior starters."""
+        text = str(reason or "").lower()
+        score_match = re.search(r"entry score too low \((\d+)/100", text)
+        liquidity_watch_only = "watch-only liquidity score" in text
+        sr = signal.scan_result
+        criteria = sr.criteria if sr is not None else {}
+        entry_trigger = str(criteria.get("entry_trigger") or "")
+        if not warrior_lanes.is_warrior_entry_trigger(entry_trigger):
+            return False
+        score_floor = 70 if entry_trigger == "warrior_high_base_reclaim" else 75
+        score_near_miss = bool(score_match and int(score_match.group(1)) >= score_floor)
+        if "dead cat bounce" not in text and not score_near_miss and not liquidity_watch_only:
+            return False
+        if str(criteria.get("entry_mode") or "") != "warrior_squeeze_playbook":
+            return False
+        if str(criteria.get("setup_tier") or "").lower() != "a+ setup":
+            return False
+
+        try:
+            size_factor = float(criteria.get("size_factor") or 1.0)
+        except (TypeError, ValueError):
+            size_factor = 1.0
+        if size_factor > 0.35:
+            return False
+
+        price = float(signal.entry_price or 0.0)
+        stop = float(signal.stop_loss or 0.0)
+        psych_level = float(criteria.get("psych_level") or 0.0)
+        if price <= 0 or stop <= 0 or stop >= price:
+            return False
+        if psych_level > 0 and price < psych_level:
+            return False
+        if (price - stop) / price > 0.09:
+            return False
+
+        if not bars or len(bars) < 3:
+            return False
+        latest = bars[-1]
+        if float(latest.close or 0.0) <= float(latest.open or 0.0):
+            return False
+        rng = float(latest.high or 0.0) - float(latest.low or 0.0)
+        if rng <= 0:
+            return False
+        close_location = (float(latest.close or 0.0) - float(latest.low or 0.0)) / rng
+        min_close_location = 0.30 if liquidity_watch_only else 0.55
+        if close_location < min_close_location:
+            return False
+
+        latest_volume = float(latest.volume or 0.0)
+        recent_volume = sum(float(b.volume or 0.0) for b in bars[-3:])
+        min_latest_volume = (
+            75_000
+            if liquidity_watch_only or entry_trigger == "warrior_prior_runner_continuation_pullback"
+            else 100_000
+        )
+        min_recent_volume = 150_000 if liquidity_watch_only else 250_000
+        if latest_volume < min_latest_volume or recent_volume < min_recent_volume:
+            return False
+
+        return True
+
+    @staticmethod
     def _log_shadow_execution(
         *,
         order: Order,
@@ -585,6 +822,7 @@ class TradingPipeline:
         """Run one full cycle: classify → exits → scan → verify → execute."""
         result = PipelineResult()
         self._missed_a_plus.update_prices(universe, now=now)
+        self._record_scanner_near_misses(universe, now)
 
         if now is None:
             for bars in universe.values():
@@ -603,7 +841,10 @@ class TradingPipeline:
             # Feed bar close data for red candle exit detection
             for sym, brs in universe.items():
                 if len(brs) >= 2:
-                    self._exit_manager.update_bar_close(sym, brs[-2].close, brs[-2].open, brs[-2].volume)
+                    self._exit_manager.update_bar_close(
+                        sym, brs[-2].close, brs[-2].open, brs[-2].volume,
+                        high_price=brs[-2].high, low_price=brs[-2].low,
+                    )
             pre_exit_positions = {
                 sym: {
                     "side": pos.side,
@@ -628,13 +869,14 @@ class TradingPipeline:
                     apply_fill(self._portfolio, fill)
                     result.exit_fills.append(fill)
                     result.exit_reasons[exit_sig.symbol] = exit_sig.reason or "unknown"
-                    self._exit_cooldowns[exit_sig.symbol] = datetime.now(timezone.utc)
+                    self._exit_cooldowns[exit_sig.symbol] = now or datetime.now(timezone.utc)
 
                     tracked_pos = self._exit_manager._positions.get(exit_sig.symbol)
                     entry_px = tracked_pos.entry_price if tracked_pos else 0
                     if entry_px > 0:
                         self.record_realized_exit(
                             exit_sig.symbol, entry_px, fill.price, fill.quantity,
+                            now=now,
                         )
 
                     logger.info(
@@ -691,7 +933,7 @@ class TradingPipeline:
             for scale_sig in scale_signals:
                 final_quality_reject = self._final_entry_quality_reject(
                     scale_sig, universe=universe, quotes=quotes,
-                    result=result, stage="scale_up_final",
+                    result=result, stage="scale_up_final", now=now,
                 )
                 if final_quality_reject:
                     result.rejected_orders += 1
@@ -757,7 +999,7 @@ class TradingPipeline:
                     break
                 final_quality_reject = self._final_entry_quality_reject(
                     re_sig, universe=universe, quotes=quotes,
-                    result=result, stage="reentry_final",
+                    result=result, stage="reentry_final", now=now,
                 )
                 if final_quality_reject:
                     result.rejected_orders += 1
@@ -872,7 +1114,7 @@ class TradingPipeline:
                             hit=hit,
                         )
                         continue
-                    signal = verifier.verify(hit, self._portfolio)
+                    signal = self._verify_hit(verifier, hit, now=now)
                     if signal is None:
                         reject = getattr(hit, '_reject_reason', None)
                         if reject is None:
@@ -968,7 +1210,7 @@ class TradingPipeline:
                         hit=hit,
                     )
                     continue
-                signal = verifier.verify(hit, self._portfolio)
+                signal = self._verify_hit(verifier, hit, now=now)
                 if signal is None:
                     reject = self._get_last_reject(hit.symbol, verifier)
                     self._scan_rejections[hit.symbol] = reject or "did not pass verifier"
@@ -1125,7 +1367,7 @@ class TradingPipeline:
 
                 last_exit_ts = self._exit_cooldowns.get(signal.symbol)
                 if last_exit_ts is not None:
-                    elapsed = (datetime.now(timezone.utc) - last_exit_ts).total_seconds()
+                    elapsed = ((now or datetime.now(timezone.utc)) - last_exit_ts).total_seconds()
                     if elapsed < self._cooldown_seconds:
                         remaining = self._cooldown_seconds - elapsed
                         logger.info(
@@ -1208,10 +1450,82 @@ class TradingPipeline:
                         signal.symbol, news_score, headlines[0],
 	                    )
 
-            if signal.action in (SignalAction.ENTER_LONG, SignalAction.REENTER_LONG, SignalAction.SCALE_UP_LONG):
+            if signal.action in (SignalAction.ENTER_LONG, SignalAction.REENTER_LONG):
+                signal = self._maybe_apply_level_capped_entry(signal, universe)
+
+            will_defer_to_timer = (
+                self._execution_timer is not None
+                and signal.action in (SignalAction.ENTER_LONG, SignalAction.ENTER_SHORT)
+            )
+
+            if (
+                signal.action in (
+                    SignalAction.ENTER_LONG,
+                    SignalAction.REENTER_LONG,
+                    SignalAction.SCALE_UP_LONG,
+                )
+                and not will_defer_to_timer
+            ):
                 final_quality_reject = self._final_entry_quality_reject(
                     signal, universe=universe, quotes=quotes,
-                    result=result, stage="final_entry_guard",
+                    result=result, stage="final_entry_guard", now=now,
+                )
+                if final_quality_reject:
+                    logger.info(
+                        "FINAL ENTRY GUARD REJECT %s: %s",
+                        signal.symbol, final_quality_reject,
+                    )
+                    result.rejected_orders += 1
+                    result.rejection_details.append({
+                        "symbol": signal.symbol,
+                        "reason": "final entry guard: {}".format(final_quality_reject),
+                    })
+                    self._scan_rejections[signal.symbol] = "final entry guard: {}".format(
+                        final_quality_reject,
+                    )
+                    self._log_shadow_missed(
+                        symbol=signal.symbol,
+                        reason="final entry guard: {}".format(final_quality_reject),
+                        universe=universe,
+                        quotes=quotes,
+                        scanner=signal.scan_result.scanner_name if signal.scan_result else "",
+                        fallback_price=signal.entry_price,
+                    )
+                    continue
+
+                chase_reject = self._normal_entry_chase_reject(
+                    signal, universe=universe, now=now,
+                )
+                if chase_reject:
+                    logger.info("ENTRY CHASE REJECT %s: %s", signal.symbol, chase_reject)
+                    result.rejected_orders += 1
+                    result.rejection_details.append({
+                        "symbol": signal.symbol,
+                        "reason": chase_reject,
+                    })
+                    self._scan_rejections[signal.symbol] = chase_reject
+                    self._append_entry_reject(
+                        result,
+                        symbol=signal.symbol,
+                        stage="entry_chase_guard",
+                        reason=chase_reject,
+                        signal=signal,
+                        price=self._latest_price_for_signal(signal, universe),
+                    )
+                    self._log_shadow_missed(
+                        symbol=signal.symbol,
+                        reason=chase_reject,
+                        universe=universe,
+                        quotes=quotes,
+                        scanner=signal.scan_result.scanner_name if signal.scan_result else "",
+                        fallback_price=self._latest_price_for_signal(signal, universe),
+                    )
+                    continue
+
+            if will_defer_to_timer:
+                final_quality_reject = self._final_entry_quality_reject(
+                    signal, universe=universe, quotes=quotes,
+                    result=result, stage="final_entry_guard", now=now,
                 )
                 if final_quality_reject:
                     logger.info(
@@ -1397,6 +1711,17 @@ class TradingPipeline:
                 guard_ok, guard_reason = self._trade_guard.check_entry(
                     signal, bars=sym_bars, quotes=sym_quotes,
                 )
+                if (
+                    not guard_ok
+                    and self._allow_vwap_reclaim_scout_trade_guard_exception(
+                        signal, bars=sym_bars, quotes=sym_quotes, reason=guard_reason,
+                    )
+                ):
+                    guard_ok = True
+                    logger.info(
+                        "GUARD PASS %s: VWAP reclaim scout liquidity exception: %s",
+                        signal.symbol, guard_reason,
+                    )
                 if not guard_ok:
                     logger.info("GUARD REJECT %s: %s", signal.symbol, guard_reason)
                     result.rejected_orders += 1
@@ -1425,9 +1750,7 @@ class TradingPipeline:
             if (self._execution_timer is not None
                     and signal.action in (SignalAction.ENTER_LONG, SignalAction.ENTER_SHORT)):
                 result.deferred_signals.append(signal)
-                result.entry_strategies[signal.symbol] = (
-                    signal.scan_result.scanner_name if signal.scan_result else signal.reason or "unknown"
-                )
+                result.entry_strategies[signal.symbol] = _entry_strategy_label(signal)
                 entered_this_cycle.add(signal.symbol)
                 logger.info(
                     "DEFERRED %s %s %.0f @ %.4f → waiting for 10s micro-entry | %s",
@@ -1454,9 +1777,7 @@ class TradingPipeline:
                 apply_fill(self._portfolio, fill)
                 result.fills.append(fill)
                 self._symbol_entry_counts[signal.symbol] = self._symbol_entry_counts.get(signal.symbol, 0) + 1
-                result.entry_strategies[signal.symbol] = (
-                    signal.scan_result.scanner_name if signal.scan_result else signal.reason or "unknown"
-                )
+                result.entry_strategies[signal.symbol] = _entry_strategy_label(signal)
                 entered_this_cycle.add(signal.symbol)
                 logger.info(
                     "FILLED %s %s %.0f @ %.4f | %s",
@@ -1510,6 +1831,7 @@ class TradingPipeline:
         quotes: Optional[Dict[str, Sequence[Quote]]] = None,
         result: Optional[PipelineResult] = None,
         stage: str = "final_entry_guard",
+        now: Optional[datetime] = None,
     ) -> Optional[str]:
         """Last shared rule/ML gate before any long entry/add/re-entry can order."""
         if signal.action not in (
@@ -1518,6 +1840,27 @@ class TradingPipeline:
             SignalAction.SCALE_UP_LONG,
         ):
             return None
+        # Risk-profile gate: a stop more than max_entry_risk_pct below entry is
+        # too wide for a scalp/momentum entry — one fail erases many wins.
+        cap = float(getattr(self, "_max_entry_risk_pct", 0.0) or 0.0)
+        entry_px = float(signal.entry_price or 0.0)
+        stop_px = float(signal.stop_loss or 0.0)
+        if cap > 0 and entry_px > 0 and 0 < stop_px < entry_px:
+            risk_pct = (entry_px - stop_px) / entry_px
+            if risk_pct > cap:
+                reason = "stop too wide: {:.1f}% risk > {:.1f}% cap".format(
+                    risk_pct * 100.0, cap * 100.0,
+                )
+                if result is not None:
+                    self._append_entry_reject(
+                        result,
+                        symbol=signal.symbol,
+                        stage=stage,
+                        reason=reason,
+                        signal=signal,
+                        price=entry_px,
+                    )
+                return reason
         sym_bars = universe.get(signal.symbol) or []
         sym_quotes = quotes.get(signal.symbol) if quotes else None
         decision = self._entry_policy.evaluate(
@@ -1526,14 +1869,258 @@ class TradingPipeline:
             quotes=sym_quotes,
             stage=stage,
             min_day_change_pct=0.0,
+            now=now,
         )
+        reject_reason = decision.reject_reason
+        if reject_reason and self._allow_warrior_starter_guard_exception(
+            signal,
+            bars=sym_bars,
+            reason=reject_reason,
+        ):
+            if result is not None:
+                result.entry_decisions.append(EntryDecision(
+                    symbol=decision.symbol,
+                    stage=decision.stage,
+                    passed=True,
+                    action=decision.action,
+                    pattern=decision.pattern,
+                    scanner=decision.scanner,
+                    setup_tier=decision.setup_tier,
+                    entry_tier=decision.entry_tier,
+                    price=decision.price,
+                    metadata={
+                        **dict(decision.metadata),
+                        "cleared_reason": reject_reason,
+                        "guard_exception": "warrior_squeeze_starter",
+                    },
+                    ts=decision.ts,
+                ).to_payload())
+            return None
         if result is not None:
             self._append_entry_decision(result, decision)
-        return decision.reject_reason
+        return reject_reason
+
+    def _normal_entry_chase_reject(
+        self,
+        signal: TradeSignal,
+        *,
+        universe: Dict[str, Sequence[Bar]],
+        now: Optional[datetime] = None,
+    ) -> Optional[str]:
+        """Block normal entries that arrive far above the setup base.
+
+        Timed entries already have a base-pinned chase guard in the runner. This
+        covers the direct pipeline path before a signal can be ordered or queued
+        to the timer.
+        """
+        if signal.action not in (
+            SignalAction.ENTER_LONG,
+            SignalAction.REENTER_LONG,
+            SignalAction.SCALE_UP_LONG,
+        ):
+            return None
+        live = (
+            float(signal.entry_price or 0.0)
+            if self._is_level_capped_entry_signal(signal)
+            else self._latest_price_for_signal(signal, universe)
+        )
+        if live <= 0:
+            return None
+
+        # Own-base anchor first: it both gates the primary chase check below and
+        # tells the memory whether the setup base has moved up off a stale level.
+        anchor = self._signal_chase_anchor(signal)
+        missed_reject = self._missed_a_plus.chase_reject(
+            symbol=signal.symbol,
+            price=live,
+            now=now,
+            signal=signal,
+            max_age_seconds=self._missed_a_plus_chase_window_sec,
+            max_chase_pct_sub5=self._missed_a_plus_chase_pct_sub5,
+            max_chase_pct_5plus=self._missed_a_plus_chase_pct_5plus,
+            fresh_base_anchor=(anchor if self._missed_a_plus_fresh_base_reset else 0.0),
+            fresh_base_reset_pct=self._missed_a_plus_fresh_base_pct,
+        )
+        if missed_reject:
+            return missed_reject
+
+        if anchor <= 0:
+            return None
+        # Price-tiered: cheap fast movers cover ground quickly between signal and
+        # fill, so they get more room; pricier names stay tight. Config-driven via
+        # StrategyConfig.entry_chase_* (was hardcoded 0.025/0.035 with a $5 tier,
+        # which rejected every entry on sub-$10 runners like CUPR).
+        max_chase_pct = (
+            self._entry_chase_pct_high
+            if anchor >= self._entry_chase_price_tier
+            else self._entry_chase_pct_low
+        )
+        if live <= anchor * (1.0 + max_chase_pct):
+            return None
+        return (
+            "late chase: ${:.4f} is {:.1f}% above setup base ${:.4f} "
+            "(max {:.1f}%)"
+        ).format(
+            live,
+            (live - anchor) / anchor * 100.0,
+            anchor,
+            max_chase_pct * 100.0,
+        )
+
+    @staticmethod
+    def _is_level_capped_entry_signal(signal: TradeSignal) -> bool:
+        hit = signal.scan_result
+        criteria = hit.criteria if hit is not None else {}
+        return str(criteria.get("entry_mode") or "") == "level_capped_scout"
+
+    def _maybe_apply_level_capped_entry(
+        self,
+        signal: TradeSignal,
+        universe: Dict[str, Sequence[Bar]],
+    ) -> TradeSignal:
+        """Backtest experiment: model a stop-limit scout near the breakout level.
+
+        The normal 1m pipeline confirms at bar close, which is too late on
+        vertical candles. This opt-in path only rewrites the signal when the
+        current 1m bar actually traded through a tight cap above the setup base.
+        Live/timed entries stay unchanged unless this explicit flag is enabled.
+        """
+        if not self._level_capped_entry_enabled:
+            return signal
+        if signal.action not in (SignalAction.ENTER_LONG, SignalAction.REENTER_LONG):
+            return signal
+        hit = signal.scan_result
+        if hit is None:
+            return signal
+        criteria = hit.criteria or {}
+        pattern = str(criteria.get("pattern") or hit.scanner_name or "")
+        entry_tier = str(criteria.get("entry_tier") or "")
+        entry_mode = str(criteria.get("entry_mode") or "")
+        if pattern not in (
+            "shallow_stair_continuation",
+            "level_breakout_reclaim",
+            "level_breakout_watch",
+        ) and entry_tier != "stair_scout" and entry_mode != "level_breakout_scout":
+            return signal
+        try:
+            base = float(
+                criteria.get("breakout_level")
+                or criteria.get("base_high")
+                or criteria.get("trigger_price")
+                or 0.0
+            )
+        except (TypeError, ValueError):
+            base = 0.0
+        if base <= 0:
+            return signal
+        bar = self._latest_bar(universe, signal.symbol)
+        if bar is None:
+            return signal
+        cap = round(base * 1.01, 4)
+        if signal.entry_price <= cap:
+            return signal
+        if not (float(bar.low) <= cap <= float(bar.high)):
+            return signal
+        try:
+            stop = float(signal.stop_loss or criteria.get("stop_price") or 0.0)
+        except (TypeError, ValueError):
+            stop = 0.0
+        if stop <= 0 or stop >= cap:
+            return signal
+        target = signal.take_profit
+        if target is None or target <= cap:
+            risk = cap - stop
+            target = cap + max(risk * 1.8, cap * 0.015)
+        criteria["entry_mode"] = "level_capped_scout"
+        criteria["level_capped_entry_price"] = cap
+        criteria["uncapped_entry_price"] = round(float(signal.entry_price or 0.0), 4)
+        criteria["level_capped_note"] = "backtest stop-limit cap at breakout level"
+        return TradeSignal(
+            symbol=signal.symbol,
+            action=signal.action,
+            quantity=signal.quantity,
+            entry_price=cap,
+            stop_loss=signal.stop_loss,
+            take_profit=target,
+            trailing_stop_offset=signal.trailing_stop_offset,
+            max_hold_seconds=signal.max_hold_seconds,
+            reason="{} (level capped scout {:.4f})".format(signal.reason, cap),
+            scan_result=signal.scan_result,
+            trend_strength=signal.trend_strength,
+        )
+
+    @staticmethod
+    def _signal_pattern(signal: TradeSignal) -> str:
+        hit = signal.scan_result
+        if hit is None:
+            return ""
+        return str(hit.criteria.get("pattern") or hit.scanner_name or "")
+
+    @staticmethod
+    def _signal_chase_anchor(signal: TradeSignal) -> float:
+        hit = signal.scan_result
+        criteria = hit.criteria if hit is not None else {}
+        for key in (
+            "setup_anchor",
+            "breakout_level",
+            "base_high",
+            "resistance",
+            "trigger_price",
+            "queued_entry_price",
+            "orb_high",
+        ):
+            try:
+                value = float(criteria.get(key) or 0.0)
+            except (TypeError, ValueError):
+                value = 0.0
+            if value > 0:
+                return value
+        return 0.0
+
+    @staticmethod
+    def _latest_price_for_signal(
+        signal: TradeSignal,
+        universe: Dict[str, Sequence[Bar]],
+    ) -> float:
+        bars = universe.get(signal.symbol) or []
+        if bars:
+            try:
+                return float(bars[-1].close or signal.entry_price or 0.0)
+            except (TypeError, ValueError):
+                pass
+        try:
+            return float(signal.entry_price or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
 
     def _at_position_limit(self) -> bool:
         open_positions = sum(1 for p in self._portfolio.positions.values() if not p.is_flat)
         return open_positions >= self._max_positions
+
+    def _verify_hit(
+        self,
+        verifier: StrategyVerifier,
+        hit: ScanResult,
+        *,
+        now: Optional[datetime] = None,
+    ) -> Optional[TradeSignal]:
+        """Call verifiers with replay clock when supported.
+
+        Legacy tests and simple verifiers may still implement the old
+        two-argument signature, so keep that path compatible.
+        """
+        try:
+            signature = inspect.signature(verifier.verify)
+            params = signature.parameters
+            supports_now = (
+                "now" in params
+                or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+            )
+        except (TypeError, ValueError):
+            supports_now = True
+        if supports_now:
+            return verifier.verify(hit, self._portfolio, now=now)
+        return verifier.verify(hit, self._portfolio)
 
     @staticmethod
     def _signal_to_order(signal: TradeSignal) -> Optional[Order]:

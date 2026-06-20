@@ -104,6 +104,91 @@ def test_full_exit_record_clears_broker_stop_when_position_qty_zero() -> None:
     assert calls == [("clear", "OLOX")]
 
 
+def test_momentum_burst_scalp_exit_clears_shared_active_flag() -> None:
+    # Regression: the momentum_burst_scalp path shares _breakout_scalp_active
+    # with HOD breakout scalps. Closing it must clear the flag, else all future
+    # quick scalps stay blocked for the session.
+    exit_manager = ExitManager()
+    pos = TrackedPosition(
+        symbol="MBUR",
+        side=Side.BUY,
+        quantity=100,
+        remaining_qty=0,
+        entry_price=2.50,
+    )
+    exit_manager.track(pos)
+    runner = _runner_for_exit_recording(exit_manager)
+    runner._breakout_scalp_active = True
+    runner._clear_broker_stop = lambda symbol: None
+    runner._refresh_broker_stop = lambda symbol: None
+
+    runner._record_trade_exit(
+        Fill("MBUR", Side.SELL, 100, 2.60, datetime.now(timezone.utc)),
+        entry_price=2.50,
+        reason="take_profit",
+        strategy="momentum_burst_scalp",
+    )
+
+    assert runner._breakout_scalp_active is False
+
+
+def test_momentum_burst_hit_run_exit_clears_active_and_sets_reentry_cooldown() -> None:
+    exit_manager = ExitManager()
+    pos = TrackedPosition(
+        symbol="MBUR",
+        side=Side.BUY,
+        quantity=100,
+        remaining_qty=0,
+        entry_price=2.50,
+    )
+    exit_manager.track(pos)
+    runner = _runner_for_exit_recording(exit_manager)
+    runner._breakout_scalp_active = True
+    runner._momentum_burst_hit_run_win_cooldown_sec = 15.0
+    runner._momentum_burst_hit_run_loss_cooldown_sec = 90.0
+    runner._momentum_burst_hit_run_block_until = {}
+    runner._clear_broker_stop = lambda symbol: None
+    runner._refresh_broker_stop = lambda symbol: None
+
+    runner._record_trade_exit(
+        Fill("MBUR", Side.SELL, 100, 2.60, datetime.now(timezone.utc)),
+        entry_price=2.50,
+        reason="take_profit",
+        strategy="momentum_burst_hit_run",
+    )
+
+    assert runner._breakout_scalp_active is False
+    assert runner._momentum_burst_hit_run_block_until["MBUR"] > time.monotonic()
+
+
+def test_post_blowoff_scout_exit_shares_hit_run_lifecycle() -> None:
+    # post_blowoff_micro_base_scout is a hit-run re-entry under a different
+    # label; its exit must clear the shared active flag and set the cooldown
+    # just like momentum_burst_hit_run, or it escapes the lifecycle controls.
+    exit_manager = ExitManager()
+    pos = TrackedPosition(
+        symbol="MBUR", side=Side.BUY, quantity=100, remaining_qty=0, entry_price=2.50,
+    )
+    exit_manager.track(pos)
+    runner = _runner_for_exit_recording(exit_manager)
+    runner._breakout_scalp_active = True
+    runner._momentum_burst_hit_run_win_cooldown_sec = 15.0
+    runner._momentum_burst_hit_run_loss_cooldown_sec = 90.0
+    runner._momentum_burst_hit_run_block_until = {}
+    runner._clear_broker_stop = lambda symbol: None
+    runner._refresh_broker_stop = lambda symbol: None
+
+    runner._record_trade_exit(
+        Fill("MBUR", Side.SELL, 100, 2.60, datetime.now(timezone.utc)),
+        entry_price=2.50,
+        reason="take_profit",
+        strategy="post_blowoff_micro_base_scout",
+    )
+
+    assert runner._breakout_scalp_active is False
+    assert runner._momentum_burst_hit_run_block_until["MBUR"] > time.monotonic()
+
+
 def test_partial_exit_record_refreshes_broker_stop_for_remaining_qty() -> None:
     exit_manager = ExitManager()
     pos = TrackedPosition(
@@ -431,6 +516,63 @@ def test_breakout_scalp_reject_does_not_reference_missing_status() -> None:
     runner._process_breakout_scalps()
 
     assert not runner._pending_breakout_scalps
+
+
+def test_breakout_scalp_honors_spread_size_factor_before_submit() -> None:
+    runner = object.__new__(AlpacaRunner)
+    runner._pending_breakout_scalps = deque([("HOT", 5.0, time.time())])
+    runner._breakout_scalp_active = False
+    runner._breakout_scalp_cooldown = {}
+    runner._quick_scalp_spread_size_factors = {"HOT": 0.35}
+    # Legacy fixed-$ sizing + ample equity so this test isolates the spread
+    # factor (capital-aware buying-power cap is exercised in its own test).
+    runner._risk_pct_of_equity = 0.0
+    runner._max_position_pct_of_equity = 1.0
+    runner._min_risk_dollars = 5.0
+    runner._fallback_equity = 100_000.0
+    runner._account_equity = 100_000.0
+    runner._account_equity_at = time.monotonic()
+    runner._pipeline = SimpleNamespace(
+        portfolio=PortfolioState(cash=10_000),
+        _symbol_entry_counts={},
+        _max_entries_per_symbol=2,
+        _exit_cooldowns={},
+        _cooldown_seconds=0,
+    )
+    now = datetime.now(timezone.utc)
+    runner._bar_buffer = {
+        "HOT": deque([
+            Bar(symbol="HOT", open=4.80, high=5.00, low=4.75, close=4.90, volume=300_000, ts=now),
+            Bar(symbol="HOT", open=4.90, high=5.20, low=4.85, close=5.10, volume=350_000, ts=now),
+            Bar(symbol="HOT", open=5.10, high=5.35, low=5.05, close=5.30, volume=400_000, ts=now),
+        ])
+    }
+    submitted = []
+
+    def submit(order, bar, portfolio):
+        submitted.append(order)
+        return Fill("HOT", Side.BUY, order.quantity, order.limit_price or bar.close, now), OrderStatus.FILLED
+
+    runner._new_entries_blocked = lambda *args, **kwargs: False
+    runner._quick_scalp_hod_alert_reject = lambda symbol: None
+    runner._quick_scalp_recent_normal_reject = lambda symbol, **kwargs: None
+    runner._check_quick_scalp_entry = lambda symbol, bars: None
+    runner._quick_scalp_shared_quality_reject = lambda symbol, bars: None
+    runner._quick_scalp_10s_reject = lambda symbol: None
+    runner._breakout_scalp_10s_reject = lambda symbol: None
+    runner._quick_scalp_tick_rr = lambda symbol, bars, alert_price: (5.30, 5.20, 5.43, "test")
+    runner._broker = SimpleNamespace(submit=submit)
+    runner._on_position_opened = lambda *args, **kwargs: None
+    runner._hub = SimpleNamespace(on_fill=lambda *args, **kwargs: None, add_log=lambda *args, **kwargs: None)
+    runner._journal = SimpleNamespace(record=lambda *args, **kwargs: None)
+    runner._market_phase = lambda: "OPEN"
+    runner._seed_recent_order_ids = lambda: None
+
+    runner._process_breakout_scalps()
+
+    assert submitted
+    assert submitted[0].quantity == 175
+    assert not runner._quick_scalp_spread_size_factors
 
 
 def test_paused_runner_blocks_timed_entries() -> None:

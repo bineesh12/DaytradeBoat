@@ -7,10 +7,11 @@ Uses a simple pub/sub pattern with SSE (Server-Sent Events).
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from threading import Lock
 from typing import Any, Deque, Dict, List, Optional
 
@@ -28,6 +29,7 @@ class TradeRecord:
     pnl: Optional[float] = None
     exit_reason: Optional[str] = None
     trade_type: str = "entry"  # entry, exit, scale_up, reentry
+    strategy: str = ""
 
 
 @dataclass
@@ -99,6 +101,7 @@ class DashboardHub:
         # Early fast-scan movers being watched for structured pullback entries
         self.hot_watch: List[dict] = []
         self.missed_a_plus: List[dict] = []
+        self.scanner_near_miss: Dict[str, Any] = {}
         # Active trading watchlist (HOD TTL + pinned + open positions)
         self.trading_watchlist: List[str] = []
         self.watchlist_pinned: List[str] = []
@@ -254,6 +257,12 @@ class DashboardHub:
             self.missed_a_plus = rows[:100]
         self._broadcast("missed_a_plus", {"rows": self.missed_a_plus})
 
+    def on_scanner_near_miss(self, summary: Dict[str, Any]) -> None:
+        """Replace the scanner-near-miss report summary (report-only)."""
+        with self._lock:
+            self.scanner_near_miss = dict(summary or {})
+        self._broadcast("scanner_near_miss", {"summary": self.scanner_near_miss})
+
     def on_rt_movers(self, new_symbols: list, all_ranked: list) -> None:
         """Deprecated — RT mover scanner removed (HOD-only mode). No-op."""
         return
@@ -347,7 +356,7 @@ class DashboardHub:
         with self._lock:
             self.total_signals += 1
 
-    def on_fill(self, fill: Any, trade_type: str = "entry") -> None:
+    def on_fill(self, fill: Any, trade_type: str = "entry", strategy: str = "") -> None:
         rec = TradeRecord(
             symbol=fill.symbol,
             side=fill.side.value,
@@ -355,6 +364,7 @@ class DashboardHub:
             entry_price=fill.price,
             entry_time=str(fill.ts),
             trade_type=trade_type,
+            strategy=strategy,
         )
         with self._lock:
             self.trades.append(rec)
@@ -513,13 +523,46 @@ class DashboardHub:
     # Snapshot for initial page load
     # ------------------------------------------------------------------
 
+    _ROLLING_CACHE_TTL_SEC = 45.0
+
+    def _cached_rolling_scorecard(self) -> dict:
+        """Rolling journal scorecard, cached ~45s.
+
+        It scans the (large) trades / market_context tables by ts, which is far
+        too heavy to recompute on every dashboard snapshot. Computed OUTSIDE the
+        hub lock (the journal DB has its own synchronization) so a cold/expired
+        scan can't stall every other hub mutation and SSE broadcast; a rare
+        concurrent double-scan is harmless.
+        """
+        now = time.monotonic()
+        cached = getattr(self, "_rolling_cache", None)
+        cached_at = getattr(self, "_rolling_cache_at", 0.0)
+        if cached is not None and (now - cached_at) < self._ROLLING_CACHE_TTL_SEC:
+            return cached
+        result = _rolling_journal_scorecard(self.journal)
+        self._rolling_cache = result
+        self._rolling_cache_at = now
+        return result
+
     def snapshot(self) -> dict:
         """Full current state for initial page load."""
+        # Heavy journal scan first, before taking the hub lock (see method docs).
+        rolling_scorecard = self._cached_rolling_scorecard()
         with self._lock:
             win_rate = 0.0
             total_closed = self.winning_trades + self.losing_trades
             if total_closed > 0:
                 win_rate = self.winning_trades / total_closed * 100
+            trade_rows = [_trade_dict(t) for t in list(self.trades)]
+            daily_scorecard = _daily_scorecard(
+                trades=trade_rows,
+                total_trades=self.total_trades,
+                total_scan_hits=self.total_scan_hits,
+                total_signals=self.total_signals,
+                total_rejected=self.total_rejected,
+                cycle_count=self.cycle_count,
+                missed_a_plus=list(self.missed_a_plus),
+            )
 
             return {
                 "account": {
@@ -544,10 +587,12 @@ class DashboardHub:
                     sym: _status_dict(s)
                     for sym, s in self.symbol_status.items()
                 },
-                "recent_trades": [_trade_dict(t) for t in list(self.trades)[-50:]],
+                "recent_trades": trade_rows[-50:],
                 "recent_scans": [_scanner_dict(s) for s in list(self.scanner_hits)[-50:]],
                 "logs": list(self.log_messages),
                 "pnl_history": list(self.pnl_history),
+                "daily_scorecard": daily_scorecard,
+                "rolling_scorecard": rolling_scorecard,
                 "market_open": self.market_open,
                 "market_phase": self.market_phase,
                 "stream_connected": self.stream_connected,
@@ -557,6 +602,7 @@ class DashboardHub:
                 "hod_momentum_alerts": list(self.hod_momentum_alerts),
                 "hot_watch": list(self.hot_watch),
                 "missed_a_plus": list(self.missed_a_plus),
+                "scanner_near_miss": dict(self.scanner_near_miss),
                 "trading_watchlist": list(self.trading_watchlist),
                 "watchlist_pinned": list(self.watchlist_pinned),
                 "candidate_hydration": dict(self.candidate_hydration),
@@ -590,7 +636,284 @@ def _trade_dict(t: TradeRecord) -> dict:
         "pnl": round(t.pnl, 2) if t.pnl is not None else None,
         "exit_reason": t.exit_reason,
         "trade_type": t.trade_type,
+        "strategy": t.strategy,
     }
+
+
+def _round_trip_pnls(trades: List[dict]) -> List[float]:
+    """Group partial exits into round-trips.
+
+    A position that exits in halves/partials produces multiple exit rows; those
+    must NOT each count as a separate closed trade (it inflates the count and can
+    push closed-rate over 100% and trip the go-live gate too early). Walk the
+    trades in time order: an entry opens/rolls a round-trip per symbol, exits
+    accumulate their P&L into it, and a completed round-trip contributes one
+    realized-P&L value.
+    """
+    def _ts(t: dict) -> str:
+        return str(t.get("ts") or t.get("exit_time") or t.get("entry_time") or "")
+
+    open_trip: dict = {}
+    trips: List[tuple] = []
+    for t in sorted(trades, key=_ts):
+        sym = t.get("symbol")
+        ttype = t.get("trade_type")
+        if ttype in ("entry", "reentry"):
+            prev = open_trip.get(sym)
+            if prev is not None and prev["has_exit"]:
+                trips.append((prev["pnl"], prev["strategy"]))
+            open_trip[sym] = {
+                "pnl": 0.0, "has_exit": False, "strategy": str(t.get("strategy") or ""),
+            }
+        elif ttype == "exit" and t.get("pnl") is not None:
+            cur = open_trip.get(sym)
+            if cur is None:
+                cur = {"pnl": 0.0, "has_exit": False, "strategy": str(t.get("strategy") or "")}
+                open_trip[sym] = cur
+            cur["pnl"] += float(t.get("pnl") or 0.0)
+            cur["has_exit"] = True
+    for cur in open_trip.values():
+        if cur["has_exit"]:
+            trips.append((cur["pnl"], cur["strategy"]))
+    return trips
+
+
+def _daily_scorecard(
+    *,
+    trades: List[dict],
+    total_trades: int,
+    total_scan_hits: int,
+    total_signals: int,
+    total_rejected: int,
+    cycle_count: int,
+    missed_a_plus: List[dict],
+) -> dict:
+    # Count round-trips, not raw exit rows — a position that scales out in
+    # partials emits several exit rows but is ONE closed trade.
+    trips = _round_trip_pnls(trades)
+    trip_pnls = [p for p, _ in trips]
+    # A scratch (pnl == 0) is neither a win nor a loss; counting breakevens as
+    # wins inflated win_rate while contributing nothing to total_win.
+    wins = [p for p in trip_pnls if p > 0.0]
+    losses = [p for p in trip_pnls if p < 0.0]
+
+    # Isolate the experimental momentum-breakout mode so its standalone
+    # expectancy can be judged separately from normal entries.
+    by_entry_mode: Dict[str, dict] = {}
+    by_strategy: Dict[str, dict] = {}
+    for pnl, strategy in trips:
+        strategy_name = strategy or "unknown"
+        _s = strategy.lower()
+        if "post_blowoff_micro_base_scout" in _s:
+            mode = "post_blowoff_micro_base_scout"
+        elif "warrior_squeeze_playbook" in _s:
+            mode = "warrior_squeeze_playbook"
+        elif "momentum_burst_hit_run" in _s:
+            mode = "momentum_burst_hit_run"
+        elif "momentum_burst_scalp" in _s:
+            mode = "momentum_burst_scalp"
+        elif "momentum" in _s:
+            mode = "momentum_breakout"
+        elif "fresh_vwap_reclaim" in _s:
+            mode = "fresh_vwap_reclaim_scout"
+        elif "vwap_reclaim_scout" in _s:
+            mode = "vwap_reclaim_scout"
+        elif "level_breakout_scout" in _s:
+            mode = "level_breakout_scout"
+        elif "level_capped_scout" in _s:
+            mode = "level_capped_scout"
+        elif "ten_second_breakout_scout" in _s:
+            mode = "ten_second_breakout_scout"
+        elif "elite_wide_spread" in _s:
+            mode = "elite_wide_spread"
+        else:
+            mode = "standard"
+        bucket = by_entry_mode.setdefault(
+            mode, {"closed_trades": 0, "wins": 0, "total_pnl": 0.0}
+        )
+        bucket["closed_trades"] += 1
+        bucket["wins"] += 1 if pnl > 0.0 else 0
+        bucket["total_pnl"] = round(bucket["total_pnl"] + pnl, 2)
+        strategy_bucket = by_strategy.setdefault(
+            strategy_name, {"closed_trades": 0, "wins": 0, "total_pnl": 0.0}
+        )
+        strategy_bucket["closed_trades"] += 1
+        strategy_bucket["wins"] += 1 if pnl > 0.0 else 0
+        strategy_bucket["total_pnl"] = round(strategy_bucket["total_pnl"] + pnl, 2)
+
+    total_win = sum(wins)
+    total_loss = abs(sum(losses))
+    total_pnl = total_win - total_loss
+    closed_trades = len(trip_pnls)
+    win_rate = (len(wins) / closed_trades * 100.0) if closed_trades else 0.0
+    avg_win = total_win / len(wins) if wins else 0.0
+    avg_loss = total_loss / len(losses) if losses else 0.0
+    profit_factor = (
+        total_win / total_loss
+        if total_loss > 0
+        else (999.0 if total_win > 0 else 0.0)
+    )
+    expectancy = ((win_rate / 100.0) * avg_win) - ((1.0 - (win_rate / 100.0)) * avg_loss)
+
+    decision_attempts = total_signals + total_rejected
+    signal_to_entry = (total_trades / total_signals * 100.0) if total_signals else 0.0
+    hit_to_signal = (total_signals / total_scan_hits * 100.0) if total_scan_hits else 0.0
+    reject_rate = (total_rejected / decision_attempts * 100.0) if decision_attempts else 0.0
+    closed_rate = (closed_trades / total_trades * 100.0) if total_trades else 0.0
+
+    missed_rows = list(missed_a_plus or [])
+    missed_opportunities = sum(1 for r in missed_rows if r.get("outcome") == "missed_opportunity")
+    correct_rejects = sum(1 for r in missed_rows if r.get("outcome") == "correct_reject")
+    neutral = sum(1 for r in missed_rows if r.get("outcome") == "neutral")
+    pending = max(0, len(missed_rows) - missed_opportunities - correct_rejects - neutral)
+    best_missed = None
+    if missed_rows:
+        best_missed = max(missed_rows, key=lambda r: float(r.get("move_after_pct") or 0.0))
+
+    if closed_trades < 5:
+        verdict = "collecting"
+    elif expectancy > 0 and profit_factor >= 1.2:
+        verdict = "positive_expectancy"
+    elif expectancy < 0 or profit_factor < 1.0:
+        verdict = "negative_expectancy"
+    else:
+        verdict = "mixed"
+
+    return {
+        "trades_taken": total_trades,
+        "closed_trades": closed_trades,
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate": round(win_rate, 1),
+        "total_pnl": round(total_pnl, 2),
+        "avg_win": round(avg_win, 2),
+        "avg_loss": round(avg_loss, 2),
+        "profit_factor": round(profit_factor, 2),
+        "expectancy_per_trade": round(expectancy, 2),
+        "by_entry_mode": by_entry_mode,
+        "by_strategy": by_strategy,
+        "cycles": cycle_count,
+        "funnel": {
+            "scan_hits": total_scan_hits,
+            "signals": total_signals,
+            "entries": total_trades,
+            "rejected": total_rejected,
+            "hit_to_signal_pct": round(hit_to_signal, 1),
+            "signal_to_entry_pct": round(signal_to_entry, 1),
+            "reject_rate_pct": round(reject_rate, 1),
+            "closed_rate_pct": round(closed_rate, 1),
+        },
+        "missed_a_plus": {
+            "rows": len(missed_rows),
+            "missed_opportunities": missed_opportunities,
+            "correct_rejects": correct_rejects,
+            "pending": pending,
+            "best_symbol": best_missed.get("symbol") if best_missed else "",
+            "best_move_pct": round(float(best_missed.get("move_after_pct") or 0.0), 1) if best_missed else 0.0,
+            "best_pattern": best_missed.get("pattern") if best_missed else "",
+            "best_reason": best_missed.get("reason") if best_missed else "",
+        },
+        "verdict": verdict,
+    }
+
+
+def _rolling_journal_scorecard(journal: Optional[Any], window_days: int = 20) -> dict:
+    min_closed_trades = 25
+    min_sessions = 10
+    if journal is None or not getattr(journal, "db_path", None):
+        return {
+            "available": False,
+            "window_days": window_days,
+            "min_closed_trades": min_closed_trades,
+            "min_sessions": min_sessions,
+            "reason": "journal not configured",
+        }
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+    cutoff_iso = cutoff.isoformat()
+    db_path = str(journal.db_path)
+    try:
+        conn = sqlite3.connect(db_path, timeout=30)
+        conn.row_factory = sqlite3.Row
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT symbol, side, trade_type, strategy, quantity, entry_price, exit_price, pnl, reason, ts
+                FROM trades
+                WHERE ts >= ?
+                ORDER BY ts ASC
+                """,
+                (cutoff_iso,),
+            )
+            trades = [
+                {
+                    "symbol": r["symbol"],
+                    "side": r["side"],
+                    "trade_type": r["trade_type"],
+                    "strategy": r["strategy"],
+                    "quantity": r["quantity"],
+                    "entry_price": r["entry_price"] or 0.0,
+                    "entry_time": r["ts"],
+                    "exit_price": r["exit_price"],
+                    "exit_time": r["ts"] if r["trade_type"] == "exit" else None,
+                    "pnl": r["pnl"],
+                    "exit_reason": r["reason"],
+                }
+                for r in cur.fetchall()
+            ]
+            cur.execute(
+                """
+                SELECT
+                    COALESCE(SUM(scan_hits), 0) AS scan_hits,
+                    COALESCE(SUM(signals), 0) AS signals,
+                    COALESCE(SUM(rejected), 0) AS rejected,
+                    COUNT(DISTINCT substr(ts, 1, 10)) AS sessions
+                FROM market_context
+                WHERE ts >= ?
+                """,
+                (cutoff_iso,),
+            )
+            ctx = cur.fetchone()
+        finally:
+            conn.close()
+    except Exception as exc:
+        return {
+            "available": False,
+            "window_days": window_days,
+            "min_closed_trades": min_closed_trades,
+            "min_sessions": min_sessions,
+            "reason": str(exc),
+        }
+
+    total_trades = sum(1 for t in trades if t.get("trade_type") == "entry")
+    scorecard = _daily_scorecard(
+        trades=trades,
+        total_trades=total_trades,
+        total_scan_hits=int(ctx["scan_hits"] or 0) if ctx else 0,
+        total_signals=int(ctx["signals"] or 0) if ctx else 0,
+        total_rejected=int(ctx["rejected"] or 0) if ctx else 0,
+        cycle_count=0,
+        missed_a_plus=[],
+    )
+    scorecard["available"] = True
+    scorecard["window_days"] = window_days
+    scorecard["sessions"] = int(ctx["sessions"] or 0) if ctx else 0
+    scorecard["min_closed_trades"] = min_closed_trades
+    scorecard["min_sessions"] = min_sessions
+    scorecard["cutoff"] = cutoff_iso
+    if (
+        int(scorecard.get("closed_trades") or 0) < min_closed_trades
+        or int(scorecard.get("sessions") or 0) < min_sessions
+    ):
+        scorecard["verdict"] = "collecting"
+        scorecard["verdict_reason"] = (
+            "needs at least {} closed trades and {} sessions".format(
+                min_closed_trades,
+                min_sessions,
+            )
+        )
+    return scorecard
 
 
 def _scanner_dict(s: ScannerHit) -> dict:

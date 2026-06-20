@@ -22,20 +22,24 @@ class LevelBreakoutWatchScanner:
         min_price: float = 1.0,
         max_price: float = 20.0,
         min_session_move_pct: float = 8.0,
+        min_live_scout_session_move_pct: float = 3.0,
         watch_distance_pct: float = 1.5,
         max_breakout_pct: float = 6.0,
         max_watch_base_range_pct: float = 22.0,
         min_recent_volume: float = 100_000,
         min_volume_surge: float = 0.75,
+        live_scout_enabled: bool = True,
     ) -> None:
         self._min_price = min_price
         self._max_price = max_price
         self._min_session_move_pct = min_session_move_pct
+        self._min_live_scout_session_move_pct = min_live_scout_session_move_pct
         self._watch_distance_pct = watch_distance_pct
         self._max_breakout_pct = max_breakout_pct
         self._max_watch_base_range_pct = max_watch_base_range_pct
         self._min_recent_volume = min_recent_volume
         self._min_volume_surge = min_volume_surge
+        self._live_scout_enabled = live_scout_enabled
 
     @property
     def name(self) -> str:
@@ -66,7 +70,7 @@ class LevelBreakoutWatchScanner:
         if session_open <= 0:
             return None
         session_move_pct = (price - session_open) / session_open * 100.0
-        if session_move_pct < self._min_session_move_pct:
+        if session_move_pct < min(self._min_session_move_pct, self._min_live_scout_session_move_pct):
             return None
 
         prior = bars[:-1]
@@ -113,8 +117,12 @@ class LevelBreakoutWatchScanner:
                     continue
                 status = "live level scout: closed above level; needs guard/10s hold"
             elif pierced_level:
+                if session_move_pct < self._min_session_move_pct:
+                    continue
                 status = "watching failed level break: wick closed below"
             elif 0 <= distance_to_level_pct <= self._watch_distance_pct:
+                if session_move_pct < self._min_session_move_pct:
+                    continue
                 status = "watching near resistance"
             else:
                 continue
@@ -131,7 +139,9 @@ class LevelBreakoutWatchScanner:
                 - wick_pct * 0.12
             )
             live_scout = (
-                closed_above
+                self._live_scout_enabled
+                and closed_above
+                and session_move_pct >= self._min_live_scout_session_move_pct
                 and breakout_pct >= 0.2
                 and breakout_pct <= min(2.5, self._max_breakout_pct)
                 and wick_pct <= 35.0
@@ -154,8 +164,9 @@ class LevelBreakoutWatchScanner:
                     **(
                         {
                             "entry_tier": "level_scout",
+                            "entry_mode": "level_breakout_scout",
                             "setup_quality": "level scout",
-                            "size_factor": 0.45,
+                            "size_factor": 0.35,
                             "stop_price": round(base_low - 0.02, 4),
                         }
                         if live_scout else {}

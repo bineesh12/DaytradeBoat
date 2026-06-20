@@ -84,6 +84,16 @@ class EntryPolicy:
         criteria = hit.criteria if hit is not None else {}
         scanner = str(hit.scanner_name or "") if hit is not None else ""
         pattern = str(criteria.get("pattern") or scanner or "")
+        setup_score = 0.0
+        for key in ("entry_score_at_signal", "setup_score"):
+            try:
+                setup_score = float(criteria.get(key) or 0.0)
+            except (TypeError, ValueError):
+                setup_score = 0.0
+            if setup_score > 0:
+                break
+        if setup_score <= 0 and hit is not None:
+            setup_score = float(getattr(hit, "score", 0.0) or 0.0)
         return {
             "symbol": signal.symbol,
             "action": signal.action.value,
@@ -92,6 +102,7 @@ class EntryPolicy:
             "setup_tier": str(criteria.get("setup_tier") or ""),
             "entry_tier": str(criteria.get("entry_tier") or ""),
             "price": float(signal.entry_price or 0.0),
+            "setup_score": setup_score,
         }
 
     def decision(
@@ -141,6 +152,7 @@ class EntryPolicy:
         float_shares: Optional[float] = None,
         min_day_change_pct: float = 0.0,
         metadata: Optional[Dict[str, Any]] = None,
+        now: Optional[datetime] = None,
     ) -> EntryDecision:
         """Evaluate the shared rule/ML entry gate and return a decision."""
         if signal.action not in self.ENTRY_ACTIONS:
@@ -165,6 +177,8 @@ class EntryPolicy:
             entry_pattern=pattern,
             setup_tier=str(ctx["setup_tier"]),
             entry_tier=str(ctx["entry_tier"]),
+            setup_score=float(ctx["setup_score"] or 0.0),
+            now=now,
         )
         return self.decision(
             symbol=signal.symbol,

@@ -115,6 +115,94 @@ class TestHalfSellAt2to1:
         assert tracked.stop_loss == pytest.approx(5.00)
         assert tracked.remaining_qty == 50
 
+    def test_vwap_pullback_does_not_use_quick_scalp_partial(self) -> None:
+        em = ExitManager()
+        pos = _long_pos(entry=5.00, stop=4.80)
+        pos.reason = "Vwap Pullback CRVO"
+        pos.entry_strategy = "vwap_pullback"
+        pos.entry_pattern = "vwap_pullback"
+        em.track(pos)
+
+        exits = em.check_exits({"ABC": 5.05}, _ts(10))
+
+        assert exits == []
+        tracked = em.tracked.get("ABC")
+        assert tracked is not None
+
+    def test_momentum_burst_hit_run_sells_full_at_first_target(self) -> None:
+        em = ExitManager()
+        pos = _long_pos(entry=5.00, stop=4.90, qty=90)
+        pos.reason = "Momentum Burst Hit-Run"
+        pos.entry_strategy = "momentum_burst_hit_run"
+        em.track(pos)
+
+        exits = em.check_exits({"ABC": 5.21}, _ts(10))
+
+        assert len(exits) == 1
+        assert exits[0].quantity == 90
+        assert "take_profit" in exits[0].reason.lower()
+        assert "ABC" not in em.tracked
+
+    def test_hit_run_emergency_dump_exits_full_position(self) -> None:
+        em = ExitManager()
+        pos = _long_pos(entry=10.00, stop=9.20, qty=90)
+        pos.reason = "Warrior Squeeze STI"
+        pos.entry_strategy = "warrior_squeeze_playbook"
+        em.track(pos)
+
+        em.update_bar_close(
+            "ABC",
+            close_price=9.52,
+            open_price=10.05,
+            high_price=10.12,
+            low_price=9.50,
+            volume=180_000,
+        )
+        exits = em.check_exits({"ABC": 9.52}, _ts(20))
+
+        assert len(exits) == 1
+        assert exits[0].quantity == 90
+        assert "stop_loss" in exits[0].reason.lower()
+        assert "ABC" not in em.tracked
+
+    def test_non_hit_run_does_not_emergency_exit_above_stop(self) -> None:
+        em = ExitManager()
+        pos = _long_pos(entry=10.00, stop=9.20, qty=90)
+        pos.reason = "Vwap Pullback ABC"
+        pos.entry_strategy = "vwap_pullback"
+        em.track(pos)
+
+        em.update_bar_close(
+            "ABC",
+            close_price=9.52,
+            open_price=10.05,
+            high_price=10.12,
+            low_price=9.50,
+            volume=180_000,
+        )
+        exits = em.check_exits({"ABC": 9.52}, _ts(20))
+
+        assert exits == []
+        assert "ABC" in em.tracked
+
+    def test_warrior_squeeze_banks_partial_at_first_target(self) -> None:
+        em = ExitManager()
+        pos = _long_pos(entry=5.00, stop=4.90, qty=90)
+        pos.reason = "Warrior Squeeze JRSH"
+        pos.entry_strategy = "warrior_squeeze_playbook"
+        em.track(pos)
+
+        exits = em.check_exits({"ABC": 5.21}, _ts(10))
+
+        assert len(exits) == 1
+        assert exits[0].quantity == 45
+        assert "take_profit" in exits[0].reason.lower()
+        tracked = em.tracked.get("ABC")
+        assert tracked is not None
+        assert tracked.sold_half is True
+        assert tracked.remaining_qty == 45
+        assert tracked.stop_loss == pytest.approx(5.00)
+
     def test_runner_candidate_confirms_after_first_partial(self) -> None:
         em = ExitManager()
         pos = _long_pos(entry=5.00, stop=4.80)
@@ -147,6 +235,57 @@ class TestHalfSellAt2to1:
         tracked = em.tracked.get("ABC")
         assert tracked is not None
         assert tracked.remaining_qty == 60
+
+    def test_runner_candidate_defaults_to_breakeven_after_first_partial(self) -> None:
+        em = ExitManager()
+        pos = _long_pos(entry=5.00, stop=4.80, qty=90)
+        pos.reason = "Quick Momentum Scalp AIIO breakout"
+        pos.runner_candidate = True
+        pos.trend_strength = 0.9
+        em.track(pos)
+
+        exits = em.check_exits({"ABC": 5.10}, _ts(10))
+
+        assert len(exits) == 1
+        tracked = em.tracked.get("ABC")
+        assert tracked is not None
+        assert tracked.sold_half is True
+        assert tracked.breakeven_locked is True
+        assert tracked.stop_loss == pytest.approx(5.00)
+
+    def test_runner_give_room_keeps_structural_stop_after_first_partial(self) -> None:
+        em = ExitManager(runner_give_room_after_partial=True)
+        pos = _long_pos(entry=5.00, stop=4.80, qty=90)
+        pos.reason = "Quick Momentum Scalp AIIO breakout"
+        pos.runner_candidate = True
+        pos.trend_strength = 0.9
+        em.track(pos)
+
+        exits = em.check_exits({"ABC": 5.10}, _ts(10))
+
+        assert len(exits) == 1
+        tracked = em.tracked.get("ABC")
+        assert tracked is not None
+        assert tracked.sold_half is True
+        assert tracked.runner_confirmed is True
+        assert tracked.breakeven_locked is True
+        assert tracked.stop_loss == pytest.approx(4.80)
+
+    def test_runner_give_room_does_not_apply_to_non_runner_partial(self) -> None:
+        em = ExitManager(runner_give_room_after_partial=True)
+        pos = _long_pos(entry=5.00, stop=4.80, qty=90)
+        pos.reason = "Momentum Burst AIIO"
+        pos.runner_candidate = False
+        em.track(pos)
+
+        exits = em.check_exits({"ABC": 5.10}, _ts(10))
+
+        assert len(exits) == 1
+        tracked = em.tracked.get("ABC")
+        assert tracked is not None
+        assert tracked.sold_half is True
+        assert tracked.breakeven_locked is True
+        assert tracked.stop_loss == pytest.approx(5.00)
 
     def test_ordinary_scalp_partial_does_not_confirm_runner(self) -> None:
         em = ExitManager()
@@ -315,3 +454,98 @@ class TestVolumeExhaustionExit:
         # Only 1 qualifying bar since reset
         exits = em.check_exits({"ABC": 5.18}, _ts(130))
         assert len(exits) == 0
+
+
+class TestConfigurableRunnerTrail:
+    def _confirmed_runner(self, em: ExitManager, peak: float) -> TrackedPosition:
+        pos = _long_pos(entry=5.00, stop=4.90, qty=100)
+        pos.sold_half = True
+        pos.breakeven_locked = True
+        pos.stop_loss = 5.00  # breakeven after the partial
+        pos.runner_candidate = True
+        em._positions[pos.symbol] = pos
+        em._maybe_confirm_runner(pos, peak)  # +10% run confirms the runner
+        return pos
+
+    def test_confirm_uses_configured_trail_pct(self) -> None:
+        em = ExitManager(runner_trail_pct=0.08, runner_min_confirm_pct=0.02)
+        pos = self._confirmed_runner(em, 5.50)
+        assert pos.runner_confirmed is True
+        assert pos.runner_trail_pct == pytest.approx(0.08)
+
+    def test_wider_trail_holds_where_tight_trail_stops(self) -> None:
+        # Same 4.5% pullback from a $5.50 high: a 3% trail stops, an 8% trail holds.
+        def run(trail: float) -> int:
+            em = ExitManager(runner_trail_pct=trail)
+            self._confirmed_runner(em, 5.50)
+            em.check_exits({"ABC": 5.50}, _ts(10))   # set high + trail stop
+            return len(em.check_exits({"ABC": 5.25}, _ts(15)))
+
+        assert run(0.03) == 1   # 5.25 <= 5.335 trail stop → exits
+        assert run(0.08) == 0   # 5.25 > 5.06 trail stop → rides
+
+
+class TestAdaptiveRunnerTrail:
+    def test_flat_when_adaptive_off(self) -> None:
+        em = ExitManager(runner_trail_pct=0.03, runner_trail_adaptive=False)
+        pos = _long_pos()
+        pos.runner_trail_pct = 0.03
+        for r in (0.05, 0.06, 0.05):  # high vol ignored when adaptive off
+            pos.record_bar_range(r)
+        assert em._runner_trail_for(pos) == pytest.approx(0.03)
+
+    def test_adaptive_scales_with_volatility_and_clamps(self) -> None:
+        em = ExitManager(
+            runner_trail_pct=0.03, runner_trail_adaptive=True,
+            runner_trail_atr_mult=2.5, runner_trail_cap=0.10,
+        )
+        smooth = _long_pos(symbol="SMOOTH")
+        for _ in range(5):
+            smooth.record_bar_range(0.014)  # 1.4% bars -> 3.5%
+        assert em._runner_trail_for(smooth) == pytest.approx(0.035)
+
+        wide = _long_pos(symbol="WIDE")
+        for _ in range(5):
+            wide.record_bar_range(0.027)    # 2.7% bars -> 6.75%
+        assert em._runner_trail_for(wide) == pytest.approx(0.0675)
+
+        floored = _long_pos(symbol="FLOOR")
+        floored.runner_trail_pct = 0.03
+        for _ in range(5):
+            floored.record_bar_range(0.005)  # 0.5% -> 1.25%, below floor
+        assert em._runner_trail_for(floored) == pytest.approx(0.03)
+
+        crazy = _long_pos(symbol="CRAZY")
+        for _ in range(5):
+            crazy.record_bar_range(0.10)     # 10% -> 25%, above cap
+        assert em._runner_trail_for(crazy) == pytest.approx(0.10)
+
+
+class TestGiveRunnerRoom:
+    def _runner(self, em: ExitManager) -> TrackedPosition:
+        pos = _long_pos(entry=5.00, stop=4.90, qty=100)  # risk 0.10, 1:1 target 5.20
+        pos.runner_candidate = True
+        em._positions[pos.symbol] = pos
+        return pos
+
+    def test_breakeven_by_default_after_partial(self) -> None:
+        em = ExitManager(runner_give_room_after_partial=False)
+        pos = self._runner(em)
+        em.check_exits({"ABC": 5.20}, _ts(30))  # hits 1:1 target -> half sell
+        assert pos.sold_half is True
+        assert pos.stop_loss == pytest.approx(5.00)  # snapped to breakeven
+
+    def test_give_room_keeps_wider_stop_after_partial(self) -> None:
+        em = ExitManager(runner_give_room_after_partial=True)
+        pos = self._runner(em)
+        em.check_exits({"ABC": 5.20}, _ts(30))
+        assert pos.sold_half is True
+        assert pos.breakeven_locked is True
+        assert pos.stop_loss == pytest.approx(4.90)  # kept the wider original stop
+
+    def test_give_room_ignored_for_non_runner(self) -> None:
+        em = ExitManager(runner_give_room_after_partial=True)
+        pos = _long_pos(entry=5.00, stop=4.90, qty=100)  # runner_candidate stays False
+        em._positions[pos.symbol] = pos
+        em.check_exits({"ABC": 5.20}, _ts(30))
+        assert pos.stop_loss == pytest.approx(5.00)  # non-runners still go breakeven

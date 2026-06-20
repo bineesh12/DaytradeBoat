@@ -26,12 +26,41 @@ from daytrading.models import Bar, Quote, Tick
 logger = logging.getLogger(__name__)
 
 ENTRY_SCORE_THRESHOLD = int(os.getenv("DAYTRADING_ENTRY_SCORE_THRESHOLD", "80"))
+ENTRY_MAX_FLOAT_SHARES = float(os.getenv("DAYTRADING_ENTRY_MAX_FLOAT_SHARES", "20000000"))
 ENTRY_ML_ENABLED = os.getenv("DAYTRADING_ENABLE_ENTRY_ML", "true").lower() in {
     "1",
     "true",
     "yes",
 }
 MIN_TICK_SPREAD = 0.01
+
+
+def _env_enabled(value: Optional[str]) -> Optional[bool]:
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def _elite_wide_spread_default_enabled() -> bool:
+    """Default the wider-spread experiment on only for paper trading.
+
+    An explicit DAYTRADING_ELITE_WIDE_SPREAD_ENABLED always wins. When unset,
+    paper mode collects scorecard evidence, while live mode keeps the money
+    gate closed until deliberately enabled.
+    """
+    explicit = _env_enabled(os.getenv("DAYTRADING_ELITE_WIDE_SPREAD_ENABLED"))
+    if explicit is not None:
+        return explicit
+    paper = _env_enabled(os.getenv("DAYTRADING_ALPACA_PAPER"))
+    return True if paper is None else paper
+
+
+ELITE_WIDE_SPREAD_ENABLED = _elite_wide_spread_default_enabled()
 
 # ML Monitor — singleton instance for tracking model performance
 _ml_monitor = None
@@ -310,6 +339,169 @@ FORMER_MOMO = ScannerProfile(
 ALL_PROFILES: List[ScannerProfile] = [LOW_FLOAT_RUNNER, MEDIUM_FLOAT_SQUEEZE, FORMER_MOMO]
 
 
+@dataclass(frozen=True)
+class SpreadAssessment:
+    """Shared spread decision for entry guard and post-release rechecks."""
+
+    ok: bool
+    reason: str = ""
+    exception: bool = False
+    size_factor: float = 1.0
+    spread: float = 0.0
+    spread_pct: float = 0.0
+    mode: str = ""
+
+
+def assess_opportunity_scaled_spread(
+    *,
+    price: float,
+    spread: float,
+    pattern: str = "",
+    setup_tier: str = "",
+    entry_tier: str = "",
+    day_volume: float = 0.0,
+    recent_avg_volume: float = 0.0,
+    latest_volume: float = 0.0,
+    distance_from_hod: float = 1.0,
+    float_shares: Optional[float] = None,
+    quote_depth: float = 0.0,
+    normal_pct_limit: float = 0.005,
+    setup_score: float = 0.0,
+) -> SpreadAssessment:
+    """Allow only elite runners to exceed the normal spread gate with size-down."""
+    if spread <= 0:
+        return SpreadAssessment(ok=True)
+    if price <= 0:
+        return SpreadAssessment(ok=False, reason="invalid price for spread check")
+
+    spread_pct = spread / price
+    if tick_aware_spread_ok(spread, price, normal_pct_limit):
+        return SpreadAssessment(ok=True, spread=spread, spread_pct=spread_pct)
+
+    pattern = str(pattern or "")
+    setup_tier = str(setup_tier or "").lower()
+    entry_tier = str(entry_tier or "").lower()
+    runner_patterns = {
+        "abc_continuation",
+        "vwap_pullback",
+        "pullback_base",
+        "hod_reclaim",
+        "level_breakout_reclaim",
+        "runner_reclaim_continuation",
+        "shallow_stair_continuation",
+        "early_vwap_reclaim_scout",
+        "first_pullback_reclaim",
+        "breakout_scalp",
+    }
+    elite_tiers = {
+        "a_plus_reclaim_scout",
+        "a_plus_retry_watch",
+        "deep_runner_scout",
+        "level_scout",
+        "pullback_scout",
+        "stair_scout",
+        "second_chance_reclaim",
+        "abc_scout",
+        "vwap_reclaim_scout",
+    }
+    is_elite_runner = (
+        pattern in runner_patterns
+        and ("a+" in setup_tier or entry_tier in elite_tiers)
+        and 1.0 <= price <= 20.0
+    )
+    if not is_elite_runner:
+        return SpreadAssessment(
+            ok=False,
+            reason="not elite A+ spread exception",
+            spread=spread,
+            spread_pct=spread_pct,
+        )
+
+    if float_shares is not None and float_shares > 20_000_000:
+        return SpreadAssessment(
+            ok=False,
+            reason="float too large for spread exception",
+            spread=spread,
+            spread_pct=spread_pct,
+        )
+
+    low_price = price < 5.0
+    # Higher-priced names ($5+) have wider *natural* spreads, so they get the
+    # same 0.9% ceiling as sub-$5 — not a tighter one. (A clean $12.88 A+ runner
+    # with an 11c/0.85% spread was being vetoed at the execute step.)
+    max_exception_pct = 0.009
+    if entry_tier in {"level_scout", "a_plus_reclaim_scout", "deep_runner_scout"}:
+        max_exception_pct += 0.002
+    if pattern == "shallow_stair_continuation":
+        max_exception_pct += 0.001
+    elite_wide_mode = False
+    if spread_pct > max_exception_pct:
+        elite_wide_ceiling = 0.011
+        if (
+            ELITE_WIDE_SPREAD_ENABLED
+            and setup_score >= 150.0
+            and spread_pct <= elite_wide_ceiling
+            and day_volume >= 5_000_000
+            and recent_avg_volume >= 75_000
+            and latest_volume >= 30_000
+            and quote_depth >= 750
+            and distance_from_hod <= 0.08
+        ):
+            elite_wide_mode = True
+        else:
+            return SpreadAssessment(
+                ok=False,
+                reason="spread above elite exception ceiling",
+                spread=spread,
+                spread_pct=spread_pct,
+            )
+
+    # One/two-tick low-price books can look large as a percentage. Still demand
+    # active participation so dead tape does not sneak through.
+    tick_like = spread <= (MIN_TICK_SPREAD * (2.01 if low_price else 1.01))
+    if elite_wide_mode:
+        volume_ok = True
+        depth_ok = True
+    elif tick_like:
+        volume_ok = day_volume >= 1_000_000 and recent_avg_volume >= 25_000 and latest_volume >= 10_000
+        depth_ok = quote_depth <= 0 or quote_depth >= 100
+    else:
+        volume_ok = day_volume >= 2_000_000 and recent_avg_volume >= 50_000 and latest_volume >= 20_000
+        depth_ok = quote_depth <= 0 or quote_depth >= 500
+
+    if not volume_ok:
+        return SpreadAssessment(
+            ok=False,
+            reason="volume too weak for spread exception",
+            spread=spread,
+            spread_pct=spread_pct,
+        )
+    if not depth_ok:
+        return SpreadAssessment(
+            ok=False,
+            reason="quote depth too weak for spread exception",
+            spread=spread,
+            spread_pct=spread_pct,
+        )
+    if distance_from_hod > (0.15 if low_price else 0.10):
+        return SpreadAssessment(
+            ok=False,
+            reason="too far from HOD for spread exception",
+            spread=spread,
+            spread_pct=spread_pct,
+        )
+
+    size_factor = 0.25 if elite_wide_mode else (0.35 if spread_pct > 0.008 else 0.45)
+    return SpreadAssessment(
+        ok=True,
+        exception=True,
+        size_factor=size_factor,
+        spread=spread,
+        spread_pct=spread_pct,
+        mode="elite_wide_spread" if elite_wide_mode else "opportunity_scaled",
+    )
+
+
 def check_entry_quality(
     bars: Sequence[Bar],
     *,
@@ -328,6 +520,8 @@ def check_entry_quality(
     entry_pattern: Optional[str] = None,
     setup_tier: Optional[str] = None,
     entry_tier: Optional[str] = None,
+    setup_score: float = 0.0,
+    now: Optional[datetime] = None,
 ) -> Optional[str]:
     """Return a rejection reason string, or ``None`` if the setup is OK.
 
@@ -371,6 +565,17 @@ def check_entry_quality(
         return _rule_reject(
             "price ${:.2f} outside range ${:.2f}-${:.2f}".format(price, min_price, max_price)
         )
+    if (
+        ENTRY_MAX_FLOAT_SHARES > 0
+        and float_shares is not None
+        and float_shares > ENTRY_MAX_FLOAT_SHARES
+    ):
+        return _rule_reject(
+            "float too large ({:.0f}M > {:.0f}M) — outside low-float thesis".format(
+                float_shares / 1_000_000,
+                ENTRY_MAX_FLOAT_SHARES / 1_000_000,
+            )
+        )
 
     # 2. Staleness — data too old to act on (5 minutes)
     #    Exception: if stock was running hot before going quiet, it's likely
@@ -378,7 +583,10 @@ def check_entry_quality(
     if latest.ts is not None:
         try:
             bar_time = latest.ts if latest.ts.tzinfo else latest.ts.replace(tzinfo=timezone.utc)
-            age = (datetime.now(timezone.utc) - bar_time).total_seconds()
+            current_time = now or datetime.now(timezone.utc)
+            if current_time.tzinfo is None:
+                current_time = current_time.replace(tzinfo=timezone.utc)
+            age = (current_time.astimezone(timezone.utc) - bar_time).total_seconds()
             if age > max_bar_age_seconds:
                 # Check if this looks like a halt (high volume spike before silence)
                 is_likely_halt = False
@@ -593,71 +801,47 @@ def check_entry_quality(
         valid_spreads = [q.ask - q.bid for q in recent_quotes if q.ask > q.bid > 0]
         avg_spread = sum(valid_spreads) / len(valid_spreads) if valid_spreads else 0.0
         avg_spread_pct = avg_spread / price if price > 0 else 1.0
-        runner_patterns = {
-            "abc_continuation",
-            "vwap_pullback",
-            "pullback_base",
-            "level_breakout_reclaim",
-            "runner_reclaim_continuation",
-            "shallow_stair_continuation",
-            "early_vwap_reclaim_scout",
-        }
-        pattern = pattern_context
-        tier = setup_context
+        valid_quotes = [q for q in recent_quotes if q.ask > q.bid > 0]
+        avg_depth = (
+            sum(min(q.bid_size, q.ask_size) for q in valid_quotes) / len(valid_quotes)
+            if valid_quotes else 0.0
+        )
         session_high = max((b.high for b in today_bars), default=price)
         distance_from_hod = (
             (session_high - price) / session_high if session_high > 0 else 1.0
         )
-        elite_spread_ceiling = 0.010 if pattern == "shallow_stair_continuation" else 0.008
-        if tier_context in {"level_scout", "a_plus_reclaim_scout", "a_plus_retry_watch"}:
-            elite_spread_ceiling = max(elite_spread_ceiling, 0.012)
-        elite_hod_distance_ceiling = 0.15 if pattern == "shallow_stair_continuation" else 0.12
-        elite_day_volume_floor = 3_000_000 if pattern == "shallow_stair_continuation" else 2_000_000
-        elite_float_ceiling = 10_000_000 if pattern == "shallow_stair_continuation" else 20_000_000
-        elite_runner_spread_ok = (
-            pattern in runner_patterns
-            and (
-                "a+" in tier
-                or pattern in {
-                    "runner_reclaim_continuation",
-                    "shallow_stair_continuation",
-                    "early_vwap_reclaim_scout",
-                }
-                or tier_context in {
-                    "a_plus_reclaim_scout",
-                    "a_plus_retry_watch",
-                    "deep_runner_scout",
-                    "level_scout",
-                }
-            )
-            and 0.005 < avg_spread_pct <= elite_spread_ceiling
-            and 1.5 <= price <= 20.0
-            and day_volume >= elite_day_volume_floor
-            and recent_avg_volume >= 75_000
-            and latest_volume >= 50_000
-            and distance_from_hod <= elite_hod_distance_ceiling
-            and (float_shares is None or float_shares <= elite_float_ceiling)
+        spread_decision = assess_opportunity_scaled_spread(
+            price=price,
+            spread=avg_spread,
+            pattern=pattern_context,
+            setup_tier=setup_context,
+            entry_tier=tier_context,
+            day_volume=day_volume,
+            recent_avg_volume=recent_avg_volume,
+            latest_volume=latest_volume,
+            distance_from_hod=distance_from_hod,
+            float_shares=float_shares,
+            quote_depth=avg_depth,
+            setup_score=setup_score,
         )
-        if (
-            price > 0
-            and not tick_aware_spread_ok(avg_spread, price, 0.005)
-            and not elite_runner_spread_ok
-        ):
+        if not spread_decision.ok:
             return _rule_reject(
                 "spread too wide ({:.2f}c = {:.2f}% of ${:.2f})".format(
                     avg_spread * 100, avg_spread_pct * 100, price)
             )
-        if elite_runner_spread_ok:
+        if spread_decision.exception:
             logger.info(
-                "ENTRY GUARD %s: elite runner spread exception %.2fc %.2f%% "
-                "pattern=%s vol=%.0f recent=%.0f latest=%.0f",
+                "ENTRY GUARD %s: opportunity-scaled spread exception %.2fc %.2f%% "
+                "pattern=%s vol=%.0f recent=%.0f latest=%.0f depth=%.0f size=%.2f",
                 symbol,
                 avg_spread * 100,
                 avg_spread_pct * 100,
-                pattern,
+                pattern_context,
                 day_volume,
                 recent_avg_volume,
                 latest_volume,
+                avg_depth,
+                spread_decision.size_factor,
             )
 
     # 8. Full liquidity score — avoid weak chop even when simple volume passes
@@ -964,8 +1148,25 @@ def check_entry_quality(
         except Exception as exc:
             logger.debug("ML scoring skipped for %s: %s", symbol, exc)
 
+    vwap_reclaim_scout_score_ok = (
+        tier_context == "vwap_reclaim_scout"
+        and pattern_context == "vwap_pullback"
+        and "a+" in setup_context
+        and max(float(setup_score or 0.0), float(score or 0.0)) >= 75
+        and score >= 60
+    )
+    post_blowoff_micro_base_score_ok = (
+        "post_blowoff_micro_base_scout" in (tier_context, pattern_context)
+        and "a+" in setup_context
+        and score >= 75
+    )
     elite_sub2_score_ok = elite_sub2_reclaim and score >= 50
-    if score < ENTRY_SCORE_THRESHOLD and not elite_sub2_score_ok:
+    if (
+        score < ENTRY_SCORE_THRESHOLD
+        and not elite_sub2_score_ok
+        and not vwap_reclaim_scout_score_ok
+        and not post_blowoff_micro_base_score_ok
+    ):
         reason = "entry score too low ({}/100, need {}+) [{}]".format(
             score, ENTRY_SCORE_THRESHOLD, ", ".join(breakdown),
         )
@@ -979,6 +1180,20 @@ def check_entry_quality(
     if elite_sub2_score_ok:
         logger.info(
             "ENTRY GUARD %s: elite sub-$2 reclaim score exception %d/%d",
+            symbol,
+            score,
+            ENTRY_SCORE_THRESHOLD,
+        )
+    if post_blowoff_micro_base_score_ok:
+        logger.info(
+            "ENTRY GUARD %s: post-blowoff micro-base scout score exception %d/%d",
+            symbol,
+            score,
+            ENTRY_SCORE_THRESHOLD,
+        )
+    if vwap_reclaim_scout_score_ok:
+        logger.info(
+            "ENTRY GUARD %s: VWAP reclaim scout score exception %d/%d",
             symbol,
             score,
             ENTRY_SCORE_THRESHOLD,
