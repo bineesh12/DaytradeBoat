@@ -732,20 +732,24 @@ class TradingPipeline:
         """Clear only narrow final-guard false blocks for Warrior starters."""
         text = str(reason or "").lower()
         score_match = re.search(r"entry score too low \((\d+)/100", text)
-        score_near_miss = bool(score_match and int(score_match.group(1)) >= 75)
         liquidity_watch_only = "watch-only liquidity score" in text
-        if "dead cat bounce" not in text and not score_near_miss and not liquidity_watch_only:
-            return False
         sr = signal.scan_result
         criteria = sr.criteria if sr is not None else {}
-        if str(criteria.get("entry_trigger") or "") not in {
+        entry_trigger = str(criteria.get("entry_trigger") or "")
+        if entry_trigger not in {
             "warrior_level_pullaway",
             "warrior_curl_reclaim",
             "warrior_second_leg_reclaim",
-            "warrior_news_continuation_pullback",
+            "warrior_prior_runner_continuation_pullback",
+            "warrior_high_base_reclaim",
+            "warrior_stair_step_runner",
             "warrior_trend_pullback_reclaim",
             "warrior_equal_high_pullaway",
         }:
+            return False
+        score_floor = 70 if entry_trigger == "warrior_high_base_reclaim" else 75
+        score_near_miss = bool(score_match and int(score_match.group(1)) >= score_floor)
+        if "dead cat bounce" not in text and not score_near_miss and not liquidity_watch_only:
             return False
         if str(criteria.get("entry_mode") or "") != "warrior_squeeze_playbook":
             return False
@@ -782,12 +786,11 @@ class TradingPipeline:
         if close_location < min_close_location:
             return False
 
-        entry_trigger = str(criteria.get("entry_trigger") or "")
         latest_volume = float(latest.volume or 0.0)
         recent_volume = sum(float(b.volume or 0.0) for b in bars[-3:])
         min_latest_volume = (
             75_000
-            if liquidity_watch_only or entry_trigger == "warrior_news_continuation_pullback"
+            if liquidity_watch_only or entry_trigger == "warrior_prior_runner_continuation_pullback"
             else 100_000
         )
         min_recent_volume = 150_000 if liquidity_watch_only else 250_000

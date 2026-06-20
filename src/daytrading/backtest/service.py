@@ -38,7 +38,6 @@ SUPPORTED_FLAGS = {
     "momentum_burst_replay",
     "momentum_burst_hit_run",
     "warrior_squeeze_playbook",
-    "warrior_news_continuation",
     "live_like_10s",
 }
 
@@ -288,7 +287,6 @@ DEFAULT_EXPERIMENTS: Dict[str, Dict[str, bool]] = {
         "momentum_burst_replay": False,
         "momentum_burst_hit_run": False,
         "warrior_squeeze_playbook": True,
-        "warrior_news_continuation": False,
         "live_like_10s": True,
     },
 }
@@ -317,7 +315,6 @@ def normalize_flags(flags: Optional[Dict[str, Any]]) -> Dict[str, bool]:
         "momentum_burst_replay": bool(raw.get("momentum_burst_replay", False)),
         "momentum_burst_hit_run": bool(raw.get("momentum_burst_hit_run", False)),
         "warrior_squeeze_playbook": bool(raw.get("warrior_squeeze_playbook", False)),
-        "warrior_news_continuation": bool(raw.get("warrior_news_continuation", False)),
         "live_like_10s": bool(raw.get("live_like_10s", False)),
     }
 
@@ -710,7 +707,6 @@ def run_backtest(
                 warrior_squeeze_add_reward_risk=(
                     settings.strategy.warrior_squeeze_add_reward_risk if settings else 1.0
                 ),
-                warrior_news_continuation_enabled=active_flags["warrior_news_continuation"],
                 live_like_10s=active_flags["live_like_10s"],
             ).run(start=start_dt)
 

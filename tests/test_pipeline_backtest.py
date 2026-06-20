@@ -35,6 +35,7 @@ from daytrading.models import (
 )
 from daytrading.pipeline.engine import PipelineResult, TradingPipeline
 from daytrading.strategy.entry_guard import check_entry_quality
+from daytrading.strategy import warrior_lanes
 
 
 _BASE_TS = datetime(2026, 6, 1, 13, 30, tzinfo=timezone.utc)
@@ -979,6 +980,44 @@ def test_warrior_backtest_ambiguous_green_bar_takes_target_before_stop() -> None
     assert driver._mb_bracket["MBUR"]["qty"] == 42
 
 
+def test_warrior_backtest_emergency_dump_exits_at_close() -> None:
+    bar = Bar(
+        "MBUR",
+        _BASE_TS + timedelta(seconds=120),
+        10.20,
+        10.30,
+        9.48,
+        9.50,
+        210_000,
+        Timeframe.SEC_10,
+    )
+    ten_sec = [_ten_bar(i * 10, 10.00 + i * 0.01, width_pct=0.006, volume=80_000) for i in range(12)]
+    ten_sec[-1] = bar
+    driver = _momentum_burst_backtest_driver(ten_sec)
+    driver._mb_bracket["MBUR"] = {
+        "stop": 9.20,
+        "target": 10.90,
+        "qty": 63,
+        "entry": 10.00,
+        "ts": bar.ts - timedelta(seconds=10),
+        "max_hold": 45,
+        "strategy": "warrior_squeeze_playbook",
+    }
+    apply_fill(
+        driver._pipeline.portfolio,
+        Fill("MBUR", Side.BUY, 63, 10.00, bar.ts - timedelta(seconds=10)),
+    )
+    result = PipelineBacktestResult()
+    ledger = BacktestLedger()
+
+    driver._process_mb_brackets(result, ledger, bar.ts)
+
+    assert ledger.trades
+    assert ledger.trades[-1]["exit_reason"] == "mb_bracket_dump: Warrior Squeeze"
+    assert ledger.trades[-1]["exit_price"] == pytest.approx(9.495)
+    assert "MBUR" not in driver._mb_bracket
+
+
 def test_warrior_squeeze_profit_lock_blocks_reentry_until_fresh_high() -> None:
     ten_sec = [_ten_bar(i * 10, 2.00 + i * 0.01, width_pct=0.006, volume=80_000) for i in range(12)]
     driver = _momentum_burst_backtest_driver(ten_sec)
@@ -1102,7 +1141,7 @@ def test_warrior_squeeze_second_leg_reclaim_after_deep_washout() -> None:
     assert context["entry_price_override"] <= context["max_pay"]
 
 
-def test_warrior_news_continuation_pullback_context_allows_controlled_reclaim() -> None:
+def test_warrior_prior_runner_continuation_pullback_context_allows_controlled_reclaim() -> None:
     ten_sec = [
         Bar("MBUR", _BASE_TS + timedelta(seconds=0), 6.10, 6.55, 6.05, 6.45, 120_000, Timeframe.SEC_10),
         Bar("MBUR", _BASE_TS + timedelta(seconds=10), 6.45, 7.20, 6.40, 7.08, 210_000, Timeframe.SEC_10),
@@ -1120,22 +1159,22 @@ def test_warrior_news_continuation_pullback_context_allows_controlled_reclaim() 
     driver = _momentum_burst_backtest_driver(ten_sec)
     driver._use_warrior_squeeze_playbook = True
 
-    context = driver._warrior_news_continuation_pullback_context(
+    context = driver._warrior_prior_runner_continuation_pullback_context(
         "MBUR",
         ten_sec[-1],
         window_high=8.80,
     )
 
     assert context is not None
-    assert context["entry_trigger"] == "warrior_news_continuation_pullback"
-    assert context["variant_override"] == "warrior_news_continuation_pullback"
+    assert context["entry_trigger"] == "warrior_prior_runner_continuation_pullback"
+    assert context["variant_override"] == "warrior_prior_runner_continuation_pullback"
     assert context["entry_price_override"] <= context["max_pay"]
     assert context["stop_price_override"] < context["base_low"]
     assert context["target_price_override"] > context["entry_price_override"]
     assert 6.0 <= context["pullback_pct"] <= 28.0
 
 
-def test_warrior_news_continuation_pullback_rejects_dump_base() -> None:
+def test_warrior_prior_runner_continuation_pullback_rejects_dump_base() -> None:
     ten_sec = [
         Bar("MBUR", _BASE_TS + timedelta(seconds=0), 6.10, 6.55, 6.05, 6.45, 120_000, Timeframe.SEC_10),
         Bar("MBUR", _BASE_TS + timedelta(seconds=10), 6.45, 7.20, 6.40, 7.08, 210_000, Timeframe.SEC_10),
@@ -1153,7 +1192,7 @@ def test_warrior_news_continuation_pullback_rejects_dump_base() -> None:
     driver = _momentum_burst_backtest_driver(ten_sec)
     driver._use_warrior_squeeze_playbook = True
 
-    context = driver._warrior_news_continuation_pullback_context(
+    context = driver._warrior_prior_runner_continuation_pullback_context(
         "MBUR",
         ten_sec[-1],
         window_high=8.80,
@@ -1162,7 +1201,7 @@ def test_warrior_news_continuation_pullback_rejects_dump_base() -> None:
     assert context is None
 
 
-def test_warrior_news_continuation_pullback_rejects_weak_reclaim_volume() -> None:
+def test_warrior_prior_runner_continuation_pullback_rejects_weak_reclaim_volume() -> None:
     ten_sec = [
         Bar("MBUR", _BASE_TS + timedelta(seconds=0), 6.10, 6.55, 6.05, 6.45, 120_000, Timeframe.SEC_10),
         Bar("MBUR", _BASE_TS + timedelta(seconds=10), 6.45, 7.20, 6.40, 7.08, 210_000, Timeframe.SEC_10),
@@ -1180,7 +1219,7 @@ def test_warrior_news_continuation_pullback_rejects_weak_reclaim_volume() -> Non
     driver = _momentum_burst_backtest_driver(ten_sec)
     driver._use_warrior_squeeze_playbook = True
 
-    context = driver._warrior_news_continuation_pullback_context(
+    context = driver._warrior_prior_runner_continuation_pullback_context(
         "MBUR",
         ten_sec[-1],
         window_high=8.80,
@@ -1222,6 +1261,208 @@ def test_warrior_trend_pullback_reclaim_context_allows_cast_style_base() -> None
     assert context["stop_price_override"] < context["entry_price_override"]
     assert context["target_price_override"] > context["entry_price_override"]
     assert 2.5 <= context["pullback_pct"] <= 22.0
+
+
+def test_warrior_high_base_reclaim_allows_sprc_style_volume_reclaim() -> None:
+    ten_sec = [
+        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 7.20, 10.40, 7.10, 9.80, 480_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 9.78, 10.55, 9.40, 9.70, 220_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 9.70, 9.95, 9.30, 9.45, 110_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 9.45, 9.65, 9.10, 9.30, 92_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 9.30, 9.50, 9.05, 9.25, 75_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 9.24, 9.40, 8.92, 9.02, 68_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 9.02, 9.20, 8.74, 8.92, 64_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=70), 8.92, 9.08, 8.62, 8.86, 58_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=80), 8.86, 9.02, 8.58, 8.78, 52_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=90), 8.78, 8.96, 8.45, 8.60, 48_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 8.60, 8.86, 8.42, 8.47, 51_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 8.49, 8.52, 8.29, 8.43, 69_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=120), 8.43, 8.66, 8.42, 8.61, 35_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=130), 8.59, 8.61, 8.49, 8.55, 32_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=140), 8.57, 8.78, 8.54, 8.77, 27_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=150), 8.74, 8.80, 8.62, 8.67, 26_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=160), 8.66, 8.70, 8.62, 8.62, 10_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=170), 8.62, 8.96, 8.62, 8.93, 52_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=180), 8.89, 9.15, 8.76, 9.11, 59_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=190), 9.12, 9.39, 9.02, 9.39, 64_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=200), 9.39, 10.66, 9.25, 10.38, 356_000, Timeframe.SEC_10),
+    ]
+
+    context = warrior_lanes.warrior_high_base_reclaim_context(
+        ten_sec[-1],
+        history=ten_sec,
+        window_high=10.55,
+    )
+
+    assert context is not None
+    assert context["entry_trigger"] == "warrior_high_base_reclaim"
+    assert context["size_factor"] == pytest.approx(0.25)
+
+
+def test_warrior_high_base_reclaim_rejects_second_blowoff_candle() -> None:
+    ten_sec = [
+        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 7.20, 10.40, 7.10, 9.80, 480_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 9.78, 10.55, 9.40, 9.70, 220_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 9.70, 9.95, 9.30, 9.45, 110_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 9.45, 9.65, 9.10, 9.30, 92_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 9.30, 9.50, 9.05, 9.25, 75_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 9.24, 9.40, 8.92, 9.02, 68_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 9.02, 9.20, 8.74, 8.92, 64_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=70), 8.92, 9.08, 8.62, 8.86, 58_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=80), 8.86, 9.02, 8.58, 8.78, 52_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=90), 8.78, 8.96, 8.45, 8.60, 48_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 8.60, 8.86, 8.42, 8.47, 51_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 8.49, 8.52, 8.29, 8.43, 69_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=120), 8.43, 8.66, 8.42, 8.61, 35_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=130), 8.59, 8.61, 8.49, 8.55, 32_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=140), 8.57, 8.78, 8.54, 8.77, 27_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=150), 8.74, 8.80, 8.62, 8.67, 26_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=160), 8.66, 8.70, 8.62, 8.62, 10_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=170), 8.62, 8.96, 8.62, 8.93, 52_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=180), 8.89, 9.15, 8.76, 9.11, 59_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=190), 9.12, 10.05, 9.02, 9.95, 226_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=200), 9.95, 10.75, 9.73, 10.47, 277_000, Timeframe.SEC_10),
+    ]
+
+    context = warrior_lanes.warrior_high_base_reclaim_context(
+        ten_sec[-1],
+        history=ten_sec,
+        window_high=10.55,
+    )
+
+    assert context is None
+
+
+def test_warrior_stair_step_runner_context_allows_sti_style_eight_base() -> None:
+    ten_sec = [
+        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 6.95, 7.08, 6.80, 7.0778, 39_121, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 7.17, 7.39, 7.11, 7.2868, 38_786, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 7.28, 7.65, 7.26, 7.50, 64_857, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 7.45, 7.85, 7.45, 7.78, 46_763, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 7.76, 8.13, 7.73, 7.98, 95_488, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 7.98, 8.05, 7.84, 7.89, 63_975, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 7.86, 8.02, 7.70, 7.9855, 51_719, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=70), 7.98, 8.03, 7.8303, 7.88, 43_498, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=80), 7.87, 8.07, 7.82, 8.04, 33_935, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=90), 8.07, 8.23, 7.96, 7.98, 62_624, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 8.16, 8.39, 8.06, 8.23, 67_057, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 8.26, 8.35, 8.18, 8.27, 39_033, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=120), 8.00, 8.27, 7.90, 8.23, 47_045, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=130), 8.23, 8.34, 8.21, 8.26, 30_874, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=140), 8.10, 8.244, 8.0686, 8.211, 20_979, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=150), 8.08, 8.31, 8.07, 8.24, 31_315, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=160), 8.21, 8.45, 8.15, 8.38, 63_354, Timeframe.SEC_10),
+    ]
+    driver = _momentum_burst_backtest_driver(ten_sec)
+    driver._use_warrior_squeeze_playbook = True
+
+    context = driver._warrior_trend_pullback_reclaim_context(
+        "MBUR",
+        ten_sec[-1],
+        window_high=8.39,
+    )
+
+    assert context is not None
+    assert context["entry_trigger"] == "warrior_stair_step_runner"
+    assert context["variant_override"] == "warrior_stair_step_runner"
+    assert context["entry_price_override"] <= context["max_pay"]
+    assert context["stop_price_override"] < context["entry_price_override"]
+    assert context["target_price_override"] > context["entry_price_override"]
+    assert (context["entry_price_override"] - context["stop_price_override"]) / context["entry_price_override"] <= 0.06
+
+
+def test_warrior_late_reentry_rejects_choppy_stair_step_after_win() -> None:
+    ten_sec = [
+        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 13.80, 14.20, 13.60, 14.05, 90_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 14.05, 14.70, 13.88, 14.48, 110_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 14.49, 14.76, 13.89, 13.90, 120_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 13.92, 14.62, 13.86, 14.50, 95_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 14.50, 15.02, 14.19, 14.31, 130_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 14.31, 14.95, 14.23, 14.89, 81_083, Timeframe.SEC_10),
+    ]
+
+    reason = warrior_lanes.warrior_late_reentry_reject(
+        ten_sec[-1],
+        history=ten_sec,
+        window_high=14.95,
+        reentry_count=2,
+        target_wins=1,
+        entry_trigger="warrior_stair_step_runner",
+    )
+
+    assert reason is not None
+    assert "late Warrior re-entry blocked" in reason
+
+
+def test_warrior_late_reentry_leaves_non_stair_lanes_alone() -> None:
+    ten_sec = [
+        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 7.00, 7.40, 6.90, 7.35, 120_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 7.35, 7.80, 7.20, 7.60, 130_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 7.60, 8.10, 7.30, 7.50, 150_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 7.50, 7.90, 7.10, 7.20, 160_000, Timeframe.SEC_10),
+    ]
+
+    reason = warrior_lanes.warrior_late_reentry_reject(
+        ten_sec[-1],
+        history=ten_sec,
+        window_high=8.10,
+        reentry_count=2,
+        target_wins=1,
+        entry_trigger="warrior_prior_runner_continuation_pullback",
+    )
+
+    assert reason is None
+
+
+def test_warrior_violent_liquid_blocks_unproven_trend_reclaim() -> None:
+    ten_sec = [
+        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 9.10, 9.72, 9.00, 9.55, 160_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 9.56, 10.10, 9.40, 9.82, 180_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 9.82, 10.26, 9.35, 9.48, 220_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 9.48, 9.92, 9.10, 9.30, 170_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 9.30, 10.05, 9.20, 9.88, 190_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 9.88, 10.30, 9.62, 10.20, 210_000, Timeframe.SEC_10),
+    ]
+
+    reason = warrior_lanes.warrior_violent_liquid_reject(
+        ten_sec[-1],
+        history=ten_sec,
+        target_wins=0,
+        entry_trigger="warrior_trend_pullback_reclaim",
+    )
+
+    assert reason is not None
+    assert "violent-liquid Warrior blocked" in reason
+
+    stair_reason = warrior_lanes.warrior_violent_liquid_reject(
+        ten_sec[-1],
+        history=ten_sec,
+        target_wins=0,
+        entry_trigger="warrior_stair_step_runner",
+    )
+
+    assert stair_reason is not None
+    assert "violent-liquid Warrior blocked" in stair_reason
+
+
+def test_warrior_violent_liquid_allows_after_target_win() -> None:
+    ten_sec = [
+        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 9.10, 9.72, 9.00, 9.55, 160_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 9.56, 10.10, 9.40, 9.82, 180_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 9.82, 10.26, 9.35, 9.48, 220_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 9.48, 9.92, 9.10, 9.30, 170_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 9.30, 10.05, 9.20, 9.88, 190_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 9.88, 10.30, 9.62, 10.20, 210_000, Timeframe.SEC_10),
+    ]
+
+    reason = warrior_lanes.warrior_violent_liquid_reject(
+        ten_sec[-1],
+        history=ten_sec,
+        target_wins=1,
+        entry_trigger="warrior_trend_pullback_reclaim",
+    )
+
+    assert reason is None
 
 
 def test_warrior_trend_pullback_reclaim_rejects_dump_base() -> None:
@@ -1675,7 +1916,6 @@ def test_backtest_flags_default_experiments_off() -> None:
     assert flags["momentum_burst_live"] is False
     assert flags["momentum_burst_hit_run"] is False
     assert flags["warrior_squeeze_playbook"] is False
-    assert flags["warrior_news_continuation"] is False
     assert flags["level_capped_entry"] is False
     assert flags["execution_timer_10s"] is True
 
@@ -1690,12 +1930,10 @@ def test_backtest_flags_accept_momentum_burst_hit_run() -> None:
 def test_backtest_flags_accept_warrior_squeeze_playbook() -> None:
     flags = normalize_flags({
         "warrior_squeeze_playbook": True,
-        "warrior_news_continuation": True,
         "live_like_10s": True,
     })
 
     assert flags["warrior_squeeze_playbook"] is True
-    assert flags["warrior_news_continuation"] is True
     assert flags["live_like_10s"] is True
 
 

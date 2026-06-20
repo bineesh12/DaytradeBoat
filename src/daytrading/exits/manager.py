@@ -38,6 +38,11 @@ MOMENTUM_THRESHOLD = 7  # ticks moved from entry to be considered "high momentum
 QUICK_SCALP_PARTIAL_PCT = 0.01  # harvest first quick scalp pop before it fades
 RUNNER_MIN_CONFIRM_PCT = 0.018  # prove strength before giving the back half room
 RUNNER_TRAIL_PCT = 0.03         # protected runners trail 3% instead of 1%
+EMERGENCY_DUMP_BODY_PCT = 0.035
+EMERGENCY_DUMP_RANGE_PCT = 0.045
+EMERGENCY_DUMP_CLOSE_LOCATION = 0.30
+EMERGENCY_DUMP_MIN_VOLUME = 50_000
+EMERGENCY_DUMP_VOLUME_RATIO = 0.75
 
 # Strategy labels that share the hit-run lifecycle: full 1R first-target exit,
 # per-symbol give-back/daily-stop P&L tracking, and win/loss cooldowns. The
@@ -54,6 +59,34 @@ def is_hit_run_strategy(label: Optional[str]) -> bool:
     """True if a strategy/reason label belongs to the hit-run lifecycle."""
     text = (label or "").lower()
     return any(name in text for name in HIT_RUN_STRATEGIES)
+
+
+def is_emergency_dump_bar(
+    open_price: float,
+    high_price: float,
+    low_price: float,
+    close_price: float,
+    volume: float = 0.0,
+    avg_volume: float = 0.0,
+) -> bool:
+    """Return True for a large red distribution candle that should flatten hit-runs."""
+    if open_price <= 0 or high_price <= 0 or low_price <= 0 or close_price <= 0:
+        return False
+    if high_price <= low_price or close_price >= open_price:
+        return False
+
+    body_pct = (open_price - close_price) / open_price
+    range_pct = (high_price - low_price) / close_price
+    close_location = (close_price - low_price) / (high_price - low_price)
+    volume_floor = max(EMERGENCY_DUMP_MIN_VOLUME, avg_volume * EMERGENCY_DUMP_VOLUME_RATIO)
+    volume_ok = volume <= 0 or volume >= volume_floor
+
+    return (
+        body_pct >= EMERGENCY_DUMP_BODY_PCT
+        and range_pct >= EMERGENCY_DUMP_RANGE_PCT
+        and close_location <= EMERGENCY_DUMP_CLOSE_LOCATION
+        and volume_ok
+    )
 
 
 @dataclass
@@ -105,6 +138,9 @@ class TrackedPosition:
     trend_strength: float = 0.5           # 0-1, from classifier (higher = stronger trend)
     consecutive_red: int = 0              # count of consecutive red candles
     prev_bar_open: float = 0.0           # previous bar open for red candle check
+    last_bar_open: float = 0.0           # most recent completed bar open
+    last_bar_high: float = 0.0           # most recent completed bar high
+    last_bar_low: float = 0.0            # most recent completed bar low
     _first_pullback_done: bool = False   # True after first red candle (grace period)
 
     # Runner handling.  These stay false for ordinary scalps.  A position only
@@ -316,6 +352,9 @@ class ExitManager:
             else:
                 pos.consecutive_red = 0
             pos.prev_bar_open = open_price if open_price > 0 else pos.last_bar_close
+            pos.last_bar_open = open_price if open_price > 0 else pos.last_bar_close
+            pos.last_bar_high = high_price
+            pos.last_bar_low = low_price
             pos.prev_bar_volume = pos.last_bar_volume
             pos.last_bar_volume = volume
             pos.last_bar_close = close_price
@@ -531,6 +570,41 @@ class ExitManager:
                 sig = self._make_exit(pos, pos.remaining_qty, price, ExitReason.STOP_LOSS)
                 pos.remaining_qty = 0
                 return [sig]
+
+        # --- emergency dump candle: flatten hit-run / Warrior positions.
+        # Warrior entries can intentionally give a runner some room after a
+        # partial. That is good on normal pullbacks, but dangerous on a large
+        # high-volume red candle closing near its low. This circuit applies to
+        # every strategy in HIT_RUN_STRATEGIES, including all Warrior lanes.
+        if (
+            is_long
+            and pos.remaining_qty > 0
+            and is_hit_run_strategy(self._position_text(pos))
+            and is_emergency_dump_bar(
+                pos.last_bar_open,
+                pos.last_bar_high,
+                pos.last_bar_low,
+                pos.last_bar_close,
+                pos.last_bar_volume,
+                pos.avg_bar_volume,
+            )
+        ):
+            logger.info(
+                "EMERGENCY DUMP EXIT %s @ %.4f | red bar %.4f→%.4f "
+                "(range %.4f–%.4f, vol=%d, avg_vol=%.0f, entry=%.4f)",
+                pos.symbol,
+                price,
+                pos.last_bar_open,
+                pos.last_bar_close,
+                pos.last_bar_low,
+                pos.last_bar_high,
+                pos.last_bar_volume,
+                pos.avg_bar_volume,
+                pos.entry_price,
+            )
+            sig = self._make_exit(pos, pos.remaining_qty, price, ExitReason.STOP_LOSS)
+            pos.remaining_qty = 0
+            return [sig]
 
         # --- hard stop loss: exit all shares ---
         if pos.stop_loss is not None:

@@ -5,6 +5,209 @@ from typing import Any, Dict, Optional, Sequence
 from daytrading.models import Bar
 
 
+WARRIOR_LATE_REENTRY_TRIGGERS = {
+    "warrior_level_pullaway",
+    "warrior_curl_reclaim",
+    "warrior_second_leg_reclaim",
+    "warrior_prior_runner_continuation_pullback",
+    "warrior_high_base_reclaim",
+    "warrior_stair_step_runner",
+    "warrior_trend_pullback_reclaim",
+    "warrior_equal_high_pullaway",
+}
+
+
+def warrior_late_reentry_reject(
+    latest_bar: Bar,
+    *,
+    history: Sequence[Bar],
+    window_high: float,
+    reentry_count: int,
+    target_wins: int,
+    entry_trigger: Optional[str],
+) -> Optional[str]:
+    """Block late Warrior adds when the 10s tape has turned distributive.
+
+    The first Warrior entry is allowed to be aggressive. After the stock has
+    already paid or the bot has already taken multiple shots, new entries need
+    cleaner tape so the playbook does not keep buying every violent HOD pop.
+    """
+    if int(target_wins or 0) < 1 and int(reentry_count or 0) < 2:
+        return None
+    if entry_trigger != "warrior_stair_step_runner":
+        return None
+
+    bars = [bar for bar in history if float(bar.close or 0.0) > 0]
+    current_ts = getattr(latest_bar, "ts", None)
+    if current_ts is not None:
+        bars = [
+            bar for bar in bars
+            if getattr(bar, "ts", None) is None or bar.ts <= current_ts
+        ]
+    if not bars or bars[-1] is not latest_bar:
+        bars = bars + [latest_bar]
+    recent = bars[-8:]
+    if len(recent) < 4:
+        return None
+
+    close = float(latest_bar.close or 0.0)
+    high = float(latest_bar.high or 0.0)
+    if close <= 0 or high <= 0:
+        return "late Warrior re-entry blocked: invalid 10s price"
+
+    ranges = sorted(
+        (float(bar.high or 0.0) - float(bar.low or 0.0)) / float(bar.close or 1.0)
+        for bar in recent[-6:]
+        if float(bar.close or 0.0) > 0
+    )
+    if ranges:
+        median_range = ranges[len(ranges) // 2]
+        if int(reentry_count or 0) >= 2 and median_range > 0.038:
+            return (
+                "late Warrior re-entry blocked: 10s tape too wide/choppy "
+                "({:.1f}% median range)"
+            ).format(median_range * 100.0)
+
+    prior = recent[:-1]
+    prior_volumes = [float(bar.volume or 0.0) for bar in prior[-5:]]
+    avg_prior_volume = (
+        sum(prior_volumes) / len(prior_volumes) if prior_volumes else 0.0
+    )
+    for bar in prior[-5:]:
+        bar_close = float(bar.close or 0.0)
+        bar_open = float(bar.open or 0.0)
+        if bar_close <= 0 or bar_close >= bar_open:
+            continue
+        bar_range = float(bar.high or 0.0) - float(bar.low or 0.0)
+        body_pct = (bar_open - bar_close) / bar_close
+        range_pct = bar_range / bar_close if bar_close > 0 else 0.0
+        close_location = (
+            (bar_close - float(bar.low or 0.0)) / bar_range
+            if bar_range > 0 else 0.0
+        )
+        volume = float(bar.volume or 0.0)
+        if (
+            body_pct >= 0.030
+            and range_pct >= 0.040
+            and close_location <= 0.45
+            and volume >= max(30_000.0, avg_prior_volume * 0.70)
+        ):
+            return "late Warrior re-entry blocked: recent red distribution candle"
+
+    # After a target win, do not buy a lower bounce unless a dedicated lane
+    # has proven a fresh reclaim. This catches CAST-style attempts that are
+    # still below the old high after the stock has started topping.
+    prior_high = max((float(bar.high or 0.0) for bar in bars[:-1]), default=0.0)
+    reference_high = max(float(window_high or 0.0), prior_high)
+    if (
+        int(target_wins or 0) >= 1
+        and reference_high > 0
+        and high < reference_high * 0.985
+        and close < reference_high * 0.965
+        and entry_trigger not in {
+            "warrior_second_leg_reclaim",
+            "warrior_prior_runner_continuation_pullback",
+        }
+    ):
+        return (
+            "late Warrior re-entry blocked: bounce below prior high "
+            "({:.2f} < {:.2f})"
+        ).format(close, reference_high * 0.965)
+
+    return None
+
+
+def warrior_violent_liquid_reject(
+    latest_bar: Bar,
+    *,
+    history: Sequence[Bar],
+    target_wins: int,
+    entry_trigger: Optional[str],
+) -> Optional[str]:
+    """Require extra proof before trading violent-liquid Warrior pullbacks.
+
+    Violent liquidity is not automatically good liquidity. EDHL-style tapes can
+    print huge volume and still fail every reclaim, so the first Warrior shot in
+    this lane needs a cleaner micro-base than normal Warrior setups.
+    """
+    if int(target_wins or 0) >= 1:
+        return None
+    if entry_trigger not in {
+        "warrior_trend_pullback_reclaim",
+        "warrior_stair_step_runner",
+    }:
+        return None
+
+    bars = [bar for bar in history if float(bar.close or 0.0) > 0]
+    current_ts = getattr(latest_bar, "ts", None)
+    if current_ts is not None:
+        bars = [
+            bar for bar in bars
+            if getattr(bar, "ts", None) is None or bar.ts <= current_ts
+        ]
+    if not bars or bars[-1] is not latest_bar:
+        bars = bars + [latest_bar]
+    recent = bars[-8:]
+    if len(recent) < 5:
+        return "violent-liquid Warrior blocked: not enough clean 10s proof"
+
+    close = float(latest_bar.close or 0.0)
+    high = float(latest_bar.high or 0.0)
+    low = float(latest_bar.low or 0.0)
+    open_ = float(latest_bar.open or 0.0)
+    if close <= 0 or high <= 0 or close <= open_:
+        return "violent-liquid Warrior blocked: confirm bar not green"
+
+    rng = high - low
+    close_location = (close - low) / rng if rng > 0 else 0.0
+    if close_location < 0.72:
+        return (
+            "violent-liquid Warrior blocked: confirm close not strong "
+            "({:.0%} of range)"
+        ).format(close_location)
+
+    ranges = sorted(
+        (float(bar.high or 0.0) - float(bar.low or 0.0)) / float(bar.close or 1.0)
+        for bar in recent[-6:]
+        if float(bar.close or 0.0) > 0
+    )
+    if not ranges:
+        return "violent-liquid Warrior blocked: no range proof"
+    median_range = ranges[len(ranges) // 2]
+    if median_range > 0.030:
+        return (
+            "violent-liquid Warrior blocked: 10s tape too wide "
+            "({:.1f}% median range)"
+        ).format(median_range * 100.0)
+
+    prior = recent[:-1]
+    prior_volumes = [float(bar.volume or 0.0) for bar in prior[-5:]]
+    avg_prior_volume = (
+        sum(prior_volumes) / len(prior_volumes) if prior_volumes else 0.0
+    )
+    for bar in prior[-5:]:
+        bar_close = float(bar.close or 0.0)
+        bar_open = float(bar.open or 0.0)
+        if bar_close <= 0 or bar_close >= bar_open:
+            continue
+        bar_range = float(bar.high or 0.0) - float(bar.low or 0.0)
+        body_pct = (bar_open - bar_close) / bar_close
+        range_pct = bar_range / bar_close if bar_close > 0 else 0.0
+        volume = float(bar.volume or 0.0)
+        if (
+            body_pct >= 0.025
+            and range_pct >= 0.035
+            and volume >= max(30_000.0, avg_prior_volume * 0.75)
+        ):
+            return "violent-liquid Warrior blocked: recent red distribution"
+
+    prior_high = max((float(bar.high or 0.0) for bar in prior[-5:]), default=0.0)
+    if prior_high > 0 and high < prior_high * 1.002 and close < prior_high:
+        return "violent-liquid Warrior blocked: no fresh 10s reclaim"
+
+    return None
+
+
 def momentum_burst_level_context(previous_high: float, current_high: float) -> Dict[str, Any]:
     try:
         prev = float(previous_high or 0.0)
@@ -578,7 +781,288 @@ def warrior_trend_pullback_reclaim_context(
     }
 
 
-def warrior_news_continuation_pullback_context(
+def warrior_high_base_reclaim_context(
+    latest_bar: Bar,
+    *,
+    history: Sequence[Bar],
+    window_high: float,
+) -> Optional[Dict[str, Any]]:
+    """Detect SPRC-style violent high-base reclaims.
+
+    This lane is for a stock that already made a large impulse, then held a
+    high, choppy base near HOD and reclaimed the base. It is intentionally more
+    permissive on base width than the stair-step lane, but compensates with
+    stronger volume/close requirements and reduced size.
+    """
+    history = [bar for bar in history if float(bar.close or 0.0) > 0][-30:]
+    if len(history) < 12:
+        return None
+    high = float(latest_bar.high or 0.0)
+    low = float(latest_bar.low or 0.0)
+    open_ = float(latest_bar.open or 0.0)
+    close = float(latest_bar.close or 0.0)
+    volume = float(latest_bar.volume or 0.0)
+    if close <= open_ or close <= 0 or high <= 0 or low <= 0:
+        return None
+
+    prior = history[:-1]
+    prior_high = max((float(bar.high or 0.0) for bar in prior), default=0.0)
+    runner_high = max(float(window_high or 0.0), prior_high, high)
+    if runner_high < max(7.0, close * 0.94):
+        return None
+    prior_high_index = max(
+        range(len(prior)),
+        key=lambda idx: float(prior[idx].high or 0.0),
+        default=-1,
+    )
+    bars_since_prior_high = (
+        len(prior) - 1 - prior_high_index if prior_high_index >= 0 else 0
+    )
+    # Do not treat the first vertical expansion as a high-base reclaim. This
+    # lane is for the later SPRC-style base after the first top is established.
+    if bars_since_prior_high < 18:
+        return None
+
+    lookback_low = min((float(bar.low or 0.0) for bar in history[:-2]), default=0.0)
+    if lookback_low <= 0 or runner_high < lookback_low * 1.18:
+        return None
+
+    base_bars = history[-10:-1]
+    if len(base_bars) < 7:
+        return None
+    base_high = max(float(bar.high or 0.0) for bar in base_bars)
+    base_low = min(float(bar.low or 0.0) for bar in base_bars)
+    if base_high <= 0 or base_low <= 0:
+        return None
+
+    pullback_pct = (runner_high - base_low) / runner_high if runner_high > 0 else 0.0
+    if pullback_pct < 0.06 or pullback_pct > 0.24:
+        return None
+    base_range_pct = (base_high - base_low) / close if close > 0 else 999.0
+    if base_range_pct < 0.035 or base_range_pct > 0.23:
+        return None
+    # Keep this lane for high bases, not deep washouts.
+    if base_low < runner_high * 0.72:
+        return None
+    if high < base_high or close < base_high * 0.985:
+        return None
+
+    rng = max(high - low, 0.0)
+    close_location = (close - low) / rng if rng > 0 else 0.0
+    if close_location < 0.62:
+        return None
+
+    total_volume = sum(float(bar.volume or 0.0) for bar in history)
+    if total_volume <= 0:
+        return None
+    vwap = sum(
+        ((float(bar.high or 0.0) + float(bar.low or 0.0) + float(bar.close or 0.0)) / 3.0)
+        * float(bar.volume or 0.0)
+        for bar in history
+    ) / total_volume
+    if close < vwap * 0.99 or base_low < vwap * 0.86:
+        return None
+
+    avg_base_volume = sum(float(bar.volume or 0.0) for bar in base_bars) / len(base_bars)
+    recent_volume = sum(float(bar.volume or 0.0) for bar in history[-3:])
+    # EDHL-style violent tapes often print several large candles in a row and
+    # then rug the reclaim. SPRC's good setup was different: a high-base reclaim
+    # on a fresh volume expansion, not a second/third chase candle. Require the
+    # reclaim bar to stand out versus the base and avoid buying immediately
+    # after another blow-off 10s body.
+    prev_bar = history[-2] if len(history) >= 2 else None
+    if prev_bar is not None:
+        prev_close = float(prev_bar.close or 0.0)
+        prev_open = float(prev_bar.open or 0.0)
+        if prev_close > 0 and prev_close > prev_open:
+            prev_body_pct = (prev_close - prev_open) / prev_close
+            if prev_body_pct > 0.06:
+                return None
+    if close_location < 0.72:
+        return None
+    if volume < max(140_000.0, avg_base_volume * 2.5):
+        return None
+    if recent_volume < max(300_000.0, avg_base_volume * 1.65):
+        return None
+
+    heavy_red_count = 0
+    for bar in history[-6:-1]:
+        bar_close = float(bar.close or 0.0)
+        bar_open = float(bar.open or 0.0)
+        if bar_close <= 0 or bar_close >= bar_open:
+            continue
+        body_pct = (bar_open - bar_close) / bar_close
+        bar_range = float(bar.high or 0.0) - float(bar.low or 0.0)
+        close_loc = (
+            (bar_close - float(bar.low or 0.0)) / bar_range
+            if bar_range > 0 else 0.0
+        )
+        if (
+            body_pct > 0.065
+            and close_loc < 0.45
+            and float(bar.volume or 0.0) >= avg_base_volume * 1.15
+        ):
+            heavy_red_count += 1
+    if heavy_red_count >= 2:
+        return None
+
+    reclaim_level = base_high
+    max_pay = round(reclaim_level * 1.045, 4)
+    if low > max_pay:
+        return None
+    entry_price = min(close, max_pay)
+    stop_anchor = max(base_low, vwap * 0.955)
+    structural_stop = max(0.01, stop_anchor - max(0.05, entry_price * 0.005))
+    risk = max(entry_price - structural_stop, entry_price * 0.020, 0.12)
+    # This lane is reduced-size and uses a capped tactical stop so it can pass
+    # the shared final guard without pretending the full base risk is small.
+    risk = min(risk, entry_price * 0.059)
+    if risk <= 0:
+        return None
+    stop_price = round(entry_price - risk, 4)
+    target_price = round(entry_price + risk * 1.0, 4)
+    return {
+        "entry_trigger": "warrior_high_base_reclaim",
+        "variant_override": "warrior_high_base_reclaim",
+        "psych_level": round(reclaim_level, 4),
+        "pullaway_level": round(reclaim_level, 4),
+        "base_high": round(base_high, 4),
+        "base_low": round(base_low, 4),
+        "pullback_pct": round(pullback_pct * 100.0, 2),
+        "vwap": round(vwap, 4),
+        "max_pay": max_pay,
+        "entry_price_override": round(entry_price, 4),
+        "stop_price_override": stop_price,
+        "target_price_override": target_price,
+        "max_hold_seconds_override": 150.0,
+        "reward_risk": 1.0,
+        "size_factor": 0.25,
+        "rr_note_override": (
+            "warrior high-base reclaim base=${:.2f}-${:.2f} "
+            "pullback={:.1f}% vwap=${:.2f} cap=${:.2f} target=${:.2f}"
+        ).format(base_low, base_high, pullback_pct * 100.0, vwap, max_pay, target_price),
+        "skip_unstable_confirm_stop_check": True,
+    }
+
+
+def warrior_stair_step_runner_context(
+    latest_bar: Bar,
+    *,
+    history: Sequence[Bar],
+    window_high: float,
+) -> Optional[Dict[str, Any]]:
+    """Detect STI-style stair-step runners after the first impulse.
+
+    This is intentionally separate from the CLWT/UTSI pull-away lanes. It looks
+    for a strong runner that pauses in a tight higher-low base, then reclaims
+    that base instead of buying the first spike candle.
+    """
+    history = [bar for bar in history if float(bar.close or 0.0) > 0][-30:]
+    if len(history) < 12:
+        return None
+    high = float(latest_bar.high or 0.0)
+    low = float(latest_bar.low or 0.0)
+    open_ = float(latest_bar.open or 0.0)
+    close = float(latest_bar.close or 0.0)
+    volume = float(latest_bar.volume or 0.0)
+    if close <= open_ or close <= 0 or high <= 0:
+        return None
+    prior = history[:-1]
+    prior_high = max((float(bar.high or 0.0) for bar in prior), default=0.0)
+    runner_high = max(float(window_high or 0.0), prior_high)
+    if runner_high < max(8.0, close * 0.96):
+        return None
+    lookback_low = min((float(bar.low or 0.0) for bar in history[:-2]), default=0.0)
+    if lookback_low <= 0 or runner_high < lookback_low * 1.08:
+        return None
+
+    base_bars = history[-8:-1]
+    if len(base_bars) < 6:
+        return None
+    base_high = max(float(bar.high or 0.0) for bar in base_bars)
+    base_low = min(float(bar.low or 0.0) for bar in base_bars)
+    if base_high <= 0 or base_low <= 0:
+        return None
+    pullback_pct = (runner_high - base_low) / runner_high if runner_high > 0 else 0.0
+    if pullback_pct < 0.025 or pullback_pct > 0.16:
+        return None
+    base_range_pct = (base_high - base_low) / close if close > 0 else 999.0
+    if base_range_pct > 0.105:
+        return None
+    if high < base_high or close < base_high * 0.995:
+        return None
+
+    rng = max(high - low, 0.0)
+    close_location = (close - low) / rng if rng > 0 else 0.0
+    if close_location < 0.54:
+        return None
+
+    total_volume = sum(float(bar.volume or 0.0) for bar in history)
+    if total_volume <= 0:
+        return None
+    vwap = sum(
+        ((float(bar.high or 0.0) + float(bar.low or 0.0) + float(bar.close or 0.0)) / 3.0)
+        * float(bar.volume or 0.0)
+        for bar in history
+    ) / total_volume
+    if close < vwap * 1.015 or base_low < vwap * 0.94:
+        return None
+
+    avg_base_volume = sum(float(bar.volume or 0.0) for bar in base_bars) / len(base_bars)
+    recent_volume = sum(float(bar.volume or 0.0) for bar in history[-3:])
+    if volume < max(30_000.0, avg_base_volume * 0.65):
+        return None
+    if recent_volume < max(100_000.0, avg_base_volume * 1.15):
+        return None
+
+    heavy_red = any(
+        float(bar.close or 0.0) < float(bar.open or 0.0)
+        and (float(bar.open or 0.0) - float(bar.close or 0.0)) / float(bar.close or 1.0) > 0.065
+        and float(bar.volume or 0.0) >= avg_base_volume * 1.35
+        for bar in history[-5:-1]
+    )
+    if heavy_red:
+        return None
+
+    reclaim_level = base_high
+    max_pay = round(reclaim_level * 1.035, 4)
+    if low > max_pay:
+        return None
+    entry_price = min(close, max_pay)
+    stop_anchor = max(base_low, vwap * 0.965)
+    structural_risk = entry_price - max(0.01, stop_anchor - max(0.03, entry_price * 0.0035))
+    risk = max(structural_risk, entry_price * 0.018, 0.10)
+    # Keep this lane inside the shared final-guard risk cap while preserving a
+    # real stop outside normal 10s noise.
+    risk = min(risk, entry_price * 0.059)
+    if risk <= 0:
+        return None
+    stop_price = round(entry_price - risk, 4)
+    target_price = round(entry_price + risk * 1.8, 4)
+    return {
+        "entry_trigger": "warrior_stair_step_runner",
+        "variant_override": "warrior_stair_step_runner",
+        "psych_level": round(reclaim_level, 4),
+        "pullaway_level": round(reclaim_level, 4),
+        "base_high": round(base_high, 4),
+        "base_low": round(base_low, 4),
+        "pullback_pct": round(pullback_pct * 100.0, 2),
+        "vwap": round(vwap, 4),
+        "max_pay": max_pay,
+        "entry_price_override": round(entry_price, 4),
+        "stop_price_override": stop_price,
+        "target_price_override": target_price,
+        "max_hold_seconds_override": 180.0,
+        "reward_risk": 1.8,
+        "rr_note_override": (
+            "warrior stair-step runner base=${:.2f}-${:.2f} "
+            "pullback={:.1f}% vwap=${:.2f} cap=${:.2f} target=${:.2f}"
+        ).format(base_low, base_high, pullback_pct * 100.0, vwap, max_pay, target_price),
+        "skip_unstable_confirm_stop_check": True,
+    }
+
+
+def warrior_prior_runner_continuation_pullback_context(
     latest_bar: Bar,
     *,
     history: Sequence[Bar],
@@ -654,8 +1138,8 @@ def warrior_news_continuation_pullback_context(
     stop_price = round(entry_price - risk, 4)
     target_price = round(entry_price + risk * 1.5, 4)
     return {
-        "entry_trigger": "warrior_news_continuation_pullback",
-        "variant_override": "warrior_news_continuation_pullback",
+        "entry_trigger": "warrior_prior_runner_continuation_pullback",
+        "variant_override": "warrior_prior_runner_continuation_pullback",
         "psych_level": round(reclaim_level, 4),
         "pullaway_level": round(reclaim_level, 4),
         "base_high": round(base_high, 4),
@@ -669,7 +1153,7 @@ def warrior_news_continuation_pullback_context(
         "max_hold_seconds_override": 180.0,
         "reward_risk": 1.5,
         "rr_note_override": (
-            "warrior news-continuation pullback "
+            "warrior prior-runner continuation pullback "
             "base=${:.2f}-${:.2f} pullback={:.1f}% vwap=${:.2f} target=${:.2f}"
         ).format(base_low, base_high, pullback_pct * 100.0, vwap, target_price),
         "skip_unstable_confirm_stop_check": True,

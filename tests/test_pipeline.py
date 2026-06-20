@@ -683,7 +683,7 @@ def test_final_entry_guard_does_not_block_exit_or_short_flattening(monkeypatch) 
     assert pipeline._final_entry_quality_reject(sig, universe={"HOT": []}) is None
 
 
-def test_warrior_guard_exception_includes_second_leg_and_news_continuation() -> None:
+def test_warrior_guard_exception_includes_second_leg_and_prior_runner_continuation() -> None:
     bars = [
         _bar("HOT", 8.80, volume=120_000, open_=8.60, high=8.90, low=8.50),
         _bar("HOT", 8.95, volume=150_000, open_=8.75, high=9.05, low=8.70),
@@ -691,7 +691,8 @@ def test_warrior_guard_exception_includes_second_leg_and_news_continuation() -> 
     ]
     for trigger in (
         "warrior_second_leg_reclaim",
-        "warrior_news_continuation_pullback",
+        "warrior_prior_runner_continuation_pullback",
+        "warrior_stair_step_runner",
         "warrior_trend_pullback_reclaim",
     ):
         hit = ScanResult(
@@ -727,6 +728,51 @@ def test_warrior_guard_exception_includes_second_leg_and_news_continuation() -> 
         )
 
         assert allowed is True
+
+
+def test_warrior_high_base_guard_exception_allows_70_score_only_for_high_base() -> None:
+    bars = [
+        _bar("HOT", 9.10, volume=120_000, open_=8.85, high=9.20, low=8.70),
+        _bar("HOT", 9.35, volume=150_000, open_=9.05, high=9.40, low=9.00),
+        _bar("HOT", 9.80, volume=180_000, open_=9.30, high=9.90, low=9.25),
+    ]
+
+    def _signal(trigger: str) -> TradeSignal:
+        hit = ScanResult(
+            symbol="HOT",
+            scanner_name="warrior_squeeze_playbook",
+            ts=TS,
+            score=100.0,
+            criteria={
+                "pattern": "warrior_squeeze_playbook",
+                "entry_mode": "warrior_squeeze_playbook",
+                "entry_trigger": trigger,
+                "setup_tier": "A+ setup",
+                "size_factor": 0.25,
+                "psych_level": 9.40,
+            },
+        )
+        return TradeSignal(
+            symbol="HOT",
+            action=SignalAction.ENTER_LONG,
+            quantity=10,
+            entry_price=9.80,
+            stop_loss=9.25,
+            take_profit=10.35,
+            reason=trigger,
+            scan_result=hit,
+        )
+
+    assert TradingPipeline._allow_warrior_starter_guard_exception(
+        _signal("warrior_high_base_reclaim"),
+        bars=bars,
+        reason="entry score too low (70/100, need 80+)",
+    ) is True
+    assert TradingPipeline._allow_warrior_starter_guard_exception(
+        _signal("warrior_stair_step_runner"),
+        bars=bars,
+        reason="entry score too low (70/100, need 80+)",
+    ) is False
 
 
 def test_scalping_factory_live_verifiers_only_allow_clean_setups() -> None:

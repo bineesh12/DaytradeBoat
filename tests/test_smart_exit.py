@@ -143,6 +143,48 @@ class TestHalfSellAt2to1:
         assert "take_profit" in exits[0].reason.lower()
         assert "ABC" not in em.tracked
 
+    def test_hit_run_emergency_dump_exits_full_position(self) -> None:
+        em = ExitManager()
+        pos = _long_pos(entry=10.00, stop=9.20, qty=90)
+        pos.reason = "Warrior Squeeze STI"
+        pos.entry_strategy = "warrior_squeeze_playbook"
+        em.track(pos)
+
+        em.update_bar_close(
+            "ABC",
+            close_price=9.52,
+            open_price=10.05,
+            high_price=10.12,
+            low_price=9.50,
+            volume=180_000,
+        )
+        exits = em.check_exits({"ABC": 9.52}, _ts(20))
+
+        assert len(exits) == 1
+        assert exits[0].quantity == 90
+        assert "stop_loss" in exits[0].reason.lower()
+        assert "ABC" not in em.tracked
+
+    def test_non_hit_run_does_not_emergency_exit_above_stop(self) -> None:
+        em = ExitManager()
+        pos = _long_pos(entry=10.00, stop=9.20, qty=90)
+        pos.reason = "Vwap Pullback ABC"
+        pos.entry_strategy = "vwap_pullback"
+        em.track(pos)
+
+        em.update_bar_close(
+            "ABC",
+            close_price=9.52,
+            open_price=10.05,
+            high_price=10.12,
+            low_price=9.50,
+            volume=180_000,
+        )
+        exits = em.check_exits({"ABC": 9.52}, _ts(20))
+
+        assert exits == []
+        assert "ABC" in em.tracked
+
     def test_warrior_squeeze_banks_partial_at_first_target(self) -> None:
         em = ExitManager()
         pos = _long_pos(entry=5.00, stop=4.90, qty=90)

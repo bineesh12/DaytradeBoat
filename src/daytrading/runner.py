@@ -258,7 +258,6 @@ class AlpacaRunner:
         self._warrior_squeeze_win_cooldown_sec = 10.0
         self._warrior_squeeze_reward_risk = 3.0
         self._warrior_squeeze_add_reward_risk = 1.0
-        self._warrior_news_continuation_enabled = False
         self._warrior_squeeze_rejection_high: Dict[str, float] = {}
         self._warrior_squeeze_rejection_reason: Dict[str, str] = {}
         self._warrior_squeeze_target_wins: Dict[str, int] = {}
@@ -630,9 +629,6 @@ class AlpacaRunner:
         runner._warrior_squeeze_reward_risk = float(cfg.strategy.warrior_squeeze_reward_risk)
         runner._warrior_squeeze_add_reward_risk = float(
             cfg.strategy.warrior_squeeze_add_reward_risk
-        )
-        runner._warrior_news_continuation_enabled = bool(
-            cfg.strategy.warrior_news_continuation_enabled
         )
         runner._exec_timer._tick_entry_enabled = bool(cfg.strategy.tick_entry_enabled)
         runner._exec_timer._tick_entry_confirm_count = max(1, int(cfg.strategy.tick_entry_confirm_count))
@@ -6093,30 +6089,29 @@ class AlpacaRunner:
                 and window_high > 0
                 and current_high <= window_high * 1.001
             ):
-                armed_news_pullback = False
-                if self._warrior_news_continuation_enabled:
-                    news_pullback_context = self._warrior_news_continuation_pullback_context(
+                armed_prior_runner_pullback = False
+                prior_runner_context = self._warrior_prior_runner_continuation_pullback_context(
+                    sym,
+                    latest_10s,
+                    window_high=window_high,
+                )
+                if prior_runner_context is not None:
+                    pending[sym] = {
+                        "ts": (
+                            bar_ts - timedelta(seconds=10)
+                            if bar_ts is not None else bar_ts
+                        ),
+                        "breakout_close": float(latest_10s.close or 0.0),
+                        "breakout_high": current_high,
+                        "breakout_volume": float(latest_10s.volume or 0.0),
+                        **prior_runner_context,
+                    }
+                    logger.info(
+                        "WARRIOR SQUEEZE %s prior-runner continuation pullback executing on reclaim bar",
                         sym,
-                        latest_10s,
-                        window_high=window_high,
                     )
-                    if news_pullback_context is not None:
-                        pending[sym] = {
-                            "ts": (
-                                bar_ts - timedelta(seconds=10)
-                                if bar_ts is not None else bar_ts
-                            ),
-                            "breakout_close": float(latest_10s.close or 0.0),
-                            "breakout_high": current_high,
-                            "breakout_volume": float(latest_10s.volume or 0.0),
-                            **news_pullback_context,
-                        }
-                        logger.info(
-                            "WARRIOR SQUEEZE %s news-continuation pullback executing on reclaim bar",
-                            sym,
-                        )
-                        armed_news_pullback = True
-                if not armed_news_pullback:
+                    armed_prior_runner_pullback = True
+                if not armed_prior_runner_pullback:
                     trend_pullback_context = self._warrior_trend_pullback_reclaim_context(
                         sym,
                         latest_10s,
@@ -6137,8 +6132,8 @@ class AlpacaRunner:
                             "WARRIOR SQUEEZE %s trend pullback reclaim executing on reclaim bar",
                             sym,
                         )
-                        armed_news_pullback = True
-                if not armed_news_pullback:
+                        armed_prior_runner_pullback = True
+                if not armed_prior_runner_pullback:
                     second_leg_context = self._warrior_squeeze_second_leg_reclaim_context(
                         sym,
                         latest_10s,
@@ -6176,6 +6171,35 @@ class AlpacaRunner:
             # bar. Entry waits for the NEXT 10s bar to prove continuation: green,
             # holding the breakout close, and trading through the breakout high.
             # A sideways hold under the spike high is not enough for hit-run.
+            if warrior_enabled and self._momentum_burst_hit_run_counts.get(sym, 0) == 0:
+                trend_pullback_fn = getattr(
+                    self,
+                    "_warrior_trend_pullback_reclaim_context",
+                    None,
+                )
+                high_base_context = (
+                    trend_pullback_fn(
+                        sym,
+                        latest_10s,
+                        window_high=window_high,
+                    )
+                    if callable(trend_pullback_fn)
+                    else None
+                )
+                if (
+                    high_base_context is not None
+                    and high_base_context.get("entry_trigger") == "warrior_high_base_reclaim"
+                ):
+                    pending[sym] = {
+                        "ts": (
+                            bar_ts - timedelta(seconds=10)
+                            if bar_ts is not None else bar_ts
+                        ),
+                        "breakout_close": float(latest_10s.close or 0.0),
+                        "breakout_high": current_high,
+                        "breakout_volume": float(latest_10s.volume or 0.0),
+                        **high_base_context,
+                    }
             pend = pending.get(sym)
             if pend is not None and bar_ts is not None and pend.get("ts") is not None:
                 try:
@@ -6215,7 +6239,9 @@ class AlpacaRunner:
                     and warrior_target_wins >= 1
                     and pend.get("entry_trigger") not in {
                         "warrior_second_leg_reclaim",
-                        "warrior_news_continuation_pullback",
+                        "warrior_prior_runner_continuation_pullback",
+                        "warrior_high_base_reclaim",
+                        "warrior_stair_step_runner",
                         "warrior_trend_pullback_reclaim",
                         "warrior_equal_high_pullaway",
                     }
@@ -6231,7 +6257,9 @@ class AlpacaRunner:
                 if warrior_enabled and (
                     pend.get("entry_trigger") in {
                         "warrior_second_leg_reclaim",
-                        "warrior_news_continuation_pullback",
+                        "warrior_prior_runner_continuation_pullback",
+                        "warrior_high_base_reclaim",
+                        "warrior_stair_step_runner",
                         "warrior_trend_pullback_reclaim",
                         "warrior_equal_high_pullaway",
                     }
@@ -6264,6 +6292,23 @@ class AlpacaRunner:
                     and curl_context is None
                     else None
                 )
+                high_base_context = (
+                    self._warrior_trend_pullback_reclaim_context(
+                        sym,
+                        latest_10s,
+                        window_high=window_high,
+                    )
+                    if warrior_enabled
+                    and pullaway_context is None
+                    and curl_context is None
+                    and equal_high_context is None
+                    else None
+                )
+                if (
+                    high_base_context is not None
+                    and high_base_context.get("entry_trigger") != "warrior_high_base_reclaim"
+                ):
+                    high_base_context = None
                 reject_reason = None
                 if pullaway_context is not None:
                     pend = {**pend, **pullaway_context}
@@ -6271,6 +6316,8 @@ class AlpacaRunner:
                     pend = {**pend, **curl_context}
                 elif equal_high_context is not None:
                     pend = {**pend, **equal_high_context}
+                elif high_base_context is not None:
+                    pend = {**pend, **high_base_context}
                 elif warrior_enabled:
                     reject_reason = "warrior setup not confirmed by playbook pattern"
                 elif not confirmed:
@@ -6324,7 +6371,7 @@ class AlpacaRunner:
                     sym,
                     latest_10s,
                     hit_run=fast_squeeze_enabled,
-                    violent_liquid=bool(hit_run_enabled and violent_ok),
+                    violent_liquid=bool(fast_squeeze_enabled and violent_ok),
                     post_blowoff_micro_base=post_blowoff_micro_base,
                     entry_context=pend,
                     strategy_override=(
@@ -6334,6 +6381,7 @@ class AlpacaRunner:
                         self._warrior_squeeze_starter_size_factor
                         if warrior_enabled else None
                     ),
+                    window_high=window_high,
                 )
                 if fill is not None:
                     if not fast_squeeze_enabled:
@@ -6368,25 +6416,26 @@ class AlpacaRunner:
                             entry_context=equal_high_context,
                             strategy_override="warrior_squeeze_playbook",
                             size_factor_override=self._warrior_squeeze_starter_size_factor,
+                            window_high=window_high,
                         )
                         if fill is not None:
                             break
-                if warrior_enabled and self._warrior_news_continuation_enabled:
-                    news_pullback_context = self._warrior_news_continuation_pullback_context(
+                if warrior_enabled:
+                    prior_runner_context = self._warrior_prior_runner_continuation_pullback_context(
                         sym,
                         latest_10s,
                         window_high=window_high,
                     )
-                    if news_pullback_context is not None:
+                    if prior_runner_context is not None:
                         pending[sym] = {
                             "ts": bar_ts,
                             "breakout_close": float(latest_10s.close or 0.0),
                             "breakout_high": current_high,
                             "breakout_volume": float(latest_10s.volume or 0.0),
-                            **news_pullback_context,
+                            **prior_runner_context,
                         }
                         logger.info(
-                            "WARRIOR SQUEEZE %s news-continuation pullback armed",
+                            "WARRIOR SQUEEZE %s prior-runner continuation pullback armed",
                             sym,
                         )
                         continue
@@ -6498,6 +6547,7 @@ class AlpacaRunner:
                             entry_context=add_context,
                             strategy_override="warrior_squeeze_playbook",
                             size_factor_override=self._warrior_squeeze_starter_size_factor,
+                            window_high=window_high,
                         )
                         if fill is not None:
                             break
@@ -6528,22 +6578,21 @@ class AlpacaRunner:
                         "breakout_volume": float(latest_10s.volume or 0.0),
                         **self._momentum_burst_level_context(window_high, current_high),
                     }
-                    if self._warrior_news_continuation_enabled:
-                        news_pullback_context = self._warrior_news_continuation_pullback_context(
+                    prior_runner_context = self._warrior_prior_runner_continuation_pullback_context(
+                        sym,
+                        latest_10s,
+                        window_high=window_high,
+                    )
+                    if prior_runner_context is not None:
+                        pending[sym] = {
+                            **add_pending,
+                            **prior_runner_context,
+                        }
+                        logger.info(
+                            "WARRIOR SQUEEZE %s prior-runner continuation pullback armed on fresh reclaim",
                             sym,
-                            latest_10s,
-                            window_high=window_high,
                         )
-                        if news_pullback_context is not None:
-                            pending[sym] = {
-                                **add_pending,
-                                **news_pullback_context,
-                            }
-                            logger.info(
-                                "WARRIOR SQUEEZE %s news-continuation pullback armed on fresh reclaim",
-                                sym,
-                            )
-                            continue
+                        continue
                     trend_pullback_context = self._warrior_trend_pullback_reclaim_context(
                         sym,
                         latest_10s,
@@ -6581,22 +6630,21 @@ class AlpacaRunner:
                         **self._momentum_burst_level_context(window_high, current_high),
                     }
                     if target_wins >= 1:
-                        if self._warrior_news_continuation_enabled:
-                            news_pullback_context = self._warrior_news_continuation_pullback_context(
+                        prior_runner_context = self._warrior_prior_runner_continuation_pullback_context(
+                            sym,
+                            latest_10s,
+                            window_high=window_high,
+                        )
+                        if prior_runner_context is not None:
+                            pending[sym] = {
+                                **add_pending,
+                                **prior_runner_context,
+                            }
+                            logger.info(
+                                "WARRIOR SQUEEZE %s prior-runner continuation pullback armed on fresh reclaim",
                                 sym,
-                                latest_10s,
-                                window_high=window_high,
                             )
-                            if news_pullback_context is not None:
-                                pending[sym] = {
-                                    **add_pending,
-                                    **news_pullback_context,
-                                }
-                                logger.info(
-                                    "WARRIOR SQUEEZE %s news-continuation pullback armed on fresh reclaim",
-                                    sym,
-                                )
-                                continue
+                            continue
                         trend_pullback_context = self._warrior_trend_pullback_reclaim_context(
                             sym,
                             latest_10s,
@@ -6639,11 +6687,13 @@ class AlpacaRunner:
                             entry_context=add_context,
                             strategy_override="warrior_squeeze_playbook",
                             size_factor_override=self._warrior_squeeze_starter_size_factor,
+                            window_high=window_high,
                         )
                         if fill is not None:
                             self._momentum_burst_window_high[sym] = current_high
                             break
                 first_clwt_context = None
+                first_reclaim_context = None
                 if warrior_enabled and self._momentum_burst_hit_run_counts.get(sym, 0) == 0:
                     first_pending = {
                         "ts": bar_ts,
@@ -6662,6 +6712,19 @@ class AlpacaRunner:
                         and candidate.get("variant_override") == "warrior_clwt_fast_pullaway"
                     ):
                         first_clwt_context = {**first_pending, **candidate}
+                    reclaim_candidate = self._warrior_trend_pullback_reclaim_context(
+                        sym,
+                        latest_10s,
+                        window_high=window_high,
+                    )
+                    if (
+                        reclaim_candidate is not None
+                        and reclaim_candidate.get("entry_trigger") in {
+                            "warrior_high_base_reclaim",
+                            "warrior_stair_step_runner",
+                        }
+                    ):
+                        first_reclaim_context = {**first_pending, **reclaim_candidate}
                 self._momentum_burst_window_high[sym] = current_high
                 pending[sym] = {
                     "ts": bar_ts,
@@ -6670,7 +6733,9 @@ class AlpacaRunner:
                     "breakout_volume": float(latest_10s.volume or 0.0),
                     **self._momentum_burst_level_context(window_high, current_high),
                 }
-                if first_clwt_context is not None:
+                if first_reclaim_context is not None:
+                    pending[sym].update(first_reclaim_context)
+                elif first_clwt_context is not None:
                     pending[sym].update(first_clwt_context)
 
     @staticmethod
@@ -6751,14 +6816,14 @@ class AlpacaRunner:
             window_high=window_high,
         )
 
-    def _warrior_news_continuation_pullback_context(
+    def _warrior_prior_runner_continuation_pullback_context(
         self,
         symbol: str,
         latest_10s: Bar,
         *,
         window_high: float,
     ) -> Optional[Dict[str, Any]]:
-        return warrior_lanes.warrior_news_continuation_pullback_context(
+        return warrior_lanes.warrior_prior_runner_continuation_pullback_context(
             latest_10s,
             history=AlpacaRunner._warrior_history_until(self, symbol, latest_10s, count=36),
             window_high=window_high,
@@ -6771,9 +6836,24 @@ class AlpacaRunner:
         *,
         window_high: float,
     ) -> Optional[Dict[str, Any]]:
+        history = AlpacaRunner._warrior_history_until(self, symbol, latest_10s, count=30)
+        stair_context = warrior_lanes.warrior_stair_step_runner_context(
+            latest_10s,
+            history=history,
+            window_high=window_high,
+        )
+        if stair_context is not None:
+            return stair_context
+        high_base_context = warrior_lanes.warrior_high_base_reclaim_context(
+            latest_10s,
+            history=history,
+            window_high=window_high,
+        )
+        if high_base_context is not None:
+            return high_base_context
         return warrior_lanes.warrior_trend_pullback_reclaim_context(
             latest_10s,
-            history=AlpacaRunner._warrior_history_until(self, symbol, latest_10s, count=30),
+            history=history,
             window_high=window_high,
         )
 
@@ -7032,6 +7112,7 @@ class AlpacaRunner:
         entry_context: Optional[Dict[str, Any]] = None,
         strategy_override: Optional[str] = None,
         size_factor_override: Optional[float] = None,
+        window_high: Optional[float] = None,
     ) -> Optional[Fill]:
         strategy_label = (
             strategy_override
@@ -7053,7 +7134,9 @@ class AlpacaRunner:
                 "warrior_level_pullaway",
                 "warrior_curl_reclaim",
                 "warrior_second_leg_reclaim",
-                "warrior_news_continuation_pullback",
+                "warrior_prior_runner_continuation_pullback",
+                "warrior_high_base_reclaim",
+                "warrior_stair_step_runner",
                 "warrior_trend_pullback_reclaim",
                 "warrior_equal_high_pullaway",
             }
@@ -7061,6 +7144,55 @@ class AlpacaRunner:
         bars = list(self._bar_buffer.get(sym, deque()))
         if len(bars) < 3:
             return None
+
+        if warrior_override and strategy_label == "warrior_squeeze_playbook":
+            if violent_liquid:
+                violent_reject = warrior_lanes.warrior_violent_liquid_reject(
+                    latest_10s,
+                    history=AlpacaRunner._warrior_history_until(
+                        self, sym, latest_10s, count=12
+                    ),
+                    target_wins=int(self._warrior_squeeze_target_wins.get(sym, 0) or 0),
+                    entry_trigger=str((entry_context or {}).get("entry_trigger") or ""),
+                )
+                if violent_reject:
+                    logger.info("WARRIOR SQUEEZE reject %s: %s", sym, violent_reject)
+                    self._record_entry_reject(
+                        self._quick_scalp_probe_signal(sym, bars[-1].close, strategy_label),
+                        stage="{}_violent_liquid".format(stage_prefix),
+                        reason=violent_reject,
+                        source=strategy_label,
+                        price=bars[-1].close,
+                    )
+                    return None
+            late_reentry_reject = warrior_lanes.warrior_late_reentry_reject(
+                latest_10s,
+                history=AlpacaRunner._warrior_history_until(
+                    self, sym, latest_10s, count=12
+                ),
+                window_high=float(
+                    window_high
+                    if window_high is not None
+                    else (entry_context or {}).get("window_high") or 0.0
+                ),
+                reentry_count=int(self._momentum_burst_hit_run_counts.get(sym, 0) or 0),
+                target_wins=int(self._warrior_squeeze_target_wins.get(sym, 0) or 0),
+                entry_trigger=str((entry_context or {}).get("entry_trigger") or ""),
+            )
+            if late_reentry_reject:
+                logger.info(
+                    "WARRIOR SQUEEZE reject %s: %s",
+                    sym,
+                    late_reentry_reject,
+                )
+                self._record_entry_reject(
+                    self._quick_scalp_probe_signal(sym, bars[-1].close, strategy_label),
+                    stage="{}_late_reentry".format(stage_prefix),
+                    reason=late_reentry_reject,
+                    source=strategy_label,
+                    price=bars[-1].close,
+                )
+                return None
 
         if not warrior_override:
             reject = self._check_quick_scalp_entry(sym, bars)
@@ -7269,9 +7401,12 @@ class AlpacaRunner:
                         else "warrior_second_leg_reclaim"
                         if entry_context
                         and entry_context.get("entry_trigger") == "warrior_second_leg_reclaim"
-                        else "warrior_news_continuation_pullback"
+                        else "warrior_prior_runner_continuation_pullback"
                         if entry_context
-                        and entry_context.get("entry_trigger") == "warrior_news_continuation_pullback"
+                        and entry_context.get("entry_trigger") == "warrior_prior_runner_continuation_pullback"
+                        else "warrior_high_base_reclaim"
+                        if entry_context
+                        and entry_context.get("entry_trigger") == "warrior_high_base_reclaim"
                         else "warrior_trend_pullback_reclaim"
                         if entry_context
                         and entry_context.get("entry_trigger") == "warrior_trend_pullback_reclaim"

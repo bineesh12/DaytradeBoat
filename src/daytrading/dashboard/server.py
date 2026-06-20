@@ -1032,8 +1032,7 @@ tr:hover { background:var(--surface2); }
         <label><input type="checkbox" id="bt-flag-spread"> elite wide spread</label>
         <label><input type="checkbox" id="bt-flag-momentum"> momentum burst live</label>
         <label title="Replay the rapid momentum-burst hit-and-run state machine from real 10s bars"><input type="checkbox" id="bt-flag-mb-hit-run"> momentum hit-run</label>
-        <label title="Replay the separate Warrior-style squeeze playbook: first popup is attention only, enter after reclaim proof"><input type="checkbox" id="bt-flag-warrior"> warrior squeeze</label>
-        <label title="CUPR-style prior-runner fresh-news continuation pullback lane, separated from base Warrior squeeze"><input type="checkbox" id="bt-flag-warrior-news"> warrior news continuation</label>
+        <label title="Replay the Warrior-style squeeze playbook: first popup is attention only, enter after reclaim proof"><input type="checkbox" id="bt-flag-warrior"> warrior squeeze</label>
         <label><input type="checkbox" id="bt-flag-capped"> level-capped entry</label>
         <label><input type="checkbox" id="bt-flag-timer" checked> 10s timer replay</label>
         <label><input type="checkbox" id="bt-flag-10s-scout"> 10s breakout scout</label>
@@ -1939,7 +1938,6 @@ function runBacktest() {
         momentum_burst_live: !!(document.getElementById('bt-flag-momentum') || {}).checked,
         momentum_burst_hit_run: !!(document.getElementById('bt-flag-mb-hit-run') || {}).checked,
         warrior_squeeze_playbook: !!(document.getElementById('bt-flag-warrior') || {}).checked,
-        warrior_news_continuation: !!(document.getElementById('bt-flag-warrior-news') || {}).checked,
         level_capped_entry: !!(document.getElementById('bt-flag-capped') || {}).checked,
         execution_timer_10s: !!(document.getElementById('bt-flag-timer') || {}).checked,
         ten_second_breakout_scout: !!(document.getElementById('bt-flag-10s-scout') || {}).checked,
@@ -2382,7 +2380,7 @@ function renderBacktest() {
   html += '<div class="stat-card"><div class="stat-label">Trades</div><div class="stat-value">' + (sc.closed_trades || 0) + '/' + (sc.trades_taken || 0) + '</div><div class="mini-muted">closed / entries</div></div>';
   html += '<div class="stat-card"><div class="stat-label">Funnel</div><div class="stat-value">' + (f.scan_hits || 0) + ' -> ' + (f.signals || 0) + ' -> ' + (f.entries || 0) + '</div><div class="mini-muted">' + pctText(f.signal_to_entry_pct) + ' signal to entry</div></div>';
   html += '</div>';
-  html += '<div class="mini-muted">Flags: fresh_vwap=' + (flags.fresh_vwap_reclaim_scout ? 'on' : 'off') + ', vwap_reclaim=' + (flags.vwap_reclaim_scout ? 'on' : 'off') + ', level_breakout=' + (flags.level_breakout_scout ? 'on' : 'off') + ', elite_wide_spread=' + (flags.elite_wide_spread ? 'on' : 'off') + ', momentum_burst_live=' + (flags.momentum_burst_live ? 'on' : 'off') + ', momentum_hit_run=' + (flags.momentum_burst_hit_run ? 'on' : 'off') + ', warrior_squeeze=' + (flags.warrior_squeeze_playbook ? 'on' : 'off') + ', warrior_news=' + (flags.warrior_news_continuation ? 'on' : 'off') + ', level_capped_entry=' + (flags.level_capped_entry ? 'on' : 'off') + ', 10s_timer=' + (flags.execution_timer_10s ? 'on' : 'off') + ', 10s_scout=' + (flags.ten_second_breakout_scout ? 'on' : 'off') + ', 10s_reclaim=' + (flags.level_reclaim_10s_scout ? 'on' : 'off') + ', breakout_scalp=' + (flags.breakout_scalp_replay ? 'on' : 'off') + ', live_like_10s=' + (flags.live_like_10s ? 'on' : 'off') + '</div>';
+  html += '<div class="mini-muted">Flags: fresh_vwap=' + (flags.fresh_vwap_reclaim_scout ? 'on' : 'off') + ', vwap_reclaim=' + (flags.vwap_reclaim_scout ? 'on' : 'off') + ', level_breakout=' + (flags.level_breakout_scout ? 'on' : 'off') + ', elite_wide_spread=' + (flags.elite_wide_spread ? 'on' : 'off') + ', momentum_burst_live=' + (flags.momentum_burst_live ? 'on' : 'off') + ', momentum_hit_run=' + (flags.momentum_burst_hit_run ? 'on' : 'off') + ', warrior_squeeze=' + (flags.warrior_squeeze_playbook ? 'on' : 'off') + ', level_capped_entry=' + (flags.level_capped_entry ? 'on' : 'off') + ', 10s_timer=' + (flags.execution_timer_10s ? 'on' : 'off') + ', 10s_scout=' + (flags.ten_second_breakout_scout ? 'on' : 'off') + ', 10s_reclaim=' + (flags.level_reclaim_10s_scout ? 'on' : 'off') + ', breakout_scalp=' + (flags.breakout_scalp_replay ? 'on' : 'off') + ', live_like_10s=' + (flags.live_like_10s ? 'on' : 'off') + '</div>';
   if (r.execution_timer_source) {
     html += '<div class="mini-muted">Execution timer source: ' + escapeHtml(r.execution_timer_source) + '</div>';
   }

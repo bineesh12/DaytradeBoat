@@ -186,10 +186,8 @@ class StrategyConfig:
     warrior_squeeze_win_cooldown_sec: float = 10.0
     warrior_squeeze_reward_risk: float = 3.0
     warrior_squeeze_add_reward_risk: float = 1.0
-    # Separate CUPR-style lane: prior runner/fresh-news continuation pullbacks.
-    # Keep off by default so base Warrior squeeze results do not get polluted by
-    # a different strategy family.
-    warrior_news_continuation_enabled: bool = False
+    # CUPR-style prior-runner continuation pullbacks are part of the Warrior
+    # playbook and are controlled by warrior_squeeze_enabled.
     # Reject any long entry whose stop sits more than this fraction below the
     # entry — a wide stop turns a single fail into many small wins lost (EDHL:
     # an 8.3% vwap_pullback stop on a $10 name = one -$55 stop-out). Applies to
@@ -442,10 +440,6 @@ class StrategyConfig:
             warrior_squeeze_add_reward_risk=_env_float(
                 "WARRIOR_SQUEEZE_ADD_REWARD_RISK",
                 cls.warrior_squeeze_add_reward_risk,
-            ),
-            warrior_news_continuation_enabled=_env_bool(
-                "WARRIOR_NEWS_CONTINUATION_ENABLED",
-                cls.warrior_news_continuation_enabled,
             ),
             max_entry_risk_pct=_env_float(
                 "MAX_ENTRY_RISK_PCT",

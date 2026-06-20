@@ -33,7 +33,6 @@ def test_strategy_config_loads_tunables_from_env(monkeypatch):
     monkeypatch.setenv("DAYTRADING_WARRIOR_SQUEEZE_WIN_COOLDOWN_SEC", "2.5")
     monkeypatch.setenv("DAYTRADING_WARRIOR_SQUEEZE_REWARD_RISK", "2.25")
     monkeypatch.setenv("DAYTRADING_WARRIOR_SQUEEZE_ADD_REWARD_RISK", "0.75")
-    monkeypatch.setenv("DAYTRADING_WARRIOR_NEWS_CONTINUATION_ENABLED", "true")
 
     cfg = StrategyConfig.from_env()
 
@@ -68,7 +67,6 @@ def test_strategy_config_loads_tunables_from_env(monkeypatch):
     assert cfg.warrior_squeeze_win_cooldown_sec == 2.5
     assert cfg.warrior_squeeze_reward_risk == 2.25
     assert cfg.warrior_squeeze_add_reward_risk == 0.75
-    assert cfg.warrior_news_continuation_enabled is True
 
 
 def test_momentum_burst_hit_run_defaults_to_one_entry_and_giveback_stop() -> None:
@@ -80,7 +78,6 @@ def test_momentum_burst_hit_run_defaults_to_one_entry_and_giveback_stop() -> Non
     assert cfg.warrior_squeeze_win_cooldown_sec == 10.0
     assert cfg.warrior_squeeze_reward_risk == 3.0
     assert cfg.warrior_squeeze_add_reward_risk == 1.0
-    assert cfg.warrior_news_continuation_enabled is False
 
 
 def test_settings_exposes_strategy_config_without_breaking_legacy_attrs(monkeypatch):
