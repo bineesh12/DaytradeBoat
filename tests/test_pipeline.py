@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from daytrading.execution.broker import PaperBroker
 from daytrading.pipeline.factory import create_scalping_pipeline
@@ -914,6 +914,28 @@ def test_reject_cooldown_rechecks_after_material_price_change() -> None:
     pipeline.run_cycle({"HOT": [_bar("HOT", 10.0), _bar("HOT", 10.25)]}, now=TS)
 
     assert verifier.calls == 2
+
+
+def test_spread_reject_cooldown_rechecks_quickly() -> None:
+    scanner = _OneHitScanner("shallow_stair_continuation", "shallow_stair_continuation")
+    verifier = _RejectVerifier("spread too wide (6.00c = 0.70% of $8.55)")
+    pipeline = TradingPipeline(
+        scanners=[scanner],
+        verifiers={"shallow_stair_continuation": verifier},
+        broker=PaperBroker(),
+        portfolio=PortfolioState(cash=50_000.0, positions={}),
+    )
+    bars = [_bar("HOT", 8.40), _bar("HOT", 8.50), _bar("HOT", 8.55)]
+
+    pipeline.run_cycle({"HOT": bars}, now=TS)
+    pipeline.run_cycle({"HOT": bars}, now=TS + timedelta(seconds=3))
+    cached_reason = pipeline.scan_rejections["HOT"]
+    pipeline.run_cycle({"HOT": bars}, now=TS + timedelta(seconds=6))
+    rechecked_reason = pipeline.scan_rejections["HOT"]
+
+    assert verifier.calls == 2
+    assert cached_reason.startswith("cached reject:")
+    assert rechecked_reason == "spread too wide (6.00c = 0.70% of $8.55)"
 
 
 def test_watch_pattern_reject_does_not_cooldown_live_reclaim_pattern(monkeypatch) -> None:

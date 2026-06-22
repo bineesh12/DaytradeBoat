@@ -949,6 +949,11 @@ class ExitManager:
         return "vwap_pullback" in text or "vwap pullback" in text
 
     @staticmethod
+    def _is_pullback_base(pos: TrackedPosition) -> bool:
+        text = ExitManager._position_text(pos)
+        return "pullback_base" in text or "pullback base" in text
+
+    @staticmethod
     def _position_text(pos: TrackedPosition) -> str:
         return " ".join(
             str(part or "").lower()
@@ -979,6 +984,13 @@ class ExitManager:
         remaining = int(pos.remaining_qty)
         if remaining <= 1:
             return max(1, remaining)
+        # Pullback-base entries are normal-flow scalp/reclaim attempts.  Recent
+        # replay showed the small +1% pop was often real, but leaving a back half
+        # exposed turned UBXG/SBFM/SPRC into net-red trades.  Take the quick scalp
+        # and let stronger continuation be handled by the dedicated Warrior /
+        # momentum lanes instead of forcing pullback_base to become a runner.
+        if ExitManager._is_pullback_base(pos):
+            return remaining
         if pos.runner_candidate:
             return max(1, int(remaining / 3))
         return max(1, int(remaining / 2))

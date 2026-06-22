@@ -182,6 +182,8 @@ class StrategyConfig:
     warrior_squeeze_enabled: bool = False
     warrior_squeeze_min_reclaim_price: float = 3.5
     warrior_squeeze_starter_size_factor: float = 0.35
+    warrior_squeeze_position_value: float = 2000.0
+    warrior_squeeze_max_dollar_risk: float = 150.0
     warrior_squeeze_max_entries: int = 3
     warrior_squeeze_win_cooldown_sec: float = 10.0
     warrior_squeeze_reward_risk: float = 3.0
@@ -424,6 +426,14 @@ class StrategyConfig:
             warrior_squeeze_starter_size_factor=_env_float(
                 "WARRIOR_SQUEEZE_STARTER_SIZE_FACTOR",
                 cls.warrior_squeeze_starter_size_factor,
+            ),
+            warrior_squeeze_position_value=_env_float(
+                "WARRIOR_SQUEEZE_POSITION_VALUE",
+                cls.warrior_squeeze_position_value,
+            ),
+            warrior_squeeze_max_dollar_risk=_env_float(
+                "WARRIOR_SQUEEZE_MAX_DOLLAR_RISK",
+                cls.warrior_squeeze_max_dollar_risk,
             ),
             warrior_squeeze_max_entries=_env_int(
                 "WARRIOR_SQUEEZE_MAX_ENTRIES",

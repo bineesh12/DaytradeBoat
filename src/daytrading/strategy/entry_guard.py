@@ -1153,7 +1153,10 @@ def check_entry_quality(
         and pattern_context == "vwap_pullback"
         and "a+" in setup_context
         and max(float(setup_score or 0.0), float(score or 0.0)) >= 75
-        and score >= 60
+        and score >= 75
+        and bar_rvol >= 0.75
+        and latest_volume >= 40_000
+        and recent_avg_volume >= 50_000
     )
     post_blowoff_micro_base_score_ok = (
         "post_blowoff_micro_base_scout" in (tier_context, pattern_context)

@@ -129,6 +129,21 @@ class TestHalfSellAt2to1:
         tracked = em.tracked.get("ABC")
         assert tracked is not None
 
+    def test_pullback_base_exits_full_size_on_quick_scalp_pop(self) -> None:
+        em = ExitManager()
+        pos = _long_pos(entry=5.00, stop=4.80, qty=90)
+        pos.reason = "Pullback Base UBXG"
+        pos.entry_strategy = "pullback_base"
+        pos.entry_pattern = "pullback_base"
+        em.track(pos)
+
+        exits = em.check_exits({"ABC": 5.05}, _ts(10))
+
+        assert len(exits) == 1
+        assert exits[0].quantity == 90
+        assert "take_profit" in exits[0].reason.lower()
+        assert "ABC" not in em.tracked
+
     def test_momentum_burst_hit_run_sells_full_at_first_target(self) -> None:
         em = ExitManager()
         pos = _long_pos(entry=5.00, stop=4.90, qty=90)

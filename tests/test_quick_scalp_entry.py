@@ -5,6 +5,8 @@ from datetime import datetime, timedelta, timezone
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from daytrading.models import Bar, Fill, OrderStatus, PortfolioState, Position, Quote, ScanResult, Side, Tick, Timeframe
 from daytrading.runner import AlpacaRunner
 
@@ -37,6 +39,8 @@ class _QuickScalpRunner:
     _momentum_burst_continuation_base_ok = AlpacaRunner._momentum_burst_continuation_base_ok
     _momentum_burst_level_context = staticmethod(AlpacaRunner._momentum_burst_level_context)
     _maybe_arm_warrior_squeeze_from_10s = AlpacaRunner._maybe_arm_warrior_squeeze_from_10s
+    _warrior_history_until = AlpacaRunner._warrior_history_until
+    _warrior_trend_pullback_reclaim_context = AlpacaRunner._warrior_trend_pullback_reclaim_context
     _warrior_squeeze_pullaway_context = AlpacaRunner._warrior_squeeze_pullaway_context
     _warrior_squeeze_equal_high_pullaway_context = (
         AlpacaRunner._warrior_squeeze_equal_high_pullaway_context
@@ -98,9 +102,49 @@ class _QuickScalpRunner:
         self._warrior_squeeze_rejection_high = {}
         self._warrior_squeeze_rejection_reason = {}
         self._warrior_squeeze_target_wins = {}
+        self._timer_bars_by_symbol = {}
         self._breakout_scalp_active = False
         self._breakout_scalp_cooldown = {}
         self._quick_scalp_spread_size_factors = {}
+
+
+def _nxts_failed_spike_reclaim_bars(symbol: str = "NXTS") -> list[Bar]:
+    return [
+        Bar(symbol, TS + timedelta(seconds=0), 4.80, 5.10, 4.70, 5.00, 30_000, Timeframe.SEC_10),
+        Bar(symbol, TS + timedelta(seconds=10), 5.00, 6.80, 4.95, 6.60, 70_000, Timeframe.SEC_10),
+        Bar(symbol, TS + timedelta(seconds=20), 6.60, 8.90, 6.50, 8.40, 120_000, Timeframe.SEC_10),
+        Bar(symbol, TS + timedelta(seconds=30), 8.35, 8.55, 7.10, 7.40, 100_000, Timeframe.SEC_10),
+        Bar(symbol, TS + timedelta(seconds=40), 7.40, 7.70, 6.80, 7.00, 80_000, Timeframe.SEC_10),
+        Bar(symbol, TS + timedelta(seconds=50), 7.05, 7.80, 7.00, 7.60, 60_000, Timeframe.SEC_10),
+        Bar(symbol, TS + timedelta(seconds=60), 7.70, 8.20, 7.50, 8.10, 45_000, Timeframe.SEC_10),
+        Bar(symbol, TS + timedelta(seconds=70), 8.10, 8.40, 7.90, 8.25, 50_000, Timeframe.SEC_10),
+        Bar(symbol, TS + timedelta(seconds=80), 8.20, 8.35, 7.95, 8.05, 35_000, Timeframe.SEC_10),
+        Bar(symbol, TS + timedelta(seconds=90), 8.05, 8.30, 7.90, 8.20, 32_000, Timeframe.SEC_10),
+        Bar(symbol, TS + timedelta(seconds=100), 8.20, 8.45, 8.05, 8.36, 45_000, Timeframe.SEC_10),
+        Bar(symbol, TS + timedelta(seconds=110), 8.35, 8.50, 8.10, 8.20, 40_000, Timeframe.SEC_10),
+        Bar(symbol, TS + timedelta(seconds=120), 8.20, 8.55, 8.15, 8.42, 50_000, Timeframe.SEC_10),
+        Bar(symbol, TS + timedelta(seconds=130), 8.40, 8.58, 8.25, 8.50, 55_000, Timeframe.SEC_10),
+        Bar(symbol, TS + timedelta(seconds=140), 8.50, 8.62, 8.30, 8.56, 60_000, Timeframe.SEC_10),
+        Bar(symbol, TS + timedelta(seconds=150), 8.62, 9.15, 8.55, 9.02, 160_000, Timeframe.SEC_10),
+    ]
+
+
+def test_warrior_live_arms_failed_spike_vwap_reclaim_below_old_high() -> None:
+    runner = _QuickScalpRunner()
+    runner._warrior_squeeze_enabled = True
+    runner._warrior_squeeze_min_reclaim_price = 3.50
+    bars = _nxts_failed_spike_reclaim_bars()
+    runner._bar_aggregator = SimpleNamespace(
+        get_latest_10s=lambda symbol, count=12: bars[-count:]
+    )
+    runner._warrior_squeeze_rejection_high["NXTS"] = 8.90
+
+    runner._maybe_arm_warrior_squeeze_from_10s("NXTS", bars[-1], time.monotonic())
+
+    pending = runner._momentum_burst_pending["NXTS"]
+    assert pending["entry_trigger"] == "warrior_failed_spike_vwap_reclaim"
+    assert pending["breakout_high"] == bars[-1].high
+    assert runner._momentum_burst_window_high["NXTS"] == pytest.approx(bars[-1].high)
 
 
 def test_warrior_squeeze_live_a_plus_reclaim_stop_stays_inside_final_guard() -> None:

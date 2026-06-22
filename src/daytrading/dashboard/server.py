@@ -1151,6 +1151,12 @@ function chartLink(sym) {
   let url = 'https://www.tradingview.com/chart/?symbol=' + encodeURIComponent(sym);
   return '<a href="' + url + '" target="_blank" rel="noopener" style="text-decoration:none" title="Open chart for ' + sym + '"><strong>' + sym + '</strong> <span style="font-size:11px;opacity:0.6">&#128200;</span></a>';
 }
+function shortStrategyLabel(name) {
+  let s = String(name || 'unknown');
+  s = s.replace(/^.*?:\s*/, '');
+  s = s.replace(/_/g, ' ');
+  return s.length > 42 ? s.slice(0, 39) + '...' : s;
+}
 function fmtCompact(v) {
   let n = Number(v || 0);
   let abs = Math.abs(n);
@@ -1445,11 +1451,11 @@ function renderTradingWatchlist() {
     let h = hotBySym[sym];
     let onBoard = a
       ? '<span class="pill pill-green">YES</span>'
-      : (h ? hotWatchModePill(h.mode) : '<span class="pill pill-yellow">waiting</span>');
+      : (h ? hotWatchModePill(h.mode) : '<span class="pill pill-blue">Watchlist</span>');
     let alertCell = a
       ? '<span class="hod-alert-name">' + escapeHtml(a.alert_name) + '</span> @ $' + (a.price||0).toFixed(2)
       : (h ? '<span style="color:var(--text2);font-size:11px">Hot Watch session ' + (h.change_pct||0).toFixed(1) + '% · now ' + hotWatchNowText(h) + ' · vol ' + fmtCompact(h.volume||0) + '</span>'
-           : '<span style="color:var(--text2);font-size:11px">TTL active — no new alert yet</span>');
+           : '<span style="color:var(--text2);font-size:11px">Watchlist only — no active scanner setup</span>');
     html += '<tr><td>' + chartLink(sym) + '</td><td>' + onBoard + '</td><td>' + alertCell + '</td></tr>';
   });
   html += '</table>';
@@ -1621,26 +1627,45 @@ function renderStockSummary() {
     return;
   }
   let stocks = {};
-  exits.forEach(t => {
-    if (!stocks[t.symbol]) stocks[t.symbol] = {pnl: 0, wins: 0, losses: 0, trades: 0, totalQty: 0};
+  let openStrategyBySymbol = {};
+  state.recent_trades.forEach(t => {
+    let sym = String(t.symbol || '').toUpperCase();
+    if (!sym) return;
+    if (t.trade_type === 'entry' || t.trade_type === 'reentry') {
+      openStrategyBySymbol[sym] = String(t.strategy || 'unknown');
+      return;
+    }
+    if (t.trade_type !== 'exit' || t.pnl == null) return;
+    if (!stocks[sym]) stocks[sym] = {pnl: 0, wins: 0, losses: 0, trades: 0, totalQty: 0, strategies: {}};
+    let strategy = String(t.strategy || openStrategyBySymbol[sym] || 'unknown');
     let s = stocks[t.symbol];
+    if (!s) s = stocks[sym];
     s.pnl += t.pnl;
     s.trades++;
     s.totalQty += t.quantity;
     if (t.pnl >= 0) s.wins++; else s.losses++;
+    if (!s.strategies[strategy]) s.strategies[strategy] = {trades: 0, pnl: 0};
+    s.strategies[strategy].trades++;
+    s.strategies[strategy].pnl += Number(t.pnl || 0);
   });
   let rows = Object.entries(stocks).sort((a,b) => b[1].pnl - a[1].pnl);
   let totalPnl = rows.reduce((s,r) => s + r[1].pnl, 0);
   let totalTrades = rows.reduce((s,r) => s + r[1].trades, 0);
   let totalWins = rows.reduce((s,r) => s + r[1].wins, 0);
   let totalLosses = rows.reduce((s,r) => s + r[1].losses, 0);
-  let html = '<table><tr><th>Symbol</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Win Rate</th><th>Shares</th><th>P&L</th></tr>';
+  let html = '<table><tr><th>Symbol</th><th>Trades</th><th>Strategies</th><th>Wins</th><th>Losses</th><th>Win Rate</th><th>Shares</th><th>P&L</th></tr>';
   rows.forEach(([sym, s]) => {
     let wr = s.trades > 0 ? ((s.wins / s.trades) * 100).toFixed(0) : '0';
     let pnlClass = s.pnl >= 0 ? 'text-green' : 'text-red';
     let wrClass = parseInt(wr) >= 50 ? 'text-green' : 'text-red';
+    let strategyText = Object.entries(s.strategies || {})
+      .sort((a,b) => Math.abs(Number(b[1].pnl || 0)) - Math.abs(Number(a[1].pnl || 0)))
+      .slice(0, 3)
+      .map(([name, row]) => '<div>' + escapeHtml(shortStrategyLabel(name)) + ' <span style="color:var(--text2)">(' + Number(row.trades || 0) + ')</span></div>')
+      .join('');
     html += '<tr><td>' + chartLink(sym) + '</td>';
     html += '<td>' + s.trades + '</td>';
+    html += '<td style="font-size:11px;color:var(--text2);line-height:1.35">' + (strategyText || 'unknown') + '</td>';
     html += '<td class="text-green">' + s.wins + '</td>';
     html += '<td class="text-red">' + s.losses + '</td>';
     html += '<td class="' + wrClass + '">' + wr + '%</td>';
@@ -1651,6 +1676,7 @@ function renderStockSummary() {
   let totalClass = totalPnl >= 0 ? 'text-green' : 'text-red';
   html += '<tr style="border-top:2px solid var(--border);font-weight:bold"><td>TOTAL</td>';
   html += '<td>' + totalTrades + '</td>';
+  html += '<td></td>';
   html += '<td class="text-green">' + totalWins + '</td>';
   html += '<td class="text-red">' + totalLosses + '</td>';
   html += '<td>' + totalWR + '%</td>';
@@ -1866,12 +1892,19 @@ function renderDailyScorecard() {
     .slice(0, 6);
   if (strategies.length) {
     html += '<div class="card-header" style="margin:14px 0 8px"><h3>Strategy P&L</h3></div>';
-    html += '<table><tr><th>Strategy</th><th>Closed</th><th>Win Rate</th><th>P&L</th></tr>';
+    html += '<table><tr><th>Strategy</th><th>Stocks</th><th>Closed</th><th>Win Rate</th><th>P&L</th></tr>';
     strategies.forEach(([name, row]) => {
       let closed = Number(row.closed_trades || 0);
       let wins = Number(row.wins || 0);
       let wr = closed ? wins / closed * 100 : 0;
-      html += '<tr><td>' + escapeHtml(name || 'unknown') + '</td><td>' + closed + '</td><td>' + wr.toFixed(1) + '%</td><td>' + fmtPnl(Number(row.total_pnl || 0)) + '</td></tr>';
+      let symbols = Object.entries(row.symbols || {})
+        .sort((a, b) => Number(b[1].total_pnl || 0) - Number(a[1].total_pnl || 0))
+        .slice(0, 4)
+        .map(([sym, sr]) => escapeHtml(sym) + ' ' + fmtPnl(Number(sr.total_pnl || 0)))
+        .join('<br>');
+      html += '<tr><td>' + escapeHtml(name || 'unknown') + '</td>';
+      html += '<td style="font-size:11px;color:var(--text2);line-height:1.35">' + (symbols || '-') + '</td>';
+      html += '<td>' + closed + '</td><td>' + wr.toFixed(1) + '%</td><td>' + fmtPnl(Number(row.total_pnl || 0)) + '</td></tr>';
     });
     html += '</table>';
   }

@@ -477,6 +477,8 @@ def _strategy_manifest(settings: Optional[Settings]) -> dict:
         "warrior_squeeze_enabled",
         "warrior_squeeze_min_reclaim_price",
         "warrior_squeeze_starter_size_factor",
+        "warrior_squeeze_position_value",
+        "warrior_squeeze_max_dollar_risk",
         "momentum_burst_live_enabled",
         "momentum_burst_cycle_enabled",
         "runner_trail_pct",
@@ -694,6 +696,12 @@ def run_backtest(
                 ),
                 warrior_squeeze_starter_size_factor=(
                     settings.strategy.warrior_squeeze_starter_size_factor if settings else 0.35
+                ),
+                warrior_squeeze_position_value=(
+                    settings.strategy.warrior_squeeze_position_value if settings else 2000.0
+                ),
+                warrior_squeeze_max_dollar_risk=(
+                    settings.strategy.warrior_squeeze_max_dollar_risk if settings else 150.0
                 ),
                 warrior_squeeze_max_entries=(
                     settings.strategy.warrior_squeeze_max_entries if settings else 3

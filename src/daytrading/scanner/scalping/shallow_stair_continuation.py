@@ -156,6 +156,12 @@ class ShallowStairContinuationScanner:
         )
         if body_ratio < 0.25:
             return None
+        if (
+            not elite_runner
+            and volume_surge < 1.25
+            and (body_ratio < 0.80 or recent_volume < 250_000)
+        ):
+            return None
 
         stop_price = max(base_low - 0.02, price * 0.94)
         risk_pct = (price - stop_price) / price * 100.0

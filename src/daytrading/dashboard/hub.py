@@ -640,7 +640,7 @@ def _trade_dict(t: TradeRecord) -> dict:
     }
 
 
-def _round_trip_pnls(trades: List[dict]) -> List[float]:
+def _round_trip_pnls(trades: List[dict]) -> List[tuple[float, str, str]]:
     """Group partial exits into round-trips.
 
     A position that exits in halves/partials produces multiple exit rows; those
@@ -661,20 +661,28 @@ def _round_trip_pnls(trades: List[dict]) -> List[float]:
         if ttype in ("entry", "reentry"):
             prev = open_trip.get(sym)
             if prev is not None and prev["has_exit"]:
-                trips.append((prev["pnl"], prev["strategy"]))
+                trips.append((prev["pnl"], prev["strategy"], prev["symbol"]))
             open_trip[sym] = {
-                "pnl": 0.0, "has_exit": False, "strategy": str(t.get("strategy") or ""),
+                "pnl": 0.0,
+                "has_exit": False,
+                "strategy": str(t.get("strategy") or ""),
+                "symbol": str(sym or "").upper(),
             }
         elif ttype == "exit" and t.get("pnl") is not None:
             cur = open_trip.get(sym)
             if cur is None:
-                cur = {"pnl": 0.0, "has_exit": False, "strategy": str(t.get("strategy") or "")}
+                cur = {
+                    "pnl": 0.0,
+                    "has_exit": False,
+                    "strategy": str(t.get("strategy") or ""),
+                    "symbol": str(sym or "").upper(),
+                }
                 open_trip[sym] = cur
             cur["pnl"] += float(t.get("pnl") or 0.0)
             cur["has_exit"] = True
     for cur in open_trip.values():
         if cur["has_exit"]:
-            trips.append((cur["pnl"], cur["strategy"]))
+            trips.append((cur["pnl"], cur["strategy"], cur["symbol"]))
     return trips
 
 
@@ -691,7 +699,7 @@ def _daily_scorecard(
     # Count round-trips, not raw exit rows — a position that scales out in
     # partials emits several exit rows but is ONE closed trade.
     trips = _round_trip_pnls(trades)
-    trip_pnls = [p for p, _ in trips]
+    trip_pnls = [p for p, _, _ in trips]
     # A scratch (pnl == 0) is neither a win nor a loss; counting breakevens as
     # wins inflated win_rate while contributing nothing to total_win.
     wins = [p for p in trip_pnls if p > 0.0]
@@ -701,7 +709,7 @@ def _daily_scorecard(
     # expectancy can be judged separately from normal entries.
     by_entry_mode: Dict[str, dict] = {}
     by_strategy: Dict[str, dict] = {}
-    for pnl, strategy in trips:
+    for pnl, strategy, symbol in trips:
         strategy_name = strategy or "unknown"
         _s = strategy.lower()
         if "post_blowoff_micro_base_scout" in _s:
@@ -735,11 +743,19 @@ def _daily_scorecard(
         bucket["wins"] += 1 if pnl > 0.0 else 0
         bucket["total_pnl"] = round(bucket["total_pnl"] + pnl, 2)
         strategy_bucket = by_strategy.setdefault(
-            strategy_name, {"closed_trades": 0, "wins": 0, "total_pnl": 0.0}
+            strategy_name,
+            {"closed_trades": 0, "wins": 0, "total_pnl": 0.0, "symbols": {}},
         )
         strategy_bucket["closed_trades"] += 1
         strategy_bucket["wins"] += 1 if pnl > 0.0 else 0
         strategy_bucket["total_pnl"] = round(strategy_bucket["total_pnl"] + pnl, 2)
+        symbol_name = symbol or "UNKNOWN"
+        symbol_bucket = strategy_bucket["symbols"].setdefault(
+            symbol_name, {"closed_trades": 0, "wins": 0, "total_pnl": 0.0}
+        )
+        symbol_bucket["closed_trades"] += 1
+        symbol_bucket["wins"] += 1 if pnl > 0.0 else 0
+        symbol_bucket["total_pnl"] = round(symbol_bucket["total_pnl"] + pnl, 2)
 
     total_win = sum(wins)
     total_loss = abs(sum(losses))

@@ -759,6 +759,21 @@ class TestShallowStairContinuationScanner:
 
         assert scanner.scan({"TST": bars}) == []
 
+    def test_rejects_borderline_shallow_stair_without_decisive_buyer_candle(self) -> None:
+        """AIIO-style stair scouts need more than barely returning volume."""
+        bars = _make_shallow_stair_bars()
+        base_ts = bars[-1].ts
+        bars[-4:] = [
+            _bar(8, close=3.36, open_=3.34, high=3.40, low=3.3201, volume=48_000, base_ts=base_ts, n=20),
+            _bar(9, close=3.37, open_=3.36, high=3.405, low=3.32, volume=50_000, base_ts=base_ts, n=20),
+            _bar(10, close=3.40, open_=3.37, high=3.425, low=3.34, volume=53_000, base_ts=base_ts, n=20),
+            # Breaks the base, but volume surge is only ~1.1x and body is not decisive.
+            _bar(11, close=3.445, open_=3.37, high=3.48, low=3.37, volume=55_506, base_ts=base_ts, n=20),
+        ]
+        scanner = ShallowStairContinuationScanner(min_price=1.0, max_price=20.0)
+
+        assert scanner.scan({"AIIO": bars}) == []
+
     def test_rejects_late_extended_level_breakout(self) -> None:
         bars = _make_level_breakout_bars()
         last = bars[-1]

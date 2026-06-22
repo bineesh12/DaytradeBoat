@@ -47,6 +47,8 @@ def _runner() -> AlpacaRunner:
     runner._last_synced_order_ids = {"old-order"}
     runner._recorded_exit_fill_keys = {"old-fill"}
     runner._last_session_reset_day = None
+    runner._warrior_normal_fallback_rejects = {"OLD": 3}
+    runner._warrior_normal_fallback_last_reason = {"OLD": "warrior setup not confirmed"}
     return runner
 
 
@@ -66,6 +68,8 @@ def test_daily_session_reset_runs_once_at_premarket(monkeypatch) -> None:
     assert runner._last_synced_order_ids == {"old-order"}
     assert runner._recorded_exit_fill_keys == set()
     assert runner._watchlist == ["SPY"]
+    assert runner._warrior_normal_fallback_rejects == {}
+    assert runner._warrior_normal_fallback_last_reason == {}
 
 
 def test_daily_session_reset_restores_today_trade_history_when_broker_exists(monkeypatch) -> None:

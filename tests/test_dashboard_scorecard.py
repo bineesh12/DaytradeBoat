@@ -231,6 +231,33 @@ def test_dashboard_fill_strategy_feeds_entry_mode_scorecard() -> None:
     assert sc["by_strategy"]["breakout_scalp_momentum"]["total_pnl"] == -5.0
 
 
+def test_scorecard_strategy_pnl_tracks_contributing_symbols() -> None:
+    from daytrading.dashboard.hub import _daily_scorecard
+
+    sc = _daily_scorecard(
+        trades=[
+            {"symbol": "SMCX", "trade_type": "entry", "strategy": "vwap_pullback", "entry_time": "t0"},
+            {"symbol": "SMCX", "trade_type": "exit", "exit_time": "t1", "pnl": -19.82},
+            {"symbol": "AIIO", "trade_type": "entry", "strategy": "shallow_stair_continuation", "entry_time": "t2"},
+            {"symbol": "AIIO", "trade_type": "exit", "exit_time": "t3", "pnl": -15.84},
+            {"symbol": "SMCX", "trade_type": "entry", "strategy": "shallow_stair_continuation", "entry_time": "t4"},
+            {"symbol": "SMCX", "trade_type": "exit", "exit_time": "t5", "pnl": 7.63},
+        ],
+        total_trades=3,
+        total_scan_hits=0,
+        total_signals=0,
+        total_rejected=0,
+        cycle_count=0,
+        missed_a_plus=[],
+    )
+
+    vwap = sc["by_strategy"]["vwap_pullback"]
+    stair = sc["by_strategy"]["shallow_stair_continuation"]
+    assert vwap["symbols"]["SMCX"]["total_pnl"] == -19.82
+    assert stair["symbols"]["AIIO"]["total_pnl"] == -15.84
+    assert stair["symbols"]["SMCX"]["total_pnl"] == 7.63
+
+
 def test_scorecard_counts_reentry_as_new_round_trip_with_strategy() -> None:
     from daytrading.dashboard.hub import _daily_scorecard
 

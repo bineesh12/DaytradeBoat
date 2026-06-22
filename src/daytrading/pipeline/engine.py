@@ -401,6 +401,11 @@ class TradingPipeline:
             return 0.0
         if "unknown pattern: level_breakout_watch" in text:
             return 0.0
+        # Quote spread can tighten within seconds on active momentum names.
+        # Treat it as a fast-changing market condition, not a structural setup
+        # failure, so Warrior/runner setups keep monitoring for a tradeable book.
+        if "spread too wide" in text:
+            return 5.0
         if "thin sub-$5 liquidity" in text or "too illiquid" in text:
             return 180.0
         if "tape too slow" in text:
@@ -739,7 +744,13 @@ class TradingPipeline:
         entry_trigger = str(criteria.get("entry_trigger") or "")
         if not warrior_lanes.is_warrior_entry_trigger(entry_trigger):
             return False
-        score_floor = 70 if entry_trigger == "warrior_high_base_reclaim" else 75
+        score_floor = (
+            60
+            if entry_trigger == "warrior_smooth_10s_pullback_continuation"
+            else 70
+            if entry_trigger == "warrior_high_base_reclaim"
+            else 75
+        )
         score_near_miss = bool(score_match and int(score_match.group(1)) >= score_floor)
         if "dead cat bounce" not in text and not score_near_miss and not liquidity_watch_only:
             return False
@@ -760,7 +771,12 @@ class TradingPipeline:
         psych_level = float(criteria.get("psych_level") or 0.0)
         if price <= 0 or stop <= 0 or stop >= price:
             return False
-        if psych_level > 0 and price < psych_level:
+        psych_tolerance = (
+            0.985
+            if entry_trigger == "warrior_smooth_10s_pullback_continuation"
+            else 1.0
+        )
+        if psych_level > 0 and price < psych_level * psych_tolerance:
             return False
         if (price - stop) / price > 0.09:
             return False
@@ -780,12 +796,16 @@ class TradingPipeline:
 
         latest_volume = float(latest.volume or 0.0)
         recent_volume = sum(float(b.volume or 0.0) for b in bars[-3:])
-        min_latest_volume = (
-            75_000
-            if liquidity_watch_only or entry_trigger == "warrior_prior_runner_continuation_pullback"
-            else 100_000
-        )
-        min_recent_volume = 150_000 if liquidity_watch_only else 250_000
+        if entry_trigger == "warrior_smooth_10s_pullback_continuation":
+            min_latest_volume = 30_000
+            min_recent_volume = 80_000
+        else:
+            min_latest_volume = (
+                75_000
+                if liquidity_watch_only or entry_trigger == "warrior_prior_runner_continuation_pullback"
+                else 100_000
+            )
+            min_recent_volume = 150_000 if liquidity_watch_only else 250_000
         if latest_volume < min_latest_volume or recent_volume < min_recent_volume:
             return False
 
