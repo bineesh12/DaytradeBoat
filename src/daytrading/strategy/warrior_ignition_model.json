@@ -1,0 +1,88 @@
+{
+  "model_type": "logistic_regression",
+  "target": "premarket_ignition_runner(MFE>=2R)",
+  "features": [
+    "rvol_surge",
+    "vol_z",
+    "vol_buildup",
+    "base_tight",
+    "range_exp",
+    "brk_strength",
+    "accel",
+    "day_move",
+    "near_hod",
+    "mins",
+    "price",
+    "min1_slope",
+    "min1_hh",
+    "pd_dist",
+    "above_pdh"
+  ],
+  "weights": [
+    0.22047,
+    -0.0352,
+    0.13464,
+    -0.25794,
+    0.11772,
+    -0.11839,
+    0.13006,
+    -0.18308,
+    0.27577,
+    -0.21161,
+    -0.0134,
+    0.05352,
+    0.16312,
+    0.32038,
+    0.0549
+  ],
+  "bias": -0.66486,
+  "feat_mean": [
+    5.601875,
+    4.939047,
+    1.583614,
+    0.058136,
+    79090.652834,
+    0.015173,
+    0.037215,
+    0.918144,
+    0.783055,
+    3.299782,
+    4.80687,
+    0.047232,
+    0.969935,
+    -0.011146,
+    0.529412
+  ],
+  "feat_std": [
+    9.499811,
+    6.055521,
+    4.971441,
+    0.052153,
+    2167937.688109,
+    0.020493,
+    0.036934,
+    0.994819,
+    0.168365,
+    1.551543,
+    3.491173,
+    0.211481,
+    1.165018,
+    0.696114,
+    0.499134
+  ],
+  "candidate_gates": {
+    "min_price": 1.5,
+    "max_price": 20.0,
+    "min_vol_surge": 2.0,
+    "max_base_range": 0.3,
+    "base_bars": 18
+  },
+  "high_conviction_cutoff": 0.4066,
+  "trained_on": {
+    "candidates": 765,
+    "runner_rate": 0.346
+  },
+  "oos_validation": {
+    "top_quartile_runner_rate": 0.5
+  }
+}

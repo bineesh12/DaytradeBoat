@@ -29,6 +29,7 @@ WARRIOR_ENTRY_TRIGGERS = {
     "warrior_failed_spike_reclaim_scalp",
     "warrior_failed_spike_vwap_reclaim",
     "warrior_second_leg_vwap_reclaim",
+    "warrior_ignition",
 }
 
 

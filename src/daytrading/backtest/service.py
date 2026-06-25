@@ -38,6 +38,7 @@ SUPPORTED_FLAGS = {
     "momentum_burst_replay",
     "momentum_burst_hit_run",
     "warrior_squeeze_playbook",
+    "warrior_ignition_model",
     "live_like_10s",
 }
 
@@ -315,6 +316,7 @@ def normalize_flags(flags: Optional[Dict[str, Any]]) -> Dict[str, bool]:
         "momentum_burst_replay": bool(raw.get("momentum_burst_replay", False)),
         "momentum_burst_hit_run": bool(raw.get("momentum_burst_hit_run", False)),
         "warrior_squeeze_playbook": bool(raw.get("warrior_squeeze_playbook", False)),
+        "warrior_ignition_model": bool(raw.get("warrior_ignition_model", False)),
         "live_like_10s": bool(raw.get("live_like_10s", False)),
     }
 
@@ -658,6 +660,7 @@ def run_backtest(
                 use_momentum_burst_replay=active_flags["momentum_burst_replay"],
                 use_momentum_burst_hit_run=active_flags["momentum_burst_hit_run"],
                 use_warrior_squeeze_playbook=active_flags["warrior_squeeze_playbook"],
+                use_warrior_ignition_model=active_flags["warrior_ignition_model"],
                 momentum_burst_window_sec=(
                     settings.strategy.momentum_burst_window_sec if settings else 300.0
                 ),

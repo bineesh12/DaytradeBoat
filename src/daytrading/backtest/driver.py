@@ -18,6 +18,7 @@ from daytrading.strategy.execution_timer import ExecutionTimer
 from daytrading.strategy.entry_guard import assess_opportunity_scaled_spread
 from daytrading.strategy import warrior_lanes
 from daytrading.strategy.warrior_engine import WarriorEngine
+from daytrading.strategy.warrior_ignition import detect_ignition, prior_day_high, get_model as get_ignition_model
 
 
 @dataclass
@@ -77,6 +78,7 @@ class PipelineBacktestDriver:
         use_momentum_burst_replay: bool = False,
         use_momentum_burst_hit_run: bool = False,
         use_warrior_squeeze_playbook: bool = False,
+        use_warrior_ignition_model: bool = False,
         momentum_burst_window_sec: float = 300.0,
         momentum_burst_cooldown_sec: float = 300.0,
         momentum_burst_hit_run_max_entries: int = 1,
@@ -130,6 +132,13 @@ class PipelineBacktestDriver:
         self._use_momentum_burst_replay = bool(use_momentum_burst_replay)
         self._use_momentum_burst_hit_run = bool(use_momentum_burst_hit_run)
         self._use_warrior_squeeze_playbook = bool(use_warrior_squeeze_playbook)
+        # When set, the per-bar Warrior path bypasses the ~20 lanes and uses the
+        # unified micro-pullback detector instead (same exits/PnL). Head-to-head.
+        # Learned premarket-ignition model: take base-breakout ignitions, size by
+        # the model's runner-conviction. Same exits/PnL path. Default off.
+        self._use_warrior_ignition_model = bool(use_warrior_ignition_model)
+        self._ignition_model = get_ignition_model() if self._use_warrior_ignition_model else None
+        self._warrior_ignition_entries: Dict[str, int] = {}  # per-symbol/day entry cap
         self._momentum_burst_window_sec = float(momentum_burst_window_sec)
         self._momentum_burst_cooldown_sec = float(momentum_burst_cooldown_sec)
         self._momentum_burst_last_entry: Dict[str, datetime] = {}
@@ -511,6 +520,11 @@ class PipelineBacktestDriver:
                 or self._use_warrior_squeeze_playbook
             ):
                 self._process_mb_brackets(result, ledger, t10)
+                if self._use_warrior_ignition_model:
+                    self._maybe_enter_warrior_ignition(
+                        result, ledger, universe=universe, now=t10,
+                    )
+                    continue
                 self._arm_momentum_burst_from_cycle(cycle, t10)
                 self._maybe_execute_momentum_burst_replay(
                     result,
@@ -519,6 +533,110 @@ class PipelineBacktestDriver:
                     quotes=quotes,
                     now=t10,
                 )
+
+    def _maybe_enter_warrior_ignition(
+        self,
+        result: PipelineBacktestResult,
+        ledger: BacktestLedger,
+        *,
+        universe: Dict[str, List[Bar]],
+        now: datetime,
+    ) -> None:
+        """Learned-model path: enter premarket base-breakout ignitions, sized by
+        the model's runner-conviction. Reuses the broker submit + _mb_bracket exit."""
+        strategy_label = "warrior_squeeze_playbook"
+        model = self._ignition_model
+        if model is None:
+            return
+        max_conc = 1
+        eng = getattr(self, "_warrior_engine", None)
+        if eng is not None:
+            max_conc = max(1, int(getattr(eng.risk, "max_concurrent_warrior_trades", 1) or 1))
+        if len(self._mb_bracket) >= max_conc:
+            return
+        max_order = int(getattr(self._pipeline, "_max_order_shares", 750) or 750)
+
+        for symbol in list(universe.keys()):
+            sym = symbol.upper()
+            if sym in self._mb_bracket:
+                continue
+            # overtrading guards: at most a few ignition entries per symbol/day,
+            # and a longer cooldown so we take the launch, not every wiggle.
+            if self._warrior_ignition_entries.get(sym, 0) >= 4:
+                continue
+            last = self._momentum_burst_last_entry.get(sym)
+            if last is not None and (now - last).total_seconds() < 180:
+                continue
+            ten_sec = self._ten_sec_bar_at(sym, now)
+            if ten_sec is None:
+                continue
+            history = self._warrior_history_until(sym, ten_sec)
+            if len(history) < 24:
+                continue
+            # ignition candle = the last COMPLETED bar (history[-2]); enter at the
+            # current bar's open. history[:-1] makes history[-2] the trigger.
+            ph = prior_day_high(sym, ten_sec.ts.date())
+            sig = detect_ignition(history[:-1], model, prior_high=ph)
+            if not sig.detected or sig.conviction < 0.20:   # drop the weakest
+                continue
+            entry, stop = float(ten_sec.open), sig.stop
+            if not (entry > stop > 0):
+                continue
+            size_factor = sig.size_factor(model.cutoff)
+            risk = entry - stop
+            quantity = max(1, min(750, max_order, int(50.0 / risk)))
+            position_value = float(getattr(self, "_warrior_squeeze_position_value", 0.0) or 0.0)
+            risk_cap = float(getattr(self, "_warrior_squeeze_max_dollar_risk", 0.0) or 0.0)
+            if position_value > 0:
+                qty_by_value = int(position_value / entry)
+                qty_by_risk = int(risk_cap / risk) if risk_cap > 0 else qty_by_value
+                quantity = max(1, min(quantity, min(qty_by_value, qty_by_risk)))
+            quantity = max(1, int(quantity * size_factor))
+            target = entry + risk * 3.0   # wide; the _mb_bracket trail rides the runner
+
+            hit = ScanResult(
+                symbol=sym, scanner_name=strategy_label, ts=ten_sec.ts, score=100.0 * sig.conviction,
+                criteria={
+                    "pattern": "warrior_ignition", "setup_tier": "A+ setup",
+                    "entry_tier": "quick_scalp", "entry_mode": strategy_label,
+                    "source_scanner": "warrior_ignition_model",
+                    "entry_trigger": "warrior_ignition", "stop_price": stop,
+                    "size_factor": round(size_factor, 2),
+                    "conviction": round(sig.conviction, 3),
+                },
+                bars=list(history[-30:]),
+            )
+            signal = TradeSignal(
+                symbol=sym, action=SignalAction.ENTER_LONG, quantity=float(quantity),
+                entry_price=entry, stop_loss=stop, take_profit=target, max_hold_seconds=600.0,
+                reason="Warrior Ignition {} ${:.2f} stop=${:.2f} conv={:.2f}".format(
+                    sym, entry, stop, sig.conviction),
+                scan_result=hit, trend_strength=0.8,
+            )
+            order = self._pipeline._signal_to_order(signal)
+            if order is None:
+                continue
+            if not self._allow_replay_order(signal, order, ten_sec):
+                continue
+            fill, status = self._broker.submit(order, ten_sec, self._pipeline.portfolio)
+            if status is not OrderStatus.FILLED or fill is None:
+                continue
+            apply_fill(self._pipeline.portfolio, fill)
+            result.fills.append(fill)
+            self._pipeline._symbol_entry_counts[sym] = self._pipeline._symbol_entry_counts.get(sym, 0) + 1
+            self._mb_bracket[sym] = self._mb_bracket_payload(signal, fill, now, strategy=strategy_label)
+            self._momentum_burst_last_entry[sym] = now
+            self._warrior_ignition_entries[sym] = self._warrior_ignition_entries.get(sym, 0) + 1
+            ledger.record_entry(fill, strategy=strategy_label)
+            result.entry_decisions.append({
+                "ts": now.isoformat(), "symbol": sym, "stage": strategy_label,
+                "passed": True, "blocked_layer": "", "reason": "", "action": signal.action.value,
+                "pattern": "warrior_ignition", "scanner": strategy_label, "setup_tier": "A+ setup",
+                "entry_tier": "quick_scalp", "price": fill.price,
+                "metadata": {"source": "warrior_ignition_model",
+                             "conviction": round(sig.conviction, 3), "size_factor": round(size_factor, 2)},
+            })
+            return
 
     def _live_like_universe(
         self,
@@ -1361,6 +1479,10 @@ class PipelineBacktestDriver:
             bar = self._ten_sec_bar_at(sym, now)
             strategy = str(br.get("strategy") or "momentum_burst_replay")
             is_warrior = strategy == "warrior_squeeze_playbook"
+            # The stop in force for THIS bar, captured before any trail update so a
+            # trail raised off this bar's own high only applies to the NEXT bar
+            # (otherwise a wide ignition candle stops itself out intrabar).
+            stop_level = float(br.get("stop") or 0.0)
             if bar is not None and is_warrior:
                 vols = br.setdefault("vol_history", [])
                 vols.append(float(getattr(bar, "volume", 0.0) or 0.0))
@@ -1372,13 +1494,36 @@ class PipelineBacktestDriver:
                     float(br.get("highest") or br.get("entry") or 0.0),
                     float(bar.high or 0.0),
                 )
-                if br.get("partial_taken"):
+                if br.get("entry_trigger") == "warrior_ignition":
+                    # Ignition runners are hyper-volatile ($4->$19). Ride them with
+                    # a trail that ADAPTS to the stock's own volatility: ~4x its
+                    # recent average 10s range, floored at 8%. A violent name gets
+                    # a wide trail so a normal pullback doesn't shake us out; a calm
+                    # one gets a tighter one. Once green by 1R, lock breakeven too.
+                    ranges = br.setdefault("range_history", [])
+                    ranges.append(max(0.0, float(bar.high or 0.0) - float(bar.low or 0.0)))
+                    if len(ranges) > 12:
+                        ranges.pop(0)
+                    atr = sum(ranges) / len(ranges) if ranges else 0.0
+                    entry_px = float(br.get("entry") or 0.0)
+                    risk0 = entry_px - float(br.get("init_stop") or br.get("stop") or 0.0)
+                    if risk0 > 0 and float(br["highest"]) >= entry_px + risk0:
+                        high = float(br["highest"])
+                        # never tighter than the 18% that rides these runners; wider
+                        # when the name's own volatility (6x ATR) demands it.
+                        trail_dist = max(high * 0.18, 6.0 * atr)
+                        br["stop"] = max(
+                            float(br.get("stop") or 0.0),
+                            entry_px,
+                            high - trail_dist,
+                        )
+                elif br.get("partial_taken"):
                     trail_pct = 0.08
                     trail_stop = float(br["highest"]) * (1.0 - trail_pct)
                     br["stop"] = max(float(br.get("stop") or 0.0), trail_stop)
             exit_price = None
             reason = None
-            hit_stop = bar is not None and float(bar.low or 0.0) <= br["stop"]
+            hit_stop = bar is not None and float(bar.low or 0.0) <= stop_level
             hit_target = (
                 bar is not None
                 and float(bar.high or 0.0) >= br["target"]
@@ -1409,7 +1554,7 @@ class PipelineBacktestDriver:
             ):
                 exit_price, reason = br["target"], "mb_bracket_target"
             elif hit_stop:
-                exit_price, reason = br["stop"], "mb_bracket_stop"
+                exit_price, reason = stop_level, "mb_bracket_stop"
             elif emergency_dump:
                 exit_price = float(bar.close)
                 reason = "mb_bracket_dump"
@@ -3189,6 +3334,7 @@ class PipelineBacktestDriver:
                 target_price = round(fill_price + reward, 4)
         return {
             "stop": stop_price,
+            "init_stop": stop_price,
             "target": target_price,
             "qty": float(fill.quantity),
             "entry": fill_price,

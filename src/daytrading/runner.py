@@ -6650,6 +6650,88 @@ class AlpacaRunner:
         self._warrior_squeeze_rejection_high[sym] = high
         self._warrior_squeeze_rejection_reason[sym] = "first explosive 10s spike"
 
+    @staticmethod
+    def _warrior_ignition_active() -> bool:
+        return os.environ.get("DAYTRADING_WARRIOR_IGNITION", "").strip().lower() in (
+            "1", "true", "yes", "on",
+        )
+
+    def _maybe_enter_warrior_ignition(self) -> None:
+        """Learned premarket-ignition path (paper). Score base-breakout ignitions,
+        log every candidate for the adaptive dataset, and place orders sized by the
+        model's runner-conviction through the shared Warrior execution (which keeps
+        all the live risk caps, entry-guard, ML and position bookkeeping)."""
+        if self._market_phase() != "PRE-MARKET":
+            return
+        if self._new_entries_blocked(None, "WARRIOR IGNITION"):
+            return
+        try:
+            from daytrading.strategy.warrior_ignition import detect_ignition, get_model, prior_day_high
+            from daytrading.strategy.warrior_ignition_log import get_logger
+        except Exception:
+            return
+        model = get_model()
+        ig_logger = get_logger()
+        counts = getattr(self, "_warrior_ignition_entries", None)
+        if counts is None:
+            counts = {}
+            self._warrior_ignition_entries = counts
+        engine = getattr(self, "_warrior_engine", None)
+        for sym, raw_bars in list(getattr(self, "_timer_bars_by_symbol", {}).items()):
+            bars = [b for b in (raw_bars or []) if float(getattr(b, "close", 0.0) or 0.0) > 0]
+            if len(bars) < 24:
+                continue
+            latest_10s = bars[-1]
+            try:
+                ph = prior_day_high(sym, latest_10s.ts.date())
+                sig = detect_ignition(bars, model, prior_high=ph)
+            except Exception:
+                continue
+            if not sig.detected:
+                continue
+            size_factor = sig.size_factor(model.cutoff)
+            try:
+                ig_logger.log(
+                    ts_iso=latest_10s.ts.isoformat(), symbol=sym, signal=sig,
+                    would_enter=sig.conviction >= 0.20, size_factor=size_factor,
+                )
+            except Exception:
+                pass
+            if sig.conviction < 0.20 or counts.get(sym.upper(), 0) >= 4:
+                continue
+            price = float(latest_10s.close or 0.0)
+            stop = float(sig.stop)
+            if not (price > stop > 0):
+                continue
+            # concurrency gate (the lane path's allocator check is bypassed here)
+            if engine is not None:
+                try:
+                    decision = engine.allow_entry(sym, open_positions=self._active_warrior_trade_count())
+                    if not decision.allowed:
+                        continue
+                except Exception:
+                    pass
+            risk = price - stop
+            ctx = {
+                "entry_trigger": "warrior_ignition",
+                "entry_price_override": round(price, 4),
+                "stop_price_override": round(stop, 4),
+                "target_price_override": round(price + risk * 3.0, 2),
+                "skip_unstable_confirm_stop_check": True,
+                "rr_note_override": "warrior ignition conv={:.2f}".format(sig.conviction),
+                "variant_override": "warrior_ignition",
+                "max_hold_seconds_override": 600.0,
+                "window_high": float(self._momentum_burst_window_high.get(sym.upper(), 0.0) or 0.0),
+            }
+            fill = self._execute_momentum_burst_scalp(
+                sym, latest_10s, entry_context=ctx,
+                strategy_override="warrior_squeeze_playbook",
+                size_factor_override=size_factor,
+            )
+            if fill is not None:
+                counts[sym.upper()] = counts.get(sym.upper(), 0) + 1
+                break   # one ignition entry per cycle
+
     def _process_momentum_burst_scalps(self) -> None:
         """Monitor armed momentum_burst symbols and scalp fresh 10s highs.
 
@@ -6658,6 +6740,22 @@ class AlpacaRunner:
         scalp shape, shared entry guard/ML, 10s confirmation, R:R, risk, broker,
         and position-open bookkeeping as HOD breakout scalps.
         """
+        # Learned premarket-ignition path. When enabled (env flag) AND it is
+        # pre-market, it takes over the Warrior path: trade ONLY base-breakout
+        # ignitions (momentum bursts) sized by model conviction, and log them for
+        # the adaptive dataset. Outside pre-market it falls through to the normal
+        # Warrior lanes below. Wrapped so a scoring bug can't disrupt the loop.
+        if (
+            os.environ.get("DAYTRADING_WARRIOR_IGNITION", "").strip().lower()
+            in ("1", "true", "yes", "on")
+            and hasattr(self, "_maybe_enter_warrior_ignition")
+            and self._market_phase() == "PRE-MARKET"
+        ):
+            try:
+                self._maybe_enter_warrior_ignition()
+            except Exception:
+                logger.debug("warrior ignition path skipped", exc_info=True)
+            return
         cycle_enabled = bool(getattr(self, "_momentum_burst_cycle_enabled", False))
         hit_run_enabled = bool(getattr(self, "_momentum_burst_hit_run_enabled", False))
         warrior_enabled = bool(getattr(self, "_warrior_squeeze_enabled", False))
@@ -9940,6 +10038,26 @@ class AlpacaRunner:
 
         # Log ML monitor summary for the day
         self._log_ml_daily_summary()
+
+        # Nightly Warrior-ignition retrain (adaptive loop): retrain on cached +
+        # paper-logged candidates, validate out-of-sample, and DEPLOY ONLY IF it
+        # beats the current model. Wrapped so a failure never breaks the nightly.
+        try:
+            from daytrading.strategy.warrior_ignition_retrain import retrain
+            res = retrain(deploy=True)
+            if res.get("status") == "ok":
+                msg = (
+                    "IGNITION RETRAIN: {} candidates, OOS {:.0%}->{:.0%}, {}".format(
+                        res["rows"], res["current_oos"], res["retrained_oos"],
+                        "DEPLOYED new model" if res["deployed"] else "kept current (no improvement)",
+                    )
+                )
+                logger.info(msg)
+                self._hub.add_log("INFO", msg)
+            else:
+                logger.info("IGNITION RETRAIN: %s (rows=%s)", res.get("status"), res.get("rows"))
+        except Exception as exc:
+            logger.error("IGNITION RETRAIN failed: %s", exc)
 
         # Daily ML model retrain after market close
         self._retrain_ml_model()
