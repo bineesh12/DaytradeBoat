@@ -706,6 +706,17 @@ def run_backtest(
                 warrior_squeeze_max_entries=(
                     settings.strategy.warrior_squeeze_max_entries if settings else 3
                 ),
+                warrior_max_concurrent_trades=(
+                    settings.strategy.warrior_max_concurrent_trades if settings else 1
+                ),
+                warrior_watch_capacity=(
+                    settings.strategy.warrior_watch_capacity if settings else 10
+                ),
+                warrior_watch_until_premarket_end=(
+                    settings.strategy.warrior_watch_until_premarket_end
+                    if settings
+                    else True
+                ),
                 warrior_squeeze_win_cooldown_sec=(
                     settings.strategy.warrior_squeeze_win_cooldown_sec if settings else 10.0
                 ),

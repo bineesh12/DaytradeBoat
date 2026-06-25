@@ -54,6 +54,7 @@ from daytrading.strategy.entry_guard import (
 )
 from daytrading.strategy.entry_policy import EntryDecision, EntryPolicy
 from daytrading.strategy import warrior_lanes
+from daytrading.strategy.warrior_engine import WarriorEngine
 
 logger = logging.getLogger(__name__)
 
@@ -231,11 +232,7 @@ class AlpacaRunner:
         self._momentum_burst_cycle_enabled = False
         self._momentum_burst_window_sec = 300.0
         self._momentum_burst_scalp_cooldown_sec = 300.0
-        self._momentum_burst_armed: Dict[str, float] = {}
-        self._momentum_burst_window_high: Dict[str, float] = {}
-        self._momentum_burst_session_anchor_high: Dict[str, float] = {}
         # symbol -> {ts, breakout_close} of a 10s high awaiting next-bar confirm
-        self._momentum_burst_pending: Dict[str, Dict[str, Any]] = {}
         self._momentum_burst_hit_run_enabled = False
         self._momentum_burst_hit_run_max_entries = 1
         self._momentum_burst_hit_run_win_cooldown_sec = 15.0
@@ -243,14 +240,23 @@ class AlpacaRunner:
         self._momentum_burst_hit_run_max_hold_sec = 45.0
         self._momentum_burst_hit_run_reward_risk = 1.0
         self._momentum_burst_hit_run_end_et = "11:30"
-        self._momentum_burst_hit_run_counts: Dict[str, int] = {}
-        self._momentum_burst_hit_run_block_until: Dict[str, float] = {}
         self._momentum_burst_hit_run_stop_after_giveback = True
         self._momentum_burst_hit_run_max_giveback = 50.0
         self._momentum_burst_hit_run_daily_loss_stop = 50.0
-        self._momentum_burst_hit_run_symbol_pnl: Dict[str, float] = {}
-        self._momentum_burst_hit_run_symbol_peak_pnl: Dict[str, float] = {}
-        self._momentum_burst_hit_run_day_blocked: Dict[str, str] = {}
+        self._warrior_max_concurrent_trades = 1
+        self._warrior_watch_capacity = 10
+        self._warrior_watch_until_premarket_end = True
+        self._warrior_engine = WarriorEngine.with_defaults(max_concurrent_warrior_trades=1)
+        self._warrior_watch = self._warrior_engine.watch
+        self._momentum_burst_armed = self._warrior_watch.armed
+        self._momentum_burst_window_high = self._warrior_watch.window_high
+        self._momentum_burst_session_anchor_high = self._warrior_watch.session_anchor_high
+        self._momentum_burst_pending = self._warrior_watch.pending
+        self._momentum_burst_hit_run_counts = self._warrior_watch.hit_run_counts
+        self._momentum_burst_hit_run_block_until = self._warrior_watch.hit_run_block_until
+        self._momentum_burst_hit_run_symbol_pnl = self._warrior_watch.symbol_pnl
+        self._momentum_burst_hit_run_symbol_peak_pnl = self._warrior_watch.symbol_peak_pnl
+        self._momentum_burst_hit_run_day_blocked = self._warrior_watch.day_blocked
         self._warrior_squeeze_enabled = False
         self._warrior_squeeze_min_reclaim_price = 3.5
         self._warrior_squeeze_starter_size_factor = 0.35
@@ -260,15 +266,20 @@ class AlpacaRunner:
         self._warrior_squeeze_win_cooldown_sec = 10.0
         self._warrior_squeeze_reward_risk = 3.0
         self._warrior_squeeze_add_reward_risk = 1.0
-        self._warrior_squeeze_rejection_high: Dict[str, float] = {}
-        self._warrior_squeeze_rejection_reason: Dict[str, str] = {}
-        self._warrior_squeeze_target_wins: Dict[str, int] = {}
-        self._warrior_squeeze_last_target_at: Dict[str, float] = {}
-        self._warrior_squeeze_failed_burst: Dict[str, str] = {}
-        self._warrior_squeeze_failed_burst_high: Dict[str, float] = {}
-        self._warrior_squeeze_post_target_reclaim_allowed: Dict[str, int] = {}
-        self._warrior_normal_fallback_rejects: Dict[str, int] = {}
-        self._warrior_normal_fallback_last_reason: Dict[str, str] = {}
+        self._warrior_squeeze_rejection_high = self._warrior_watch.rejection_high
+        self._warrior_squeeze_rejection_reason = self._warrior_watch.rejection_reason
+        self._warrior_squeeze_target_wins = self._warrior_watch.target_wins
+        self._warrior_squeeze_last_target_at = self._warrior_watch.last_target_at
+        self._warrior_squeeze_failed_burst = self._warrior_watch.failed_burst
+        self._warrior_squeeze_failed_burst_high = self._warrior_watch.failed_burst_high
+        self._warrior_squeeze_post_target_reclaim_allowed = (
+            self._warrior_watch.post_target_reclaim_allowed
+        )
+        self._warrior_squeeze_last_entry_trigger = self._warrior_watch.last_entry_trigger
+        self._warrior_normal_fallback_rejects = self._warrior_watch.normal_fallback_rejects
+        self._warrior_normal_fallback_last_reason = (
+            self._warrior_watch.normal_fallback_last_reason
+        )
         self._trade_analyzer = None
         self._analysis_interval = 10  # run analysis every N cycles
         self._reconciler = PositionReconciler()
@@ -369,6 +380,7 @@ class AlpacaRunner:
         self._breakout_scalp_cooldown: Dict[str, float] = {}
         self._breakout_scalp_active: bool = False  # True if we have an open breakout scalp
         self._quick_scalp_spread_size_factors: Dict[str, float] = {}
+        self._recent_quick_scalp_rejects: Dict[str, tuple[float, str]] = {}
         self._hod_seed_max_per_minute = 30
         self._hod_seed_minute_start = time.time()
         self._hod_seed_processed_this_minute = 0
@@ -637,6 +649,17 @@ class AlpacaRunner:
             cfg.strategy.warrior_squeeze_max_dollar_risk
         )
         runner._warrior_squeeze_max_entries = int(cfg.strategy.warrior_squeeze_max_entries)
+        runner._warrior_max_concurrent_trades = int(
+            cfg.strategy.warrior_max_concurrent_trades
+        )
+        runner._warrior_watch_capacity = int(cfg.strategy.warrior_watch_capacity)
+        runner._warrior_watch_until_premarket_end = bool(
+            cfg.strategy.warrior_watch_until_premarket_end
+        )
+        runner._warrior_engine.risk.max_concurrent_warrior_trades = max(
+            1,
+            runner._warrior_max_concurrent_trades,
+        )
         runner._warrior_squeeze_win_cooldown_sec = float(
             cfg.strategy.warrior_squeeze_win_cooldown_sec
         )
@@ -1411,8 +1434,89 @@ class AlpacaRunner:
                 prev_active = self._hod_active.get(sym)
                 if prev_active is None or alert_ts > prev_active:
                     self._hod_active[sym] = alert_ts
+            self._maybe_arm_warrior_from_hod_alert(row)
         self._hub.on_hod_momentum_alerts(alerts)
         self._sync_watchlist_to_hod_alerts()
+
+    def _maybe_arm_warrior_from_hod_alert(self, row: dict) -> None:
+        """Put extreme HOD/mover alerts into Warrior watch-only monitoring.
+
+        This is not an entry promotion. It only keeps the symbol in the Warrior
+        watch loop so existing 10s pullback/reclaim lanes can evaluate it. The
+        PLSM class of miss was detected by HOD/Hot Watch but never reached
+        Warrior state because no scanner arming event survived after hydration.
+        """
+        if not getattr(self, "_warrior_squeeze_enabled", False):
+            return
+        sym = str(row.get("symbol") or "").upper().strip()
+        if not sym:
+            return
+        if sym in getattr(self, "_momentum_burst_hit_run_day_blocked", {}):
+            return
+        try:
+            price = float(row.get("price") or 0.0)
+            day_volume = float(row.get("day_volume") or 0.0)
+            rel_vol = float(row.get("rel_vol") or 0.0)
+            bar_rvol = float(row.get("bar_rvol") or 0.0)
+            change_session_pct = float(row.get("change_session_pct") or 0.0)
+            change_from_close_pct = float(row.get("change_from_close_pct") or 0.0)
+            change_from_low_pct = float(row.get("change_from_low_pct") or 0.0)
+            float_shares = float(row.get("float_shares") or 0.0)
+        except (TypeError, ValueError):
+            return
+
+        if price <= 0:
+            return
+        effective_min_price = max(
+            1.5,
+            float(getattr(self, "_hod_sub2_min_price", 1.0) or 1.0),
+        )
+        max_price = float(getattr(self, "_hod_max_price", 20.0) or 20.0)
+        if price < effective_min_price or price > max_price:
+            return
+        max_float = float(getattr(self, "_hod_max_float", 20_000_000) or 20_000_000)
+        if float_shares > 0 and float_shares > max_float:
+            return
+
+        active_rvol = max(rel_vol, bar_rvol)
+        momentum_pct = max(change_session_pct, change_from_close_pct, change_from_low_pct)
+        alert_name = str(row.get("alert_name") or "").lower()
+        is_squeeze_alert = "squeeze" in alert_name or "hod" in alert_name
+        exceptional_tape_watch = (
+            day_volume >= 200_000
+            and active_rvol >= 8.0
+            and momentum_pct >= 40.0
+            and is_squeeze_alert
+        )
+        if day_volume < 1_000_000 and not exceptional_tape_watch:
+            return
+        if momentum_pct < 80.0 and active_rvol < 1.0 and not is_squeeze_alert:
+            return
+
+        candidate_high = price
+        for key in ("session_high", "high"):
+            try:
+                candidate_high = max(candidate_high, float(row.get(key) or 0.0))
+            except (TypeError, ValueError):
+                pass
+        if not self._ensure_warrior_watch_capacity(sym, candidate_high):
+            return
+
+        now_mono = time.monotonic()
+        self._momentum_burst_armed.setdefault(sym, now_mono)
+        self._momentum_burst_window_high[sym] = max(
+            candidate_high,
+            float(self._momentum_burst_window_high.get(sym, 0.0) or 0.0),
+        )
+        self._momentum_burst_session_anchor_high.setdefault(sym, candidate_high)
+        logger.info(
+            "WARRIOR SQUEEZE watch-only armed %s from HOD alert price=$%.4f "
+            "day_vol=%.0f move=%.1f%%",
+            sym,
+            price,
+            day_volume,
+            momentum_pct,
+        )
 
     def _is_tradeable_hod_watchlist_alert(self, row: dict) -> bool:
         """Return True when a HOD alert is liquid enough for active routing.
@@ -1600,8 +1704,144 @@ class AlpacaRunner:
             "session_high": round(session_high, 4) if session_high else None,
         }
 
+    def _warrior_watch_snapshot(self) -> List[dict]:
+        """Dashboard view of current Warrior playbook state.
+
+        This is intentionally read-only telemetry.  The strategy keeps using the
+        WarriorWatchBook dictionaries as before; the dashboard only receives a
+        compact explanation of what each symbol is waiting on.
+        """
+        watch = getattr(self, "_warrior_watch", None)
+        if watch is None:
+            return []
+        symbols = set()
+        for mapping_name in (
+            "armed",
+            "pending",
+            "window_high",
+            "session_anchor_high",
+            "rejection_high",
+            "rejection_reason",
+            "target_wins",
+            "failed_burst",
+            "failed_burst_high",
+            "hit_run_counts",
+            "hit_run_block_until",
+            "symbol_pnl",
+            "symbol_peak_pnl",
+            "day_blocked",
+            "normal_fallback_rejects",
+            "normal_fallback_last_reason",
+            "last_entry_trigger",
+        ):
+            mapping = getattr(watch, mapping_name, {})
+            if isinstance(mapping, dict):
+                symbols.update(str(s).upper() for s in mapping.keys() if s)
+        symbols.update(_ensure_market_data_service(self).hot_watch_keys())
+        symbols.update(str(s).upper() for s in self._trade_symbol_set())
+
+        now_mono = time.monotonic()
+        rows: List[dict] = []
+        for sym in sorted(symbols):
+            pending = watch.pending.get(sym, {}) if isinstance(watch.pending.get(sym), dict) else {}
+            armed_at = watch.armed.get(sym)
+            block_until = watch.hit_run_block_until.get(sym)
+            block_seconds = 0.0
+            if block_until is not None:
+                try:
+                    block_seconds = max(0.0, float(block_until) - now_mono)
+                except (TypeError, ValueError):
+                    block_seconds = 0.0
+
+            if sym in watch.day_blocked:
+                state = "day_blocked"
+            elif block_seconds > 0:
+                state = "cooldown"
+            elif pending:
+                state = "pending"
+            elif sym in watch.armed:
+                state = "watching"
+            elif sym in watch.failed_burst:
+                state = "failed_burst"
+            elif sym in watch.rejection_high:
+                state = "proof_wait"
+            else:
+                state = "candidate"
+
+            reason = (
+                watch.day_blocked.get(sym)
+                or watch.failed_burst.get(sym)
+                or watch.rejection_reason.get(sym)
+                or watch.normal_fallback_last_reason.get(sym)
+                or ""
+            )
+            armed_for = 0.0
+            if armed_at is not None:
+                try:
+                    armed_for = max(0.0, now_mono - float(armed_at))
+                except (TypeError, ValueError):
+                    armed_for = 0.0
+            rows.append({
+                "symbol": sym,
+                "state": state,
+                "pending_trigger": (
+                    pending.get("entry_trigger")
+                    or pending.get("scanner_name")
+                    or watch.last_entry_trigger.get(sym, "")
+                    or ""
+                ),
+                "window_high": round(float(watch.window_high.get(sym, 0.0) or 0.0), 4),
+                "session_anchor_high": round(
+                    float(watch.session_anchor_high.get(sym, 0.0) or 0.0),
+                    4,
+                ),
+                "rejection_high": round(float(watch.rejection_high.get(sym, 0.0) or 0.0), 4),
+                "failed_burst_high": round(
+                    float(watch.failed_burst_high.get(sym, 0.0) or 0.0),
+                    4,
+                ),
+                "target_wins": int(watch.target_wins.get(sym, 0) or 0),
+                "entries": int(watch.hit_run_counts.get(sym, 0) or 0),
+                "pnl": round(float(watch.symbol_pnl.get(sym, 0.0) or 0.0), 2),
+                "peak_pnl": round(float(watch.symbol_peak_pnl.get(sym, 0.0) or 0.0), 2),
+                "fallback_rejects": int(watch.normal_fallback_rejects.get(sym, 0) or 0),
+                "block_seconds": round(block_seconds, 1),
+                "armed_for_seconds": round(armed_for, 1),
+                "reason": str(reason or ""),
+            })
+
+        state_rank = {
+            "pending": 0,
+            "watching": 1,
+            "cooldown": 2,
+            "proof_wait": 3,
+            "failed_burst": 4,
+            "day_blocked": 5,
+            "candidate": 6,
+        }
+        rows.sort(key=lambda r: (
+            state_rank.get(str(r.get("state")), 9),
+            -float(r.get("target_wins") or 0),
+            -float(r.get("window_high") or 0.0),
+            str(r.get("symbol") or ""),
+        ))
+        capacity = int(getattr(self, "_warrior_watch_capacity", 10) or 0)
+        if capacity <= 0:
+            return rows
+
+        active_rows = [r for r in rows if str(r.get("state") or "") != "candidate"]
+        candidate_rows = [r for r in rows if str(r.get("state") or "") == "candidate"]
+        remaining_slots = max(0, capacity - len(active_rows))
+        return active_rows + candidate_rows[:remaining_slots]
+
     def _publish_hot_watch(self) -> None:
         self._hub.on_hot_watch(self._hot_watch_snapshot())
+        self._publish_warrior_watch()
+
+    def _publish_warrior_watch(self) -> None:
+        handler = getattr(self._hub, "on_warrior_watch", None)
+        if handler is not None:
+            handler(self._warrior_watch_snapshot())
 
     def is_hot_watch_active(self, symbol: str) -> bool:
         self._prune_hot_watch()
@@ -1769,6 +2009,11 @@ class AlpacaRunner:
             "mode": mode,
             "ttl_minutes": ttl_minutes,
         })
+        self._maybe_arm_warrior_from_hot_watch_mover(
+            mover,
+            flt=flt,
+            mode=mode,
+        )
         self._ensure_streaming_symbols([sym])
         self._enqueue_hod_seed_symbols([sym])
         self._journal.record("hot_watch", {
@@ -1804,6 +2049,85 @@ class AlpacaRunner:
         self._publish_hot_watch()
         self._publish_trading_watchlist()
         return
+
+    def _maybe_arm_warrior_from_hot_watch_mover(
+        self,
+        mover: Dict,
+        *,
+        flt: Optional[float],
+        mode: str,
+    ) -> None:
+        """Put strong fast-scan movers into Warrior watch-only monitoring.
+
+        Hot Watch premarket volume is recent tape volume, not full day volume,
+        so it cannot reuse the HOD-alert day-volume gate. This closes the PLSM
+        path where fast scan finds the runner but no current HOD alert row
+        exists to arm Warrior.
+        """
+        if not getattr(self, "_warrior_squeeze_enabled", False):
+            return
+        sym = str(mover.get("symbol") or "").upper().strip()
+        if not sym:
+            return
+        if sym in getattr(self, "_momentum_burst_hit_run_day_blocked", {}):
+            return
+        try:
+            price = float(mover.get("price") or 0.0)
+            volume = float(mover.get("volume") or 0.0)
+            score = float(mover.get("score") or 0.0)
+            change_pct = abs(
+                float(mover.get("abs_change_pct", mover.get("change_pct", 0.0)) or 0.0)
+            )
+            short_change_pct = abs(float(mover.get("short_change_pct") or 0.0))
+            session_high = float(mover.get("session_high") or 0.0)
+        except (TypeError, ValueError):
+            return
+
+        effective_min_price = max(
+            1.5,
+            float(getattr(self, "_hod_sub2_min_price", 1.0) or 1.0),
+        )
+        max_price = float(getattr(self, "_hod_max_price", 20.0) or 20.0)
+        if price < effective_min_price or price > max_price:
+            return
+        max_float = float(getattr(self, "_hod_max_float", 20_000_000) or 20_000_000)
+        if flt is not None and flt > max_float:
+            return
+
+        min_recent_volume = 50_000.0 if price < 5.0 else 40_000.0
+        strong_mover = (
+            mode in {"strong_watch", "runner_watch"}
+            or change_pct >= 80.0
+            or short_change_pct >= 10.0
+        )
+        if not strong_mover:
+            return
+        if volume < min_recent_volume:
+            return
+        if score < max(0.30, float(getattr(self, "_hot_watch_min_score", 0.30) or 0.30)):
+            return
+
+        candidate_high = max(price, session_high)
+        if candidate_high <= 0:
+            return
+        if not self._ensure_warrior_watch_capacity(sym, candidate_high):
+            return
+        now_mono = time.monotonic()
+        self._momentum_burst_armed.setdefault(sym, now_mono)
+        self._momentum_burst_window_high[sym] = max(
+            candidate_high,
+            float(self._momentum_burst_window_high.get(sym, 0.0) or 0.0),
+        )
+        self._momentum_burst_session_anchor_high.setdefault(sym, candidate_high)
+        logger.info(
+            "WARRIOR SQUEEZE watch-only armed %s from hot watch price=$%.4f "
+            "vol=%.0f change=%.1f%% mode=%s",
+            sym,
+            price,
+            volume,
+            change_pct,
+            mode,
+        )
 
     def _on_breakout_scalp_alert(self, symbol: str, price: float) -> None:
         """Called from tick_tracker when a HOD alert fires — queue for instant scalp."""
@@ -2009,7 +2333,17 @@ class AlpacaRunner:
             if not pos.is_flat
         }
         tracked = set(self._pipeline.exit_manager.tracked.keys())
-        return self._watchlist_pinned | open_syms | tracked
+        warrior_watch = {
+            str(sym).upper()
+            for sym in getattr(self, "_momentum_burst_armed", {}).keys()
+            if sym
+        }
+        warrior_watch.update(
+            str(sym).upper()
+            for sym in getattr(self, "_momentum_burst_pending", {}).keys()
+            if sym
+        )
+        return self._watchlist_pinned | open_syms | tracked | warrior_watch
 
     def _trade_symbol_set(self) -> Set[str]:
         """Symbols eligible for the trading pipeline this cycle."""
@@ -2051,9 +2385,10 @@ class AlpacaRunner:
         """Keep the trading watchlist aligned with recent HOD alerts (TTL)."""
         del alerts  # TTL tracked in _hod_last_alert_at via _on_hod_alerts_changed
         alert_syms = self._hod_watchlist_symbols()
+        hot_syms = _ensure_market_data_service(self).hot_watch_keys()
 
         protected = self._protected_watchlist_symbols()
-        target = (alert_syms | protected)
+        target = alert_syms | protected | hot_syms
         if len(target) > self._max_watchlist:
             ordered = []
             seen: Set[str] = set()
@@ -2061,6 +2396,12 @@ class AlpacaRunner:
                 if sym not in seen:
                     ordered.append(sym)
                     seen.add(sym)
+            for sym in hot_syms:
+                if sym not in seen:
+                    ordered.append(sym)
+                    seen.add(sym)
+                if len(ordered) >= self._max_watchlist:
+                    break
             recent_alerts = sorted(
                 alert_syms,
                 key=lambda s: self._hod_last_alert_at.get(
@@ -2091,6 +2432,7 @@ class AlpacaRunner:
             active_symbols,
             pinned=sorted(self._watchlist_pinned),
         )
+        self._publish_warrior_watch()
 
     def _publish_hod_alert_board(self) -> None:
         if self._hod_alert_store is not None:
@@ -3193,14 +3535,20 @@ class AlpacaRunner:
                         symbol_pnl = float(
                             self._momentum_burst_hit_run_symbol_pnl.get(fill.symbol, 0.0) or 0.0
                         )
+                        entry_trigger = str(
+                            getattr(self, "_warrior_squeeze_last_entry_trigger", {}).get(
+                                fill.symbol, ""
+                            )
+                        )
                         if symbol_pnl > 0:
                             self._warrior_squeeze_target_wins[fill.symbol] = (
                                 self._warrior_squeeze_target_wins.get(fill.symbol, 0) + 1
                             )
                             self._warrior_squeeze_last_target_at[fill.symbol] = time.monotonic()
-                            self._pipeline._symbol_entry_counts[fill.symbol] = (
-                                self._pipeline._max_entries_per_symbol
-                            )
+                            if entry_trigger != "warrior_low_price_proof_reclaim":
+                                self._pipeline._symbol_entry_counts[fill.symbol] = (
+                                    self._pipeline._max_entries_per_symbol
+                                )
                             getattr(self, "_warrior_squeeze_failed_burst", {}).pop(fill.symbol, None)
                             getattr(self, "_warrior_squeeze_failed_burst_high", {}).pop(fill.symbol, None)
                         else:
@@ -3229,15 +3577,11 @@ class AlpacaRunner:
                         strategy == "warrior_squeeze_playbook"
                         and self._warrior_squeeze_target_wins.get(fill.symbol, 0) <= 0
                     ):
-                        failed_bursts = getattr(self, "_warrior_squeeze_failed_burst", None)
-                        if failed_bursts is None:
-                            failed_bursts = self._warrior_squeeze_failed_burst = {}
+                        failed_bursts = self._warrior_squeeze_failed_burst
                         failed_bursts[fill.symbol] = (
                             "first Warrior burst failed via {}; require a fresh new window".format(reason)
                         )
-                        failed_highs = getattr(self, "_warrior_squeeze_failed_burst_high", None)
-                        if failed_highs is None:
-                            failed_highs = self._warrior_squeeze_failed_burst_high = {}
+                        failed_highs = self._warrior_squeeze_failed_burst_high
                         recent_10s = self._momentum_burst_recent_10s(fill.symbol, count=4)
                         failed_highs[fill.symbol] = max(
                             [float(fill.price or 0.0)]
@@ -3335,6 +3679,62 @@ class AlpacaRunner:
             self._momentum_burst_hit_run_day_blocked[sym] = reason
             return reason
         return None
+
+    def _active_warrior_trade_count(self) -> int:
+        """Count active Warrior/burst scalps for the shared risk allocator."""
+        count = 0
+        try:
+            tracked = getattr(self._pipeline.exit_manager, "tracked", {})
+            for pos in tracked.values():
+                reason = str(getattr(pos, "reason", "") or "").lower()
+                if (
+                    "warrior squeeze" in reason
+                    or "momentum burst hit-run" in reason
+                    or "momentum burst scalp" in reason
+                    or "breakout scalp" in reason
+                ):
+                    count += 1
+        except Exception:
+            return 1 if getattr(self, "_breakout_scalp_active", False) else 0
+        if count <= 0 and getattr(self, "_breakout_scalp_active", False):
+            return 1
+        return count
+
+    def _active_warrior_symbols(self) -> set[str]:
+        symbols: set[str] = set()
+        try:
+            tracked = getattr(self._pipeline.exit_manager, "tracked", {})
+            for sym, pos in tracked.items():
+                reason = str(getattr(pos, "reason", "") or "").lower()
+                if (
+                    "warrior squeeze" in reason
+                    or "momentum burst hit-run" in reason
+                    or "momentum burst scalp" in reason
+                    or "breakout scalp" in reason
+                ):
+                    symbols.add(str(sym).upper())
+        except Exception:
+            return symbols
+        return symbols
+
+    def _ensure_warrior_watch_capacity(self, symbol: str, high: float) -> bool:
+        watch = getattr(self, "_warrior_watch", None)
+        if watch is None:
+            return True
+        capacity = int(getattr(self, "_warrior_watch_capacity", 10) or 0)
+        ok = watch.ensure_capacity(
+            symbol,
+            capacity=capacity,
+            candidate_high=high,
+            active_symbols=self._active_warrior_symbols(),
+        )
+        if not ok:
+            logger.info(
+                "WARRIOR SQUEEZE watch full (%s); not arming %s",
+                capacity,
+                symbol.upper(),
+            )
+        return ok
 
     def _seed_recent_order_ids(self) -> None:
         """Add recent closed order IDs to prevent duplicate dashboard pushes."""
@@ -3536,44 +3936,41 @@ class AlpacaRunner:
         # Clear per-symbol timed-entry chase anchors for the new day
         if getattr(self, "_timed_entry_anchor", None):
             self._timed_entry_anchor.clear()
-        if getattr(self, "_momentum_burst_armed", None):
-            self._momentum_burst_armed.clear()
-        if getattr(self, "_momentum_burst_window_high", None):
-            self._momentum_burst_window_high.clear()
-        if getattr(self, "_momentum_burst_session_anchor_high", None):
-            self._momentum_burst_session_anchor_high.clear()
-        if getattr(self, "_momentum_burst_pending", None):
-            self._momentum_burst_pending.clear()
-        if getattr(self, "_momentum_burst_hit_run_counts", None):
-            self._momentum_burst_hit_run_counts.clear()
-        if getattr(self, "_momentum_burst_hit_run_block_until", None):
-            self._momentum_burst_hit_run_block_until.clear()
-        if getattr(self, "_momentum_burst_hit_run_symbol_pnl", None):
-            self._momentum_burst_hit_run_symbol_pnl.clear()
-        if getattr(self, "_momentum_burst_hit_run_symbol_peak_pnl", None):
-            self._momentum_burst_hit_run_symbol_peak_pnl.clear()
-        if getattr(self, "_momentum_burst_hit_run_day_blocked", None):
-            self._momentum_burst_hit_run_day_blocked.clear()
-        if getattr(self, "_warrior_squeeze_rejection_high", None):
-            self._warrior_squeeze_rejection_high.clear()
-        if getattr(self, "_warrior_squeeze_rejection_reason", None):
-            self._warrior_squeeze_rejection_reason.clear()
-        if getattr(self, "_warrior_squeeze_target_wins", None):
-            self._warrior_squeeze_target_wins.clear()
-        if getattr(self, "_warrior_squeeze_last_target_at", None):
-            self._warrior_squeeze_last_target_at.clear()
-        if getattr(self, "_warrior_squeeze_failed_burst", None):
-            self._warrior_squeeze_failed_burst.clear()
-        if getattr(self, "_warrior_squeeze_failed_burst_high", None):
-            self._warrior_squeeze_failed_burst_high.clear()
-        if getattr(self, "_warrior_squeeze_post_target_reclaim_allowed", None):
-            self._warrior_squeeze_post_target_reclaim_allowed.clear()
-        if getattr(self, "_warrior_normal_fallback_rejects", None):
-            self._warrior_normal_fallback_rejects.clear()
-        if getattr(self, "_warrior_normal_fallback_last_reason", None):
-            self._warrior_normal_fallback_last_reason.clear()
+        if getattr(self, "_warrior_watch", None):
+            engine = getattr(self, "_warrior_engine", None)
+            if engine is not None:
+                engine.reset_session()
+            else:
+                self._warrior_watch.reset_session()
+        else:
+            for attr in (
+                "_momentum_burst_armed",
+                "_momentum_burst_window_high",
+                "_momentum_burst_session_anchor_high",
+                "_momentum_burst_pending",
+                "_momentum_burst_hit_run_counts",
+                "_momentum_burst_hit_run_block_until",
+                "_momentum_burst_hit_run_symbol_pnl",
+                "_momentum_burst_hit_run_symbol_peak_pnl",
+                "_momentum_burst_hit_run_day_blocked",
+                "_warrior_squeeze_rejection_high",
+                "_warrior_squeeze_rejection_reason",
+                "_warrior_squeeze_target_wins",
+                "_warrior_squeeze_last_target_at",
+                "_warrior_squeeze_failed_burst",
+                "_warrior_squeeze_failed_burst_high",
+                "_warrior_squeeze_post_target_reclaim_allowed",
+                "_warrior_squeeze_last_entry_trigger",
+                "_warrior_normal_fallback_rejects",
+                "_warrior_normal_fallback_last_reason",
+            ):
+                value = getattr(self, attr, None)
+                if value:
+                    value.clear()
         # Defensive: never carry a latched quick-scalp-open flag across a session
         self._breakout_scalp_active = False
+        if getattr(self, "_recent_quick_scalp_rejects", None):
+            self._recent_quick_scalp_rejects.clear()
 
         # Reset daily P&L tracking
         self._pipeline._daily_pnl = 0.0
@@ -4257,6 +4654,37 @@ class AlpacaRunner:
             client_order_id=order.client_order_id,
         )
 
+    def _submit_protective_exit_order(self, order: Order, bar: Bar, label: str):
+        """Submit a protective exit and escalate when the first limit misses."""
+        fill, status = self._submit_fast_exit_order(order, bar)
+        if fill:
+            return fill, status
+
+        logger.warning(
+            "%s limit not filled for %s — escalating to urgent marketable exit",
+            label, order.symbol,
+        )
+        if not self._broker_has_compatible_exit_position(order.symbol, order.side):
+            logger.info(
+                "%s %s: broker already flat/incompatible after failed exit; syncing state",
+                label, order.symbol,
+            )
+            self._push_positions_from_alpaca()
+            return None, status
+
+        if hasattr(self._broker, "submit_urgent_exit"):
+            return self._broker.submit_urgent_exit(
+                order, bar, self._pipeline.portfolio,
+            )
+
+        fallback_order = Order(
+            symbol=order.symbol,
+            side=order.side,
+            quantity=order.quantity,
+            limit_price=None,
+        )
+        return self._submit_fast_exit_order(fallback_order, bar)
+
     def _instant_trail_exit(self, symbol: str, price: float) -> None:
         """Immediately exit a position when the tick-level trailing stop is hit."""
         try:
@@ -4280,7 +4708,7 @@ class AlpacaRunner:
                 symbol=symbol, open=price, high=price,
                 low=price, close=price, volume=0, ts=now,
             )
-            fill, status = self._broker.submit(order, bar, self._pipeline.portfolio)
+            fill, status = self._submit_protective_exit_order(order, bar, "TICK TRAIL EXIT")
             if fill:
                 apply_fill(self._pipeline.portfolio, fill)
                 pos.remaining_qty = 0
@@ -4353,7 +4781,7 @@ class AlpacaRunner:
                 symbol=symbol, open=price, high=price,
                 low=price, close=price, volume=0, ts=now,
             )
-            fill, status = self._broker.submit(order, bar, self._pipeline.portfolio)
+            fill, status = self._submit_protective_exit_order(order, bar, "TAPE PRESSURE EXIT")
             if fill:
                 apply_fill(self._pipeline.portfolio, fill)
                 pos.remaining_qty = 0
@@ -4440,7 +4868,7 @@ class AlpacaRunner:
                 symbol=symbol, open=price, high=price,
                 low=price, close=price, volume=0, ts=now,
             )
-            fill, status = self._broker.submit(order, bar, self._pipeline.portfolio)
+            fill, status = self._submit_protective_exit_order(order, bar, "RED 10s EXIT")
             if fill:
                 apply_fill(self._pipeline.portfolio, fill)
                 pos.remaining_qty = 0
@@ -4839,12 +5267,27 @@ class AlpacaRunner:
                 return "HOD reclaim 10s confirmation weak close ({:.0%} location)".format(
                     close_location,
                 )
+            if latest_close < 3.0 and close_location < 0.75:
+                return (
+                    "low-price HOD reclaim 10s close too weak "
+                    "({:.0%} location, need 75%+)"
+                ).format(close_location)
 
         if len(bars_10s) >= 2:
             prev = bars_10s[-2]
             prev_high = float(getattr(prev, "high", 0.0) or 0.0)
+            prev_volume = float(getattr(prev, "volume", 0.0) or 0.0)
             if prev_high > 0 and latest_high <= prev_high * 1.001:
                 return "HOD reclaim 10s confirmation no expansion"
+            if (
+                latest_close < 3.0
+                and prev_volume > 0
+                and latest_volume < prev_volume * 0.65
+            ):
+                return (
+                    "low-price HOD reclaim 10s volume faded "
+                    "{:.0f} vs prior {:.0f}"
+                ).format(latest_volume, prev_volume)
 
         try:
             setup_volume = float(criteria.get("volume") or 0.0)
@@ -5332,6 +5775,7 @@ class AlpacaRunner:
             alert_reject = self._quick_scalp_hod_alert_reject(sym)
             if alert_reject is not None:
                 logger.info("BREAKOUT SCALP reject %s: %s", sym, alert_reject)
+                self._remember_quick_scalp_reject(sym, alert_reject)
                 probe_signal = self._quick_scalp_probe_signal(sym, alert_price, "breakout_scalp")
                 self._record_entry_reject(
                     probe_signal,
@@ -5349,6 +5793,7 @@ class AlpacaRunner:
             )
             if recent_reject is not None:
                 logger.info("BREAKOUT SCALP reject %s: %s", sym, recent_reject)
+                self._remember_quick_scalp_reject(sym, recent_reject)
                 probe_signal = self._quick_scalp_probe_signal(sym, alert_price, "breakout_scalp")
                 self._record_entry_reject(
                     probe_signal,
@@ -5362,6 +5807,7 @@ class AlpacaRunner:
             reject = self._check_quick_scalp_entry(sym, bars)
             if reject is not None:
                 logger.info("BREAKOUT SCALP reject %s: %s", sym, reject)
+                self._remember_quick_scalp_reject(sym, reject)
                 probe_signal = self._quick_scalp_probe_signal(sym, bars[-1].close, "breakout_scalp")
                 self._record_entry_reject(
                     probe_signal,
@@ -5380,6 +5826,7 @@ class AlpacaRunner:
             ten_second_reject = self._breakout_scalp_10s_reject(sym)
             if ten_second_reject is not None:
                 logger.info("BREAKOUT SCALP reject %s: %s", sym, ten_second_reject)
+                self._remember_quick_scalp_reject(sym, ten_second_reject)
                 probe_signal = self._quick_scalp_probe_signal(sym, bars[-1].close, "breakout_scalp")
                 self._record_entry_reject(
                     probe_signal,
@@ -5393,6 +5840,7 @@ class AlpacaRunner:
             rr = self._quick_scalp_tick_rr(sym, bars, alert_price)
             if rr is None:
                 logger.info("BREAKOUT SCALP reject %s: no usable tick R:R", sym)
+                self._remember_quick_scalp_reject(sym, "no usable tick R:R")
                 probe_signal = self._quick_scalp_probe_signal(sym, bars[-1].close, "breakout_scalp")
                 self._record_entry_reject(
                     probe_signal,
@@ -5911,9 +6359,6 @@ class AlpacaRunner:
         10s micro-base/reclaim instead of taking the current bar.
         """
         recent_reject = self._quick_scalp_recent_normal_reject(symbol)
-        if not recent_reject:
-            return None
-        lower = recent_reject.lower()
         bad_tape_terms = (
             "selling pressure",
             "dump candle",
@@ -5922,9 +6367,34 @@ class AlpacaRunner:
             "dead price action",
             "dead cat bounce",
         )
-        if any(term in lower for term in bad_tape_terms):
+        if recent_reject and any(term in recent_reject.lower() for term in bad_tape_terms):
             return recent_reject
+        quick_reject = self._recent_quick_scalp_rejects.get(str(symbol or "").upper())
+        if quick_reject:
+            ts, reason = quick_reject
+            age = time.monotonic() - float(ts or 0.0)
+            quick_tape_terms = (
+                "active rvol too weak",
+                "selling pressure",
+                "weak reclaim volume",
+                "volume faded",
+                "red 10s",
+                "dump candle",
+                "no fresh 10s expansion",
+                "confirmation faded",
+                "confirmation weak close",
+                "too volatile without strong close",
+            )
+            if 0.0 <= age <= 120.0 and any(term in str(reason).lower() for term in quick_tape_terms):
+                return "recent breakout scalp reject: {}".format(reason)
         return None
+
+    def _remember_quick_scalp_reject(self, symbol: str, reason: str) -> None:
+        symbol_key = str(symbol or "").upper()
+        reason_text = str(reason or "")
+        if not symbol_key or not reason_text:
+            return
+        self._recent_quick_scalp_rejects[symbol_key] = (time.monotonic(), reason_text)
 
     @staticmethod
     def _quick_scalp_probe_signal(
@@ -5977,6 +6447,21 @@ class AlpacaRunner:
             should_arm, reason = self._warrior_squeeze_should_arm(hit, high)
             if not should_arm:
                 logger.info("WARRIOR SQUEEZE watch %s: %s", sym, reason)
+                reject_high = float(self._warrior_squeeze_rejection_high.get(sym, 0.0) or 0.0)
+                if reject_high > 0 and self._ensure_warrior_watch_capacity(sym, max(high, reject_high)):
+                    now_mono = time.monotonic()
+                    self._momentum_burst_armed.setdefault(sym, now_mono)
+                    self._momentum_burst_window_high[sym] = max(
+                        high,
+                        reject_high,
+                        float(self._momentum_burst_window_high.get(sym, 0.0) or 0.0),
+                    )
+                    self._momentum_burst_session_anchor_high.setdefault(sym, max(high, reject_high))
+                    logger.info(
+                        "WARRIOR SQUEEZE watch-only armed %s after %s",
+                        sym,
+                        reason,
+                    )
                 return
         if (
             (
@@ -5992,6 +6477,8 @@ class AlpacaRunner:
             )
             return
         now_mono = time.monotonic()
+        if warrior_enabled and not self._ensure_warrior_watch_capacity(sym, high):
+            return
         self._momentum_burst_armed[sym] = now_mono
         self._momentum_burst_window_high[sym] = max(
             high,
@@ -6068,6 +6555,21 @@ class AlpacaRunner:
         volume = float(latest_10s.volume or 0.0)
         if open_ <= 0 or high <= 0 or close <= 0:
             return
+        min_price = max(0.0, float(getattr(self, "_warrior_squeeze_min_reclaim_price", 3.5) or 0.0))
+        reject_high = float(self._warrior_squeeze_rejection_high.get(sym, 0.0) or 0.0)
+        if high < min_price and reject_high <= 0:
+            self._warrior_squeeze_rejection_high[sym] = high
+            self._warrior_squeeze_rejection_reason[sym] = (
+                "first cheap 10s spike under ${:.2f}".format(min_price)
+            )
+            if self._ensure_warrior_watch_capacity(sym, high):
+                self._momentum_burst_armed.setdefault(sym, now_mono)
+                self._momentum_burst_window_high[sym] = max(
+                    high,
+                    float(self._momentum_burst_window_high.get(sym, 0.0) or 0.0),
+                )
+                self._momentum_burst_session_anchor_high.setdefault(sym, high)
+            return
         first_pullback_context = self._warrior_trend_pullback_reclaim_context(
             sym,
             latest_10s,
@@ -6082,6 +6584,8 @@ class AlpacaRunner:
                 first_pullback_context.get("entry_trigger")
             )
         ):
+            if not self._ensure_warrior_watch_capacity(sym, max(high, close)):
+                return
             self._momentum_burst_armed[sym] = now_mono
             self._momentum_burst_window_high[sym] = max(
                 high,
@@ -6094,10 +6598,17 @@ class AlpacaRunner:
                 if isinstance(bar_ts, datetime)
                 else datetime.now(timezone.utc) - timedelta(seconds=10)
             )
+            pending_breakout_high = high
+            if first_pullback_context.get("entry_trigger") == "warrior_low_price_proof_reclaim":
+                pending_breakout_high = float(
+                    first_pullback_context.get("pullaway_level")
+                    or first_pullback_context.get("psych_level")
+                    or high
+                )
             self._momentum_burst_pending[sym] = {
                 "ts": pending_ts,
                 "breakout_close": close,
-                "breakout_high": high,
+                "breakout_high": pending_breakout_high,
                 "breakout_volume": volume,
                 **first_pullback_context,
             }
@@ -6106,11 +6617,11 @@ class AlpacaRunner:
                 sym,
             )
             return
-        min_price = max(0.0, float(getattr(self, "_warrior_squeeze_min_reclaim_price", 3.5) or 0.0))
-        reject_high = float(self._warrior_squeeze_rejection_high.get(sym, 0.0) or 0.0)
         if reject_high > 0:
             reclaim_level = max(reject_high * 1.03, min_price)
             if high < reclaim_level:
+                return
+            if not self._ensure_warrior_watch_capacity(sym, max(high, reject_high)):
                 return
             self._momentum_burst_armed[sym] = now_mono
             self._momentum_burst_window_high[sym] = max(high, reject_high)
@@ -6191,7 +6702,15 @@ class AlpacaRunner:
                 or warrior_post_target_allowed.get(sym, 0) > 0
             ):
                 effective_window_sec = max(effective_window_sec, 900.0)
-            if now_mono - float(armed_at or 0.0) > effective_window_sec:
+            hold_until_premarket_end = (
+                warrior_enabled
+                and bool(getattr(self, "_warrior_watch_until_premarket_end", True))
+                and self._market_phase() == "PRE-MARKET"
+            )
+            if (
+                not hold_until_premarket_end
+                and now_mono - float(armed_at or 0.0) > effective_window_sec
+            ):
                 armed.pop(sym, None)
                 self._momentum_burst_window_high.pop(sym, None)
                 pending.pop(sym, None)
@@ -6201,7 +6720,23 @@ class AlpacaRunner:
                 getattr(self, "_warrior_squeeze_failed_burst_high", {}).pop(sym, None)
                 continue
 
-            if self._breakout_scalp_active:
+            warrior_engine = getattr(self, "_warrior_engine", None)
+            if warrior_engine is not None:
+                risk_decision = warrior_engine.allow_entry(
+                    sym,
+                    open_positions=self._active_warrior_trade_count(),
+                )
+                if not risk_decision.allowed:
+                    if sym in self._momentum_burst_hit_run_day_blocked:
+                        pending.pop(sym, None)
+                        logger.info(
+                            "WARRIOR SQUEEZE %s blocked for day: %s",
+                            sym,
+                            risk_decision.reason,
+                        )
+                        continue
+                    return
+            elif self._breakout_scalp_active:
                 return
 
             if fast_squeeze_enabled:
@@ -6216,6 +6751,101 @@ class AlpacaRunner:
                 )
                 if failed_burst and self._warrior_squeeze_target_wins.get(sym, 0) <= 0:
                     latest_10s = self._latest_momentum_burst_10s_bar(sym)
+                    second_leg_context = (
+                        self._warrior_trend_pullback_reclaim_context(
+                            sym,
+                            latest_10s,
+                            window_high=float(
+                                self._momentum_burst_window_high.get(sym, 0.0) or 0.0
+                            ),
+                        )
+                        if latest_10s is not None
+                        else None
+                    )
+                    if (
+                        second_leg_context is not None
+                        and second_leg_context.get("entry_trigger")
+                        == "warrior_second_leg_vwap_reclaim"
+                    ):
+                        getattr(self, "_warrior_squeeze_failed_burst", {}).pop(sym, None)
+                        getattr(self, "_warrior_squeeze_failed_burst_high", {}).pop(sym, None)
+                        self._momentum_burst_hit_run_block_until.pop(sym, None)
+                        current_high = float(latest_10s.high or 0.0)
+                        trigger_high = float(
+                            second_leg_context.get("base_high")
+                            or second_leg_context.get("entry_price_override")
+                            or current_high
+                        )
+                        trigger_close = float(
+                            second_leg_context.get("entry_price_override")
+                            or latest_10s.close
+                            or 0.0
+                        )
+                        bar_ts = getattr(latest_10s, "ts", None)
+                        pending[sym] = {
+                            "ts": (
+                                bar_ts - timedelta(seconds=10)
+                                if isinstance(bar_ts, datetime)
+                                else datetime.now(timezone.utc) - timedelta(seconds=10)
+                            ),
+                            "breakout_close": trigger_close,
+                            "breakout_high": trigger_high,
+                            "breakout_volume": float(latest_10s.volume or 0.0),
+                            **second_leg_context,
+                        }
+                        logger.info(
+                            "WARRIOR SQUEEZE %s second-leg VWAP reclaim reset failed burst",
+                            sym,
+                        )
+                        continue
+                    halt_resume_context = (
+                        self._warrior_halt_resume_continuation_context(
+                            sym,
+                            latest_10s,
+                            failed_high=float(
+                                getattr(self, "_warrior_squeeze_failed_burst_high", {}).get(sym, 0.0) or 0.0
+                            ),
+                            window_high=float(self._momentum_burst_window_high.get(sym, 0.0) or 0.0),
+                        )
+                        if latest_10s is not None
+                        else None
+                    )
+                    if halt_resume_context is not None:
+                        getattr(self, "_warrior_squeeze_failed_burst", {}).pop(sym, None)
+                        getattr(self, "_warrior_squeeze_failed_burst_high", {}).pop(sym, None)
+                        self._momentum_burst_hit_run_block_until.pop(sym, None)
+                        current_high = float(latest_10s.high or 0.0)
+                        self._momentum_burst_window_high[sym] = max(
+                            float(self._momentum_burst_window_high.get(sym, 0.0) or 0.0),
+                            current_high,
+                        )
+                        trigger_high = float(
+                            halt_resume_context.get("pullaway_level")
+                            or halt_resume_context.get("entry_price_override")
+                            or current_high
+                        )
+                        trigger_close = float(
+                            halt_resume_context.get("entry_price_override")
+                            or latest_10s.close
+                            or 0.0
+                        )
+                        bar_ts = getattr(latest_10s, "ts", None)
+                        pending[sym] = {
+                            "ts": (
+                                bar_ts - timedelta(seconds=10)
+                                if isinstance(bar_ts, datetime)
+                                else datetime.now(timezone.utc) - timedelta(seconds=10)
+                            ),
+                            "breakout_close": trigger_close,
+                            "breakout_high": trigger_high,
+                            "breakout_volume": float(latest_10s.volume or 0.0),
+                            **halt_resume_context,
+                        }
+                        logger.info(
+                            "WARRIOR SQUEEZE %s halt-resume continuation reset failed burst",
+                            sym,
+                        )
+                        continue
                     recovery_context = (
                         self._warrior_failed_burst_recovery_context(
                             sym,
@@ -6223,6 +6853,7 @@ class AlpacaRunner:
                             failed_high=float(
                                 getattr(self, "_warrior_squeeze_failed_burst_high", {}).get(sym, 0.0) or 0.0
                             ),
+                            window_high=float(self._momentum_burst_window_high.get(sym, 0.0) or 0.0),
                         )
                         if latest_10s is not None
                         else None
@@ -6290,7 +6921,12 @@ class AlpacaRunner:
             if latest_10s is None:
                 continue
             if fast_squeeze_enabled:
-                if not self._momentum_burst_hit_run_time_allowed(getattr(latest_10s, "ts", None)):
+                if (
+                    not warrior_enabled
+                    and not self._momentum_burst_hit_run_time_allowed(
+                        getattr(latest_10s, "ts", None)
+                    )
+                ):
                     armed.pop(sym, None)
                     self._momentum_burst_window_high.pop(sym, None)
                     pending.pop(sym, None)
@@ -6339,7 +6975,7 @@ class AlpacaRunner:
             bar_ts = getattr(latest_10s, "ts", None)
             current_high = float(latest_10s.high or 0.0)
             window_high = float(self._momentum_burst_window_high.get(sym, 0.0) or 0.0)
-            warrior_target_wins = (
+            warrior_target_win_count = (
                 int(self._warrior_squeeze_target_wins.get(sym, 0) or 0)
                 if warrior_enabled and warrior_target_fresh else 0
             )
@@ -6352,7 +6988,7 @@ class AlpacaRunner:
                 continue
             if (
                 warrior_enabled
-                and warrior_target_wins >= 1
+                and warrior_target_win_count >= 1
                 and window_high > 0
                 and pending.get(sym) is None
             ):
@@ -6401,6 +7037,54 @@ class AlpacaRunner:
                                 sym,
                             )
                             continue
+                    parabolic_reclaim_context = self._warrior_parabolic_micro_pullback_reclaim_context(
+                        sym,
+                        latest_10s,
+                        window_high=window_high,
+                    )
+                    if (
+                        parabolic_reclaim_context is not None
+                        and parabolic_reclaim_context.get("entry_trigger")
+                        == "warrior_parabolic_micro_pullback_reclaim"
+                    ):
+                        pending[sym] = {
+                            "ts": (
+                                bar_ts - timedelta(seconds=10)
+                                if bar_ts is not None else bar_ts
+                            ),
+                            "breakout_close": float(latest_10s.close or 0.0),
+                            "breakout_high": current_high,
+                            "breakout_volume": float(latest_10s.volume or 0.0),
+                            **parabolic_reclaim_context,
+                        }
+                        logger.info(
+                            "WARRIOR SQUEEZE %s post-target parabolic micro-pullback reclaim armed",
+                            sym,
+                        )
+                        continue
+                    fresh_continuation_context = (
+                        self._warrior_post_target_fresh_continuation_context(
+                            sym,
+                            latest_10s,
+                            window_high=window_high,
+                        )
+                        if current_high > window_high * 1.001
+                        else None
+                    )
+                    if fresh_continuation_context is not None:
+                        self._momentum_burst_window_high[sym] = current_high
+                        pending[sym] = {
+                            "ts": bar_ts,
+                            "breakout_close": float(latest_10s.close or 0.0),
+                            "breakout_high": current_high,
+                            "breakout_volume": float(latest_10s.volume or 0.0),
+                            **fresh_continuation_context,
+                        }
+                        logger.info(
+                            "WARRIOR SQUEEZE %s post-target fresh continuation armed",
+                            sym,
+                        )
+                        continue
                     second_leg_context = self._warrior_squeeze_second_leg_reclaim_context(
                         sym,
                         latest_10s,
@@ -6525,7 +7209,7 @@ class AlpacaRunner:
                 reentry = fast_squeeze_enabled and self._momentum_burst_hit_run_counts.get(sym, 0) > 0
                 if (
                     warrior_enabled
-                    and warrior_target_wins >= 1
+                    and warrior_target_win_count >= 1
                     and not warrior_lanes.is_warrior_entry_trigger(
                         pend.get("entry_trigger")
                     )
@@ -6539,6 +7223,10 @@ class AlpacaRunner:
                 volume_ratio = 0.5 if reentry else (0.25 if hit_run_enabled and violent_ok else 0.5)
                 chase_cap = 0.03 if reentry else (0.08 if hit_run_enabled and violent_ok else 0.03)
                 first_pullback_context = None
+                current_pullaway_context = (
+                    self._warrior_squeeze_pullaway_context(sym, latest_10s, pend)
+                    if warrior_enabled else None
+                )
                 if warrior_enabled:
                     trend_pullback_fn = getattr(
                         self,
@@ -6557,10 +7245,19 @@ class AlpacaRunner:
                     if (
                         first_pullback_candidate is not None
                         and first_pullback_candidate.get("entry_trigger")
-                        == "warrior_first_pullback_reclaim"
+                        in {
+                            "warrior_first_pullback_reclaim",
+                            "warrior_low_price_proof_reclaim",
+                        }
                     ):
                         first_pullback_context = first_pullback_candidate
-                if first_pullback_context is not None:
+                if (
+                    current_pullaway_context is not None
+                    and current_pullaway_context.get("variant_override")
+                    == "warrior_clwt_fast_pullaway"
+                ):
+                    pullaway_context = current_pullaway_context
+                elif first_pullback_context is not None:
                     pullaway_context = first_pullback_context
                 elif warrior_enabled and (
                     warrior_lanes.is_warrior_entry_trigger(pend.get("entry_trigger"))
@@ -6568,10 +7265,7 @@ class AlpacaRunner:
                 ):
                     pullaway_context = dict(pend)
                 else:
-                    pullaway_context = (
-                        self._warrior_squeeze_pullaway_context(sym, latest_10s, pend)
-                        if warrior_enabled else None
-                    )
+                    pullaway_context = current_pullaway_context
                 curl_context = (
                     self._warrior_squeeze_curl_reclaim_context(
                         sym,
@@ -6700,6 +7394,16 @@ class AlpacaRunner:
                         if callable(recent_bad_tape_fn)
                         else None
                     )
+                    if (
+                        recent_bad_tape
+                        and pend.get("variant_override")
+                        in {
+                            "warrior_clwt_fast_pullaway",
+                            "warrior_low_price_proof_reclaim",
+                            "warrior_second_leg_vwap_reclaim",
+                        }
+                    ):
+                        recent_bad_tape = None
                     if recent_bad_tape:
                         rebase_reason = "volume too light after {}".format(recent_bad_tape)
                         if (
@@ -6813,13 +7517,23 @@ class AlpacaRunner:
                         window_high=window_high,
                     )
                     if trend_pullback_context is not None:
+                        trigger_high = float(
+                            trend_pullback_context.get("base_high")
+                            or trend_pullback_context.get("entry_price_override")
+                            or current_high
+                        )
+                        trigger_close = float(
+                            trend_pullback_context.get("entry_price_override")
+                            or latest_10s.close
+                            or 0.0
+                        )
                         pending[sym] = {
                             "ts": (
                                 bar_ts - timedelta(seconds=10)
                                 if bar_ts is not None else bar_ts
                             ),
-                            "breakout_close": float(latest_10s.close or 0.0),
-                            "breakout_high": current_high,
+                            "breakout_close": trigger_close,
+                            "breakout_high": trigger_high,
                             "breakout_volume": float(latest_10s.volume or 0.0),
                             **trend_pullback_context,
                         }
@@ -6828,7 +7542,7 @@ class AlpacaRunner:
                             sym,
                         )
                         continue
-                if warrior_enabled and warrior_target_wins >= 1:
+                if warrior_enabled and warrior_target_win_count >= 1:
                     second_leg_context = self._warrior_squeeze_second_leg_reclaim_context(
                         sym,
                         latest_10s,
@@ -6937,7 +7651,7 @@ class AlpacaRunner:
                 continue
 
             if current_high > 0 and (window_high <= 0 or current_high > window_high):
-                if warrior_enabled and warrior_target_wins >= 1:
+                if warrior_enabled and warrior_target_win_count >= 1:
                     add_pending = {
                         "ts": bar_ts,
                         "breakout_close": float(latest_10s.close or 0.0),
@@ -6969,7 +7683,7 @@ class AlpacaRunner:
                     self._momentum_burst_window_high[sym] = current_high
                     continue
                 if warrior_enabled and self._momentum_burst_hit_run_counts.get(sym, 0) > 0:
-                    target_wins = warrior_target_wins
+                    target_wins = warrior_target_win_count
                     add_pending = {
                         "ts": bar_ts,
                         "breakout_close": float(latest_10s.close or 0.0),
@@ -7061,10 +7775,16 @@ class AlpacaRunner:
                     "breakout_volume": float(latest_10s.volume or 0.0),
                     **self._momentum_burst_level_context(window_high, current_high),
                 }
-                if first_reclaim_context is not None:
-                    pending[sym].update(first_reclaim_context)
-                elif first_clwt_context is not None:
-                    pending[sym].update(first_clwt_context)
+                initial_warrior_context = warrior_lanes.choose_initial_warrior_context(
+                    first_clwt_context,
+                    first_reclaim_context,
+                )
+                if initial_warrior_context is not None:
+                    pending[sym].update(initial_warrior_context)
+        if warrior_enabled:
+            publisher = getattr(self, "_publish_warrior_watch", None)
+            if callable(publisher):
+                publisher()
 
     @staticmethod
     def _momentum_burst_level_context(previous_high: float, current_high: float) -> Dict[str, Any]:
@@ -7170,17 +7890,47 @@ class AlpacaRunner:
             window_high=window_high,
         )
 
+    def _warrior_post_target_fresh_continuation_context(
+        self,
+        symbol: str,
+        latest_10s: Bar,
+        *,
+        window_high: float,
+    ) -> Optional[Dict[str, Any]]:
+        return warrior_lanes.warrior_post_target_fresh_continuation_context(
+            latest_10s,
+            history=AlpacaRunner._warrior_history_until(self, symbol, latest_10s, count=30),
+            window_high=window_high,
+        )
+
     def _warrior_failed_burst_recovery_context(
         self,
         symbol: str,
         latest_10s: Bar,
         *,
         failed_high: float,
+        window_high: float = 0.0,
     ) -> Optional[Dict[str, Any]]:
         return warrior_lanes.warrior_failed_burst_recovery_context(
             latest_10s,
             history=AlpacaRunner._warrior_history_until(self, symbol, latest_10s, count=10),
             failed_high=failed_high,
+            window_high=window_high,
+        )
+
+    def _warrior_halt_resume_continuation_context(
+        self,
+        symbol: str,
+        latest_10s: Bar,
+        *,
+        failed_high: float,
+        window_high: float = 0.0,
+    ) -> Optional[Dict[str, Any]]:
+        return warrior_lanes.warrior_halt_resume_continuation_context(
+            latest_10s,
+            history=AlpacaRunner._warrior_history_until(self, symbol, latest_10s, count=20),
+            failed_high=failed_high,
+            window_high=window_high,
         )
 
     def _warrior_level_break_starter_context(
@@ -7204,10 +7954,23 @@ class AlpacaRunner:
         *,
         window_high: float,
     ) -> Optional[Dict[str, Any]]:
-        history = AlpacaRunner._warrior_history_until(self, symbol, latest_10s, count=30)
+        history = AlpacaRunner._warrior_history_until(self, symbol, latest_10s, count=90)
         return warrior_lanes.warrior_trend_playbook_context(
             latest_10s,
             history=history,
+            window_high=window_high,
+        )
+
+    def _warrior_parabolic_micro_pullback_reclaim_context(
+        self,
+        symbol: str,
+        latest_10s: Bar,
+        *,
+        window_high: float,
+    ) -> Optional[Dict[str, Any]]:
+        return warrior_lanes.warrior_parabolic_micro_pullback_reclaim_context(
+            latest_10s,
+            history=AlpacaRunner._warrior_history_until(self, symbol, latest_10s, count=90),
             window_high=window_high,
         )
 
@@ -7906,6 +8669,10 @@ class AlpacaRunner:
                 self._momentum_burst_hit_run_counts[sym] = (
                     self._momentum_burst_hit_run_counts.get(sym, 0) + 1
                 )
+                if strategy_label == "warrior_squeeze_playbook":
+                    self._warrior_squeeze_last_entry_trigger[sym] = str(
+                        (signal.scan_result.criteria or {}).get("entry_trigger") or ""
+                    )
                 if (
                     signal.scan_result
                     and (signal.scan_result.criteria or {}).get("entry_trigger")

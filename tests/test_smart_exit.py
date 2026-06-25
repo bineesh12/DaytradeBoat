@@ -218,6 +218,95 @@ class TestHalfSellAt2to1:
         assert tracked.remaining_qty == 45
         assert tracked.stop_loss == pytest.approx(5.00)
 
+    def test_warrior_halt_resume_trigger_sells_full_without_reason_literal(self) -> None:
+        em = ExitManager()
+        pos = _long_pos(entry=10.00, stop=9.50, qty=90)
+        pos.reason = "Warrior Squeeze CUPR"
+        pos.entry_strategy = "warrior_squeeze_playbook"
+        pos.entry_pattern = "warrior_squeeze_playbook"
+        pos.entry_trigger = "warrior_halt_resume_continuation"
+        em.track(pos)
+
+        exits = em.check_exits({"ABC": 11.05}, _ts(10))
+
+        assert len(exits) == 1
+        assert exits[0].quantity == 90
+        assert "take_profit" in exits[0].reason.lower()
+        assert "ABC" not in em.tracked
+
+    def test_warrior_stair_step_runner_uses_partial_not_full_target_exit(self) -> None:
+        em = ExitManager()
+        pos = _long_pos(entry=10.00, stop=9.50, qty=90)
+        pos.reason = "Warrior Squeeze STI"
+        pos.entry_strategy = "warrior_squeeze_playbook"
+        pos.entry_pattern = "warrior_squeeze_playbook"
+        pos.entry_trigger = "warrior_stair_step_runner"
+        em.track(pos)
+
+        exits = em.check_exits({"ABC": 11.05}, _ts(10))
+
+        assert len(exits) == 1
+        assert exits[0].quantity == 45
+        assert "take_profit" in exits[0].reason.lower()
+        tracked = em.tracked.get("ABC")
+        assert tracked is not None
+        assert tracked.remaining_qty == 45
+        assert tracked.stop_loss == pytest.approx(10.00)
+
+    def test_warrior_failed_follow_through_exits_before_full_stop(self) -> None:
+        em = ExitManager()
+        pos = _long_pos(entry=9.74, stop=9.2043, qty=205)
+        pos.reason = "Warrior Squeeze PLSM"
+        pos.entry_strategy = "warrior_squeeze_playbook"
+        pos.entry_pattern = "warrior_squeeze_playbook"
+        pos.entry_trigger = "warrior_parabolic_micro_pullback_reclaim"
+        pos.first_target_price = 10.4096
+        em.track(pos)
+
+        # First bar after entry pushes 0.6R toward target, then closes red near
+        # its low on heavy volume. Warrior should cut the failed follow-through
+        # at the bar close instead of waiting for the full tactical stop.
+        tracked = em.tracked["ABC"]
+        tracked.highest_price = 10.08
+        em.update_bar_close(
+            "ABC",
+            close_price=9.59,
+            open_price=9.78,
+            high_price=10.08,
+            low_price=9.48,
+            volume=229_569,
+        )
+
+        exits = em.check_exits({"ABC": 9.59}, _ts(10))
+
+        assert len(exits) == 1
+        assert exits[0].quantity == 205
+        assert exits[0].entry_price == pytest.approx(9.59)
+        assert "stop_loss" in exits[0].reason.lower()
+        assert "ABC" not in em.tracked
+
+    def test_normal_position_does_not_use_warrior_failed_follow_through_exit(self) -> None:
+        em = ExitManager()
+        pos = _long_pos(entry=9.74, stop=9.2043, qty=205)
+        pos.reason = "ABC Continuation PLSM"
+        pos.entry_strategy = "standard"
+        em.track(pos)
+        tracked = em.tracked["ABC"]
+        tracked.highest_price = 10.08
+        em.update_bar_close(
+            "ABC",
+            close_price=9.59,
+            open_price=9.78,
+            high_price=10.08,
+            low_price=9.48,
+            volume=229_569,
+        )
+
+        exits = em.check_exits({"ABC": 9.59}, _ts(10))
+
+        assert exits == []
+        assert "ABC" in em.tracked
+
     def test_runner_candidate_confirms_after_first_partial(self) -> None:
         em = ExitManager()
         pos = _long_pos(entry=5.00, stop=4.80)

@@ -8,7 +8,7 @@ import time
 from types import SimpleNamespace
 
 from daytrading.exits.manager import ExitManager, TrackedPosition
-from daytrading.models import Bar, Fill, Order, OrderStatus, PortfolioState, Position, Side, SignalAction, TradeSignal
+from daytrading.models import Bar, Fill, Order, OrderStatus, PortfolioState, Position, ScanResult, Side, SignalAction, TradeSignal
 from daytrading.pipeline.factory import create_scalping_pipeline
 from daytrading.runner import AlpacaRunner
 
@@ -102,6 +102,54 @@ def test_full_exit_record_clears_broker_stop_when_position_qty_zero() -> None:
     )
 
     assert calls == [("clear", "OLOX")]
+
+
+def test_tick_trail_exit_escalates_to_urgent_exit_after_limit_miss() -> None:
+    exit_manager = ExitManager()
+    pos = TrackedPosition(
+        symbol="FCUV",
+        side=Side.BUY,
+        quantity=36,
+        remaining_qty=24,
+        entry_price=7.96,
+        entry_ts=datetime.now(timezone.utc) - timedelta(seconds=120),
+        stop_loss=7.60,
+    )
+    pos.highest_price = 8.28
+    pos.reason = "Warrior Squeeze FCUV"
+    exit_manager.track(pos)
+
+    class Broker:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def submit(self, order, bar, portfolio):
+            self.calls.append(("limit", order.limit_price))
+            return None, OrderStatus.CANCELLED
+
+        def submit_urgent_exit(self, order, bar, portfolio):
+            self.calls.append(("urgent", bar.close))
+            return (
+                Fill(order.symbol, order.side, order.quantity, 7.42, datetime.now(timezone.utc)),
+                OrderStatus.FILLED,
+            )
+
+    broker = Broker()
+    runner = object.__new__(AlpacaRunner)
+    runner._pipeline = SimpleNamespace(
+        exit_manager=exit_manager,
+        portfolio=PortfolioState(cash=10_000),
+    )
+    runner._broker = broker
+    runner._record_trade_exit = lambda *args, **kwargs: -12.96
+    runner._hub = SimpleNamespace(add_log=lambda *args, **kwargs: None)
+    runner._seed_recent_order_ids = lambda: None
+    runner._push_positions_from_alpaca = lambda: None
+
+    runner._instant_trail_exit("FCUV", 7.70)
+
+    assert broker.calls == [("limit", 7.70), ("urgent", 7.70)]
+    assert "FCUV" not in exit_manager.tracked
 
 
 def test_momentum_burst_scalp_exit_clears_shared_active_flag() -> None:
@@ -391,6 +439,67 @@ def test_filled_position_stop_is_capped_by_dollar_risk_after_slippage() -> None:
     pos = exit_manager.tracked["MNTS"]
     assert round(pos.entry_price - pos.stop_loss, 4) <= round(50.0 / 151, 4)
     assert pos.stop_loss > 16.59
+
+
+def test_register_from_signal_honors_planned_take_profit_target() -> None:
+    exit_manager = ExitManager(max_unrealized_loss=150.0)
+    signal = TradeSignal(
+        symbol="PLSM",
+        action=SignalAction.ENTER_LONG,
+        quantity=30,
+        entry_price=10.75,
+        stop_loss=10.19,
+        take_profit=11.76,
+        reason="Warrior Squeeze PLSM",
+        scan_result=ScanResult(
+            symbol="PLSM",
+            scanner_name="warrior_squeeze_playbook",
+            ts=datetime.now(timezone.utc),
+            score=0.0,
+            criteria={
+                "pattern": "warrior_squeeze_playbook",
+                "entry_trigger": "warrior_stair_step_runner",
+            },
+        ),
+    )
+
+    exit_manager.register_from_signal(
+        signal,
+        datetime.now(timezone.utc),
+        fill_price=10.6733,
+    )
+
+    pos = exit_manager.tracked["PLSM"]
+    assert pos.first_target_price == 11.76
+
+
+def test_register_from_signal_keeps_normal_first_target_at_one_r() -> None:
+    exit_manager = ExitManager(max_unrealized_loss=150.0)
+    signal = TradeSignal(
+        symbol="NORM",
+        action=SignalAction.ENTER_LONG,
+        quantity=100,
+        entry_price=10.00,
+        stop_loss=9.50,
+        take_profit=12.00,
+        reason="Vwap Pullback NORM",
+        scan_result=ScanResult(
+            symbol="NORM",
+            scanner_name="vwap_pullback",
+            ts=datetime.now(timezone.utc),
+            score=82.0,
+            criteria={"pattern": "vwap_pullback"},
+        ),
+    )
+
+    exit_manager.register_from_signal(
+        signal,
+        datetime.now(timezone.utc),
+        fill_price=10.00,
+    )
+
+    pos = exit_manager.tracked["NORM"]
+    assert pos.first_target_price == 10.50
 
 
 def test_fast_exit_uses_short_broker_wait_then_restores() -> None:

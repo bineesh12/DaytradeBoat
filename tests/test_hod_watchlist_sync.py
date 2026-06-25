@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 
 from daytrading.models import Bar
 from daytrading.runner import AlpacaRunner
+from daytrading.strategy.warrior_watch import WarriorWatchBook
 
 
 class _RunnerStub:
@@ -20,6 +21,7 @@ class _RunnerStub:
     _trade_universe = AlpacaRunner._trade_universe
     _sync_watchlist_to_hod_alerts = AlpacaRunner._sync_watchlist_to_hod_alerts
     _on_hod_alerts_changed = AlpacaRunner._on_hod_alerts_changed
+    _maybe_arm_warrior_from_hod_alert = AlpacaRunner._maybe_arm_warrior_from_hod_alert
     _is_tradeable_hod_watchlist_alert = AlpacaRunner._is_tradeable_hod_watchlist_alert
     _parse_hod_alert_time = staticmethod(AlpacaRunner._parse_hod_alert_time)
     _publish_trading_watchlist = AlpacaRunner._publish_trading_watchlist
@@ -27,8 +29,15 @@ class _RunnerStub:
     _hot_watch_setup_refresh_reason = AlpacaRunner._hot_watch_setup_refresh_reason
     _hot_watch_snapshot = AlpacaRunner._hot_watch_snapshot
     _hot_watch_live_metrics = AlpacaRunner._hot_watch_live_metrics
+    _warrior_watch_snapshot = AlpacaRunner._warrior_watch_snapshot
+    _ensure_warrior_watch_capacity = AlpacaRunner._ensure_warrior_watch_capacity
+    _active_warrior_symbols = AlpacaRunner._active_warrior_symbols
     _publish_hot_watch = AlpacaRunner._publish_hot_watch
+    _publish_warrior_watch = AlpacaRunner._publish_warrior_watch
     _promote_hot_watch = AlpacaRunner._promote_hot_watch
+    _maybe_arm_warrior_from_hot_watch_mover = (
+        AlpacaRunner._maybe_arm_warrior_from_hot_watch_mover
+    )
     _hot_watch_reject_reason = AlpacaRunner._hot_watch_reject_reason
     _hot_watch_level_breakout_scout_candidate = AlpacaRunner._hot_watch_level_breakout_scout_candidate
     _hot_watch_mode = AlpacaRunner._hot_watch_mode
@@ -53,6 +62,14 @@ class _RunnerStub:
         self._hod_min_price = 2.0
         self._hod_max_price = 20.0
         self._hod_max_float = 20_000_000
+        self._warrior_squeeze_enabled = False
+        self._warrior_watch_capacity = 10
+        self._warrior_watch = WarriorWatchBook()
+        self._momentum_burst_armed = self._warrior_watch.armed
+        self._momentum_burst_window_high = self._warrior_watch.window_high
+        self._momentum_burst_session_anchor_high = self._warrior_watch.session_anchor_high
+        self._momentum_burst_pending = self._warrior_watch.pending
+        self._momentum_burst_hit_run_day_blocked = self._warrior_watch.day_blocked
         self._hot_watch: dict = {}
         self._hot_watch_ttl_minutes = 8.0
         self._hot_watch_strong_ttl_minutes = 15.0
@@ -123,6 +140,36 @@ class _CachedOnlyFloat:
 
     def get_float(self, symbol: str):
         raise AssertionError("fast scan must not perform network float lookups")
+
+
+class TestWarriorWatchSnapshot:
+    def test_caps_display_only_candidates_to_remaining_watch_slots(self) -> None:
+        runner = _make_runner([])
+        runner._warrior_watch_capacity = 3
+        runner._warrior_watch.armed.update({"AAA": 1.0, "BBB": 1.0})
+        runner._warrior_watch.window_high.update({"AAA": 5.0, "BBB": 4.0})
+        runner._hot_watch.update({
+            "CCC": {},
+            "DDD": {},
+            "EEE": {},
+        })
+
+        rows = runner._warrior_watch_snapshot()
+
+        assert [r["symbol"] for r in rows] == ["AAA", "BBB", "CCC"]
+        assert [r["state"] for r in rows] == ["watching", "watching", "candidate"]
+
+    def test_keeps_all_active_rows_even_when_capacity_is_full(self) -> None:
+        runner = _make_runner([])
+        runner._warrior_watch_capacity = 1
+        runner._warrior_watch.armed.update({"AAA": 1.0, "BBB": 1.0})
+        runner._warrior_watch.pending["CCC"] = {"entry_trigger": "warrior_level_pullaway"}
+        runner._hot_watch.update({"DDD": {}})
+
+        rows = runner._warrior_watch_snapshot()
+
+        assert {r["symbol"] for r in rows} == {"AAA", "BBB", "CCC"}
+        assert all(r["state"] != "candidate" for r in rows)
 
 
 class TestFloatFilteredHodPool:
@@ -262,6 +309,32 @@ class TestHodWatchlistSync:
         assert "NEWS" in runner._watchlist_set
         assert "SPY" in runner._watchlist_set
 
+    def test_hot_watch_symbol_stays_active_when_hod_alert_ttl_expires(self) -> None:
+        runner = _make_runner(["SPY", "EHGO"])
+        runner._hod_tradeable_alert_at["EHGO"] = (
+            datetime.now(timezone.utc) - timedelta(minutes=10)
+        )
+        runner._hot_watch["EHGO"] = {
+            "added_at": datetime.now(timezone.utc),
+            "reason": "fast scan mover",
+        }
+        runner._bar_buffer["EHGO"] = [
+            Bar(
+                "EHGO",
+                datetime.now(timezone.utc),
+                4.90,
+                5.10,
+                4.80,
+                5.00,
+                120_000,
+            )
+        ]
+
+        runner._sync_watchlist_to_hod_alerts()
+
+        assert "EHGO" in runner._watchlist_set
+        assert runner._bar_buffer["EHGO"]
+
     def test_hod_alert_with_weak_liquidity_stays_watch_only(self) -> None:
         runner = _make_runner(["SPY"])
         now = datetime.now(timezone.utc).isoformat()
@@ -296,6 +369,76 @@ class TestHodWatchlistSync:
 
         assert "LIQD" in runner._hod_tradeable_alert_at
         assert "LIQD" in runner._watchlist_set
+
+    def test_extreme_hod_alert_arms_warrior_watch_without_entry(self) -> None:
+        runner = _make_runner(["SPY"])
+        runner._warrior_squeeze_enabled = True
+        now = datetime.now(timezone.utc).isoformat()
+
+        runner._on_hod_alerts_changed([{
+            "symbol": "PLSM",
+            "time": now,
+            "price": 12.74,
+            "session_high": 19.52,
+            "alert_name": "Squeeze - Up 10% in 10min",
+            "day_volume": 9_377_593,
+            "float_shares": 1_542_214,
+            "rel_vol": 0.55,
+            "bar_rvol": 0.84,
+            "change_session_pct": 269.2,
+            "change_from_close_pct": 269.2,
+            "change_from_low_pct": 280.2,
+        }])
+
+        assert "PLSM" in runner._momentum_burst_armed
+        assert runner._momentum_burst_window_high["PLSM"] == 19.52
+        assert runner._momentum_burst_session_anchor_high["PLSM"] == 19.52
+        assert runner._momentum_burst_pending == {}
+        assert "PLSM" in runner._watchlist_set
+
+    def test_weak_hod_alert_does_not_arm_warrior_watch(self) -> None:
+        runner = _make_runner(["SPY"])
+        runner._warrior_squeeze_enabled = True
+        now = datetime.now(timezone.utc).isoformat()
+
+        runner._on_hod_alerts_changed([{
+            "symbol": "WEAK",
+            "time": now,
+            "price": 4.20,
+            "alert_name": "Gapper Continuation",
+            "day_volume": 240_000,
+            "float_shares": 2_000_000,
+            "rel_vol": 0.5,
+            "bar_rvol": 0.6,
+            "change_session_pct": 40.0,
+        }])
+
+        assert "WEAK" not in runner._momentum_burst_armed
+        assert "WEAK" not in runner._watchlist_set
+
+    def test_extreme_tape_surge_hod_alert_arms_warrior_under_one_million_volume(self) -> None:
+        runner = _make_runner(["SPY"])
+        runner._warrior_squeeze_enabled = True
+        now = datetime.now(timezone.utc).isoformat()
+
+        runner._on_hod_alerts_changed([{
+            "symbol": "FCUV",
+            "time": now,
+            "price": 4.3999,
+            "session_high": 4.3999,
+            "alert_name": "HOD Tick Alert",
+            "day_volume": 221_316,
+            "float_shares": 392_953,
+            "rel_vol": 35.2,
+            "bar_rvol": 35.2,
+            "change_session_pct": 656.9,
+            "change_from_low_pct": 120.0,
+        }])
+
+        assert "FCUV" in runner._momentum_burst_armed
+        assert runner._momentum_burst_window_high["FCUV"] == 4.3999
+        assert runner._momentum_burst_pending == {}
+        assert "FCUV" in runner._watchlist_set
 
     def test_sub_two_hod_alert_above_dollar_fifty_can_enter_trading_watchlist(self) -> None:
         runner = _make_runner(["SPY"])
@@ -406,6 +549,51 @@ class TestTradeUniverse:
 
         symbols = runner._hub.on_trading_watchlist.call_args.args[0]
         assert symbols == ["SPY", "XOS"] or symbols == ["XOS", "SPY"]
+
+    def test_extreme_hot_watch_mover_arms_warrior_watch_without_entry(self) -> None:
+        runner = _make_runner(["SPY"])
+        runner._warrior_squeeze_enabled = True
+
+        runner._promote_hot_watch(
+            {
+                "symbol": "PLSM",
+                "price": 11.25,
+                "session_high": 19.52,
+                "abs_change_pct": 229.91,
+                "change_pct": 229.91,
+                "short_change_pct": -6.86,
+                "volume": 117_985,
+                "score": 0.89,
+            },
+            flt=1_542_214,
+            reason="fast scan mover",
+        )
+
+        assert "PLSM" in runner._momentum_burst_armed
+        assert runner._momentum_burst_window_high["PLSM"] == 19.52
+        assert runner._momentum_burst_session_anchor_high["PLSM"] == 19.52
+        assert runner._momentum_burst_pending == {}
+        assert runner._hot_watch["PLSM"]["mode"] == "watch"
+
+    def test_quiet_hot_watch_mover_does_not_arm_warrior_watch(self) -> None:
+        runner = _make_runner(["SPY"])
+        runner._warrior_squeeze_enabled = True
+
+        runner._promote_hot_watch(
+            {
+                "symbol": "QUIET",
+                "price": 4.20,
+                "abs_change_pct": 8.0,
+                "change_pct": 8.0,
+                "volume": 20_000,
+                "score": 0.35,
+            },
+            flt=2_000_000,
+            reason="fast scan mover",
+        )
+
+        assert "QUIET" not in runner._momentum_burst_armed
+        assert "QUIET" in runner._hot_watch
 
     def test_expired_hot_watch_symbol_drops_from_trade_universe(self) -> None:
         runner = _make_runner(["SPY"])

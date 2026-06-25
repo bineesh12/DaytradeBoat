@@ -450,6 +450,30 @@ def _ten_bar(second: int, close: float, *, width_pct: float, volume: float = 5_0
     )
 
 
+def test_warrior_backtest_watches_first_cheap_momentum_burst_without_entry() -> None:
+    ten_sec = [_ten_bar(i * 10, 1.55 + i * 0.01, width_pct=0.012, volume=50_000) for i in range(12)]
+    driver = _momentum_burst_backtest_driver(ten_sec)
+    driver._use_warrior_squeeze_playbook = True
+    driver._warrior_squeeze_min_reclaim_price = 2.0
+    hit = ScanResult(
+        symbol="MBUR",
+        scanner_name="momentum_burst",
+        ts=ten_sec[-1].ts,
+        score=80.0,
+        criteria={"pattern": "momentum_burst", "close": 1.70},
+        bars=[
+            Bar("MBUR", _BASE_TS, 1.25, 1.70, 1.20, 1.62, 120_000, Timeframe.SEC_10),
+        ],
+    )
+
+    driver._arm_momentum_burst_from_cycle(PipelineResult(scan_hits=[hit]), ten_sec[-1].ts)
+
+    assert "MBUR" in driver._momentum_burst_armed
+    assert driver._momentum_burst_pending == {}
+    assert driver._momentum_burst_window_high["MBUR"] == 1.70
+    assert driver._warrior_squeeze_rejection_reason["MBUR"].startswith("first cheap")
+
+
 def test_momentum_burst_replay_allows_smooth_10s_tape() -> None:
     ten_sec = [_ten_bar(i * 10, 2.00 + i * 0.01, width_pct=0.006, volume=5_000) for i in range(12)]
     driver = _momentum_burst_backtest_driver(ten_sec)
@@ -621,6 +645,39 @@ def test_warrior_squeeze_backtest_clwt_fast_pullaway_without_slow_proof_hold() -
     assert signal.scan_result.criteria["max_pay"] == 4.025
     assert signal.entry_price == 3.9674
     assert signal.take_profit > signal.entry_price
+
+
+def test_warrior_squeeze_backtest_fast_pullaway_rejects_high_reject_chase() -> None:
+    ten_sec = [
+        Bar("JRSH", _BASE_TS + timedelta(seconds=0), 3.98, 4.02, 3.93, 3.9792, 2_905, Timeframe.SEC_10),
+        Bar("JRSH", _BASE_TS + timedelta(seconds=10), 3.98, 3.98, 3.93, 3.9316, 1_204, Timeframe.SEC_10),
+        Bar("JRSH", _BASE_TS + timedelta(seconds=20), 3.93, 3.9697, 3.85, 3.85, 2_152, Timeframe.SEC_10),
+        Bar("JRSH", _BASE_TS + timedelta(seconds=30), 3.95, 4.7163, 3.85, 4.7163, 10_003, Timeframe.SEC_10),
+        Bar("JRSH", _BASE_TS + timedelta(seconds=40), 4.35, 4.98, 4.16, 4.53, 10_319, Timeframe.SEC_10),
+        Bar("JRSH", _BASE_TS + timedelta(seconds=50), 4.54, 4.57, 4.16, 4.30, 25_262, Timeframe.SEC_10),
+        Bar("JRSH", _BASE_TS + timedelta(seconds=60), 4.29, 4.32, 3.95, 4.1426, 21_981, Timeframe.SEC_10),
+        Bar("JRSH", _BASE_TS + timedelta(seconds=70), 4.16, 4.45, 4.1408, 4.24, 29_054, Timeframe.SEC_10),
+        Bar("JRSH", _BASE_TS + timedelta(seconds=80), 4.25, 4.27, 4.00, 4.12, 26_693, Timeframe.SEC_10),
+        Bar("JRSH", _BASE_TS + timedelta(seconds=90), 4.20, 4.57, 4.11, 4.5273, 55_466, Timeframe.SEC_10),
+        Bar("JRSH", _BASE_TS + timedelta(seconds=100), 4.53, 4.81, 4.40, 4.77, 129_040, Timeframe.SEC_10),
+        Bar("JRSH", _BASE_TS + timedelta(seconds=110), 4.77, 5.7005, 4.7409, 5.4897, 215_893, Timeframe.SEC_10),
+    ]
+    driver = _momentum_burst_backtest_driver(ten_sec)
+    driver._use_warrior_squeeze_playbook = True
+    driver._warrior_squeeze_min_reclaim_price = 3.50
+    driver._warrior_squeeze_rejection_high["JRSH"] = 4.98
+    driver._warrior_squeeze_rejection_reason["JRSH"] = "first explosive 10s spike"
+    pending = {
+        "ts": ten_sec[-2].ts,
+        "breakout_close": 4.77,
+        "breakout_high": 4.81,
+        "breakout_volume": 129_040,
+        "entry_trigger": "warrior_a_plus_reclaim",
+    }
+
+    context = driver._warrior_squeeze_pullaway_context("JRSH", ten_sec[-1], pending)
+
+    assert context is None
 
 
 def test_warrior_squeeze_backtest_fast_pullaway_rejects_immediate_wide_red_fakeout() -> None:
@@ -853,7 +910,7 @@ def test_warrior_squeeze_curl_reclaim_rejects_wgrx_giant_expansion_bar() -> None
     assert "blocked giant Warrior spike" in reason
 
 
-def test_warrior_failed_burst_recovery_allows_wgrx_fresh_reclaim_after_spike() -> None:
+def test_warrior_failed_burst_recovery_rejects_below_prior_window_high() -> None:
     ten_sec = [
         Bar("WGRX", _BASE_TS + timedelta(seconds=0), 3.24, 3.57, 3.24, 3.536, 14_099, Timeframe.SEC_10),
         Bar("WGRX", _BASE_TS + timedelta(seconds=10), 3.56, 3.7087, 3.55, 3.70, 6_998, Timeframe.SEC_10),
@@ -880,12 +937,10 @@ def test_warrior_failed_burst_recovery_allows_wgrx_fresh_reclaim_after_spike() -
         ten_sec[-2],
         history=ten_sec,
         failed_high=5.55,
+        window_high=6.17,
     )
 
-    assert context is not None
-    assert context["entry_trigger"] == "warrior_failed_burst_recovery"
-    assert context["entry_price_override"] < ten_sec[-1].close
-    assert context["target_price_override"] > context["entry_price_override"]
+    assert context is None
 
 
 def test_warrior_squeeze_backtest_reentry_uses_current_level_pullaway() -> None:
@@ -1107,6 +1162,59 @@ def test_backtest_momentum_burst_respects_global_active_scalp_latch() -> None:
     assert driver._has_active_replay_scalp() is True
 
 
+def test_backtest_warrior_active_count_ignores_non_warrior_brackets() -> None:
+    ten_sec = [_ten_bar(i * 10, 2.00 + i * 0.01, width_pct=0.006, volume=80_000) for i in range(12)]
+    driver = _momentum_burst_backtest_driver(ten_sec)
+    driver._mb_bracket["NORMAL"] = {
+        "stop": 3.90,
+        "target": 4.30,
+        "qty": 10,
+        "entry": 4.10,
+        "ts": ten_sec[-1].ts,
+        "max_hold": 45,
+        "strategy": "standard_pipeline",
+    }
+
+    assert driver._active_replay_warrior_trade_count() == 0
+    assert driver._active_replay_warrior_symbols() == set()
+
+    driver._mb_bracket["MBUR"] = {
+        "stop": 2.90,
+        "target": 3.30,
+        "qty": 10,
+        "entry": 3.10,
+        "ts": ten_sec[-1].ts,
+        "max_hold": 45,
+        "strategy": "warrior_squeeze_playbook",
+    }
+
+    assert driver._active_replay_warrior_trade_count() == 1
+    assert driver._active_replay_warrior_symbols() == {"MBUR"}
+
+
+def test_backtest_warrior_day_block_clears_pending() -> None:
+    ten_sec = [_ten_bar(i * 10, 2.00 + i * 0.01, width_pct=0.006, volume=80_000) for i in range(12)]
+    driver = _momentum_burst_backtest_driver(ten_sec)
+    driver._use_warrior_squeeze_playbook = True
+    driver._momentum_burst_armed["MBUR"] = ten_sec[-1].ts
+    driver._momentum_burst_window_high["MBUR"] = 2.20
+    driver._momentum_burst_pending["MBUR"] = {"entry_trigger": "warrior_level_pullaway"}
+    driver._mb_hit_run_day_blocked["MBUR"] = "test daily stop"
+    result = PipelineBacktestResult()
+
+    driver._maybe_execute_momentum_burst_replay(
+        result,
+        BacktestLedger(),
+        universe=driver._bars_by_symbol,
+        quotes={},
+        now=ten_sec[-1].ts,
+    )
+
+    assert "MBUR" not in driver._momentum_burst_pending
+    assert result.rejection_details[-1]["blocked_layer"] == "warrior_squeeze_playbook_daily_stop"
+    assert result.rejection_details[-1]["reason"] == "test daily stop"
+
+
 def test_warrior_backtest_ambiguous_green_bar_takes_target_before_stop() -> None:
     ten_sec = [_ten_bar(i * 10, 8.50 + i * 0.01, width_pct=0.006, volume=80_000) for i in range(12)]
     bar = Bar(
@@ -1130,12 +1238,11 @@ def test_warrior_backtest_ambiguous_green_bar_takes_target_before_stop() -> None
         "max_hold": 45,
         "strategy": "warrior_squeeze_playbook",
     }
-    apply_fill(
-        driver._pipeline.portfolio,
-        Fill("MBUR", Side.BUY, 63, 8.58, bar.ts - timedelta(seconds=10)),
-    )
     result = PipelineBacktestResult()
     ledger = BacktestLedger()
+    entry_fill = Fill("MBUR", Side.BUY, 63, 8.58, bar.ts - timedelta(seconds=10))
+    apply_fill(driver._pipeline.portfolio, entry_fill)
+    ledger.record_entry(entry_fill, strategy="warrior_squeeze_playbook")
 
     driver._process_mb_brackets(result, ledger, bar.ts)
 
@@ -1145,6 +1252,48 @@ def test_warrior_backtest_ambiguous_green_bar_takes_target_before_stop() -> None
     assert ledger.trades[-1]["exit_price"] > 8.58
     assert driver._mb_bracket["MBUR"]["partial_taken"] is True
     assert driver._mb_bracket["MBUR"]["qty"] == 42
+    assert driver._warrior_squeeze_last_target_at["MBUR"] == bar.ts
+
+
+def test_warrior_same_bar_full_target_clears_failed_burst_state() -> None:
+    ten_sec = [_ten_bar(i * 10, 8.50 + i * 0.01, width_pct=0.006, volume=80_000) for i in range(12)]
+    bar = Bar(
+        "MBUR",
+        ten_sec[-1].ts,
+        8.50,
+        9.75,
+        8.21,
+        8.67,
+        290_000,
+        Timeframe.SEC_10,
+    )
+    ten_sec[-1] = bar
+    driver = _momentum_burst_backtest_driver(ten_sec)
+    driver._mb_bracket["MBUR"] = {
+        "stop": 8.24,
+        "target": 9.35,
+        "qty": 63,
+        "entry": 8.58,
+        "ts": bar.ts - timedelta(seconds=10),
+        "max_hold": 45,
+        "strategy": "warrior_squeeze_playbook",
+        "full_first_target": True,
+    }
+    driver._warrior_squeeze_failed_burst["MBUR"] = "prior failed burst"
+    driver._warrior_squeeze_failed_burst_high["MBUR"] = 9.20
+    result = PipelineBacktestResult()
+    ledger = BacktestLedger()
+    entry_fill = Fill("MBUR", Side.BUY, 63, 8.58, bar.ts - timedelta(seconds=10))
+    apply_fill(driver._pipeline.portfolio, entry_fill)
+    ledger.record_entry(entry_fill, strategy="warrior_squeeze_playbook")
+
+    assert driver._maybe_warrior_same_bar_target(result, ledger, "MBUR", bar) is True
+
+    assert "MBUR" not in driver._mb_bracket
+    assert driver._warrior_squeeze_target_wins["MBUR"] == 1
+    assert driver._warrior_squeeze_last_target_at["MBUR"] == bar.ts
+    assert "MBUR" not in driver._warrior_squeeze_failed_burst
+    assert "MBUR" not in driver._warrior_squeeze_failed_burst_high
 
 
 def test_warrior_backtest_emergency_dump_exits_at_close() -> None:
@@ -1570,6 +1719,54 @@ def test_warrior_first_impulse_scalp_allows_clean_nct_style_second_push() -> Non
     assert dispatched["entry_trigger"] == "warrior_first_impulse_scalp"
 
 
+def test_initial_warrior_context_prefers_clwt_fast_pullaway_over_reclaim() -> None:
+    clwt_context = {
+        "entry_trigger": "warrior_level_pullaway",
+        "variant_override": "warrior_clwt_fast_pullaway",
+    }
+    reclaim_context = {
+        "entry_trigger": "warrior_first_pullback_reclaim",
+        "variant_override": "warrior_first_pullback_reclaim",
+    }
+
+    chosen = warrior_lanes.choose_initial_warrior_context(
+        clwt_context,
+        reclaim_context,
+    )
+
+    assert chosen is clwt_context
+
+
+def test_warrior_classifier_intentionally_uses_older_session_low() -> None:
+    ten_sec = [
+        Bar("LOWP", _BASE_TS + timedelta(seconds=0), 1.05, 1.08, 1.00, 1.04, 80_000, Timeframe.SEC_10),
+    ]
+    for idx in range(1, 36):
+        ten_sec.append(
+            Bar(
+                "LOWP",
+                _BASE_TS + timedelta(seconds=idx * 10),
+                1.92,
+                1.98,
+                1.90,
+                1.94,
+                20_000,
+                Timeframe.SEC_10,
+            )
+        )
+    ten_sec.append(
+        Bar("LOWP", _BASE_TS + timedelta(seconds=360), 2.05, 2.17, 2.03, 2.13, 700_000, Timeframe.SEC_10)
+    )
+
+    lane = warrior_lanes.classify_warrior_trend_lane(
+        ten_sec[-1],
+        history=ten_sec,
+        window_high=2.17,
+    )
+
+    assert lane == "warrior_low_price_proof_reclaim"
+
+
 def test_warrior_first_impulse_scalp_rejects_prior_red_breakdown() -> None:
     ten_sec = [
         Bar("MBUR", _BASE_TS + timedelta(seconds=0), 3.95, 4.20, 3.91, 4.05, 12_000, Timeframe.SEC_10),
@@ -1750,6 +1947,87 @@ def test_warrior_first_pullback_reclaim_allows_labt_style_low_price_base() -> No
     assert context["pullback_pct"] >= 4.5
 
 
+def test_warrior_low_price_proof_reclaim_allows_rdgt_style_runner() -> None:
+    ten_sec = [
+        Bar("RDGT", _BASE_TS + timedelta(seconds=0), 1.41, 1.43, 1.38, 1.38, 6_776, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=10), 1.3887, 1.42, 1.3803, 1.3803, 1_634, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=20), 1.38, 1.39, 1.38, 1.39, 1_144, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=30), 1.39, 1.48, 1.39, 1.45, 7_991, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=40), 1.45, 1.4668, 1.415, 1.4668, 4_366, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=50), 1.50, 1.65, 1.48, 1.56, 35_202, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=60), 1.58, 1.73, 1.50, 1.69, 159_262, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=70), 1.68, 1.9476, 1.66, 1.86, 436_328, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=80), 1.8596, 1.97, 1.79, 1.8404, 480_661, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=90), 1.86, 2.0, 1.69, 1.89, 605_247, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=100), 1.8996, 1.97, 1.88, 1.92, 140_000, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=110), 1.9204, 2.17, 1.90, 2.13, 676_131, Timeframe.SEC_10),
+    ]
+
+    context = warrior_lanes.warrior_trend_playbook_context(
+        ten_sec[-1],
+        history=ten_sec,
+        window_high=2.17,
+    )
+
+    assert context is not None
+    assert context["entry_trigger"] == "warrior_low_price_proof_reclaim"
+    assert context["variant_override"] == "warrior_low_price_proof_reclaim"
+    assert context["size_factor"] == pytest.approx(0.12)
+    assert context["entry_price_override"] <= context["max_pay"]
+    assert context["stop_price_override"] < context["entry_price_override"]
+    assert context["target_price_override"] > context["entry_price_override"]
+
+
+def test_warrior_post_target_fresh_continuation_waits_for_graduated_reclaim() -> None:
+    early = [
+        Bar("RDGT", _BASE_TS + timedelta(seconds=0), 1.86, 2.0, 1.69, 1.89, 605_247, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=10), 1.8996, 1.97, 1.88, 1.92, 140_000, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=20), 1.9204, 2.17, 1.90, 2.13, 676_131, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=30), 2.13, 2.23, 2.07, 2.20, 260_000, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=40), 2.20, 2.256, 2.16, 2.25, 170_000, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=50), 2.24, 2.27, 2.18, 2.256, 180_000, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=60), 2.25, 2.28, 2.19, 2.26, 190_000, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=70), 2.26, 2.31, 2.22, 2.30, 210_000, Timeframe.SEC_10),
+    ]
+
+    assert (
+        warrior_lanes.warrior_post_target_fresh_continuation_context(
+            early[-1],
+            history=early,
+            window_high=2.23,
+        )
+        is None
+    )
+
+    graduated = [
+        Bar("RDGT", _BASE_TS + timedelta(seconds=0), 3.25, 3.32, 3.24, 3.2706, 46_414, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=10), 3.2709, 3.28, 3.24, 3.2404, 16_577, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=20), 3.24, 3.25, 3.01, 3.0193, 108_709, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=30), 3.01, 3.07, 3.0, 3.0394, 86_316, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=40), 3.0394, 3.21, 3.03, 3.19, 67_830, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=50), 3.19, 3.27, 3.14, 3.26, 63_117, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=60), 3.27, 3.31, 3.22, 3.22, 62_460, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=70), 3.22, 3.3695, 3.21, 3.3499, 88_514, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=80), 3.34, 3.36, 3.30, 3.3211, 71_316, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=90), 3.33, 3.40, 3.29, 3.3705, 61_349, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=100), 3.3796, 3.83, 3.32, 3.71, 205_117, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=110), 3.71, 3.95, 3.66, 3.85, 285_769, Timeframe.SEC_10),
+    ]
+
+    context = warrior_lanes.warrior_post_target_fresh_continuation_context(
+        graduated[-1],
+        history=graduated,
+        window_high=3.83,
+    )
+
+    assert context is not None
+    assert context["entry_trigger"] == "warrior_post_target_fresh_continuation"
+    assert context["size_factor"] == pytest.approx(0.25)
+    assert context["entry_price_override"] <= context["max_pay"]
+    assert context["stop_price_override"] < context["entry_price_override"]
+    assert context["target_price_override"] > context["entry_price_override"]
+
+
 def test_warrior_first_pullback_reclaim_rejects_red_distribution_base() -> None:
     ten_sec = [
         Bar("MBUR", _BASE_TS + timedelta(seconds=0), 1.55, 1.62, 1.52, 1.60, 15_000, Timeframe.SEC_10),
@@ -1769,6 +2047,45 @@ def test_warrior_first_pullback_reclaim_rejects_red_distribution_base() -> None:
         ten_sec[-1],
         history=ten_sec,
         window_high=2.42,
+    )
+
+    assert context is None
+
+
+def test_warrior_first_pullback_reclaim_rejects_rdgt_recent_dump_reclaim() -> None:
+    ten_sec = [
+        Bar("RDGT", _BASE_TS + timedelta(seconds=0), 2.64, 2.72, 2.53, 2.54, 119_321, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=10), 2.55, 2.65, 2.53, 2.6495, 69_389, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=20), 2.6505, 2.78, 2.60, 2.7595, 84_741, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=30), 2.74, 2.89, 2.69, 2.84, 172_898, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=40), 2.83, 2.90, 2.79, 2.8312, 135_941, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=50), 2.83, 2.9499, 2.83, 2.92, 108_565, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=60), 2.91, 3.00, 2.87, 2.9305, 139_691, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=70), 2.93, 2.97, 2.89, 2.94, 93_583, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=80), 2.93, 3.0716, 2.92, 3.05, 114_244, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=90), 3.0517, 3.3299, 3.05, 3.28, 189_258, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=100), 3.29, 3.45, 3.26, 3.4217, 141_525, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=110), 3.43, 3.52, 3.38, 3.43, 145_515, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=120), 3.4395, 3.45, 3.20, 3.32, 190_553, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=130), 3.3194, 3.50, 3.2805, 3.43, 152_865, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=140), 3.44, 3.65, 3.39, 3.5407, 185_348, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=150), 3.5404, 3.65, 3.22, 3.3204, 215_179, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=160), 3.32, 3.3775, 3.21, 3.2873, 125_031, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=170), 3.2717, 3.32, 3.22, 3.24, 65_027, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=180), 3.25, 3.40, 3.22, 3.30, 114_720, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=190), 3.31, 3.39, 3.2788, 3.33, 57_410, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=200), 3.32, 3.33, 3.21, 3.22, 61_665, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=210), 3.21, 3.22, 3.01, 3.08, 115_162, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=220), 3.0797, 3.17, 3.04, 3.12, 95_375, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=230), 3.13, 3.24, 3.11, 3.20, 51_794, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=240), 3.20, 3.29, 3.18, 3.27, 65_424, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=250), 3.26, 3.44, 3.21, 3.421, 129_271, Timeframe.SEC_10),
+    ]
+
+    context = warrior_lanes.warrior_trend_playbook_context(
+        ten_sec[-1],
+        history=ten_sec,
+        window_high=3.65,
     )
 
     assert context is None
@@ -1824,6 +2141,149 @@ def test_warrior_first_pullback_reclaim_rejects_stair_up_without_pullback() -> N
         ten_sec[-1],
         history=ten_sec,
         window_high=2.55,
+    )
+
+    assert context is None
+
+
+def test_warrior_low_price_proof_reclaim_allows_sbfm_style_proof_pullback() -> None:
+    ten_sec = [
+        Bar("SBFM", _BASE_TS + timedelta(seconds=0), 1.10, 1.50, 1.10, 1.25, 1_113_447, Timeframe.SEC_10),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=10), 1.25, 1.62, 1.23, 1.55, 620_000, Timeframe.SEC_10),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=20), 1.55, 1.84, 1.52, 1.80, 686_319, Timeframe.SEC_10),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=30), 1.90, 2.00, 1.89, 1.95, 799_268, Timeframe.SEC_10),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=40), 1.95, 1.97, 1.90, 1.93, 692_732, Timeframe.SEC_10),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=50), 1.93, 1.96, 1.92, 1.94, 490_068, Timeframe.SEC_10),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=60), 1.94, 1.96, 1.93, 1.96, 360_232, Timeframe.SEC_10),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=70), 1.96, 2.00, 1.94, 1.97, 755_893, Timeframe.SEC_10),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=80), 1.96, 2.06, 1.96, 2.03, 764_794, Timeframe.SEC_10),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=90), 2.04, 2.09, 2.03, 2.07, 628_559, Timeframe.SEC_10),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=100), 2.07, 2.10, 2.05, 2.07, 592_001, Timeframe.SEC_10),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=110), 2.03, 2.04, 1.94, 1.95, 491_906, Timeframe.SEC_10),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=120), 1.95, 1.95, 1.90, 1.90, 428_237, Timeframe.SEC_10),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=130), 1.90, 1.91, 1.83, 1.84, 445_711, Timeframe.SEC_10),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=140), 1.84, 1.88, 1.84, 1.87, 520_778, Timeframe.SEC_10),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=150), 1.87, 2.01, 1.86, 2.00, 563_528, Timeframe.SEC_10),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=160), 2.00, 2.05, 1.98, 2.00, 507_195, Timeframe.SEC_10),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=170), 1.97, 2.09, 1.97, 2.07, 560_761, Timeframe.SEC_10),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=180), 2.07, 2.19, 2.05, 2.17, 824_780, Timeframe.SEC_10),
+    ]
+
+    context = warrior_lanes.warrior_trend_playbook_context(
+        ten_sec[-1],
+        history=ten_sec,
+        window_high=2.19,
+    )
+
+    assert context is not None
+    assert context["entry_trigger"] == "warrior_low_price_proof_reclaim"
+    assert context["entry_price_override"] <= context["max_pay"]
+    assert context["size_factor"] == pytest.approx(0.12)
+
+
+def test_warrior_low_price_proof_reclaim_allows_vtak_sub_two_dollar_proof() -> None:
+    ten_sec = [
+        Bar("VTAK", _BASE_TS + timedelta(seconds=0), 1.10, 1.34, 1.07, 1.28, 620_000, Timeframe.SEC_10),
+        Bar("VTAK", _BASE_TS + timedelta(seconds=10), 1.28, 1.44, 1.17, 1.42, 729_165, Timeframe.SEC_10),
+        Bar("VTAK", _BASE_TS + timedelta(seconds=20), 1.42, 1.62, 1.37, 1.58, 815_248, Timeframe.SEC_10),
+        Bar("VTAK", _BASE_TS + timedelta(seconds=30), 1.58, 1.83, 1.55, 1.72, 1_020_000, Timeframe.SEC_10),
+        Bar("VTAK", _BASE_TS + timedelta(seconds=40), 1.72, 1.77, 1.63, 1.66, 380_000, Timeframe.SEC_10),
+        Bar("VTAK", _BASE_TS + timedelta(seconds=50), 1.66, 1.74, 1.61, 1.70, 340_000, Timeframe.SEC_10),
+        Bar("VTAK", _BASE_TS + timedelta(seconds=60), 1.70, 1.78, 1.66, 1.76, 360_000, Timeframe.SEC_10),
+        Bar("VTAK", _BASE_TS + timedelta(seconds=70), 1.76, 1.99, 1.74, 1.94, 1_027_863, Timeframe.SEC_10),
+    ]
+
+    context = warrior_lanes.warrior_trend_playbook_context(
+        ten_sec[-1],
+        history=ten_sec,
+        window_high=1.99,
+    )
+
+    assert context is not None
+    assert context["entry_trigger"] == "warrior_low_price_proof_reclaim"
+    assert context["psych_level"] >= 1.80
+    assert context["entry_price_override"] <= context["max_pay"]
+    assert context["size_factor"] == pytest.approx(0.12)
+
+
+def test_warrior_low_price_proof_reclaim_rejects_first_two_dollar_poke() -> None:
+    ten_sec = [
+        Bar("SBFM", _BASE_TS + timedelta(seconds=0), 1.73, 1.81, 1.72, 1.77, 746_811, Timeframe.SEC_10),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=10), 1.77, 1.83, 1.76, 1.80, 619_337, Timeframe.SEC_10),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=20), 1.7935, 1.83, 1.7935, 1.8103, 527_094, Timeframe.SEC_10),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=30), 1.82, 1.82, 1.80, 1.8085, 356_479, Timeframe.SEC_10),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=40), 1.80, 1.81, 1.79, 1.8098, 176_166, Timeframe.SEC_10),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=50), 1.8081, 1.81, 1.80, 1.805, 166_932, Timeframe.SEC_10),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=60), 1.8003, 1.81, 1.71, 1.71, 215_931, Timeframe.SEC_10),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=70), 1.73, 1.77, 1.71, 1.74, 459_645, Timeframe.SEC_10),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=80), 1.7387, 1.75, 1.71, 1.7402, 278_838, Timeframe.SEC_10),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=90), 1.74, 1.90, 1.73, 1.90, 481_651, Timeframe.SEC_10),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=100), 1.90, 2.00, 1.89, 1.9503, 799_268, Timeframe.SEC_10),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=110), 1.9503, 1.97, 1.90, 1.93, 692_732, Timeframe.SEC_10),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=120), 1.93, 1.96, 1.92, 1.9397, 490_068, Timeframe.SEC_10),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=130), 1.94, 1.96, 1.93, 1.9587, 360_232, Timeframe.SEC_10),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=140), 1.96, 2.00, 1.94, 1.97, 755_893, Timeframe.SEC_10),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=150), 1.98, 2.00, 1.97, 1.98, 481_881, Timeframe.SEC_10),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=160), 1.9785, 1.98, 1.96, 1.97, 289_822, Timeframe.SEC_10),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=170), 1.96, 2.06, 1.96, 2.03, 764_794, Timeframe.SEC_10),
+    ]
+
+    context = warrior_lanes.warrior_low_price_proof_reclaim_context(
+        ten_sec[-1],
+        history=ten_sec,
+        window_high=2.06,
+    )
+
+    assert context is None
+
+
+def test_warrior_low_price_proof_reclaim_rejects_govx_extension_without_base() -> None:
+    ten_sec = [
+        Bar("GOVX", _BASE_TS + timedelta(seconds=0), 1.88, 1.93, 1.84, 1.91, 71_877, Timeframe.SEC_10),
+        Bar("GOVX", _BASE_TS + timedelta(seconds=10), 1.91, 1.93, 1.87, 1.93, 76_477, Timeframe.SEC_10),
+        Bar("GOVX", _BASE_TS + timedelta(seconds=20), 1.99, 2.00, 1.90, 1.91, 113_715, Timeframe.SEC_10),
+        Bar("GOVX", _BASE_TS + timedelta(seconds=30), 1.91, 2.01, 1.90, 1.99, 95_192, Timeframe.SEC_10),
+        Bar("GOVX", _BASE_TS + timedelta(seconds=40), 2.00, 2.04, 1.99, 2.04, 96_392, Timeframe.SEC_10),
+        Bar("GOVX", _BASE_TS + timedelta(seconds=50), 2.03, 2.10, 2.01, 2.06, 93_423, Timeframe.SEC_10),
+        Bar("GOVX", _BASE_TS + timedelta(seconds=60), 2.06, 2.06, 1.98, 1.99, 105_112, Timeframe.SEC_10),
+        Bar("GOVX", _BASE_TS + timedelta(seconds=70), 1.95, 2.04, 1.94, 2.03, 52_033, Timeframe.SEC_10),
+        Bar("GOVX", _BASE_TS + timedelta(seconds=80), 2.04, 2.07, 2.02, 2.06, 63_594, Timeframe.SEC_10),
+        Bar("GOVX", _BASE_TS + timedelta(seconds=90), 2.05, 2.27, 2.04, 2.17, 135_168, Timeframe.SEC_10),
+        Bar("GOVX", _BASE_TS + timedelta(seconds=100), 2.17, 2.23, 2.15, 2.22, 119_778, Timeframe.SEC_10),
+        Bar("GOVX", _BASE_TS + timedelta(seconds=110), 2.22, 2.30, 2.20, 2.29, 111_444, Timeframe.SEC_10),
+    ]
+
+    context = warrior_lanes.warrior_low_price_proof_reclaim_context(
+        ten_sec[-1],
+        history=ten_sec,
+        window_high=2.30,
+    )
+
+    assert context is None
+
+
+def test_warrior_low_price_proof_reclaim_rejects_clwt_style_post_proof_dump() -> None:
+    ten_sec = [
+        Bar("CLWT", _BASE_TS + timedelta(seconds=0), 1.30, 1.42, 1.30, 1.38, 40_000, Timeframe.SEC_10),
+        Bar("CLWT", _BASE_TS + timedelta(seconds=10), 1.38, 1.46, 1.35, 1.44, 55_000, Timeframe.SEC_10),
+        Bar("CLWT", _BASE_TS + timedelta(seconds=20), 1.45, 1.60, 1.39, 1.55, 110_000, Timeframe.SEC_10),
+        Bar("CLWT", _BASE_TS + timedelta(seconds=30), 1.55, 1.82, 1.50, 1.77, 210_000, Timeframe.SEC_10),
+        Bar("CLWT", _BASE_TS + timedelta(seconds=40), 1.87, 2.1799, 1.845, 2.04, 535_094, Timeframe.SEC_10),
+        Bar("CLWT", _BASE_TS + timedelta(seconds=50), 2.04, 2.21, 1.9701, 2.20, 469_167, Timeframe.SEC_10),
+        Bar("CLWT", _BASE_TS + timedelta(seconds=60), 2.21, 2.25, 2.03, 2.08, 421_267, Timeframe.SEC_10),
+        Bar("CLWT", _BASE_TS + timedelta(seconds=70), 2.08, 2.10, 1.95, 2.02, 240_000, Timeframe.SEC_10),
+        Bar("CLWT", _BASE_TS + timedelta(seconds=80), 2.10, 2.11, 1.82, 1.8302, 474_148, Timeframe.SEC_10),
+        Bar("CLWT", _BASE_TS + timedelta(seconds=90), 1.835, 1.92, 1.65, 1.6897, 432_333, Timeframe.SEC_10),
+        Bar("CLWT", _BASE_TS + timedelta(seconds=100), 1.70, 1.84, 1.68, 1.79, 180_000, Timeframe.SEC_10),
+        Bar("CLWT", _BASE_TS + timedelta(seconds=110), 1.80, 1.98, 1.76, 1.93, 220_000, Timeframe.SEC_10),
+        Bar("CLWT", _BASE_TS + timedelta(seconds=120), 1.98, 2.25, 1.98, 2.23, 428_655, Timeframe.SEC_10),
+        Bar("CLWT", _BASE_TS + timedelta(seconds=130), 2.23, 2.44, 2.15, 2.3398, 707_284, Timeframe.SEC_10),
+    ]
+
+    context = warrior_lanes.warrior_low_price_proof_reclaim_context(
+        ten_sec[-1],
+        history=ten_sec,
+        window_high=2.44,
     )
 
     assert context is None
@@ -1887,6 +2347,82 @@ def test_backtest_timed_release_rejects_late_vwap_pullback_from_base() -> None:
     )
 
     assert reason == "late VWAP pullback release: $4.1800 too extended from base $4.0500 (max 2.5%)"
+
+
+def test_backtest_timed_hod_reclaim_rejects_low_price_weak_close() -> None:
+    ts = _BASE_TS
+    bars = [
+        Bar("GOVX", ts, 2.18, 2.22, 2.16, 2.21, 106_474, Timeframe.SEC_10),
+        Bar("GOVX", ts + timedelta(seconds=10), 2.2199, 2.34, 2.21, 2.30, 141_722, Timeframe.SEC_10),
+        Bar("GOVX", ts + timedelta(seconds=20), 2.31, 2.37, 2.30, 2.3087, 163_841, Timeframe.SEC_10),
+        Bar("GOVX", ts + timedelta(seconds=30), 2.31, 2.34, 2.28, 2.32, 93_468, Timeframe.SEC_10),
+    ]
+    driver = PipelineBacktestDriver(
+        {"GOVX": []},
+        use_execution_timer=True,
+        timer_bars_by_symbol={"GOVX": bars},
+    )
+    signal = TradeSignal(
+        symbol="GOVX",
+        action=SignalAction.ENTER_LONG,
+        quantity=100,
+        entry_price=2.306,
+        stop_loss=2.16,
+        reason="HOD Reclaim",
+        scan_result=ScanResult(
+            symbol="GOVX",
+            scanner_name="hod_reclaim",
+            ts=bars[-1].ts,
+            score=90.0,
+            criteria={
+                "pattern": "hod_reclaim",
+                "close": 2.306,
+                "hod": 2.306,
+                "volume": 93_468,
+            },
+        ),
+    )
+
+    reason = driver._timed_hod_reclaim_10s_reject(signal, bars[-1])
+
+    assert reason is not None
+    assert "low-price HOD reclaim 10s close too weak" in reason
+
+
+def test_backtest_timed_hod_reclaim_allows_low_price_strong_close() -> None:
+    ts = _BASE_TS
+    bars = [
+        Bar("HOD", ts, 1.95, 2.00, 1.93, 1.98, 70_000, Timeframe.SEC_10),
+        Bar("HOD", ts + timedelta(seconds=10), 1.98, 2.04, 1.97, 2.03, 80_000, Timeframe.SEC_10),
+        Bar("HOD", ts + timedelta(seconds=20), 2.03, 2.12, 2.02, 2.11, 95_000, Timeframe.SEC_10),
+    ]
+    driver = PipelineBacktestDriver(
+        {"HOD": []},
+        use_execution_timer=True,
+        timer_bars_by_symbol={"HOD": bars},
+    )
+    signal = TradeSignal(
+        symbol="HOD",
+        action=SignalAction.ENTER_LONG,
+        quantity=100,
+        entry_price=2.10,
+        stop_loss=1.95,
+        reason="HOD Reclaim",
+        scan_result=ScanResult(
+            symbol="HOD",
+            scanner_name="hod_reclaim",
+            ts=bars[-1].ts,
+            score=90.0,
+            criteria={
+                "pattern": "hod_reclaim",
+                "close": 2.10,
+                "hod": 2.10,
+                "volume": 95_000,
+            },
+        ),
+    )
+
+    assert driver._timed_hod_reclaim_10s_reject(signal, bars[-1]) is None
 
 
 def test_warrior_reject_history_blocks_weak_normal_fallback() -> None:
@@ -1988,6 +2524,27 @@ def test_backtest_remembers_recent_normal_bad_tape_for_warrior_wait() -> None:
     assert reason is not None
     assert "selling pressure" in reason
     assert driver._warrior_recent_bad_tape_reject("EHGO", _BASE_TS + timedelta(seconds=90)) is None
+
+
+def test_backtest_remembers_recent_quick_scalp_active_rvol_for_warrior_wait() -> None:
+    driver = PipelineBacktestDriver(
+        {"HSCS": []},
+        use_warrior_squeeze_playbook=True,
+    )
+    result = PipelineBacktestResult()
+    driver._append_rejection(result, {
+        "ts": _BASE_TS.isoformat(),
+        "symbol": "HSCS",
+        "blocked_layer": "breakout_scalp_alert",
+        "reason": "HOD alert active RVOL too weak 0.31x (need 1.0x+)",
+    })
+
+    reason = driver._warrior_recent_bad_tape_reject("HSCS", _BASE_TS + timedelta(seconds=30))
+
+    assert reason is not None
+    assert "recent breakout scalp reject" in reason
+    assert "active RVOL too weak" in reason
+    assert driver._warrior_recent_bad_tape_reject("HSCS", _BASE_TS + timedelta(seconds=121)) is None
 
 
 def test_backtest_does_not_treat_unreclaimed_level_watch_as_bad_tape() -> None:
@@ -2196,6 +2753,145 @@ def test_warrior_smooth_10s_pullback_continuation_rejects_first_spike() -> None:
     assert context is None
 
 
+def test_warrior_parabolic_micro_pullback_reclaim_allows_plsm_style_reclaim() -> None:
+    ten_sec = [
+        Bar("PLSM", _BASE_TS + timedelta(seconds=0), 3.82, 3.98, 3.75, 3.92, 18_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=10), 3.93, 4.08, 3.86, 4.00, 20_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=20), 4.02, 4.20, 3.98, 4.15, 24_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=30), 4.16, 5.20, 4.12, 5.05, 55_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=40), 5.08, 6.70, 5.02, 6.58, 92_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=50), 6.60, 8.40, 6.52, 8.12, 118_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=60), 8.20, 10.60, 8.05, 10.15, 132_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=70), 10.20, 12.35, 10.00, 12.00, 146_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=80), 12.05, 15.20, 11.90, 14.80, 190_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=90), 14.85, 19.50, 14.70, 18.90, 260_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=100), 18.85, 19.20, 16.80, 17.20, 210_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=110), 17.15, 17.55, 15.80, 16.10, 160_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=120), 16.08, 16.65, 15.40, 15.95, 130_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=130), 15.98, 16.45, 15.55, 16.20, 98_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=140), 16.18, 16.55, 15.92, 16.35, 92_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=150), 16.34, 16.60, 15.98, 16.18, 86_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=160), 16.15, 16.70, 16.02, 16.52, 112_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=170), 16.50, 17.05, 16.30, 16.92, 155_000, Timeframe.SEC_10),
+    ]
+
+    context = warrior_lanes.warrior_trend_playbook_context(
+        ten_sec[-1],
+        history=ten_sec,
+        window_high=19.50,
+    )
+
+    assert context is not None
+    assert context["entry_trigger"] == "warrior_parabolic_micro_pullback_reclaim"
+    assert context["variant_override"] == "warrior_parabolic_micro_pullback_reclaim"
+    assert context["size_factor"] == pytest.approx(0.25)
+    assert context["entry_price_override"] <= context["max_pay"]
+    assert context["stop_price_override"] < context["entry_price_override"]
+    assert context["target_price_override"] > context["entry_price_override"]
+    assert 4.5 <= context["pullback_pct"] <= 30.0
+
+    lane = warrior_lanes.classify_warrior_trend_lane(
+        ten_sec[-1],
+        history=ten_sec,
+        window_high=19.50,
+    )
+    assert lane == "warrior_parabolic_micro_pullback_reclaim"
+
+
+def test_warrior_parabolic_micro_pullback_reclaim_rejects_immediate_top_tick() -> None:
+    ten_sec = [
+        Bar("PLSM", _BASE_TS + timedelta(seconds=0), 4.00, 4.25, 3.95, 4.20, 20_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=10), 4.25, 5.10, 4.20, 5.00, 60_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=20), 5.05, 6.80, 5.00, 6.55, 100_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=30), 6.60, 9.25, 6.55, 9.05, 140_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=40), 9.10, 12.80, 9.05, 12.40, 190_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=50), 12.50, 17.80, 12.40, 17.20, 250_000, Timeframe.SEC_10),
+    ]
+
+    context = warrior_lanes.warrior_parabolic_micro_pullback_reclaim_context(
+        ten_sec[-1],
+        history=ten_sec,
+        window_high=17.80,
+    )
+
+    assert context is None
+
+
+def test_warrior_parabolic_micro_pullback_reclaim_rejects_weak_reclaim_volume() -> None:
+    ten_sec = [
+        Bar("PLSM", _BASE_TS + timedelta(seconds=0), 3.82, 3.98, 3.75, 3.92, 18_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=10), 3.93, 4.08, 3.86, 4.00, 20_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=20), 4.02, 4.20, 3.98, 4.15, 24_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=30), 4.16, 5.20, 4.12, 5.05, 55_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=40), 5.08, 6.70, 5.02, 6.58, 92_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=50), 6.60, 8.40, 6.52, 8.12, 118_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=60), 8.20, 10.60, 8.05, 10.15, 132_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=70), 10.20, 12.35, 10.00, 12.00, 146_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=80), 12.05, 15.20, 11.90, 14.80, 190_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=90), 14.85, 19.50, 14.70, 18.90, 260_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=100), 18.85, 19.20, 16.80, 17.20, 210_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=110), 17.15, 17.55, 15.80, 16.10, 160_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=120), 16.08, 16.65, 15.40, 15.95, 130_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=130), 15.98, 16.45, 15.55, 16.20, 98_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=140), 16.18, 16.55, 15.92, 16.35, 92_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=150), 16.34, 16.60, 15.98, 16.18, 86_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=160), 16.15, 16.70, 16.02, 16.52, 112_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=170), 16.50, 17.05, 16.30, 16.92, 70_000, Timeframe.SEC_10),
+    ]
+
+    context = warrior_lanes.warrior_parabolic_micro_pullback_reclaim_context(
+        ten_sec[-1],
+        history=ten_sec,
+        window_high=19.50,
+    )
+
+    assert context is None
+
+
+def test_warrior_early_10s_pullback_reclaim_allows_frtt_style_pause_reclaim() -> None:
+    ten_sec = [
+        Bar("FRTT", _BASE_TS + timedelta(seconds=0), 1.90, 1.90, 1.89, 1.89, 250, Timeframe.SEC_10),
+        Bar("FRTT", _BASE_TS + timedelta(seconds=10), 1.91, 1.94, 1.90, 1.92, 900, Timeframe.SEC_10),
+        Bar("FRTT", _BASE_TS + timedelta(seconds=20), 2.15, 2.24, 2.15, 2.24, 707, Timeframe.SEC_10),
+        Bar("FRTT", _BASE_TS + timedelta(seconds=30), 2.17, 2.45, 2.17, 2.4488, 12_494, Timeframe.SEC_10),
+        Bar("FRTT", _BASE_TS + timedelta(seconds=40), 2.44, 2.69, 2.44, 2.52, 45_037, Timeframe.SEC_10),
+        Bar("FRTT", _BASE_TS + timedelta(seconds=50), 2.51, 3.07, 2.32, 3.05, 38_774, Timeframe.SEC_10),
+    ]
+
+    context = warrior_lanes.warrior_trend_playbook_context(
+        ten_sec[-1],
+        history=ten_sec,
+        window_high=3.07,
+    )
+
+    assert context is not None
+    assert context["entry_trigger"] == "warrior_early_10s_pullback_reclaim"
+    assert context["variant_override"] == "warrior_early_10s_pullback_reclaim"
+    assert context["entry_price_override"] == pytest.approx(2.7976)
+    assert context["stop_price_override"] < context["entry_price_override"]
+    assert context["target_price_override"] > context["entry_price_override"]
+    assert context["size_factor"] == pytest.approx(0.18)
+
+
+def test_warrior_early_10s_pullback_reclaim_rejects_no_pause_spike() -> None:
+    ten_sec = [
+        Bar("FRTT", _BASE_TS + timedelta(seconds=0), 1.90, 1.90, 1.89, 1.89, 250, Timeframe.SEC_10),
+        Bar("FRTT", _BASE_TS + timedelta(seconds=10), 1.91, 1.94, 1.90, 1.92, 900, Timeframe.SEC_10),
+        Bar("FRTT", _BASE_TS + timedelta(seconds=20), 2.15, 2.24, 2.15, 2.24, 707, Timeframe.SEC_10),
+        Bar("FRTT", _BASE_TS + timedelta(seconds=30), 2.17, 2.45, 2.17, 2.4488, 12_494, Timeframe.SEC_10),
+        Bar("FRTT", _BASE_TS + timedelta(seconds=40), 2.44, 2.69, 2.44, 2.68, 45_037, Timeframe.SEC_10),
+        Bar("FRTT", _BASE_TS + timedelta(seconds=50), 2.69, 3.07, 2.68, 3.05, 38_774, Timeframe.SEC_10),
+    ]
+
+    context = warrior_lanes.warrior_early_10s_pullback_reclaim_context(
+        ten_sec[-1],
+        history=ten_sec,
+        window_high=3.07,
+    )
+
+    assert context is None
+
+
 def test_warrior_failed_spike_vwap_reclaim_allows_nxts_style_reclaim() -> None:
     ten_sec = [
         Bar("NXTS", _BASE_TS + timedelta(seconds=0), 4.80, 5.10, 4.70, 5.00, 30_000, Timeframe.SEC_10),
@@ -2230,6 +2926,67 @@ def test_warrior_failed_spike_vwap_reclaim_allows_nxts_style_reclaim() -> None:
     assert context["entry_price_override"] <= context["max_pay"]
     assert context["stop_price_override"] < context["entry_price_override"]
     assert context["target_price_override"] > context["entry_price_override"]
+
+
+def test_warrior_failed_spike_reclaim_scalp_allows_oris_style_fast_reclaim() -> None:
+    ten_sec = [
+        Bar("ORIS", _BASE_TS + timedelta(seconds=0), 2.96, 2.99, 2.96, 2.99, 862, Timeframe.SEC_10),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=10), 2.99, 3.00, 2.96, 2.99, 613, Timeframe.SEC_10),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=20), 2.99, 3.12, 2.98, 3.12, 2_060, Timeframe.SEC_10),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=30), 3.10, 3.30, 3.10, 3.30, 5_034, Timeframe.SEC_10),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=40), 3.30, 3.60, 3.14, 3.59, 20_004, Timeframe.SEC_10),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=50), 3.58, 4.41, 3.52, 4.1945, 55_619, Timeframe.SEC_10),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=60), 4.12, 4.30, 3.40, 3.50, 62_793, Timeframe.SEC_10),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=70), 3.37, 3.50, 2.99, 3.34, 32_498, Timeframe.SEC_10),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=80), 3.44, 3.84, 3.30, 3.61, 20_697, Timeframe.SEC_10),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=90), 3.7079, 4.00, 3.50, 3.7644, 20_174, Timeframe.SEC_10),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=100), 3.71, 3.895, 3.50, 3.79, 18_617, Timeframe.SEC_10),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=110), 3.7932, 3.92, 3.50, 3.80, 28_246, Timeframe.SEC_10),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=120), 3.90, 4.36, 3.82, 4.32, 51_527, Timeframe.SEC_10),
+    ]
+
+    context = warrior_lanes.warrior_trend_playbook_context(
+        ten_sec[-1],
+        history=ten_sec,
+        window_high=4.41,
+    )
+
+    assert context is not None
+    assert context["entry_trigger"] == "warrior_failed_spike_reclaim_scalp"
+    assert context["variant_override"] == "warrior_failed_spike_reclaim_scalp"
+    assert context["size_factor"] == pytest.approx(0.12)
+    assert context["dump_high"] == pytest.approx(4.30)
+    assert context["entry_price_override"] == pytest.approx(4.32)
+    assert context["stop_price_override"] < context["entry_price_override"]
+    assert context["target_price_override"] > context["entry_price_override"]
+
+
+def test_warrior_failed_spike_reclaim_scalp_rejects_late_dump_candle() -> None:
+    ten_sec = [
+        Bar("ORIS", _BASE_TS + timedelta(seconds=0), 2.99, 3.12, 2.98, 3.12, 2_060, Timeframe.SEC_10),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=10), 3.10, 3.30, 3.10, 3.30, 5_034, Timeframe.SEC_10),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=20), 3.30, 3.60, 3.14, 3.59, 20_004, Timeframe.SEC_10),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=30), 3.58, 4.41, 3.52, 4.1945, 55_619, Timeframe.SEC_10),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=40), 4.12, 4.30, 3.40, 3.50, 62_793, Timeframe.SEC_10),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=50), 3.37, 3.50, 2.99, 3.34, 32_498, Timeframe.SEC_10),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=60), 3.44, 3.84, 3.30, 3.61, 20_697, Timeframe.SEC_10),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=70), 3.7079, 4.00, 3.50, 3.7644, 20_174, Timeframe.SEC_10),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=80), 3.71, 3.895, 3.50, 3.79, 18_617, Timeframe.SEC_10),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=90), 3.7932, 3.92, 3.50, 3.80, 28_246, Timeframe.SEC_10),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=100), 3.90, 4.36, 3.82, 4.32, 51_527, Timeframe.SEC_10),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=110), 4.32, 4.7697, 4.00, 4.46, 62_416, Timeframe.SEC_10),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=120), 4.45, 4.76, 4.00, 4.56, 50_370, Timeframe.SEC_10),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=130), 4.56, 5.20, 4.43, 4.73, 63_122, Timeframe.SEC_10),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=140), 5.239, 5.24, 4.60, 4.79, 72_204, Timeframe.SEC_10),
+    ]
+
+    context = warrior_lanes.warrior_failed_spike_reclaim_scalp_context(
+        ten_sec[-1],
+        history=ten_sec,
+        window_high=5.20,
+    )
+
+    assert context is None
 
 
 def test_warrior_failed_spike_vwap_reclaim_rejects_wide_unstable_reclaim() -> None:
@@ -2600,6 +3357,49 @@ def test_warrior_violent_liquid_allows_after_target_win() -> None:
     )
 
     assert reason is None
+
+
+def test_warrior_halt_resume_continuation_allows_cupr_style_resume() -> None:
+    ten_sec = [
+        Bar("CUPR", _BASE_TS + timedelta(seconds=0), 10.92, 10.92, 9.93, 10.92, 145_838, Timeframe.SEC_10),
+        Bar("CUPR", _BASE_TS + timedelta(seconds=10), 11.20, 12.21, 11.03, 12.04, 321_258, Timeframe.SEC_10),
+        Bar("CUPR", _BASE_TS + timedelta(seconds=20), 12.21, 12.63, 11.99, 12.63, 173_161, Timeframe.SEC_10),
+        Bar("CUPR", _BASE_TS + timedelta(seconds=320), 12.72, 13.23, 11.45, 11.45, 325_788, Timeframe.SEC_10),
+        Bar("CUPR", _BASE_TS + timedelta(seconds=330), 11.45, 13.20, 11.45, 13.09, 253_233, Timeframe.SEC_10),
+        Bar("CUPR", _BASE_TS + timedelta(seconds=340), 13.11, 13.82, 12.75, 13.67, 245_633, Timeframe.SEC_10),
+    ]
+
+    context = warrior_lanes.warrior_halt_resume_continuation_context(
+        ten_sec[-1],
+        history=ten_sec,
+        failed_high=13.23,
+        window_high=13.23,
+    )
+
+    assert context is not None
+    assert context["entry_trigger"] == "warrior_halt_resume_continuation"
+    assert context["entry_price_override"] == pytest.approx(13.67)
+    assert context["stop_price_override"] < context["entry_price_override"]
+    assert context["target_price_override"] > context["entry_price_override"]
+    assert context["size_factor"] == pytest.approx(0.20)
+
+
+def test_warrior_halt_resume_continuation_rejects_single_resume_spike() -> None:
+    ten_sec = [
+        Bar("CUPR", _BASE_TS + timedelta(seconds=0), 10.92, 10.92, 9.93, 10.92, 145_838, Timeframe.SEC_10),
+        Bar("CUPR", _BASE_TS + timedelta(seconds=10), 12.21, 12.63, 11.99, 12.63, 173_161, Timeframe.SEC_10),
+        Bar("CUPR", _BASE_TS + timedelta(seconds=320), 12.72, 13.23, 11.45, 11.45, 325_788, Timeframe.SEC_10),
+        Bar("CUPR", _BASE_TS + timedelta(seconds=330), 11.45, 13.20, 11.45, 13.09, 253_233, Timeframe.SEC_10),
+    ]
+
+    context = warrior_lanes.warrior_halt_resume_continuation_context(
+        ten_sec[-1],
+        history=ten_sec,
+        failed_high=13.23,
+        window_high=13.23,
+    )
+
+    assert context is None
 
 
 def test_warrior_trend_pullback_reclaim_rejects_dump_base() -> None:

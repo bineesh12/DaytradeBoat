@@ -135,6 +135,33 @@ def test_hot_watch_updates_snapshot() -> None:
     ]
 
 
+def test_warrior_watch_updates_snapshot_and_broadcasts() -> None:
+    hub = DashboardHub()
+    q = hub.subscribe()
+
+    hub.on_warrior_watch([
+        {
+            "symbol": "VTAK",
+            "state": "watching",
+            "pending_trigger": "warrior_first_pullback_reclaim",
+            "window_high": 2.4,
+            "reason": "waiting for 10s pullback",
+        }
+    ])
+
+    snap = hub.snapshot()
+    assert snap["warrior_watch"] == [
+        {
+            "symbol": "VTAK",
+            "state": "watching",
+            "pending_trigger": "warrior_first_pullback_reclaim",
+            "window_high": 2.4,
+            "reason": "waiting for 10s pullback",
+        }
+    ]
+    assert any(e["type"] == "warrior_watch" for e in q)
+
+
 def test_hot_watch_broadcast_refreshes_visible_trading_watchlist() -> None:
     hub = DashboardHub()
     q = hub.subscribe()
@@ -184,6 +211,19 @@ def test_dashboard_hot_watch_shows_session_and_current_move_separately() -> None
     assert "function hotWatchNowText" in html
     assert "from high" in html
     assert "short-term" in html
+
+
+def test_dashboard_renders_warrior_watch_panel() -> None:
+    hub = DashboardHub()
+    app = create_app(hub)
+
+    resp = app.test_client().get("/")
+
+    assert resp.status_code == 200
+    html = resp.get_data(as_text=True)
+    assert "Warrior Watch" in html
+    assert "function renderWarriorWatch" in html
+    assert "case 'warrior_watch'" in html
 
 
 def test_candidate_hydration_stats_snapshot_and_broadcast() -> None:

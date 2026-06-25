@@ -167,6 +167,58 @@ class AlpacaBroker:
 
         return self._wait_for_fill(alpaca_order.id, order)
 
+    def submit_urgent_exit(
+        self,
+        order: Order,
+        bar: Bar,
+        portfolio: PortfolioState,
+        *,
+        slippage_pct: float = 0.05,
+    ) -> Tuple[Optional[Fill], OrderStatus]:
+        """Submit a protective exit without using potentially stale smart quotes.
+
+        Extended-hours exits must use limit orders. For stop/trail/tape exits,
+        getting flat is more important than preserving a tight displayed quote,
+        so this uses the latest execution bar price with a wider marketable
+        limit instead of the slippage guard's cached bid/ask.
+        """
+        if order.quantity <= 0:
+            return None, OrderStatus.REJECTED
+
+        self._cancel_open_orders_for(order.symbol)
+        base = float(bar.close or order.limit_price or 0.0)
+        if base <= 0:
+            logger.error("URGENT EXIT REJECTED %s: no executable price", order.symbol)
+            return None, OrderStatus.REJECTED
+
+        pct = max(0.0, min(float(slippage_pct or 0.05), 0.20))
+        alpaca_side = OrderSide.BUY if order.side is Side.BUY else OrderSide.SELL
+        if order.side is Side.SELL:
+            adj_price = round(base * (1.0 - pct), 2)
+        else:
+            adj_price = round(base * (1.0 + pct), 2)
+
+        try:
+            request = LimitOrderRequest(
+                symbol=order.symbol,
+                qty=int(order.quantity),
+                side=alpaca_side,
+                time_in_force=TimeInForce.DAY,
+                limit_price=adj_price,
+                extended_hours=True,
+            )
+            alpaca_order = self._client.submit_order(order_data=request)
+            logger.warning(
+                "URGENT EXIT SUBMITTED %s %s %d limit=%.2f (base %.2f, %.1f%% window) → id=%s",
+                order.side.value, order.symbol, int(order.quantity),
+                adj_price, base, pct * 100.0, alpaca_order.id,
+            )
+        except Exception as exc:
+            logger.error("URGENT EXIT REJECTED by Alpaca: %s", exc)
+            return None, OrderStatus.REJECTED
+
+        return self._wait_for_fill(alpaca_order.id, order)
+
     def _buy_slippage_window_pct(self, bar: Bar) -> float:
         """Return the maximum buy chase window for the current execution bar.
 

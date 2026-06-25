@@ -54,6 +54,15 @@ HIT_RUN_STRATEGIES = frozenset({
     "warrior_squeeze_playbook",
 })
 
+WARRIOR_PLANNED_FIRST_TARGET_TRIGGERS = frozenset({
+    "warrior_stair_step_runner",
+    "warrior_halt_resume_continuation",
+})
+
+WARRIOR_FULL_FIRST_TARGET_TRIGGERS = frozenset({
+    "warrior_halt_resume_continuation",
+})
+
 
 def is_hit_run_strategy(label: Optional[str]) -> bool:
     """True if a strategy/reason label belongs to the hit-run lifecycle."""
@@ -113,6 +122,7 @@ class TrackedPosition:
     reason: str = ""
     entry_strategy: str = ""
     entry_pattern: str = ""
+    entry_trigger: str = ""
     entry_score: float = 0.0
 
     tiers: List[ExitTier] = field(default_factory=list)
@@ -139,6 +149,7 @@ class TrackedPosition:
     consecutive_red: int = 0              # count of consecutive red candles
     prev_bar_open: float = 0.0           # previous bar open for red candle check
     last_bar_open: float = 0.0           # most recent completed bar open
+    last_bar_has_real_open: bool = False  # true only when feed supplied bar open
     last_bar_high: float = 0.0           # most recent completed bar high
     last_bar_low: float = 0.0            # most recent completed bar low
     _first_pullback_done: bool = False   # True after first red candle (grace period)
@@ -347,12 +358,14 @@ class ExitManager:
         """Called when a new 1-min bar closes. Updates red candle + volume tracking."""
         pos = self._positions.get(symbol)
         if pos is not None:
-            if pos.last_bar_close > 0 and close_price < pos.last_bar_close:
+            previous_close = pos.last_bar_close
+            if previous_close > 0 and close_price < previous_close:
                 pos.consecutive_red += 1
             else:
                 pos.consecutive_red = 0
-            pos.prev_bar_open = open_price if open_price > 0 else pos.last_bar_close
-            pos.last_bar_open = open_price if open_price > 0 else pos.last_bar_close
+            pos.prev_bar_open = pos.last_bar_open
+            pos.last_bar_open = open_price if open_price > 0 else 0.0
+            pos.last_bar_has_real_open = open_price > 0
             pos.last_bar_high = high_price
             pos.last_bar_low = low_price
             pos.prev_bar_volume = pos.last_bar_volume
@@ -367,7 +380,7 @@ class ExitManager:
                     pos.record_bar_range(abs(close_price - open_price) / close_price)
 
             # Track green bars with declining volume (exhaustion detection)
-            is_green = close_price > open_price if open_price > 0 else close_price > pos.prev_bar_open
+            is_green = close_price > open_price if open_price > 0 else close_price > previous_close
             if is_green and pos.prev_bar_volume > 0 and volume < pos.prev_bar_volume:
                 pos.consecutive_green_declining_vol += 1
             else:
@@ -454,11 +467,22 @@ class ExitManager:
         entry_score = 0.0
         if scan is not None:
             entry_pattern = str(scan.criteria.get("pattern") or scan.scanner_name or "")
+            entry_trigger = str(scan.criteria.get("entry_trigger") or "")
             try:
                 entry_score = float(scan.score)
             except (TypeError, ValueError):
                 entry_score = 0.0
+        else:
+            entry_trigger = ""
         runner_candidate = self._is_runner_candidate_signal(signal, entry_strategy, entry_pattern, entry_score)
+        planned_first_target = 0.0
+        if (
+            side is Side.BUY
+            and signal.take_profit
+            and signal.take_profit > actual_price
+            and self._uses_signal_planned_first_target(signal)
+        ):
+            planned_first_target = float(signal.take_profit)
 
         self.track(TrackedPosition(
             symbol=signal.symbol,
@@ -472,9 +496,11 @@ class ExitManager:
             reason=signal.reason,
             entry_strategy=entry_strategy,
             entry_pattern=entry_pattern,
+            entry_trigger=entry_trigger,
             entry_score=entry_score,
             trend_strength=signal.trend_strength,
             runner_candidate=runner_candidate,
+            first_target_price=planned_first_target,
         ))
 
     def check_exits(
@@ -605,6 +631,58 @@ class ExitManager:
             sig = self._make_exit(pos, pos.remaining_qty, price, ExitReason.STOP_LOSS)
             pos.remaining_qty = 0
             return [sig]
+
+        # --- failed follow-through exit for fast Warrior scalps.
+        # If a Warrior entry pushes meaningfully toward target but then prints a
+        # high-volume red 10s candle closing near its low, the breakout attempt
+        # has failed. Exit at the bar close instead of waiting for the full
+        # tactical stop. This catches PLSM-style failed reclaims without
+        # affecting normal pipeline entries.
+        if (
+            is_long
+            and pos.remaining_qty > 0
+            and not pos.sold_half
+            and "warrior_squeeze_playbook" in self._position_text(pos)
+            and pos.entry_price > 0
+            and pos.risk_per_share > 0
+            and pos.last_bar_has_real_open
+            and pos.last_bar_open > 0
+            and pos.last_bar_high > pos.last_bar_low > 0
+            and pos.last_bar_close < pos.last_bar_open
+        ):
+            hold_secs = (now - pos.entry_ts).total_seconds() if pos.entry_ts else 0.0
+            bar_range = pos.last_bar_high - pos.last_bar_low
+            close_location = (pos.last_bar_close - pos.last_bar_low) / bar_range
+            body_pct = (pos.last_bar_open - pos.last_bar_close) / pos.last_bar_close
+            range_pct = bar_range / pos.last_bar_close
+            progress_r = (pos.highest_price - pos.entry_price) / pos.risk_per_share
+            volume_floor = max(75_000.0, pos.avg_bar_volume * 0.90)
+            if (
+                0 <= hold_secs <= 90
+                and progress_r >= 0.45
+                and close_location <= 0.25
+                and body_pct >= 0.012
+                and range_pct >= 0.035
+                and pos.last_bar_volume > 0
+                and pos.last_bar_volume >= volume_floor
+            ):
+                logger.info(
+                    "FAILED FOLLOW-THROUGH EXIT %s @ %.4f | red close near low "
+                    "(progress=%.2fR, bar %.4f→%.4f, range %.4f–%.4f, "
+                    "vol=%d, avg_vol=%.0f)",
+                    pos.symbol,
+                    price,
+                    progress_r,
+                    pos.last_bar_open,
+                    pos.last_bar_close,
+                    pos.last_bar_low,
+                    pos.last_bar_high,
+                    pos.last_bar_volume,
+                    pos.avg_bar_volume,
+                )
+                sig = self._make_exit(pos, pos.remaining_qty, price, ExitReason.STOP_LOSS)
+                pos.remaining_qty = 0
+                return [sig]
 
         # --- hard stop loss: exit all shares ---
         if pos.stop_loss is not None:
@@ -924,6 +1002,25 @@ class ExitManager:
         )
 
     @staticmethod
+    def _uses_signal_planned_first_target(signal: TradeSignal) -> bool:
+        scan = signal.scan_result
+        criteria = scan.criteria if scan is not None and isinstance(scan.criteria, dict) else {}
+        entry_trigger = str(criteria.get("entry_trigger") or "").lower()
+        if entry_trigger in WARRIOR_PLANNED_FIRST_TARGET_TRIGGERS:
+            return True
+        text = " ".join(
+            str(part or "").lower()
+            for part in (
+                signal.reason,
+                scan.scanner_name if scan is not None else "",
+                criteria.get("pattern") or "",
+                criteria.get("entry_mode") or "",
+                entry_trigger,
+            )
+        )
+        return any(trigger in text for trigger in WARRIOR_PLANNED_FIRST_TARGET_TRIGGERS)
+
+    @staticmethod
     def _uses_quick_scalp_partial(pos: TrackedPosition) -> bool:
         if ExitManager._uses_full_first_target(pos):
             return False
@@ -961,19 +1058,25 @@ class ExitManager:
                 pos.reason,
                 pos.entry_strategy,
                 pos.entry_pattern,
+                pos.entry_trigger,
             )
         )
 
     @staticmethod
     def _uses_full_first_target(pos: TrackedPosition) -> bool:
+        if str(pos.entry_trigger or "").lower() in WARRIOR_FULL_FIRST_TARGET_TRIGGERS:
+            return True
         text = " ".join(
             str(part or "").lower()
             for part in (
                 pos.reason,
                 pos.entry_strategy,
                 pos.entry_pattern,
+                pos.entry_trigger,
             )
         )
+        if any(trigger in text for trigger in WARRIOR_FULL_FIRST_TARGET_TRIGGERS):
+            return True
         if "warrior_squeeze_playbook" in text:
             return False
         return is_hit_run_strategy(text)

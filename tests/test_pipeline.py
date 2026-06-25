@@ -731,6 +731,45 @@ def test_warrior_guard_exception_includes_second_leg_and_prior_runner_continuati
         assert allowed is True
 
 
+def test_warrior_second_leg_vwap_guard_exception_uses_lane_volume_floor() -> None:
+    bars = [
+        _bar("HOT", 3.19, volume=67_000, open_=3.04, high=3.21, low=3.03),
+        _bar("HOT", 3.26, volume=63_000, open_=3.19, high=3.27, low=3.14),
+        _bar("HOT", 3.35, volume=88_000, open_=3.22, high=3.37, low=3.21),
+    ]
+    hit = ScanResult(
+        symbol="HOT",
+        scanner_name="warrior_squeeze_playbook",
+        ts=TS,
+        score=100.0,
+        criteria={
+            "pattern": "warrior_squeeze_playbook",
+            "entry_mode": "warrior_squeeze_playbook",
+            "entry_trigger": "warrior_second_leg_vwap_reclaim",
+            "setup_tier": "A+ setup",
+            "size_factor": 0.25,
+            "psych_level": 3.32,
+        },
+        bars=bars,
+    )
+    signal = TradeSignal(
+        symbol="HOT",
+        action=SignalAction.ENTER_LONG,
+        quantity=10,
+        entry_price=3.35,
+        stop_loss=3.15,
+        take_profit=3.63,
+        reason="warrior_second_leg_vwap_reclaim",
+        scan_result=hit,
+    )
+
+    assert TradingPipeline._allow_warrior_starter_guard_exception(
+        signal,
+        bars=bars,
+        reason="entry score too low (75/100, need 80+)",
+    )
+
+
 def test_warrior_high_base_guard_exception_allows_70_score_only_for_high_base() -> None:
     bars = [
         _bar("HOT", 9.10, volume=120_000, open_=8.85, high=9.20, low=8.70),

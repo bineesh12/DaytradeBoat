@@ -9,6 +9,7 @@ import pytest
 
 from daytrading.models import Bar, Fill, OrderStatus, PortfolioState, Position, Quote, ScanResult, Side, Tick, Timeframe
 from daytrading.runner import AlpacaRunner
+from daytrading.strategy.warrior_engine import WarriorEngine
 
 
 TS = datetime(2026, 5, 29, 13, 30, tzinfo=timezone.utc)
@@ -22,6 +23,8 @@ class _QuickScalpRunner:
         AlpacaRunner._quick_scalp_can_ignore_recent_shape_reject
     )
     _quick_scalp_hod_alert_reject = AlpacaRunner._quick_scalp_hod_alert_reject
+    _warrior_recent_bad_tape_reject = AlpacaRunner._warrior_recent_bad_tape_reject
+    _remember_quick_scalp_reject = AlpacaRunner._remember_quick_scalp_reject
     _momentum_breakout_tape_is_smooth = AlpacaRunner._momentum_breakout_tape_is_smooth
     _momentum_breakout_consume = AlpacaRunner._momentum_breakout_consume
     _quick_scalp_shared_quality_reject = AlpacaRunner._quick_scalp_shared_quality_reject
@@ -39,6 +42,7 @@ class _QuickScalpRunner:
     _momentum_burst_continuation_base_ok = AlpacaRunner._momentum_burst_continuation_base_ok
     _momentum_burst_level_context = staticmethod(AlpacaRunner._momentum_burst_level_context)
     _maybe_arm_warrior_squeeze_from_10s = AlpacaRunner._maybe_arm_warrior_squeeze_from_10s
+    _ensure_warrior_watch_capacity = AlpacaRunner._ensure_warrior_watch_capacity
     _warrior_history_until = AlpacaRunner._warrior_history_until
     _warrior_trend_pullback_reclaim_context = AlpacaRunner._warrior_trend_pullback_reclaim_context
     _warrior_squeeze_pullaway_context = AlpacaRunner._warrior_squeeze_pullaway_context
@@ -52,6 +56,8 @@ class _QuickScalpRunner:
     _momentum_burst_rebase_pending_after_reject = AlpacaRunner._momentum_burst_rebase_pending_after_reject
     _momentum_burst_hit_run_time_allowed = AlpacaRunner._momentum_burst_hit_run_time_allowed
     _record_momentum_burst_hit_run_pnl = AlpacaRunner._record_momentum_burst_hit_run_pnl
+    _active_warrior_trade_count = AlpacaRunner._active_warrior_trade_count
+    _active_warrior_symbols = AlpacaRunner._active_warrior_symbols
     _execute_momentum_burst_scalp = AlpacaRunner._execute_momentum_burst_scalp
     _capital_aware_quantity = AlpacaRunner._capital_aware_quantity
     _current_equity = AlpacaRunner._current_equity
@@ -93,19 +99,33 @@ class _QuickScalpRunner:
         self._momentum_burst_hit_run_stop_after_giveback = True
         self._momentum_burst_hit_run_max_giveback = 50.0
         self._momentum_burst_hit_run_daily_loss_stop = 50.0
-        self._momentum_burst_hit_run_symbol_pnl = {}
-        self._momentum_burst_hit_run_symbol_peak_pnl = {}
-        self._momentum_burst_hit_run_day_blocked = {}
+        self._warrior_engine = WarriorEngine.with_defaults(max_concurrent_warrior_trades=1)
+        self._warrior_watch = self._warrior_engine.watch
+        self._momentum_burst_hit_run_symbol_pnl = self._warrior_watch.symbol_pnl
+        self._momentum_burst_hit_run_symbol_peak_pnl = self._warrior_watch.symbol_peak_pnl
+        self._momentum_burst_hit_run_day_blocked = self._warrior_watch.day_blocked
         self._warrior_squeeze_enabled = False
         self._warrior_squeeze_min_reclaim_price = 2.0
         self._warrior_squeeze_starter_size_factor = 0.35
-        self._warrior_squeeze_rejection_high = {}
-        self._warrior_squeeze_rejection_reason = {}
-        self._warrior_squeeze_target_wins = {}
+        self._warrior_squeeze_rejection_high = self._warrior_watch.rejection_high
+        self._warrior_squeeze_rejection_reason = self._warrior_watch.rejection_reason
+        self._warrior_squeeze_target_wins = self._warrior_watch.target_wins
+        self._warrior_squeeze_last_target_at = self._warrior_watch.last_target_at
+        self._warrior_squeeze_failed_burst = self._warrior_watch.failed_burst
+        self._warrior_squeeze_failed_burst_high = self._warrior_watch.failed_burst_high
+        self._warrior_squeeze_post_target_reclaim_allowed = (
+            self._warrior_watch.post_target_reclaim_allowed
+        )
+        self._warrior_squeeze_last_entry_trigger = self._warrior_watch.last_entry_trigger
+        self._warrior_normal_fallback_rejects = self._warrior_watch.normal_fallback_rejects
+        self._warrior_normal_fallback_last_reason = (
+            self._warrior_watch.normal_fallback_last_reason
+        )
         self._timer_bars_by_symbol = {}
         self._breakout_scalp_active = False
         self._breakout_scalp_cooldown = {}
         self._quick_scalp_spread_size_factors = {}
+        self._recent_quick_scalp_rejects = {}
 
 
 def _nxts_failed_spike_reclaim_bars(symbol: str = "NXTS") -> list[Bar]:
@@ -556,6 +576,33 @@ def test_quick_scalp_rejects_weak_active_hod_rvol() -> None:
     reject = runner._quick_scalp_hod_alert_reject("SUNE")
 
     assert reject == "HOD alert active RVOL too weak 0.71x (need 1.0x+)"
+
+
+def test_warrior_waits_after_recent_quick_scalp_weak_active_rvol() -> None:
+    runner = _QuickScalpRunner()
+    runner._pipeline.scan_rejections = {}
+
+    runner._remember_quick_scalp_reject(
+        "HSCS",
+        "HOD alert active RVOL too weak 0.31x (need 1.0x+)",
+    )
+
+    reject = runner._warrior_recent_bad_tape_reject("HSCS")
+
+    assert reject is not None
+    assert "recent breakout scalp reject" in reject
+    assert "active RVOL too weak" in reject
+
+
+def test_warrior_ignores_stale_quick_scalp_weak_active_rvol() -> None:
+    runner = _QuickScalpRunner()
+    runner._pipeline.scan_rejections = {}
+    runner._recent_quick_scalp_rejects["HSCS"] = (
+        time.monotonic() - 121.0,
+        "HOD alert active RVOL too weak 0.31x (need 1.0x+)",
+    )
+
+    assert runner._warrior_recent_bad_tape_reject("HSCS") is None
 
 
 def test_quick_scalp_requires_10s_confirmation_feed() -> None:
@@ -1012,7 +1059,7 @@ def test_warrior_squeeze_off_preserves_normal_hit_run_arming() -> None:
     assert runner._warrior_squeeze_rejection_high == {}
 
 
-def test_warrior_squeeze_ignores_first_cheap_spike_then_arms_reclaim() -> None:
+def test_warrior_squeeze_watches_first_cheap_spike_without_entry() -> None:
     runner = _QuickScalpRunner()
     runner._warrior_squeeze_enabled = True
     runner._warrior_squeeze_min_reclaim_price = 2.0
@@ -1020,7 +1067,9 @@ def test_warrior_squeeze_ignores_first_cheap_spike_then_arms_reclaim() -> None:
 
     runner._maybe_arm_momentum_burst_scalp(cheap_hit)
 
-    assert runner._momentum_burst_armed == {}
+    assert "MBUR" in runner._momentum_burst_armed
+    assert runner._momentum_burst_pending == {}
+    assert runner._momentum_burst_window_high["MBUR"] == 1.70
     assert runner._warrior_squeeze_rejection_high["MBUR"] == 1.70
 
     reclaim_hit = _momentum_burst_hit(high=2.08)
@@ -1028,6 +1077,20 @@ def test_warrior_squeeze_ignores_first_cheap_spike_then_arms_reclaim() -> None:
 
     assert "MBUR" in runner._momentum_burst_armed
     assert runner._momentum_burst_window_high["MBUR"] == 2.08
+
+
+def test_warrior_live_10s_watches_first_cheap_spike_without_entry() -> None:
+    runner = _QuickScalpRunner()
+    runner._warrior_squeeze_enabled = True
+    runner._warrior_squeeze_min_reclaim_price = 2.0
+    bar = Bar("MBUR", TS, 1.25, 1.70, 1.20, 1.62, 120_000, Timeframe.SEC_10)
+
+    runner._maybe_arm_warrior_squeeze_from_10s("MBUR", bar, time.monotonic())
+
+    assert "MBUR" in runner._momentum_burst_armed
+    assert runner._momentum_burst_pending == {}
+    assert runner._momentum_burst_window_high["MBUR"] == 1.70
+    assert runner._warrior_squeeze_rejection_reason["MBUR"].startswith("first cheap")
 
 
 def test_warrior_squeeze_rejects_first_high_volume_shooting_star() -> None:
@@ -1070,7 +1133,9 @@ def test_warrior_squeeze_rejects_first_high_volume_shooting_star() -> None:
 
     runner._maybe_arm_momentum_burst_scalp(hit)
 
-    assert runner._momentum_burst_armed == {}
+    assert "MBUR" in runner._momentum_burst_armed
+    assert runner._momentum_burst_pending == {}
+    assert runner._momentum_burst_window_high["MBUR"] == 2.60
     assert runner._warrior_squeeze_rejection_high["MBUR"] == 2.60
     assert runner._warrior_squeeze_rejection_reason["MBUR"] == "high-volume shooting-star rejection"
 
@@ -1088,6 +1153,40 @@ def test_momentum_burst_cycle_expires_window() -> None:
 
     assert runner._momentum_burst_armed == {}
     assert runner._momentum_burst_window_high == {}
+
+
+def test_warrior_multi_symbol_loop_keeps_target_wins_dict() -> None:
+    runner = _momentum_burst_trade_runner()
+    now = runner._test_now
+    runner._momentum_burst_cycle_enabled = False
+    runner._momentum_burst_hit_run_enabled = False
+    runner._warrior_squeeze_enabled = True
+    runner._market_phase = lambda: "REGULAR"
+    runner._momentum_burst_armed = {
+        "AAA": time.monotonic(),
+        "BBB": time.monotonic(),
+    }
+    runner._momentum_burst_window_high = {"AAA": 3.00, "BBB": 3.00}
+    runner._momentum_burst_session_anchor_high = {"AAA": 3.00, "BBB": 3.00}
+    runner._bar_buffer = {
+        "AAA": deque([
+            Bar("AAA", now - timedelta(minutes=1), 2.10, 2.30, 2.05, 2.22, 150_000, Timeframe.MIN_1)
+        ]),
+        "BBB": deque([
+            Bar("BBB", now - timedelta(minutes=1), 2.10, 2.30, 2.05, 2.22, 150_000, Timeframe.MIN_1)
+        ]),
+    }
+    runner._bar_aggregator = _Bars10([
+        Bar("AAA", now - timedelta(seconds=10), 2.38, 2.40, 2.36, 2.39, 75_000, Timeframe.SEC_10),
+        Bar("AAA", now, 2.39, 2.55, 2.38, 2.52, 125_000, Timeframe.SEC_10),
+    ])
+    runner._warrior_squeeze_target_wins = {}
+    runner._warrior_squeeze_last_target_at = {}
+    runner._warrior_prior_runner_continuation_pullback_context = lambda *args, **kwargs: None
+
+    runner._process_momentum_burst_scalps()
+
+    assert isinstance(runner._warrior_squeeze_target_wins, dict)
 
 
 class _Bars10:
@@ -1503,6 +1602,50 @@ def test_momentum_burst_hit_run_giveback_blocks_symbol_for_day() -> None:
 
     assert "gave back" in reason
     assert "MBUR" in runner._momentum_burst_hit_run_day_blocked
+
+
+def test_warrior_pending_confirm_accepts_trend_pullback_lane() -> None:
+    runner = _momentum_burst_trade_runner()
+    runner._momentum_burst_cycle_enabled = False
+    runner._warrior_squeeze_enabled = True
+    now = runner._test_now
+    runner._momentum_burst_window_high = {"MBUR": 5.00}
+    runner._momentum_burst_pending = {
+        "MBUR": {
+            "ts": now - timedelta(seconds=10),
+            "breakout_close": 4.90,
+            "breakout_high": 5.00,
+            "breakout_volume": 140_000,
+        }
+    }
+    runner._bar_aggregator = _Bars10([
+        Bar("MBUR", now - timedelta(seconds=20), 4.90, 5.00, 4.80, 4.92, 140_000, Timeframe.SEC_10),
+        Bar("MBUR", now - timedelta(seconds=10), 4.78, 4.86, 4.62, 4.70, 85_000, Timeframe.SEC_10),
+        Bar("MBUR", now, 4.72, 4.88, 4.66, 4.84, 155_000, Timeframe.SEC_10),
+    ])
+    runner._warrior_trend_pullback_reclaim_context = lambda *args, **kwargs: {
+        "entry_trigger": "warrior_trend_pullback_reclaim",
+        "variant_override": "warrior_trend_pullback_reclaim",
+        "entry_price_override": 4.84,
+        "stop_price_override": 4.66,
+        "target_price_override": 5.08,
+    }
+    runner._warrior_squeeze_pullaway_context = lambda *args, **kwargs: None
+    runner._warrior_squeeze_curl_reclaim_context = lambda *args, **kwargs: None
+    runner._warrior_squeeze_equal_high_pullaway_context = lambda *args, **kwargs: None
+    captured = {}
+
+    def _execute(sym, bar, **kwargs):
+        captured.update(kwargs)
+        return Fill(sym, Side.BUY, 1, float(bar.close or 0.0), bar.ts)
+
+    runner._execute_momentum_burst_scalp = _execute
+
+    runner._process_momentum_burst_scalps()
+
+    assert captured["strategy_override"] == "warrior_squeeze_playbook"
+    assert captured["entry_context"]["entry_trigger"] == "warrior_trend_pullback_reclaim"
+    assert "MBUR" not in runner._momentum_burst_pending
 
 
 def test_momentum_burst_hit_run_daily_loss_blocks_symbol_for_day() -> None:

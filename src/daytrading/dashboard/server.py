@@ -36,9 +36,16 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, float):
         return value if math.isfinite(value) else None
     if isinstance(value, dict):
-        return {k: _json_safe(v) for k, v in value.items()}
+        return {str(_json_safe(k)): _json_safe(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [_json_safe(v) for v in value]
+    if isinstance(value, set):
+        return [_json_safe(v) for v in value]
+    if hasattr(value, "to_dict") and callable(getattr(value, "to_dict")):
+        try:
+            return _json_safe(value.to_dict())
+        except Exception:
+            return str(value)
     return value
 
 
@@ -148,7 +155,7 @@ def create_app(hub: DashboardHub) -> Flask:
 
     @app.route("/api/snapshot")
     def snapshot():
-        return jsonify(_hub.snapshot())
+        return jsonify(_json_safe(_hub.snapshot()))
 
     @app.route("/api/ml-stats")
     def ml_stats():
@@ -471,17 +478,28 @@ def create_app(hub: DashboardHub) -> Flask:
     def stream():
         q = _hub.subscribe()
 
+        def encode_sse(payload: Any) -> Optional[str]:
+            try:
+                return "data: {}\n\n".format(
+                    json.dumps(_json_safe(payload), allow_nan=False)
+                )
+            except (TypeError, ValueError) as exc:
+                logger.warning("Skipping non-JSON dashboard stream payload: %s", exc)
+                return None
+
         def generate():
             try:
                 # Push full state once on connect (replaces removed /api/snapshot polling).
-                yield "data: {}\n\n".format(
-                    json.dumps({"type": "snapshot", "data": _hub.snapshot()}),
-                )
+                payload = encode_sse({"type": "snapshot", "data": _hub.snapshot()})
+                if payload is not None:
+                    yield payload
                 heartbeat_counter = 0
                 while True:
                     while q:
                         msg = q.popleft()
-                        yield "data: {}\n\n".format(json.dumps(msg))
+                        payload = encode_sse(msg)
+                        if payload is not None:
+                            yield payload
                         heartbeat_counter = 0
                     time.sleep(0.3)
                     heartbeat_counter += 1
@@ -490,6 +508,8 @@ def create_app(hub: DashboardHub) -> Flask:
                         yield ": keepalive\n\n"
                         heartbeat_counter = 0
             except GeneratorExit:
+                pass
+            finally:
                 _hub.unsubscribe(q)
 
         return Response(generate(), mimetype="text/event-stream")
@@ -848,6 +868,17 @@ tr:hover { background:var(--surface2); }
 
   <div class="card" style="margin-bottom:16px">
     <div class="card-header">
+      <h3>Warrior Watch</h3>
+      <span style="font-size:11px;color:var(--text2)">Momentum-burst playbook state, pending lane, cooldowns, and last block reason</span>
+      <span class="badge pill-purple" id="warrior-watch-count">0</span>
+    </div>
+    <div id="warrior-watch-wrap">
+      <div class="empty"><div class="icon">&#9876;</div>No Warrior symbols being watched</div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-header">
       <h3>HOD Momentum Scanner</h3>
       <span style="font-size:11px;color:var(--text2)">Chg % = from today open (or vs prior close if bars truncated) · vs Close % = like TradingView day change</span>
     </div>
@@ -1105,7 +1136,7 @@ let state = {
   recent_trades: [], recent_scans: [], pnl_history: [],
   daily_scorecard: {}, rolling_scorecard: {},
   market_open: false, stream_connected: false,
-  watchlist_scan: [], rt_movers: [], hod_momentum_alerts: [], hot_watch: [], trading_watchlist: [],
+  watchlist_scan: [], rt_movers: [], hod_momentum_alerts: [], hot_watch: [], warrior_watch: [], trading_watchlist: [],
   missed_a_plus: [],
   candidate_hydration: {},
   watchlist_pinned: ['SPY'],
@@ -1148,8 +1179,9 @@ function fmtPnl(v) {
   return '<span class="' + (v>=0?'text-green':'text-red') + '">' + s + '</span>';
 }
 function chartLink(sym) {
-  let url = 'https://www.tradingview.com/chart/?symbol=' + encodeURIComponent(sym);
-  return '<a href="' + url + '" target="_blank" rel="noopener" style="text-decoration:none" title="Open chart for ' + sym + '"><strong>' + sym + '</strong> <span style="font-size:11px;opacity:0.6">&#128200;</span></a>';
+  let safeSym = escapeHtml(String(sym || ''));
+  let url = 'https://www.tradingview.com/chart/?symbol=' + encodeURIComponent(sym || '');
+  return '<a href="' + url + '" target="_blank" rel="noopener" style="text-decoration:none" title="Open chart for ' + safeSym + '"><strong>' + safeSym + '</strong> <span style="font-size:11px;opacity:0.6">&#128200;</span></a>';
 }
 function shortStrategyLabel(name) {
   let s = String(name || 'unknown');
@@ -1393,6 +1425,7 @@ function renderScanner() {
   renderCandidateWorker();
   renderTradingWatchlist();
   renderHotWatch();
+  renderWarriorWatch();
   renderHodMomentumScanner();
 }
 
@@ -1522,6 +1555,68 @@ function renderHotWatch() {
     html += '<td>' + volume.toLocaleString() + '</td>';
     html += '<td>' + score.toFixed(2) + '</td>';
     html += '<td style="color:var(--text2);font-size:11px">' + escapeHtml(r.reason || '') + '</td>';
+    html += '</tr>';
+  });
+  html += '</table>';
+  wrap.innerHTML = html;
+}
+
+function warriorStatePill(stateName) {
+  let map = {
+    pending: {label: 'Pending', cls: 'pill-green'},
+    watching: {label: 'Watching', cls: 'pill-blue'},
+    cooldown: {label: 'Cooldown', cls: 'pill-yellow'},
+    proof_wait: {label: 'Proof wait', cls: 'pill-purple'},
+    failed_burst: {label: 'Failed burst', cls: 'pill-red'},
+    day_blocked: {label: 'Day blocked', cls: 'pill-red'},
+    candidate: {label: 'Candidate', cls: 'pill-yellow'}
+  };
+  let m = map[stateName] || {label: stateName || 'Unknown', cls: 'pill-yellow'};
+  return '<span class="pill '+m.cls+'">'+escapeHtml(m.label)+'</span>';
+}
+
+function warriorSecondsText(seconds) {
+  let n = Number(seconds || 0);
+  if (!Number.isFinite(n) || n <= 0) return '';
+  if (n < 60) return Math.ceil(n) + 's';
+  return Math.ceil(n / 60) + 'm';
+}
+
+function renderWarriorWatch() {
+  let wrap = document.getElementById('warrior-watch-wrap');
+  if (!wrap) return;
+  let rows = (state.warrior_watch || []).slice();
+  let countEl = document.getElementById('warrior-watch-count');
+  if (countEl) countEl.textContent = rows.length;
+
+  if (rows.length === 0) {
+    wrap.innerHTML = '<div class="empty"><div class="icon">&#9876;</div>No Warrior symbols being watched</div>';
+    return;
+  }
+
+  let html = '<table><tr>'
+    + '<th>Symbol</th><th>State</th><th>Lane / Trigger</th><th>Window High</th><th>Anchor</th>'
+    + '<th>Reject High</th><th>Targets</th><th>Entries</th><th>P&L</th><th>Cooldown</th><th>Reason</th>'
+    + '</tr>';
+  rows.forEach(r => {
+    let pnl = Number(r.pnl || 0);
+    let cooldown = warriorSecondsText(r.block_seconds);
+    let trigger = r.pending_trigger || '';
+    let anchor = Number(r.session_anchor_high || 0);
+    let windowHigh = Number(r.window_high || 0);
+    let rejectHigh = Number(r.rejection_high || r.failed_burst_high || 0);
+    html += '<tr>';
+    html += '<td>' + chartLink(r.symbol) + '</td>';
+    html += '<td>' + warriorStatePill(r.state) + '</td>';
+    html += '<td style="font-size:11px;color:var(--text2)">' + escapeHtml(trigger || '-') + '</td>';
+    html += '<td>' + (windowHigh > 0 ? '$' + windowHigh.toFixed(2) : '-') + '</td>';
+    html += '<td>' + (anchor > 0 ? '$' + anchor.toFixed(2) : '-') + '</td>';
+    html += '<td>' + (rejectHigh > 0 ? '$' + rejectHigh.toFixed(2) : '-') + '</td>';
+    html += '<td>' + (r.target_wins || 0) + '</td>';
+    html += '<td>' + (r.entries || 0) + '</td>';
+    html += '<td class="' + (pnl >= 0 ? 'text-green' : 'text-red') + '">' + fmtPnl(pnl) + '</td>';
+    html += '<td>' + (cooldown || '-') + '</td>';
+    html += '<td style="font-size:11px;color:var(--text2)">' + escapeHtml(r.reason || '') + '</td>';
     html += '</tr>';
   });
   html += '</table>';
@@ -3084,6 +3179,7 @@ function applySnapshot(data) {
   state.rt_movers = data.rt_movers || [];
   state.hod_momentum_alerts = data.hod_momentum_alerts || [];
   state.hot_watch = data.hot_watch || [];
+  state.warrior_watch = data.warrior_watch || [];
   state.missed_a_plus = data.missed_a_plus || [];
   state.daily_scorecard = data.daily_scorecard || {};
   state.rolling_scorecard = data.rolling_scorecard || {};
@@ -3176,6 +3272,10 @@ es.onmessage = function(e) {
       state.hot_watch = msg.data.symbols || [];
       renderHotWatch();
       renderTradingWatchlist();
+      break;
+    case 'warrior_watch':
+      state.warrior_watch = msg.data.symbols || [];
+      renderWarriorWatch();
       break;
     case 'candidate_hydration':
       state.candidate_hydration = msg.data || {};

@@ -185,6 +185,13 @@ class StrategyConfig:
     warrior_squeeze_position_value: float = 2000.0
     warrior_squeeze_max_dollar_risk: float = 150.0
     warrior_squeeze_max_entries: int = 3
+    warrior_max_concurrent_trades: int = 1
+    # Watch up to this many Warrior-qualified momentum names at once. This is
+    # observation capacity only; concurrent entries are controlled separately.
+    warrior_watch_capacity: int = 10
+    # Premarket squeezes can base for longer than a fixed 5-minute arm window.
+    # Keep Warrior watches alive through the premarket session unless disabled.
+    warrior_watch_until_premarket_end: bool = True
     warrior_squeeze_win_cooldown_sec: float = 10.0
     warrior_squeeze_reward_risk: float = 3.0
     warrior_squeeze_add_reward_risk: float = 1.0
@@ -438,6 +445,18 @@ class StrategyConfig:
             warrior_squeeze_max_entries=_env_int(
                 "WARRIOR_SQUEEZE_MAX_ENTRIES",
                 cls.warrior_squeeze_max_entries,
+            ),
+            warrior_max_concurrent_trades=_env_int(
+                "WARRIOR_MAX_CONCURRENT_TRADES",
+                cls.warrior_max_concurrent_trades,
+            ),
+            warrior_watch_capacity=_env_int(
+                "WARRIOR_WATCH_CAPACITY",
+                cls.warrior_watch_capacity,
+            ),
+            warrior_watch_until_premarket_end=_env_bool(
+                "WARRIOR_WATCH_UNTIL_PREMARKET_END",
+                cls.warrior_watch_until_premarket_end,
             ),
             warrior_squeeze_win_cooldown_sec=_env_float(
                 "WARRIOR_SQUEEZE_WIN_COOLDOWN_SEC",

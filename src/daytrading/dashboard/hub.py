@@ -100,6 +100,8 @@ class DashboardHub:
         self.hod_momentum_alerts: List[dict] = []
         # Early fast-scan movers being watched for structured pullback entries
         self.hot_watch: List[dict] = []
+        # Experimental Warrior playbook watch state (read-only dashboard view)
+        self.warrior_watch: List[dict] = []
         self.missed_a_plus: List[dict] = []
         self.scanner_near_miss: Dict[str, Any] = {}
         # Active trading watchlist (HOD TTL + pinned + open positions)
@@ -199,6 +201,13 @@ class DashboardHub:
             "symbols": merged,
             "pinned": self.watchlist_pinned,
         })
+
+    def on_warrior_watch(self, symbols: List[dict]) -> None:
+        """Replace active Warrior playbook watch-state rows."""
+        rows = symbols or []
+        with self._lock:
+            self.warrior_watch = rows[:100]
+        self._broadcast("warrior_watch", {"symbols": self.warrior_watch})
 
     def on_trading_watchlist(
         self,
@@ -601,6 +610,7 @@ class DashboardHub:
                 "rt_movers": self.rt_movers,
                 "hod_momentum_alerts": list(self.hod_momentum_alerts),
                 "hot_watch": list(self.hot_watch),
+                "warrior_watch": list(self.warrior_watch),
                 "missed_a_plus": list(self.missed_a_plus),
                 "scanner_near_miss": dict(self.scanner_near_miss),
                 "trading_watchlist": list(self.trading_watchlist),

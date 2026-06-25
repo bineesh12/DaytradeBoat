@@ -30,6 +30,9 @@ def test_strategy_config_loads_tunables_from_env(monkeypatch):
     monkeypatch.setenv("DAYTRADING_WARRIOR_SQUEEZE_MIN_RECLAIM_PRICE", "3.50")
     monkeypatch.setenv("DAYTRADING_WARRIOR_SQUEEZE_STARTER_SIZE_FACTOR", "0.25")
     monkeypatch.setenv("DAYTRADING_WARRIOR_SQUEEZE_MAX_ENTRIES", "4")
+    monkeypatch.setenv("DAYTRADING_WARRIOR_MAX_CONCURRENT_TRADES", "2")
+    monkeypatch.setenv("DAYTRADING_WARRIOR_WATCH_CAPACITY", "9")
+    monkeypatch.setenv("DAYTRADING_WARRIOR_WATCH_UNTIL_PREMARKET_END", "false")
     monkeypatch.setenv("DAYTRADING_WARRIOR_SQUEEZE_WIN_COOLDOWN_SEC", "2.5")
     monkeypatch.setenv("DAYTRADING_WARRIOR_SQUEEZE_REWARD_RISK", "2.25")
     monkeypatch.setenv("DAYTRADING_WARRIOR_SQUEEZE_ADD_REWARD_RISK", "0.75")
@@ -64,6 +67,9 @@ def test_strategy_config_loads_tunables_from_env(monkeypatch):
     assert cfg.warrior_squeeze_min_reclaim_price == 3.50
     assert cfg.warrior_squeeze_starter_size_factor == 0.25
     assert cfg.warrior_squeeze_max_entries == 4
+    assert cfg.warrior_max_concurrent_trades == 2
+    assert cfg.warrior_watch_capacity == 9
+    assert cfg.warrior_watch_until_premarket_end is False
     assert cfg.warrior_squeeze_win_cooldown_sec == 2.5
     assert cfg.warrior_squeeze_reward_risk == 2.25
     assert cfg.warrior_squeeze_add_reward_risk == 0.75
@@ -75,6 +81,9 @@ def test_momentum_burst_hit_run_defaults_to_one_entry_and_giveback_stop() -> Non
     assert cfg.momentum_burst_hit_run_max_entries == 1
     assert cfg.momentum_burst_hit_run_stop_after_giveback is True
     assert cfg.warrior_squeeze_max_entries == 3
+    assert cfg.warrior_max_concurrent_trades == 1
+    assert cfg.warrior_watch_capacity == 10
+    assert cfg.warrior_watch_until_premarket_end is True
     assert cfg.warrior_squeeze_win_cooldown_sec == 10.0
     assert cfg.warrior_squeeze_reward_risk == 3.0
     assert cfg.warrior_squeeze_add_reward_risk == 1.0

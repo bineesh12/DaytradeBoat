@@ -739,6 +739,7 @@ class TradingPipeline:
         text = str(reason or "").lower()
         score_match = re.search(r"entry score too low \((\d+)/100", text)
         liquidity_watch_only = "watch-only liquidity score" in text
+        low_day_volume = "low day volume" in text
         sr = signal.scan_result
         criteria = sr.criteria if sr is not None else {}
         entry_trigger = str(criteria.get("entry_trigger") or "")
@@ -752,7 +753,15 @@ class TradingPipeline:
             else 75
         )
         score_near_miss = bool(score_match and int(score_match.group(1)) >= score_floor)
-        if "dead cat bounce" not in text and not score_near_miss and not liquidity_watch_only:
+        if (
+            "dead cat bounce" not in text
+            and not score_near_miss
+            and not liquidity_watch_only
+            and not (
+                low_day_volume
+                and entry_trigger == "warrior_early_10s_pullback_reclaim"
+            )
+        ):
             return False
         if str(criteria.get("entry_mode") or "") != "warrior_squeeze_playbook":
             return False
@@ -781,7 +790,7 @@ class TradingPipeline:
         if (price - stop) / price > 0.09:
             return False
 
-        if not bars or len(bars) < 3:
+        if not bars:
             return False
         latest = bars[-1]
         if float(latest.close or 0.0) <= float(latest.open or 0.0):
@@ -794,11 +803,28 @@ class TradingPipeline:
         if close_location < min_close_location:
             return False
 
-        latest_volume = float(latest.volume or 0.0)
-        recent_volume = sum(float(b.volume or 0.0) for b in bars[-3:])
+        try:
+            criteria_latest_volume = float(criteria.get("latest_volume") or 0.0)
+        except (TypeError, ValueError):
+            criteria_latest_volume = 0.0
+        try:
+            criteria_recent_volume = float(criteria.get("recent_volume") or 0.0)
+        except (TypeError, ValueError):
+            criteria_recent_volume = 0.0
+        latest_volume = max(float(latest.volume or 0.0), criteria_latest_volume)
+        recent_volume = max(
+            sum(float(b.volume or 0.0) for b in bars[-3:]),
+            criteria_recent_volume,
+        )
         if entry_trigger == "warrior_smooth_10s_pullback_continuation":
             min_latest_volume = 30_000
             min_recent_volume = 80_000
+        elif entry_trigger == "warrior_early_10s_pullback_reclaim":
+            min_latest_volume = 25_000
+            min_recent_volume = 65_000
+        elif entry_trigger == "warrior_second_leg_vwap_reclaim":
+            min_latest_volume = 60_000
+            min_recent_volume = 180_000
         else:
             min_latest_volume = (
                 75_000
