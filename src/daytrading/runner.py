@@ -280,6 +280,7 @@ class AlpacaRunner:
         self._warrior_normal_fallback_last_reason = (
             self._warrior_watch.normal_fallback_last_reason
         )
+        self._warrior_failed_momentum = self._warrior_watch.failed_momentum
         self._warrior_ignition_entries: Dict[str, int] = {}
         self._warrior_ignition_failed_entries: Dict[str, int] = {}
         self._warrior_ignition_peak_price: Dict[str, float] = {}
@@ -3533,6 +3534,19 @@ class AlpacaRunner:
                 self._record_warrior_ignition_exit(fill.symbol, pnl, reason, completed=completed)
             except Exception:
                 logger.debug("failed to record warrior ignition exit", exc_info=True)
+        elif (
+            pnl < 0.0
+            and tracked_for_exit is not None
+            and (
+                str(getattr(tracked_for_exit, "entry_strategy", "") or "") == "warrior_squeeze_playbook"
+                or str(getattr(tracked_for_exit, "entry_trigger", "") or "").startswith("warrior_")
+            )
+        ):
+            failed = getattr(self, "_warrior_failed_momentum", None)
+            if failed is None:
+                failed = {}
+                self._warrior_failed_momentum = failed
+            failed[str(fill.symbol or "").upper()] = reason or "warrior momentum loss"
         try:
             from daytrading.ml.shadow_collector import label_exit_snapshots
             label_exit_snapshots(fill.symbol, fill.price)
@@ -4032,6 +4046,7 @@ class AlpacaRunner:
                 "_warrior_squeeze_last_entry_trigger",
                 "_warrior_normal_fallback_rejects",
                 "_warrior_normal_fallback_last_reason",
+                "_warrior_failed_momentum",
             ):
                 value = getattr(self, attr, None)
                 if value:
@@ -6940,6 +6955,11 @@ class AlpacaRunner:
         net_pnl = float(trade_pnls.pop(sym, 0.0) or 0.0)
         if net_pnl < 0.0:
             failures[sym] = int(failures.get(sym, 0) or 0) + 1
+            failed = getattr(self, "_warrior_failed_momentum", None)
+            if failed is None:
+                failed = {}
+                self._warrior_failed_momentum = failed
+            failed[sym] = reason or "warrior ignition loss"
             logger.info(
                 "IGNITION failed %s count=%d net_pnl=$%.2f reason=%s",
                 sym,
@@ -6949,6 +6969,9 @@ class AlpacaRunner:
             )
         elif net_pnl > 0.0:
             failures.pop(sym, None)
+            failed = getattr(self, "_warrior_failed_momentum", None)
+            if failed is not None:
+                failed.pop(sym, None)
 
     def _warrior_ignition_watch_snapshot(self) -> List[dict]:
         """Read-only telemetry of what the learned ignition path is watching this
@@ -10030,18 +10053,30 @@ class AlpacaRunner:
             return None
         criteria = hit.criteria or {}
         pattern = str(criteria.get("pattern") or hit.scanner_name or "")
-        if pattern not in ("abc_continuation", "pullback_base", "level_breakout_reclaim"):
+        if pattern not in (
+            "abc_continuation",
+            "pullback_base",
+            "level_breakout_reclaim",
+            "vwap_pullback",
+            "hod_reclaim",
+        ):
             return None
         sym = str(signal.symbol or "").upper()
-        watch_count = int(self._warrior_normal_fallback_rejects.get(sym, 0) or 0)
-        if watch_count < 3:
-            return None
         setup_tier = str(criteria.get("setup_tier") or "")
         try:
             score = float(criteria.get("entry_score") or hit.score or 0.0)
         except (TypeError, ValueError):
             score = float(hit.score or 0.0)
         if "A+" in setup_tier and score >= 90.0:
+            return None
+        failed_reason = getattr(self, "_warrior_failed_momentum", {}).get(sym)
+        if failed_reason:
+            return (
+                "Warrior/Ignition already failed on {} today ({}); "
+                "blocking weak normal {} fallback"
+            ).format(sym, failed_reason, pattern)
+        watch_count = int(self._warrior_normal_fallback_rejects.get(sym, 0) or 0)
+        if watch_count < 3:
             return None
         last_reason = self._warrior_normal_fallback_last_reason.get(sym, "not confirmed")
         return (

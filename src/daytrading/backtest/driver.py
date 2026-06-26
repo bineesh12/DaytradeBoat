@@ -197,6 +197,7 @@ class PipelineBacktestDriver:
         self._warrior_normal_fallback_last_reason = (
             self._warrior_watch.normal_fallback_last_reason
         )
+        self._warrior_failed_momentum = self._warrior_watch.failed_momentum
         self._recent_normal_entry_rejects: Dict[str, Tuple[datetime, str]] = {}
         self._recent_quick_scalp_rejects: Dict[str, Tuple[datetime, str]] = {}
         # symbol -> {ts, breakout_close} of a fresh 10s high awaiting next-bar
@@ -1671,8 +1672,10 @@ class PipelineBacktestDriver:
                             self._warrior_ignition_failed_entries[sym] = (
                                 int(self._warrior_ignition_failed_entries.get(sym, 0) or 0) + 1
                             )
+                            self._warrior_failed_momentum[sym] = reason or "warrior ignition loss"
                         elif net_pnl > 0.0:
                             self._warrior_ignition_failed_entries.pop(sym, None)
+                            self._warrior_failed_momentum.pop(sym, None)
                 if reason == "mb_bracket_target" and is_warrior:
                     cooldown = self._record_warrior_target_exit(
                         sym,
@@ -1685,7 +1688,10 @@ class PipelineBacktestDriver:
                     self._record_mb_hit_run_pnl(sym, float(last_trade.get("pnl") or 0.0))
                     cooldown = self._mb_hit_run_win_cooldown_sec
                 else:
-                    self._record_mb_hit_run_pnl(sym, float(last_trade.get("pnl") or 0.0))
+                    trade_pnl = float(last_trade.get("pnl") or 0.0)
+                    self._record_mb_hit_run_pnl(sym, trade_pnl)
+                    if is_warrior and trade_pnl < 0.0 and sym not in self._mb_bracket:
+                        self._warrior_failed_momentum[sym] = reason or "warrior momentum loss"
                     cooldown = self._mb_hit_run_loss_cooldown_sec
                     if (
                         strategy == "warrior_squeeze_playbook"
@@ -4747,18 +4753,30 @@ class PipelineBacktestDriver:
             return None
         criteria = hit.criteria or {}
         pattern = str(criteria.get("pattern") or hit.scanner_name or "")
-        if pattern not in ("abc_continuation", "pullback_base", "level_breakout_reclaim"):
+        if pattern not in (
+            "abc_continuation",
+            "pullback_base",
+            "level_breakout_reclaim",
+            "vwap_pullback",
+            "hod_reclaim",
+        ):
             return None
         symbol = str(signal.symbol or "").upper()
-        watch_count = int(self._warrior_normal_fallback_rejects.get(symbol, 0) or 0)
-        if watch_count < 3:
-            return None
         setup_tier = str(criteria.get("setup_tier") or "")
         try:
             score = float(criteria.get("entry_score") or hit.score or 0.0)
         except (TypeError, ValueError):
             score = float(hit.score or 0.0)
         if "A+" in setup_tier and score >= 90.0:
+            return None
+        failed_reason = getattr(self, "_warrior_failed_momentum", {}).get(symbol)
+        if failed_reason:
+            return (
+                "Warrior/Ignition already failed on {} today ({}); "
+                "blocking weak normal {} fallback"
+            ).format(symbol, failed_reason, pattern)
+        watch_count = int(self._warrior_normal_fallback_rejects.get(symbol, 0) or 0)
+        if watch_count < 3:
             return None
         last_reason = self._warrior_normal_fallback_last_reason.get(symbol, "not confirmed")
         return (

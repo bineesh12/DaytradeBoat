@@ -674,6 +674,34 @@ def test_warrior_pullaway_waits_for_micro_base_after_bad_tape() -> None:
     assert context is None
 
 
+def test_warrior_pullaway_rejects_cap_edge_without_strong_confirm() -> None:
+    ten_sec = [
+        Bar("CANF", _BASE_TS + timedelta(seconds=0), 4.12, 4.22, 4.09, 4.15, 230_000, Timeframe.SEC_10),
+        Bar("CANF", _BASE_TS + timedelta(seconds=10), 4.16, 4.25, 4.10, 4.18, 240_000, Timeframe.SEC_10),
+        Bar("CANF", _BASE_TS + timedelta(seconds=20), 4.18, 4.27, 4.09, 4.21, 245_000, Timeframe.SEC_10),
+        Bar("CANF", _BASE_TS + timedelta(seconds=30), 4.21, 4.30, 4.13, 4.24, 300_000, Timeframe.SEC_10),
+        # Trades almost at the max-pay cap but without enough volume confirmation.
+        Bar("CANF", _BASE_TS + timedelta(seconds=40), 4.24, 4.40, 4.20, 4.36, 180_000, Timeframe.SEC_10),
+    ]
+
+    context = warrior_lanes.warrior_squeeze_pullaway_context(
+        ten_sec[-1],
+        {
+            "breakout_volume": 300_000,
+            "entry_trigger": "momentum_burst",
+        },
+        history=ten_sec,
+        reject_high=4.00,
+        rejection_reason="weak reclaim volume",
+        reentry_count=0,
+        min_reclaim_price=3.50,
+        reward_risk_value=3.0,
+        add_reward_risk_value=1.0,
+    )
+
+    assert context is None
+
+
 def test_warrior_pullaway_allows_bad_tape_after_fresh_micro_base_reclaim() -> None:
     ten_sec = [
         Bar("CANF", _BASE_TS + timedelta(seconds=0), 4.05, 4.12, 4.04, 4.09, 240_000, Timeframe.SEC_10),
@@ -2528,6 +2556,39 @@ def test_warrior_reject_history_blocks_weak_normal_fallback() -> None:
     )
 
     assert "Warrior watched UBXG" in str(driver._warrior_normal_fallback_reject(weak))
+    assert driver._warrior_normal_fallback_reject(elite) is None
+
+
+def test_warrior_failed_momentum_blocks_weak_vwap_and_hod_fallbacks() -> None:
+    driver = PipelineBacktestDriver(
+        {"SKYQ": []},
+        use_warrior_squeeze_playbook=True,
+    )
+    driver._warrior_failed_momentum["SKYQ"] = "warrior ignition loss"
+
+    def signal(pattern: str, score: float = 78.0) -> TradeSignal:
+        return TradeSignal(
+            symbol="SKYQ",
+            action=SignalAction.ENTER_LONG,
+            quantity=100,
+            entry_price=3.16,
+            stop_loss=3.00,
+            scan_result=ScanResult(
+                symbol="SKYQ",
+                scanner_name=pattern,
+                ts=_BASE_TS,
+                score=score,
+                criteria={"pattern": pattern, "setup_tier": "A setup", "entry_score": score},
+            ),
+        )
+
+    vwap_reject = driver._warrior_normal_fallback_reject(signal("vwap_pullback"))
+    hod_reject = driver._warrior_normal_fallback_reject(signal("hod_reclaim"))
+    elite = signal("vwap_pullback", score=94.0)
+    elite.scan_result.criteria["setup_tier"] = "A+ setup"
+
+    assert "Warrior/Ignition already failed on SKYQ" in str(vwap_reject)
+    assert "Warrior/Ignition already failed on SKYQ" in str(hod_reject)
     assert driver._warrior_normal_fallback_reject(elite) is None
 
 

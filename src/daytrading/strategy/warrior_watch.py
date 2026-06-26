@@ -36,6 +36,7 @@ class WarriorWatchBook:
     last_entry_trigger: Dict[str, str] = field(default_factory=dict)
     normal_fallback_rejects: Dict[str, int] = field(default_factory=dict)
     normal_fallback_last_reason: Dict[str, str] = field(default_factory=dict)
+    failed_momentum: Dict[str, str] = field(default_factory=dict)
 
     def reset_session(self) -> None:
         """Clear all state that must not leak between trading sessions."""
@@ -58,6 +59,7 @@ class WarriorWatchBook:
         self.last_entry_trigger.clear()
         self.normal_fallback_rejects.clear()
         self.normal_fallback_last_reason.clear()
+        self.failed_momentum.clear()
 
     def clear_watch_symbol(self, symbol: str) -> None:
         """Remove a symbol from active Warrior watch state without erasing P&L.

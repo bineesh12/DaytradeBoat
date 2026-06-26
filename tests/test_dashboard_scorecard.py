@@ -231,6 +231,33 @@ def test_dashboard_fill_strategy_feeds_entry_mode_scorecard() -> None:
     assert sc["by_strategy"]["breakout_scalp_momentum"]["total_pnl"] == -5.0
 
 
+def test_dashboard_exit_fill_inherits_open_entry_strategy() -> None:
+    from daytrading.execution.broker import Fill, Side
+
+    hub = DashboardHub()
+    entry = Fill(
+        symbol="SKYQ",
+        side=Side.BUY,
+        quantity=100,
+        price=3.12,
+        ts=datetime.fromisoformat("2026-06-26T12:29:57+00:00"),
+    )
+    exit_fill = Fill(
+        symbol="SKYQ",
+        side=Side.SELL,
+        quantity=100,
+        price=3.08,
+        ts=datetime.fromisoformat("2026-06-26T12:30:36+00:00"),
+    )
+
+    hub.on_fill(entry, "entry", strategy="warrior_squeeze_playbook")
+    hub.on_exit_fill(exit_fill, entry_price=3.12, reason="tape_pressure_sell")
+
+    last = hub.snapshot()["recent_trades"][-1]
+    assert last["trade_type"] == "exit"
+    assert last["strategy"] == "warrior_squeeze_playbook"
+
+
 def test_scorecard_strategy_pnl_tracks_contributing_symbols() -> None:
     from daytrading.dashboard.hub import _daily_scorecard
 

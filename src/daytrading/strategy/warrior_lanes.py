@@ -1267,6 +1267,19 @@ def warrior_squeeze_pullaway_context(
     if low > max_pay:
         return None
     entry_price = min(close, max_pay)
+    paying_cap = entry_price >= max_pay * 0.995
+    if (
+        paying_cap
+        and not clwt_fast_pullaway
+        and not warrior_reclaim_trigger
+        and not bool(pending_breakout.get("micro_base_reclaim"))
+        and (
+            close_location < 0.72
+            or (high > 0 and (high - close) / max(high - low, 0.01) > 0.32)
+            or volume < max(200_000.0, breakout_volume)
+        )
+    ):
+        return None
     stop_price = round(max(0.01, proof_level - max(0.08, proof_level * 0.03)), 4)
     risk = max(entry_price - stop_price, entry_price * 0.015, 0.06)
     if clwt_fast_pullaway:

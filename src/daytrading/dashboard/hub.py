@@ -411,6 +411,14 @@ class DashboardHub:
             trade_type="exit",
         )
         with self._lock:
+            for prior in reversed(self.trades):
+                if (
+                    prior.symbol == rec.symbol
+                    and prior.trade_type in ("entry", "reentry", "scale_up")
+                    and prior.strategy
+                ):
+                    rec.strategy = prior.strategy
+                    break
             self.trades.append(rec)
             if pnl is not None and not skip_pnl_accum:
                 self.total_pnl += pnl
