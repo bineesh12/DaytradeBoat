@@ -71,6 +71,44 @@ class IgnitionSignal:
         return max(floor, min(cap, self.conviction / cutoff))
 
 
+def ignition_suppression_reason(
+    signal: IgnitionSignal,
+    *,
+    failed_entries: int = 0,
+    peak_price: float = 0.0,
+    peak_day_move: float = 0.0,
+) -> str:
+    """Return a human-readable reason to skip post-peak chop re-ignitions.
+
+    The first ignition on a symbol is untouched. After a losing ignition, require
+    the next one to be a genuine fresh launch again, not a local bounce while the
+    earlier move is fading. Two failed ignition attempts stop the symbol for the
+    day.
+    """
+    failures = max(0, int(failed_entries or 0))
+    if failures <= 0 or not signal.detected:
+        return ""
+    if failures >= 2:
+        return "suppressed: 2 failed ignitions today"
+
+    price = float(signal.entry_ref or 0.0)
+    peak = float(peak_price or 0.0)
+    day_move = float(signal.features.get("day_move", 0.0) or 0.0)
+    peak_move = float(peak_day_move or 0.0)
+    near_hod = float(signal.features.get("near_hod", 0.0) or 0.0)
+
+    below_prior_peak = peak > 0 and price <= peak * 0.97
+    collapsed_vs_peak = peak_move > 0 and day_move <= peak_move * 0.60
+    weak_day_move = day_move <= 0.12
+    local_bounce = near_hod >= 0.90
+    if below_prior_peak and local_bounce and (collapsed_vs_peak or weak_day_move):
+        return (
+            "suppressed: post-peak chop after failed ignition "
+            "(price ${:.2f} below peak ${:.2f}, day_move {:.1%})"
+        ).format(price, peak, day_move)
+    return ""
+
+
 _MODEL_CACHE: Optional[IgnitionModel] = None
 
 

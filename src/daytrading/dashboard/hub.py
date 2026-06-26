@@ -102,6 +102,7 @@ class DashboardHub:
         self.hot_watch: List[dict] = []
         # Experimental Warrior playbook watch state (read-only dashboard view)
         self.warrior_watch: List[dict] = []
+        self.warrior_ignition_watch: List[dict] = []
         self.missed_a_plus: List[dict] = []
         self.scanner_near_miss: Dict[str, Any] = {}
         # Active trading watchlist (HOD TTL + pinned + open positions)
@@ -208,6 +209,14 @@ class DashboardHub:
         with self._lock:
             self.warrior_watch = rows[:100]
         self._broadcast("warrior_watch", {"symbols": self.warrior_watch})
+
+    def on_warrior_ignition_watch(self, symbols: List[dict]) -> None:
+        """Replace the learned-ignition watch-state rows (its own surface, separate
+        from the squeeze playbook's warrior_watch)."""
+        rows = symbols or []
+        with self._lock:
+            self.warrior_ignition_watch = rows[:100]
+        self._broadcast("warrior_ignition_watch", {"symbols": self.warrior_ignition_watch})
 
     def on_trading_watchlist(
         self,
@@ -611,6 +620,7 @@ class DashboardHub:
                 "hod_momentum_alerts": list(self.hod_momentum_alerts),
                 "hot_watch": list(self.hot_watch),
                 "warrior_watch": list(self.warrior_watch),
+                "warrior_ignition_watch": list(self.warrior_ignition_watch),
                 "missed_a_plus": list(self.missed_a_plus),
                 "scanner_near_miss": dict(self.scanner_near_miss),
                 "trading_watchlist": list(self.trading_watchlist),

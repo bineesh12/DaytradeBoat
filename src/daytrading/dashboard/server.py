@@ -879,6 +879,17 @@ tr:hover { background:var(--surface2); }
 
   <div class="card" style="margin-bottom:16px">
     <div class="card-header">
+      <h3>Warrior Ignition Watch</h3>
+      <span style="font-size:11px;color:var(--text2)">Learned base-breakout model &mdash; live conviction per symbol and why each did/didn&#39;t fire</span>
+      <span class="badge pill-purple" id="warrior-ignition-watch-count">0</span>
+    </div>
+    <div id="warrior-ignition-watch-wrap">
+      <div class="empty"><div class="icon">&#9889;</div>No ignition candidates yet</div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-header">
       <h3>HOD Momentum Scanner</h3>
       <span style="font-size:11px;color:var(--text2)">Chg % = from today open (or vs prior close if bars truncated) · vs Close % = like TradingView day change</span>
     </div>
@@ -1146,7 +1157,7 @@ let state = {
   recent_trades: [], recent_scans: [], pnl_history: [],
   daily_scorecard: {}, rolling_scorecard: {},
   market_open: false, stream_connected: false,
-  watchlist_scan: [], rt_movers: [], hod_momentum_alerts: [], hot_watch: [], warrior_watch: [], trading_watchlist: [],
+  watchlist_scan: [], rt_movers: [], hod_momentum_alerts: [], hot_watch: [], warrior_watch: [], warrior_ignition_watch: [], trading_watchlist: [],
   missed_a_plus: [],
   candidate_hydration: {},
   watchlist_pinned: ['SPY'],
@@ -1490,6 +1501,7 @@ function renderScanner() {
   renderTradingWatchlist();
   renderHotWatch();
   renderWarriorWatch();
+  renderWarriorIgnitionWatch();
   renderHodMomentumScanner();
 }
 
@@ -1680,6 +1692,57 @@ function renderWarriorWatch() {
     html += '<td>' + (r.entries || 0) + '</td>';
     html += '<td class="' + (pnl >= 0 ? 'text-green' : 'text-red') + '">' + fmtPnl(pnl) + '</td>';
     html += '<td>' + (cooldown || '-') + '</td>';
+    html += '<td style="font-size:11px;color:var(--text2)">' + escapeHtml(r.reason || '') + '</td>';
+    html += '</tr>';
+  });
+  html += '</table>';
+  wrap.innerHTML = html;
+}
+
+function ignitionStatePill(stateName) {
+  let map = {
+    ready: {label: 'Ready', cls: 'pill-green'},
+    queued: {label: 'Queued', cls: 'pill-blue'},
+    concurrency: {label: 'Slots full', cls: 'pill-yellow'},
+    capped: {label: 'Capped', cls: 'pill-yellow'},
+    suppressed: {label: 'Suppressed', cls: 'pill-red'},
+    low_conviction: {label: 'Low conv', cls: 'pill-purple'},
+    bad_stop: {label: 'Bad stop', cls: 'pill-red'},
+    no_ignition: {label: 'Basing', cls: 'pill-yellow'}
+  };
+  let m = map[stateName] || {label: stateName || 'Unknown', cls: 'pill-yellow'};
+  return '<span class="pill '+m.cls+'">'+escapeHtml(m.label)+'</span>';
+}
+
+function renderWarriorIgnitionWatch() {
+  let wrap = document.getElementById('warrior-ignition-watch-wrap');
+  if (!wrap) return;
+  let rows = (state.warrior_ignition_watch || []).slice();
+  let countEl = document.getElementById('warrior-ignition-watch-count');
+  if (countEl) countEl.textContent = rows.length;
+
+  if (rows.length === 0) {
+    wrap.innerHTML = '<div class="empty"><div class="icon">&#9889;</div>No ignition candidates yet</div>';
+    return;
+  }
+
+  let html = '<table><tr>'
+    + '<th>Symbol</th><th>State</th><th>Conviction</th><th>Size</th><th>Entry</th>'
+    + '<th>Stop</th><th>Age</th><th>Reason</th>'
+    + '</tr>';
+  rows.forEach(r => {
+    let conv = Number(r.conviction || 0);
+    let size = Number(r.size_factor || 0);
+    let entry = Number(r.entry_ref || 0);
+    let stop = Number(r.stop || 0);
+    html += '<tr>';
+    html += '<td>' + chartLink(r.symbol) + '</td>';
+    html += '<td>' + ignitionStatePill(r.state) + '</td>';
+    html += '<td>' + conv.toFixed(2) + '</td>';
+    html += '<td>' + (size > 0 ? size.toFixed(2) + 'x' : '-') + '</td>';
+    html += '<td>' + (entry > 0 ? '$' + entry.toFixed(2) : '-') + '</td>';
+    html += '<td>' + (stop > 0 ? '$' + stop.toFixed(2) : '-') + '</td>';
+    html += '<td>' + warriorSecondsText(r.age_seconds) + '</td>';
     html += '<td style="font-size:11px;color:var(--text2)">' + escapeHtml(r.reason || '') + '</td>';
     html += '</tr>';
   });
@@ -3333,6 +3396,7 @@ function applySnapshot(data) {
   state.hod_momentum_alerts = data.hod_momentum_alerts || [];
   state.hot_watch = data.hot_watch || [];
   state.warrior_watch = data.warrior_watch || [];
+  state.warrior_ignition_watch = data.warrior_ignition_watch || [];
   state.missed_a_plus = data.missed_a_plus || [];
   state.daily_scorecard = data.daily_scorecard || {};
   state.rolling_scorecard = data.rolling_scorecard || {};
@@ -3425,6 +3489,10 @@ es.onmessage = function(e) {
       state.hot_watch = msg.data.symbols || [];
       renderHotWatch();
       renderTradingWatchlist();
+      break;
+    case 'warrior_ignition_watch':
+      state.warrior_ignition_watch = msg.data.symbols || [];
+      renderWarriorIgnitionWatch();
       break;
     case 'warrior_watch':
       state.warrior_watch = msg.data.symbols || [];

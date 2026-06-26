@@ -647,6 +647,63 @@ def test_warrior_squeeze_backtest_clwt_fast_pullaway_without_slow_proof_hold() -
     assert signal.take_profit > signal.entry_price
 
 
+def test_warrior_pullaway_waits_for_micro_base_after_bad_tape() -> None:
+    ten_sec = [
+        Bar("CANF", _BASE_TS + timedelta(seconds=0), 4.05, 4.12, 4.04, 4.09, 240_000, Timeframe.SEC_10),
+        Bar("CANF", _BASE_TS + timedelta(seconds=10), 4.08, 4.15, 4.05, 4.12, 260_000, Timeframe.SEC_10),
+        Bar("CANF", _BASE_TS + timedelta(seconds=20), 4.12, 4.18, 4.07, 4.15, 280_000, Timeframe.SEC_10),
+        Bar("CANF", _BASE_TS + timedelta(seconds=30), 4.14, 4.24, 4.08, 4.20, 330_000, Timeframe.SEC_10),
+        Bar("CANF", _BASE_TS + timedelta(seconds=40), 4.20, 4.39, 4.19, 4.32, 620_000, Timeframe.SEC_10),
+    ]
+
+    context = warrior_lanes.warrior_squeeze_pullaway_context(
+        ten_sec[-1],
+        {
+            "breakout_volume": 330_000,
+            "entry_trigger": "momentum_burst",
+        },
+        history=ten_sec,
+        reject_high=3.96,
+        rejection_reason="high-volume shooting-star rejection",
+        reentry_count=0,
+        min_reclaim_price=3.50,
+        reward_risk_value=3.0,
+        add_reward_risk_value=1.0,
+    )
+
+    assert context is None
+
+
+def test_warrior_pullaway_allows_bad_tape_after_fresh_micro_base_reclaim() -> None:
+    ten_sec = [
+        Bar("CANF", _BASE_TS + timedelta(seconds=0), 4.05, 4.12, 4.04, 4.09, 240_000, Timeframe.SEC_10),
+        Bar("CANF", _BASE_TS + timedelta(seconds=10), 4.08, 4.15, 4.05, 4.12, 260_000, Timeframe.SEC_10),
+        Bar("CANF", _BASE_TS + timedelta(seconds=20), 4.12, 4.18, 4.07, 4.15, 280_000, Timeframe.SEC_10),
+        Bar("CANF", _BASE_TS + timedelta(seconds=30), 4.14, 4.24, 4.08, 4.20, 330_000, Timeframe.SEC_10),
+        Bar("CANF", _BASE_TS + timedelta(seconds=40), 4.20, 4.39, 4.19, 4.32, 620_000, Timeframe.SEC_10),
+    ]
+
+    context = warrior_lanes.warrior_squeeze_pullaway_context(
+        ten_sec[-1],
+        {
+            "breakout_volume": 330_000,
+            "entry_trigger": "momentum_burst",
+            "micro_base_reclaim": True,
+        },
+        history=ten_sec,
+        reject_high=3.96,
+        rejection_reason="high-volume shooting-star rejection",
+        reentry_count=0,
+        min_reclaim_price=3.50,
+        reward_risk_value=3.0,
+        add_reward_risk_value=1.0,
+    )
+
+    assert context is not None
+    assert context["entry_trigger"] == "warrior_level_pullaway"
+    assert context["variant_override"] == "warrior_proof_pullback_hold"
+
+
 def test_warrior_squeeze_backtest_fast_pullaway_rejects_high_reject_chase() -> None:
     ten_sec = [
         Bar("JRSH", _BASE_TS + timedelta(seconds=0), 3.98, 4.02, 3.93, 3.9792, 2_905, Timeframe.SEC_10),

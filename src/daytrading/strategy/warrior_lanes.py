@@ -1226,6 +1226,21 @@ def warrior_squeeze_pullaway_context(
         "warrior_a_plus_reclaim",
         "psych_level_break",
     }
+    bad_tape_reclaim_required = False
+    rejection_text = str(rejection_reason or "").lower()
+    if reentry_count == 0 and rejection_text:
+        bad_tape_reclaim_required = (
+            rejection_reason
+            in {
+                "high-volume shooting-star rejection",
+                "first explosive 10s spike",
+            }
+            or "bad tape" in rejection_text
+            or "slippage" in rejection_text
+            or "spread" in rejection_text
+            or "weak reclaim" in rejection_text
+            or "reclaim volume weak" in rejection_text
+        )
     min_close_location = 0.30 if warrior_reclaim_trigger else 0.55
     if close_location < min_close_location:
         return None
@@ -1234,6 +1249,13 @@ def warrior_squeeze_pullaway_context(
         and proof_level < 5.0
         and not clwt_fast_pullaway
         and not first_starter_has_proof_hold(history, proof_level)
+    ):
+        return None
+    if (
+        bad_tape_reclaim_required
+        and not clwt_fast_pullaway
+        and not warrior_reclaim_trigger
+        and not bool(pending_breakout.get("micro_base_reclaim"))
     ):
         return None
     breakout_volume = float(pending_breakout.get("breakout_volume") or 0.0)

@@ -18,7 +18,12 @@ from daytrading.strategy.execution_timer import ExecutionTimer
 from daytrading.strategy.entry_guard import assess_opportunity_scaled_spread
 from daytrading.strategy import warrior_lanes
 from daytrading.strategy.warrior_engine import WarriorEngine
-from daytrading.strategy.warrior_ignition import detect_ignition, prior_day_high, get_model as get_ignition_model
+from daytrading.strategy.warrior_ignition import (
+    detect_ignition,
+    get_model as get_ignition_model,
+    ignition_suppression_reason,
+    prior_day_high,
+)
 
 
 @dataclass
@@ -139,6 +144,10 @@ class PipelineBacktestDriver:
         self._use_warrior_ignition_model = bool(use_warrior_ignition_model)
         self._ignition_model = get_ignition_model() if self._use_warrior_ignition_model else None
         self._warrior_ignition_entries: Dict[str, int] = {}  # per-symbol/day entry cap
+        self._warrior_ignition_failed_entries: Dict[str, int] = {}
+        self._warrior_ignition_peak_price: Dict[str, float] = {}
+        self._warrior_ignition_peak_day_move: Dict[str, float] = {}
+        self._warrior_ignition_trade_pnl: Dict[str, float] = {}
         self._momentum_burst_window_sec = float(momentum_burst_window_sec)
         self._momentum_burst_cooldown_sec = float(momentum_burst_cooldown_sec)
         self._momentum_burst_last_entry: Dict[str, datetime] = {}
@@ -578,6 +587,32 @@ class PipelineBacktestDriver:
             ph = prior_day_high(sym, ten_sec.ts.date())
             sig = detect_ignition(history[:-1], model, prior_high=ph)
             if not sig.detected or sig.conviction < 0.20:   # drop the weakest
+                continue
+            self._warrior_ignition_peak_price[sym] = max(
+                float(self._warrior_ignition_peak_price.get(sym, 0.0) or 0.0),
+                float(sig.entry_ref or 0.0),
+            )
+            self._warrior_ignition_peak_day_move[sym] = max(
+                float(self._warrior_ignition_peak_day_move.get(sym, 0.0) or 0.0),
+                float(sig.features.get("day_move", 0.0) or 0.0),
+            )
+            suppress_reason = ignition_suppression_reason(
+                sig,
+                failed_entries=int(self._warrior_ignition_failed_entries.get(sym, 0) or 0),
+                peak_price=float(self._warrior_ignition_peak_price.get(sym, 0.0) or 0.0),
+                peak_day_move=float(self._warrior_ignition_peak_day_move.get(sym, 0.0) or 0.0),
+            )
+            if suppress_reason:
+                result.entry_decisions.append({
+                    "ts": now.isoformat(), "symbol": sym, "stage": strategy_label,
+                    "passed": False, "blocked_layer": "warrior_ignition",
+                    "reason": suppress_reason, "action": SignalAction.ENTER_LONG.value,
+                    "pattern": "warrior_ignition", "scanner": strategy_label,
+                    "setup_tier": "A+ setup", "entry_tier": "quick_scalp",
+                    "price": float(ten_sec.open or 0.0),
+                    "metadata": {"source": "warrior_ignition_model",
+                                 "conviction": round(sig.conviction, 3)},
+                })
                 continue
             entry, stop = float(ten_sec.open), sig.stop
             if not (entry > stop > 0):
@@ -1625,6 +1660,19 @@ class PipelineBacktestDriver:
             ledger.record_exit(fill, reason="{}: {}".format(reason, label))
             if is_warrior or is_hit_run_strategy(strategy):
                 last_trade = ledger.trades[-1] if ledger.trades else {}
+                if br.get("entry_trigger") == "warrior_ignition":
+                    pnl = float(last_trade.get("pnl") or 0.0)
+                    self._warrior_ignition_trade_pnl[sym] = (
+                        float(self._warrior_ignition_trade_pnl.get(sym, 0.0) or 0.0) + pnl
+                    )
+                    if sym not in self._mb_bracket:
+                        net_pnl = float(self._warrior_ignition_trade_pnl.pop(sym, 0.0) or 0.0)
+                        if net_pnl < 0.0:
+                            self._warrior_ignition_failed_entries[sym] = (
+                                int(self._warrior_ignition_failed_entries.get(sym, 0) or 0) + 1
+                            )
+                        elif net_pnl > 0.0:
+                            self._warrior_ignition_failed_entries.pop(sym, None)
                 if reason == "mb_bracket_target" and is_warrior:
                     cooldown = self._record_warrior_target_exit(
                         sym,

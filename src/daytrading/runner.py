@@ -280,6 +280,11 @@ class AlpacaRunner:
         self._warrior_normal_fallback_last_reason = (
             self._warrior_watch.normal_fallback_last_reason
         )
+        self._warrior_ignition_entries: Dict[str, int] = {}
+        self._warrior_ignition_failed_entries: Dict[str, int] = {}
+        self._warrior_ignition_peak_price: Dict[str, float] = {}
+        self._warrior_ignition_peak_day_move: Dict[str, float] = {}
+        self._warrior_ignition_trade_pnl: Dict[str, float] = {}
         self._trade_analyzer = None
         self._analysis_interval = 10  # run analysis every N cycles
         self._reconciler = PositionReconciler()
@@ -518,12 +523,20 @@ class AlpacaRunner:
             if cfg.hod_sub2_momentum_enabled
             else cfg.hod_momentum_min_price
         )
+        # Part B of volume-surge discovery: when enabled, broaden the PRE-MARKET
+        # candidate pool by lowering the minute-volume gate, so sleepy small-caps
+        # (SDOT-type) are pre-loaded and the surge detector can watch them BEFORE
+        # they explode. Off = the normal 10k gate (production unchanged).
+        _surge_disc = os.environ.get("DAYTRADING_VOLUME_SURGE_DISCOVERY", "").strip().lower() in (
+            "1", "true", "yes", "on",
+        )
         scanner = WatchlistScanner(
             api_key=cfg.alpaca_api_key,
             secret_key=cfg.alpaca_secret_key,
             min_price=scanner_min_price,
             max_price=cfg.hod_momentum_max_price,
             min_volume=10_000,
+            premarket_min_volume=1_000 if _surge_disc else 10_000,
             min_change_pct=2.0,
             max_symbols=30,
             feed=cfg.alpaca_feed,
@@ -1227,6 +1240,33 @@ class AlpacaRunner:
                     return
                 time.sleep(1)
 
+    def _volume_surge_detected(self, c: Dict[str, Any]) -> bool:
+        """True if this symbol's volume just spiked vs its OWN trailing baseline.
+
+        Uses the snapshot volume (current-minute volume in pre-market) tracked
+        across fast-scan cycles. Fires on a >=5x jump over the symbol's recent
+        median, with a meaningful absolute floor and price ticking up — so a
+        sleepy stock that suddenly explodes (SDOT-type) is caught immediately
+        instead of waiting for slow cumulative thresholds."""
+        if not hasattr(self, "_surge_vol_hist"):
+            self._surge_vol_hist: Dict[str, List[float]] = {}
+        sym = str(c.get("symbol") or "")
+        vol = float(c.get("volume") or 0.0)
+        price = float(c.get("price") or 0.0)
+        chg = float(c.get("change_pct") or 0.0)
+        if not sym or vol <= 0 or not (1.0 <= price <= 20.0):
+            return False
+        hist = self._surge_vol_hist.setdefault(sym, [])
+        prior = list(hist)
+        hist.append(vol)
+        if len(hist) > 6:
+            hist.pop(0)
+        if len(prior) < 3 or vol < 20_000 or chg <= 0:
+            return False
+        sprior = sorted(prior)
+        baseline = sprior[len(sprior) // 2]   # median of prior samples
+        return vol >= 5.0 * max(baseline, 1.0)
+
     def _run_fast_scan(self) -> None:
         """Quick rescan of cached candidates to find new movers."""
         if self._scanner is None:
@@ -1245,11 +1285,24 @@ class AlpacaRunner:
         candidates = self._scanner.scan_candidates(readonly=True)
 
         current_pool = set(self._hod_bar_pool)
+        surge_on = os.environ.get("DAYTRADING_VOLUME_SURGE_DISCOVERY", "").strip().lower() in (
+            "1", "true", "yes", "on",
+        ) and phase == "PRE-MARKET"
         new_movers = []
         for c in candidates:
             sym = c["symbol"]
             # Force-add strong movers even if seen before
             is_strong = c.get("abs_change_pct", 0) >= 10.0 and c.get("volume", 0) >= 200_000
+            # Volume-surge fast-discovery: catch a sleepy stock the instant its
+            # volume spikes vs its OWN baseline (SDOT-type early-premarket launch),
+            # not after slow cumulative thresholds. Tag it so the promote path can
+            # bypass the +5% change gate.
+            surged = surge_on and self._volume_surge_detected(c)
+            if surged:
+                c["surge"] = True
+                if sym not in current_pool:
+                    new_movers.append(c)
+                    continue
             hot_watch_candidate = (
                 not _ensure_market_data_service(self).hot_watch_contains(sym)
                 and self._hot_watch_reject_reason(c, None) is None
@@ -1270,6 +1323,12 @@ class AlpacaRunner:
                         bars_stale = False
                 if hot_watch_candidate or (is_strong and (not bars or bars_stale)):
                     new_movers.append(c)
+                continue
+            if phase == "PRE-MARKET" and not is_strong and not hot_watch_candidate:
+                # Premarket scanner snapshots can include many baseline-only
+                # candidates with stale/flat change. Track them for surge history,
+                # but do not enqueue them for hydration unless they actually surge
+                # or independently qualify as a real mover/hot-watch setup.
                 continue
             if sym in self._fast_scan_known and not is_strong and not hot_watch_candidate:
                 continue
@@ -1886,7 +1945,10 @@ class AlpacaRunner:
 
         change = abs(float(mover.get("abs_change_pct", mover.get("change_pct", 0.0)) or 0.0))
         early_level_scout = self._hot_watch_level_breakout_scout_candidate(mover)
-        if change < self._hot_watch_min_change_pct and not early_level_scout:
+        # A detected volume surge promotes on the spike alone — don't wait for the
+        # full +5% change gate (catches the launch a leg earlier).
+        volume_surge = bool(mover.get("surge"))
+        if change < self._hot_watch_min_change_pct and not early_level_scout and not volume_surge:
             return "change {:.1f}% < {:.1f}%".format(
                 change, self._hot_watch_min_change_pct,
             )
@@ -3464,6 +3526,13 @@ class AlpacaRunner:
             pnl = self._pipeline.record_realized_exit(
                 fill.symbol, entry_price, fill.price, fill.quantity,
             )
+        tracked_for_exit = self._pipeline.exit_manager.tracked.get(fill.symbol)
+        if str(getattr(tracked_for_exit, "entry_trigger", "") or "") == "warrior_ignition":
+            try:
+                completed = tracked_for_exit is None or float(getattr(tracked_for_exit, "remaining_qty", 0.0) or 0.0) <= 0.0
+                self._record_warrior_ignition_exit(fill.symbol, pnl, reason, completed=completed)
+            except Exception:
+                logger.debug("failed to record warrior ignition exit", exc_info=True)
         try:
             from daytrading.ml.shadow_collector import label_exit_snapshots
             label_exit_snapshots(fill.symbol, fill.price)
@@ -3971,6 +4040,19 @@ class AlpacaRunner:
         self._breakout_scalp_active = False
         if getattr(self, "_recent_quick_scalp_rejects", None):
             self._recent_quick_scalp_rejects.clear()
+        if getattr(self, "_surge_vol_hist", None):
+            self._surge_vol_hist.clear()
+        for attr in (
+            "_warrior_ignition_entries",
+            "_warrior_ignition_failed_entries",
+            "_warrior_ignition_peak_price",
+            "_warrior_ignition_peak_day_move",
+            "_warrior_ignition_trade_pnl",
+            "_warrior_ignition_watch",
+        ):
+            value = getattr(self, attr, None)
+            if value:
+                value.clear()
 
         # Reset daily P&L tracking
         self._pipeline._daily_pnl = 0.0
@@ -4123,7 +4205,8 @@ class AlpacaRunner:
         """
         got_bars = False
         drained = 0
-        while True:
+        max_drain = 5000
+        while drained < max_drain:
             try:
                 evt = self._event_queue.get_nowait()
             except queue.Empty:
@@ -4257,7 +4340,12 @@ class AlpacaRunner:
                     source="fast scan event",
                 )
 
-        if drained > 5000:
+        if drained >= max_drain:
+            logger.warning(
+                "Event drain capped at %d events; leaving backlog for next loop",
+                max_drain,
+            )
+        elif drained > 2500:
             logger.info("Drained %d events from queue", drained)
         return got_bars
 
@@ -6666,7 +6754,12 @@ class AlpacaRunner:
         if self._new_entries_blocked(None, "WARRIOR IGNITION"):
             return
         try:
-            from daytrading.strategy.warrior_ignition import detect_ignition, get_model, prior_day_high
+            from daytrading.strategy.warrior_ignition import (
+                detect_ignition,
+                get_model,
+                ignition_suppression_reason,
+                prior_day_high,
+            )
             from daytrading.strategy.warrior_ignition_log import get_logger
         except Exception:
             return
@@ -6676,8 +6769,51 @@ class AlpacaRunner:
         if counts is None:
             counts = {}
             self._warrior_ignition_entries = counts
+        failed_counts = getattr(self, "_warrior_ignition_failed_entries", None)
+        if failed_counts is None:
+            failed_counts = {}
+            self._warrior_ignition_failed_entries = failed_counts
+        peak_prices = getattr(self, "_warrior_ignition_peak_price", None)
+        if peak_prices is None:
+            peak_prices = {}
+            self._warrior_ignition_peak_price = peak_prices
+        peak_moves = getattr(self, "_warrior_ignition_peak_day_move", None)
+        if peak_moves is None:
+            peak_moves = {}
+            self._warrior_ignition_peak_day_move = peak_moves
         engine = getattr(self, "_warrior_engine", None)
-        for sym, raw_bars in list(getattr(self, "_timer_bars_by_symbol", {}).items()):
+        # LIVE bar source: the aggregator's rolling 10s buffer, keyed by the
+        # symbols we are actively tracking this cycle (watchlist + hot-watch +
+        # protected). NOTE: ``_timer_bars_by_symbol`` is a BACKTEST-ONLY
+        # structure (set in backtest/driver.py); it is always empty in the live
+        # runner, so iterating it here scored nothing and never traded.
+        aggregator = getattr(self, "_bar_aggregator", None)
+        if aggregator is None:
+            return
+        watch = getattr(self, "_warrior_ignition_watch", None)
+        if watch is None:
+            watch = {}
+            self._warrior_ignition_watch = watch
+        now_mono = time.monotonic()
+        entered = 0
+        max_per_cycle = 3      # was 1 (hard break) — let several real ignitions fire
+        floor = 0.20
+
+        def _mark(symu, st, conv, px, stp, sz, why):
+            # visible, real-time watch record on the ignition's OWN surface — it
+            # deliberately does NOT touch the WarriorWatchBook the squeeze lanes read.
+            watch[symu] = {
+                "symbol": symu, "state": st, "conviction": round(float(conv), 3),
+                "entry_ref": round(float(px), 4), "stop": round(float(stp), 4),
+                "size_factor": round(float(sz), 2), "reason": why, "ts": now_mono,
+            }
+
+        for sym in sorted(self._trade_symbol_set()):
+            symu = sym.upper()
+            try:
+                raw_bars = aggregator.get_10s_bars(sym)
+            except Exception:
+                continue
             bars = [b for b in (raw_bars or []) if float(getattr(b, "close", 0.0) or 0.0) > 0]
             if len(bars) < 24:
                 continue
@@ -6687,30 +6823,78 @@ class AlpacaRunner:
                 sig = detect_ignition(bars, model, prior_high=ph)
             except Exception:
                 continue
+            price = float(latest_10s.close or 0.0)
             if not sig.detected:
+                # surface near-misses (a real base, in band) so you can SEE what is
+                # forming but not yet igniting; skip pure noise (warming/out-of-band).
+                if sig.reject in ("no ignition (gate)", "bad base"):
+                    _mark(symu, "no_ignition", 0.0, price, 0.0, 0.0, sig.reject)
                 continue
+            conv = float(sig.conviction)
             size_factor = sig.size_factor(model.cutoff)
+            stop = float(sig.stop)
+            suppress_reason = ""
+            if conv >= floor:
+                peak_prices[symu] = max(
+                    float(peak_prices.get(symu, 0.0) or 0.0),
+                    float(sig.entry_ref or price or 0.0),
+                )
+                peak_moves[symu] = max(
+                    float(peak_moves.get(symu, 0.0) or 0.0),
+                    float(sig.features.get("day_move", 0.0) or 0.0),
+                )
+                suppress_reason = ignition_suppression_reason(
+                    sig,
+                    failed_entries=int(failed_counts.get(symu, 0) or 0),
+                    peak_price=float(peak_prices.get(symu, 0.0) or 0.0),
+                    peak_day_move=float(peak_moves.get(symu, 0.0) or 0.0),
+                )
             try:
                 ig_logger.log(
                     ts_iso=latest_10s.ts.isoformat(), symbol=sym, signal=sig,
-                    would_enter=sig.conviction >= 0.20, size_factor=size_factor,
+                    would_enter=conv >= floor and not suppress_reason, size_factor=size_factor,
                 )
             except Exception:
                 pass
-            if sig.conviction < 0.20 or counts.get(sym.upper(), 0) >= 4:
+            # record a visible state + reason for EVERY detected ignition
+            if conv < floor:
+                _mark(symu, "low_conviction", conv, price, stop, size_factor,
+                      "conv {:.2f} < {:.2f} floor".format(conv, floor))
+            else:
+                if suppress_reason:
+                    _mark(symu, "suppressed", conv, price, stop, size_factor, suppress_reason)
+            if conv < floor:
+                pass
+            elif suppress_reason:
+                pass
+            elif counts.get(symu, 0) >= 4:
+                _mark(symu, "capped", conv, price, stop, size_factor, "per-symbol cap (4 entries)")
+            elif not (price > stop > 0):
+                _mark(symu, "bad_stop", conv, price, stop, size_factor, "stop not below price")
+            elif entered >= max_per_cycle:
+                _mark(symu, "queued", conv, price, stop, size_factor, "entry slot taken this cycle")
+            else:
+                allowed, why = True, ""
+                if engine is not None:
+                    try:
+                        decision = engine.allow_entry(
+                            symu, open_positions=self._active_warrior_trade_count() + entered)
+                        allowed = bool(decision.allowed)
+                        why = getattr(decision, "reason", "") or "concurrency full"
+                    except Exception:
+                        allowed = True
+                if not allowed:
+                    _mark(symu, "concurrency", conv, price, stop, size_factor, why)
+                else:
+                    _mark(symu, "ready", conv, price, stop, size_factor,
+                          "conv {:.2f} → ENTER".format(conv))
+            rec = watch.get(symu, {})
+            logger.info(
+                "⚡ IGNITION %s [%s] conv=%.2f size=%.2f entry=%.3f stop=%.3f %s",
+                symu, rec.get("state", "?"), conv, size_factor, price, stop, rec.get("reason", ""),
+            )
+            if rec.get("state") != "ready":
                 continue
-            price = float(latest_10s.close or 0.0)
-            stop = float(sig.stop)
-            if not (price > stop > 0):
-                continue
-            # concurrency gate (the lane path's allocator check is bypassed here)
-            if engine is not None:
-                try:
-                    decision = engine.allow_entry(sym, open_positions=self._active_warrior_trade_count())
-                    if not decision.allowed:
-                        continue
-                except Exception:
-                    pass
             risk = price - stop
             ctx = {
                 "entry_trigger": "warrior_ignition",
@@ -6718,10 +6902,10 @@ class AlpacaRunner:
                 "stop_price_override": round(stop, 4),
                 "target_price_override": round(price + risk * 3.0, 2),
                 "skip_unstable_confirm_stop_check": True,
-                "rr_note_override": "warrior ignition conv={:.2f}".format(sig.conviction),
+                "rr_note_override": "warrior ignition conv={:.2f}".format(conv),
                 "variant_override": "warrior_ignition",
                 "max_hold_seconds_override": 600.0,
-                "window_high": float(self._momentum_burst_window_high.get(sym.upper(), 0.0) or 0.0),
+                "window_high": float(self._momentum_burst_window_high.get(symu, 0.0) or 0.0),
             }
             fill = self._execute_momentum_burst_scalp(
                 sym, latest_10s, entry_context=ctx,
@@ -6729,8 +6913,75 @@ class AlpacaRunner:
                 size_factor_override=size_factor,
             )
             if fill is not None:
-                counts[sym.upper()] = counts.get(sym.upper(), 0) + 1
-                break   # one ignition entry per cycle
+                counts[symu] = counts.get(symu, 0) + 1
+                entered += 1
+        self._publish_warrior_ignition_watch()
+
+    def _record_warrior_ignition_exit(
+        self,
+        symbol: str,
+        pnl: float,
+        reason: str,
+        *,
+        completed: bool,
+    ) -> None:
+        sym = symbol.upper()
+        failures = getattr(self, "_warrior_ignition_failed_entries", None)
+        if failures is None:
+            failures = {}
+            self._warrior_ignition_failed_entries = failures
+        trade_pnls = getattr(self, "_warrior_ignition_trade_pnl", None)
+        if trade_pnls is None:
+            trade_pnls = {}
+            self._warrior_ignition_trade_pnl = trade_pnls
+        trade_pnls[sym] = float(trade_pnls.get(sym, 0.0) or 0.0) + float(pnl or 0.0)
+        if not completed:
+            return
+        net_pnl = float(trade_pnls.pop(sym, 0.0) or 0.0)
+        if net_pnl < 0.0:
+            failures[sym] = int(failures.get(sym, 0) or 0) + 1
+            logger.info(
+                "IGNITION failed %s count=%d net_pnl=$%.2f reason=%s",
+                sym,
+                failures[sym],
+                net_pnl,
+                reason,
+            )
+        elif net_pnl > 0.0:
+            failures.pop(sym, None)
+
+    def _warrior_ignition_watch_snapshot(self) -> List[dict]:
+        """Read-only telemetry of what the learned ignition path is watching this
+        cycle and WHY each symbol did/didn't fire. This is its OWN surface, kept
+        separate from the WarriorWatchBook that the squeeze lanes mutate."""
+        watch = getattr(self, "_warrior_ignition_watch", None)
+        if not watch:
+            return []
+        now_mono = time.monotonic()
+        rank = {"ready": 0, "queued": 1, "concurrency": 2, "capped": 3,
+                "suppressed": 4, "low_conviction": 5, "bad_stop": 6, "no_ignition": 7}
+        rows: List[dict] = []
+        for symu, rec in list(watch.items()):
+            try:
+                age = now_mono - float(rec.get("ts", 0.0))
+            except (TypeError, ValueError):
+                age = 0.0
+            if age > 120.0:          # drop stale scores so the table reflects NOW
+                watch.pop(symu, None)
+                continue
+            row = {k: v for k, v in rec.items() if k != "ts"}
+            row["age_seconds"] = round(age, 1)
+            rows.append(row)
+        rows.sort(key=lambda r: (rank.get(str(r.get("state")), 9), -float(r.get("conviction") or 0.0)))
+        return rows[:15]
+
+    def _publish_warrior_ignition_watch(self) -> None:
+        handler = getattr(self._hub, "on_warrior_ignition_watch", None)
+        if handler is not None:
+            try:
+                handler(self._warrior_ignition_watch_snapshot())
+            except Exception:
+                pass
 
     def _process_momentum_burst_scalps(self) -> None:
         """Monitor armed momentum_burst symbols and scalp fresh 10s highs.
