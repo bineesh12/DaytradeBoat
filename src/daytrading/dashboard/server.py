@@ -926,6 +926,15 @@ tr:hover { background:var(--surface2); }
       <div class="empty"><div class="icon">&#128202;</div>No trades yet</div>
     </div>
   </div>
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-header">
+      <h3>Warrior Ignition Details</h3>
+      <span class="pill pill-purple" id="warrior-ignition-count">0 closed</span>
+    </div>
+    <div id="warrior-ignition-wrap">
+      <div class="empty"><div class="icon">&#9889;</div>No Warrior ignition trades yet</div>
+    </div>
+  </div>
   <div class="card">
     <div class="card-header"><h3>Trade History</h3></div>
     <div id="trades-table-wrap">
@@ -1064,6 +1073,7 @@ tr:hover { background:var(--surface2); }
         <label><input type="checkbox" id="bt-flag-momentum"> momentum burst live</label>
         <label title="Replay the rapid momentum-burst hit-and-run state machine from real 10s bars"><input type="checkbox" id="bt-flag-mb-hit-run"> momentum hit-run</label>
         <label title="Replay the Warrior-style squeeze playbook: first popup is attention only, enter after reclaim proof"><input type="checkbox" id="bt-flag-warrior"> warrior squeeze</label>
+        <label title="Replay the learned Warrior ignition model on premarket base-breakout ignitions"><input type="checkbox" id="bt-flag-warrior-ignition"> warrior ignition</label>
         <label><input type="checkbox" id="bt-flag-capped"> level-capped entry</label>
         <label><input type="checkbox" id="bt-flag-timer" checked> 10s timer replay</label>
         <label><input type="checkbox" id="bt-flag-10s-scout"> 10s breakout scout</label>
@@ -1185,6 +1195,9 @@ function chartLink(sym) {
 }
 function shortStrategyLabel(name) {
   let s = String(name || 'unknown');
+  if (s.toLowerCase().includes('warrior_ignition') || s.toLowerCase().includes('warrior ignition')) {
+    return 'warrior ignition';
+  }
   s = s.replace(/^.*?:\s*/, '');
   s = s.replace(/_/g, ' ');
   return s.length > 42 ? s.slice(0, 39) + '...' : s;
@@ -1229,6 +1242,57 @@ function escapeHtml(v) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+
+function textHasIgnition(v) {
+  let s = String(v || '').toLowerCase();
+  return s.includes('warrior_ignition') || s.includes('warrior ignition') || s.includes('ignition_model');
+}
+
+function isWarriorIgnitionRow(t) {
+  if (!t) return false;
+  return textHasIgnition(t.strategy)
+    || textHasIgnition(t.exit_reason)
+    || textHasIgnition(t.reason)
+    || textHasIgnition(t.pattern)
+    || textHasIgnition(t.mode)
+    || textHasIgnition(t.entry_mode)
+    || textHasIgnition(t.entry_trigger);
+}
+
+function ignitionConviction(t) {
+  let text = [t && t.exit_reason, t && t.reason, t && t.strategy, t && t.pattern, t && t.mode].join(' ');
+  let m = String(text || '').match(/conv(?:iction)?[=:\s]+([0-9.]+)/i);
+  if (!m) return '';
+  let n = Number(m[1]);
+  return Number.isFinite(n) ? n.toFixed(2) : '';
+}
+
+function collectWarriorIgnitionTrades(sourceTrades) {
+  let openBySymbol = {};
+  let rows = [];
+  (sourceTrades || []).forEach(t => {
+    let sym = String(t.symbol || '').toUpperCase();
+    if (!sym) return;
+    let type = String(t.trade_type || '').toLowerCase();
+    if (type === 'entry' || type === 'reentry' || type === 'scale_up') {
+      if (isWarriorIgnitionRow(t)) {
+        openBySymbol[sym] = t;
+        rows.push(Object.assign({_ignitionEntry: t, _ignitionOpen: true}, t));
+      }
+      return;
+    }
+    if (type === 'exit') {
+      let entry = openBySymbol[sym] || null;
+      if (entry || isWarriorIgnitionRow(t)) {
+        rows.push(Object.assign({_ignitionEntry: entry || t, _ignitionOpen: false}, t));
+      }
+      if (entry && t.pnl !== null && t.pnl !== undefined) {
+        delete openBySymbol[sym];
+      }
+    }
+  });
+  return rows;
 }
 
 // Render functions
@@ -1696,6 +1760,8 @@ function renderTrades() {
   let trades = state.recent_trades.filter(t => t.trade_type !== 'entry' || t.pnl != null).slice(-50).reverse();
   if (state.recent_trades.length === 0) {
     wrap.innerHTML = '<div class="empty"><div class="icon">&#128202;</div>No trades yet</div>';
+    renderStockSummary();
+    renderWarriorIgnitionDetails();
     return;
   }
   let html = '<table><tr><th>Time</th><th>Type</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Exit</th><th>P&L</th><th>Reason</th></tr>';
@@ -1712,6 +1778,7 @@ function renderTrades() {
   html += '</table>';
   wrap.innerHTML = html;
   renderStockSummary();
+  renderWarriorIgnitionDetails();
 }
 
 function renderStockSummary() {
@@ -1777,6 +1844,51 @@ function renderStockSummary() {
   html += '<td>' + totalWR + '%</td>';
   html += '<td></td>';
   html += '<td class="' + totalClass + '">' + fmtPnl(totalPnl) + '</td></tr>';
+  html += '</table>';
+  wrap.innerHTML = html;
+}
+
+function renderWarriorIgnitionDetails() {
+  let wrap = document.getElementById('warrior-ignition-wrap');
+  let countEl = document.getElementById('warrior-ignition-count');
+  if (!wrap) return;
+  let rows = collectWarriorIgnitionTrades(state.recent_trades || []);
+  let closed = rows.filter(t => String(t.trade_type || '').toLowerCase() === 'exit' && t.pnl !== null && t.pnl !== undefined);
+  let open = rows.filter(t => t._ignitionOpen);
+  let pnl = closed.reduce((sum, t) => sum + Number(t.pnl || 0), 0);
+  let wins = closed.filter(t => Number(t.pnl || 0) > 0).length;
+  let losses = closed.filter(t => Number(t.pnl || 0) < 0).length;
+  let winRate = closed.length ? ((wins / closed.length) * 100).toFixed(0) : '0';
+  if (countEl) countEl.textContent = closed.length + ' closed';
+  if (!rows.length) {
+    wrap.innerHTML = '<div class="empty"><div class="icon">&#9889;</div>No Warrior ignition trades yet</div>';
+    return;
+  }
+  let html = '<div class="grid grid-4" style="margin-bottom:12px">';
+  html += '<div class="stat-card"><div class="stat-label">Ignition P&L</div><div class="stat-value">' + fmtPnl(pnl) + '</div><div class="mini-muted">' + closed.length + ' closed trades</div></div>';
+  html += '<div class="stat-card"><div class="stat-label">Win Rate</div><div class="stat-value">' + winRate + '%</div><div class="mini-muted">' + wins + 'W / ' + losses + 'L</div></div>';
+  html += '<div class="stat-card"><div class="stat-label">Open Ignition</div><div class="stat-value">' + open.length + '</div><div class="mini-muted">entries still visible in feed</div></div>';
+  html += '<div class="stat-card"><div class="stat-label">Avg P&L</div><div class="stat-value">' + fmtPnl(closed.length ? pnl / closed.length : 0) + '</div><div class="mini-muted">per closed ignition</div></div>';
+  html += '</div>';
+  html += '<table><tr><th>Time</th><th>Symbol</th><th>Status</th><th>Qty</th><th>Entry</th><th>Exit</th><th>P&L</th><th>Conv</th><th>Reason</th></tr>';
+  rows.slice(-12).reverse().forEach(t => {
+    let type = String(t.trade_type || '').toLowerCase();
+    let status = type === 'exit' ? 'EXIT' : 'ENTRY';
+    let entry = t._ignitionEntry || t;
+    let conv = ignitionConviction(t) || ignitionConviction(entry) || '-';
+    let reason = t.exit_reason || entry.exit_reason || t.reason || entry.reason || entry.strategy || '';
+    html += '<tr>';
+    html += '<td style="color:var(--text2)">' + shortTime(t.exit_time || t.entry_time || entry.entry_time) + '</td>';
+    html += '<td>' + chartLink(t.symbol || entry.symbol) + '</td>';
+    html += '<td><span class="pill ' + (status === 'EXIT' ? 'pill-green' : 'pill-purple') + '">' + status + '</span></td>';
+    html += '<td>' + Number(t.quantity || entry.quantity || 0).toFixed(0) + '</td>';
+    html += '<td>$' + Number(t.entry_price || entry.entry_price || 0).toFixed(4) + '</td>';
+    html += '<td>' + (t.exit_price ? '$' + Number(t.exit_price || 0).toFixed(4) : '-') + '</td>';
+    html += '<td>' + (t.pnl !== null && t.pnl !== undefined ? fmtPnl(Number(t.pnl || 0)) : '-') + '</td>';
+    html += '<td>' + escapeHtml(conv) + '</td>';
+    html += '<td>' + escapeHtml(reason || '-') + '</td>';
+    html += '</tr>';
+  });
   html += '</table>';
   wrap.innerHTML = html;
 }
@@ -2066,6 +2178,7 @@ function runBacktest() {
         momentum_burst_live: !!(document.getElementById('bt-flag-momentum') || {}).checked,
         momentum_burst_hit_run: !!(document.getElementById('bt-flag-mb-hit-run') || {}).checked,
         warrior_squeeze_playbook: !!(document.getElementById('bt-flag-warrior') || {}).checked,
+        warrior_ignition_model: !!(document.getElementById('bt-flag-warrior-ignition') || {}).checked,
         level_capped_entry: !!(document.getElementById('bt-flag-capped') || {}).checked,
         execution_timer_10s: !!(document.getElementById('bt-flag-timer') || {}).checked,
         ten_second_breakout_scout: !!(document.getElementById('bt-flag-10s-scout') || {}).checked,
@@ -2395,6 +2508,45 @@ function renderBacktestSection(title, renderer) {
   }
 }
 
+function renderBacktestIgnitionDetails(r) {
+  let trips = (r.round_trips || []).filter(t => isWarriorIgnitionRow(t));
+  let flags = r.flags || {};
+  if (!trips.length && !flags.warrior_ignition_model) {
+    return '';
+  }
+  let pnl = trips.reduce((sum, t) => sum + Number(t.pnl || 0), 0);
+  let wins = trips.filter(t => Number(t.pnl || 0) > 0).length;
+  let losses = trips.filter(t => Number(t.pnl || 0) < 0).length;
+  let winRate = trips.length ? ((wins / trips.length) * 100).toFixed(1) : '0.0';
+  let avgQty = trips.length ? trips.reduce((sum, t) => sum + Number(t.quantity || 0), 0) / trips.length : 0;
+  let html = '<div class="card" style="margin-bottom:16px"><div class="card-header"><h3>Warrior Ignition Details</h3>';
+  html += '<span class="pill pill-purple">' + trips.length + ' closed</span></div>';
+  html += '<div class="grid grid-4" style="margin-bottom:12px">';
+  html += '<div class="stat-card"><div class="stat-label">Ignition P&L</div><div class="stat-value">' + fmtPnl(pnl) + '</div><div class="mini-muted">' + fmtPnl(trips.length ? pnl / trips.length : 0) + ' avg</div></div>';
+  html += '<div class="stat-card"><div class="stat-label">Win Rate</div><div class="stat-value">' + winRate + '%</div><div class="mini-muted">' + wins + 'W / ' + losses + 'L</div></div>';
+  html += '<div class="stat-card"><div class="stat-label">Avg Shares</div><div class="stat-value">' + avgQty.toFixed(0) + '</div><div class="mini-muted">per ignition trade</div></div>';
+  html += '<div class="stat-card"><div class="stat-label">Flag</div><div class="stat-value" style="font-size:18px">' + (flags.warrior_ignition_model ? 'on' : 'off') + '</div><div class="mini-muted">warrior_ignition_model</div></div>';
+  html += '</div>';
+  if (!trips.length) {
+    html += '<div class="empty"><div class="icon">&#128269;</div>No Warrior ignition trades in this replay</div></div>';
+    return html;
+  }
+  html += '<table><tr><th>Entry Time</th><th>Entry</th><th>Exit</th><th>Qty</th><th>P&L</th><th>Hold</th><th>Exit Reason</th></tr>';
+  trips.forEach(t => {
+    html += '<tr>';
+    html += '<td>' + shortEtTime(t.entry_time) + '</td>';
+    html += '<td>$' + Number(t.entry_price || 0).toFixed(4) + '</td>';
+    html += '<td>$' + Number(t.exit_price || 0).toFixed(4) + '</td>';
+    html += '<td>' + Number(t.quantity || 0).toFixed(0) + '</td>';
+    html += '<td>' + fmtPnl(Number(t.pnl || 0)) + '</td>';
+    html += '<td>' + escapeHtml(t.hold_seconds != null ? Number(t.hold_seconds || 0).toFixed(0) + 's' : '') + '</td>';
+    html += '<td>' + escapeHtml(t.exit_reason || '') + '</td>';
+    html += '</tr>';
+  });
+  html += '</table></div>';
+  return html;
+}
+
 function renderBacktestLayerBreakdown(r) {
   let f = r.funnel || {};
   let layers = f.rejected_by_layer || r.rejected_by_layer || {};
@@ -2508,7 +2660,7 @@ function renderBacktest() {
   html += '<div class="stat-card"><div class="stat-label">Trades</div><div class="stat-value">' + (sc.closed_trades || 0) + '/' + (sc.trades_taken || 0) + '</div><div class="mini-muted">closed / entries</div></div>';
   html += '<div class="stat-card"><div class="stat-label">Funnel</div><div class="stat-value">' + (f.scan_hits || 0) + ' -> ' + (f.signals || 0) + ' -> ' + (f.entries || 0) + '</div><div class="mini-muted">' + pctText(f.signal_to_entry_pct) + ' signal to entry</div></div>';
   html += '</div>';
-  html += '<div class="mini-muted">Flags: fresh_vwap=' + (flags.fresh_vwap_reclaim_scout ? 'on' : 'off') + ', vwap_reclaim=' + (flags.vwap_reclaim_scout ? 'on' : 'off') + ', level_breakout=' + (flags.level_breakout_scout ? 'on' : 'off') + ', elite_wide_spread=' + (flags.elite_wide_spread ? 'on' : 'off') + ', momentum_burst_live=' + (flags.momentum_burst_live ? 'on' : 'off') + ', momentum_hit_run=' + (flags.momentum_burst_hit_run ? 'on' : 'off') + ', warrior_squeeze=' + (flags.warrior_squeeze_playbook ? 'on' : 'off') + ', level_capped_entry=' + (flags.level_capped_entry ? 'on' : 'off') + ', 10s_timer=' + (flags.execution_timer_10s ? 'on' : 'off') + ', 10s_scout=' + (flags.ten_second_breakout_scout ? 'on' : 'off') + ', 10s_reclaim=' + (flags.level_reclaim_10s_scout ? 'on' : 'off') + ', breakout_scalp=' + (flags.breakout_scalp_replay ? 'on' : 'off') + ', live_like_10s=' + (flags.live_like_10s ? 'on' : 'off') + '</div>';
+  html += '<div class="mini-muted">Flags: fresh_vwap=' + (flags.fresh_vwap_reclaim_scout ? 'on' : 'off') + ', vwap_reclaim=' + (flags.vwap_reclaim_scout ? 'on' : 'off') + ', level_breakout=' + (flags.level_breakout_scout ? 'on' : 'off') + ', elite_wide_spread=' + (flags.elite_wide_spread ? 'on' : 'off') + ', momentum_burst_live=' + (flags.momentum_burst_live ? 'on' : 'off') + ', momentum_hit_run=' + (flags.momentum_burst_hit_run ? 'on' : 'off') + ', warrior_squeeze=' + (flags.warrior_squeeze_playbook ? 'on' : 'off') + ', warrior_ignition=' + (flags.warrior_ignition_model ? 'on' : 'off') + ', level_capped_entry=' + (flags.level_capped_entry ? 'on' : 'off') + ', 10s_timer=' + (flags.execution_timer_10s ? 'on' : 'off') + ', 10s_scout=' + (flags.ten_second_breakout_scout ? 'on' : 'off') + ', 10s_reclaim=' + (flags.level_reclaim_10s_scout ? 'on' : 'off') + ', breakout_scalp=' + (flags.breakout_scalp_replay ? 'on' : 'off') + ', live_like_10s=' + (flags.live_like_10s ? 'on' : 'off') + '</div>';
   if (r.execution_timer_source) {
     html += '<div class="mini-muted">Execution timer source: ' + escapeHtml(r.execution_timer_source) + '</div>';
   }
@@ -2522,6 +2674,7 @@ function renderBacktest() {
   html += renderBacktestSection('10s Opportunity Map', () => renderBacktestMicroOpportunities(r));
   html += renderBacktestSection('Backtest Gate Breakdown', () => renderBacktestLayerBreakdown(r));
   html += renderBacktestSection('A+ Funnel Detail', () => renderBacktestFunnel(r));
+  html += renderBacktestSection('Warrior Ignition Details', () => renderBacktestIgnitionDetails(r));
   html += renderBacktestSection('Live Paper Entry Scores (same name/day)', () => renderLivePaperScores());
 
   html += '<div class="card" style="margin-bottom:16px"><div class="card-header"><h3>Trades</h3></div>';

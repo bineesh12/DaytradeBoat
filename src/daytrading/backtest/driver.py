@@ -627,7 +627,10 @@ class PipelineBacktestDriver:
             self._mb_bracket[sym] = self._mb_bracket_payload(signal, fill, now, strategy=strategy_label)
             self._momentum_burst_last_entry[sym] = now
             self._warrior_ignition_entries[sym] = self._warrior_ignition_entries.get(sym, 0) + 1
-            ledger.record_entry(fill, strategy=strategy_label)
+            # Tag the LEDGER record as warrior_ignition so the dashboard can identify
+            # these trades (round_trip.pattern reads entry.strategy). The bracket
+            # exit routing uses the bracket's own strategy, so it's unaffected.
+            ledger.record_entry(fill, strategy="warrior_ignition")
             result.entry_decisions.append({
                 "ts": now.isoformat(), "symbol": sym, "stage": strategy_label,
                 "passed": True, "blocked_layer": "", "reason": "", "action": signal.action.value,

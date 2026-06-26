@@ -8793,7 +8793,15 @@ class AlpacaRunner:
                 log_label,
                 sym, fill.quantity, fill.price, stop_price, target_price, rr_note,
             )
-            self._hub.on_fill(fill, "entry", strategy=strategy_label)
+            # Tag ignition entries distinctly for the dashboard (the trade record's
+            # strategy is what the live "Warrior Ignition" panel reads). The actual
+            # strategy logic still uses strategy_label, so behavior is unchanged.
+            hub_strategy = (
+                "warrior_ignition"
+                if (entry_context and entry_context.get("entry_trigger") == "warrior_ignition")
+                else strategy_label
+            )
+            self._hub.on_fill(fill, "entry", strategy=hub_strategy)
             self._hub.add_log(
                 "INFO",
                 "{} {} {:.0f} @ ${:.2f}".format(log_label, sym, fill.quantity, fill.price),
