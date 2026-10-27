@@ -17,11 +17,12 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime
-from typing import Optional
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Sequence
+from zoneinfo import ZoneInfo
 
 from daytrading.indicators.core import vwap
-from daytrading.models import PortfolioState, ScanResult, SignalAction, TradeSignal
+from daytrading.models import Bar, PortfolioState, ScanResult, SignalAction, TradeSignal
 from daytrading.strategy.entry_guard import (
     assess_opportunity_scaled_spread,
     check_entry_quality,
@@ -1346,12 +1347,55 @@ class MomentumPatternVerifier:
         portfolio: PortfolioState,
         *,
         now: Optional[datetime] = None,
+        session_bars: Optional[Sequence[Bar]] = None,
     ) -> Optional[TradeSignal]:
         self._current_symbol = scan_result.symbol
+        scan_result.criteria.pop("_pending_structure_valid", None)
         bars = scan_result.bars
         if len(bars) < 3:
             self._reject("insufficient bar data")
             return None
+
+        if (scan_result.scanner_name == "vwap_pullback"
+                and scan_result.criteria.get("vwap_reference_source")):
+            from daytrading.data.session_vwap import session_vwap_context
+            from daytrading.data.completed_bars import Rejection
+            trigger=bars[-1]
+            observed=(trigger.ts+timedelta(minutes=1)) if trigger.ts is not None else None
+            if now is not None and observed is not None:observed=min(now,observed)
+            context=session_vwap_context(session_bars if session_bars is not None else bars,
+                symbol=scan_result.symbol,now=observed)
+            if isinstance(context,Rejection):
+                self._reject(context.code+": "+context.reason);return None
+            if context['bars'][-1]!=trigger:
+                self._reject("session context does not match setup candle");return None
+            reference=scan_result.criteria['vwap_reference']
+            if abs(context['metadata']['vwap_reference']-reference)>1e-10:
+                self._reject("session VWAP input changed since detection");return None
+            session_bars=context['bars']
+        if session_bars is not None:
+            # Detectors intentionally use a short pattern window. Its first
+            # candle is not the session open. Verify with the complete session
+            # available at the trigger, without replacing the detector's bars,
+            # original technical stop or trigger criteria.
+            trigger = bars[-1]
+            if trigger.ts is None:
+                self._reject("session context requires a timestamped setup candle")
+                return None
+            def utc(stamp):
+                return (stamp.replace(tzinfo=timezone.utc) if stamp.tzinfo is None
+                        else stamp.astimezone(timezone.utc))
+            trigger_ts = utc(trigger.ts)
+            session_day = trigger_ts.astimezone(ZoneInfo("America/New_York")).date()
+            context = [b for b in session_bars if b.symbol == scan_result.symbol
+                       and b.ts is not None and utc(b.ts) <= trigger_ts
+                       and utc(b.ts).astimezone(ZoneInfo("America/New_York")).date() == session_day]
+            # Do not silently fall back to a truncated window or substitute a
+            # different candle when a caller supplies inconsistent context.
+            if len(context) < 3 or context[-1] != trigger:
+                self._reject("session context does not match setup candle")
+                return None
+            bars = context
 
         latest = bars[-1]
         price = latest.close
@@ -1392,6 +1436,19 @@ class MomentumPatternVerifier:
             return None
 
         float_shares = self._get_float_shares(scan_result.symbol)
+        session = [b for b in bars if b.ts and bars[-1].ts and b.ts.date() == bars[-1].ts.date()]
+        if len(session) < 3:
+            session = list(bars)
+        scan_result.criteria["quality_inputs"] = {
+            "price_min": self._min_price, "price_max": self._max_price,
+            "movement_reference": "session_open", "min_session_change_pct": 5.0,
+            "session_change_pct": (session[-1].close / session[0].open - 1) * 100 if session and session[0].open > 0 else None,
+            "float_shares": float_shares,
+            "session_context": "pipeline_universe" if session_bars is not None else "scan_result",
+            "session_open": session[0].open if session else None,
+            "session_open_ts": session[0].ts.isoformat() if session and session[0].ts else None,
+            "session_bar_count": len(session),
+        }
 
         if pattern in ("vwap_pullback", "pullback_base"):
             late_reject = self._late_pullback_reject(
@@ -1426,6 +1483,10 @@ class MomentumPatternVerifier:
             self._reject(tape_reject)
             return None
 
+        if pattern == "vwap_pullback" or (pattern == "hod_reclaim" and
+                                           scan_result.criteria.get("_pending_hod_retry")):
+            scan_result.criteria["_pending_structure_valid"] = True
+
         bars_5m = None
         if self._bar_aggregator is not None:
             bars_5m = self._bar_aggregator.get_5m_bars(scan_result.symbol)
@@ -1433,12 +1494,14 @@ class MomentumPatternVerifier:
         reject = check_entry_quality(
             bars,
             symbol=scan_result.symbol,
+            min_price=self._min_price, max_price=self._max_price,
             avg_daily_volume=self._get_avg_volume(scan_result.symbol),
             bars_5m=bars_5m,
             float_shares=float_shares,
             ticks=list(self._tick_buffer.get(scan_result.symbol, [])) if self._tick_buffer else None,
             quotes=list(self._quote_buffer.get(scan_result.symbol, [])) if self._quote_buffer else None,
             entry_pattern=str(pattern or scan_result.scanner_name),
+            **({"session_vwap_required":True} if pattern=="vwap_pullback" and scan_result.criteria.get("vwap_reference_source") else {}),
             setup_tier=str(scan_result.criteria.get("setup_tier") or ""),
             entry_tier=str(scan_result.criteria.get("entry_tier") or ""),
             now=now,
@@ -1459,6 +1522,7 @@ class MomentumPatternVerifier:
             reject = check_entry_quality(
                 bars,
                 symbol=scan_result.symbol,
+                min_price=self._min_price, max_price=self._max_price,
                 avg_daily_volume=self._get_avg_volume(scan_result.symbol),
                 bars_5m=bars_5m,
                 float_shares=float_shares,

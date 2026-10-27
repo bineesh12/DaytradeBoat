@@ -1,4 +1,5 @@
 from __future__ import annotations
+from daytrading.models import BarSource
 
 import json
 from datetime import date, datetime, timedelta, timezone
@@ -52,7 +53,7 @@ def _bar(symbol: str, minute: int, close: float, *, volume: float = 250_000) -> 
         close=close,
         volume=volume,
         timeframe=Timeframe.MIN_1,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
 
 
 class _OnceScanner:
@@ -144,7 +145,7 @@ def test_backtest_broker_buys_at_ask_and_sells_at_bid() -> None:
     assert sell is not None and sell.price == pytest.approx(9.99)
 
 
-def test_backtest_broker_can_fill_touched_buy_limit_below_close() -> None:
+def test_backtest_broker_cannot_fill_at_a_low_before_signal_was_emitted() -> None:
     broker = BacktestBroker(FillModel(min_spread_cents=0.02, spread_pct_of_range=0.0))
     portfolio = PortfolioState(cash=1_000)
     bar = Bar(
@@ -156,13 +157,12 @@ def test_backtest_broker_can_fill_touched_buy_limit_below_close() -> None:
         close=4.70,
         volume=750_000,
         timeframe=Timeframe.MIN_1,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
 
     fill, status = broker.submit(Order("TEST", Side.BUY, 10, limit_price=4.49), bar, portfolio)
 
-    assert status.value == "filled"
-    assert fill is not None
-    assert fill.price == pytest.approx(4.50)
+    assert status.value == "cancelled"
+    assert fill is None
 
 
 def test_level_capped_entry_reprices_late_stair_scout_near_base() -> None:
@@ -185,7 +185,7 @@ def test_level_capped_entry_reprices_late_stair_scout_near_base() -> None:
             close=4.6987,
             volume=750_000,
             timeframe=Timeframe.MIN_1,
-        )
+         provenance=BarSource.CANONICAL_INTERVAL)
     ]
     hit = ScanResult(
         symbol="CUPR",
@@ -321,7 +321,7 @@ def test_10s_breakout_scout_requires_a_plus_context() -> None:
         close=10.12,
         volume=75_000,
         timeframe=Timeframe.SEC_10,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
     pipeline = TradingPipeline(
         scanners=[],
         verifiers={},
@@ -358,7 +358,7 @@ def test_10s_breakout_scout_can_enter_for_matching_a_plus_context() -> None:
         close=10.12,
         volume=75_000,
         timeframe=Timeframe.SEC_10,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
     portfolio = PortfolioState(cash=10_000)
     pipeline = TradingPipeline(
         scanners=[],
@@ -447,7 +447,7 @@ def _ten_bar(second: int, close: float, *, width_pct: float, volume: float = 5_0
         close=close,
         volume=volume,
         timeframe=Timeframe.SEC_10,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
 
 
 def test_warrior_backtest_watches_first_cheap_momentum_burst_without_entry() -> None:
@@ -462,7 +462,7 @@ def test_warrior_backtest_watches_first_cheap_momentum_burst_without_entry() -> 
         score=80.0,
         criteria={"pattern": "momentum_burst", "close": 1.70},
         bars=[
-            Bar("MBUR", _BASE_TS, 1.25, 1.70, 1.20, 1.62, 120_000, Timeframe.SEC_10),
+            Bar("MBUR", _BASE_TS, 1.25, 1.70, 1.20, 1.62, 120_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
         ],
     )
 
@@ -513,10 +513,10 @@ def test_momentum_burst_hit_run_signal_uses_1r_and_short_hold() -> None:
 def test_warrior_squeeze_backtest_signal_requires_named_playbook_trigger() -> None:
     ten_sec = [_ten_bar(i * 10, 2.00 + i * 0.01, width_pct=0.006, volume=5_000) for i in range(10)]
     ten_sec.extend([
-        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 3.46, 3.56, 3.45, 3.53, 260_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 3.54, 3.62, 3.49, 3.58, 320_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=120), 3.58, 3.70, 3.50, 3.64, 760_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=130), 3.65, 4.08, 3.56, 3.97, 845_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 3.46, 3.56, 3.45, 3.53, 260_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 3.54, 3.62, 3.49, 3.58, 320_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=120), 3.58, 3.70, 3.50, 3.64, 760_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=130), 3.65, 4.08, 3.56, 3.97, 845_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ])
     driver = _momentum_burst_backtest_driver(ten_sec)
     driver._use_warrior_squeeze_playbook = True
@@ -563,10 +563,10 @@ def test_warrior_squeeze_backtest_signal_requires_named_playbook_trigger() -> No
 def test_warrior_squeeze_backtest_pullaway_uses_capped_level_price() -> None:
     ten_sec = [_ten_bar(i * 10, 2.00 + i * 0.01, width_pct=0.006, volume=5_000) for i in range(10)]
     ten_sec.extend([
-        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 3.46, 3.56, 3.45, 3.53, 260_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 3.54, 3.62, 3.49, 3.58, 320_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=120), 3.58, 3.70, 3.50, 3.64, 760_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=130), 3.65, 4.08, 3.56, 3.97, 845_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 3.46, 3.56, 3.45, 3.53, 260_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 3.54, 3.62, 3.49, 3.58, 320_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=120), 3.58, 3.70, 3.50, 3.64, 760_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=130), 3.65, 4.08, 3.56, 3.97, 845_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ])
     driver = _momentum_burst_backtest_driver(ten_sec)
     driver._use_warrior_squeeze_playbook = True
@@ -609,10 +609,10 @@ def test_warrior_squeeze_backtest_pullaway_uses_capped_level_price() -> None:
 def test_warrior_squeeze_backtest_clwt_fast_pullaway_without_slow_proof_hold() -> None:
     ten_sec = [_ten_bar(i * 10, 1.85 + i * 0.01, width_pct=0.006, volume=8_000) for i in range(10)]
     ten_sec.extend([
-        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 1.20, 1.60, 1.18, 1.48, 320_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 2.00, 2.25, 1.84, 1.92, 900_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=120), 2.70, 3.50, 2.70, 3.16, 760_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=130), 3.17, 4.08, 3.10, 3.9674, 845_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 1.20, 1.60, 1.18, 1.48, 320_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 2.00, 2.25, 1.84, 1.92, 900_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=120), 2.70, 3.50, 2.70, 3.16, 760_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=130), 3.17, 4.08, 3.10, 3.9674, 845_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ])
     driver = _momentum_burst_backtest_driver(ten_sec)
     driver._use_warrior_squeeze_playbook = True
@@ -649,11 +649,11 @@ def test_warrior_squeeze_backtest_clwt_fast_pullaway_without_slow_proof_hold() -
 
 def test_warrior_pullaway_waits_for_micro_base_after_bad_tape() -> None:
     ten_sec = [
-        Bar("CANF", _BASE_TS + timedelta(seconds=0), 4.05, 4.12, 4.04, 4.09, 240_000, Timeframe.SEC_10),
-        Bar("CANF", _BASE_TS + timedelta(seconds=10), 4.08, 4.15, 4.05, 4.12, 260_000, Timeframe.SEC_10),
-        Bar("CANF", _BASE_TS + timedelta(seconds=20), 4.12, 4.18, 4.07, 4.15, 280_000, Timeframe.SEC_10),
-        Bar("CANF", _BASE_TS + timedelta(seconds=30), 4.14, 4.24, 4.08, 4.20, 330_000, Timeframe.SEC_10),
-        Bar("CANF", _BASE_TS + timedelta(seconds=40), 4.20, 4.39, 4.19, 4.32, 620_000, Timeframe.SEC_10),
+        Bar("CANF", _BASE_TS + timedelta(seconds=0), 4.05, 4.12, 4.04, 4.09, 240_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CANF", _BASE_TS + timedelta(seconds=10), 4.08, 4.15, 4.05, 4.12, 260_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CANF", _BASE_TS + timedelta(seconds=20), 4.12, 4.18, 4.07, 4.15, 280_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CANF", _BASE_TS + timedelta(seconds=30), 4.14, 4.24, 4.08, 4.20, 330_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CANF", _BASE_TS + timedelta(seconds=40), 4.20, 4.39, 4.19, 4.32, 620_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_squeeze_pullaway_context(
@@ -676,12 +676,12 @@ def test_warrior_pullaway_waits_for_micro_base_after_bad_tape() -> None:
 
 def test_warrior_pullaway_rejects_cap_edge_without_strong_confirm() -> None:
     ten_sec = [
-        Bar("CANF", _BASE_TS + timedelta(seconds=0), 4.12, 4.22, 4.09, 4.15, 230_000, Timeframe.SEC_10),
-        Bar("CANF", _BASE_TS + timedelta(seconds=10), 4.16, 4.25, 4.10, 4.18, 240_000, Timeframe.SEC_10),
-        Bar("CANF", _BASE_TS + timedelta(seconds=20), 4.18, 4.27, 4.09, 4.21, 245_000, Timeframe.SEC_10),
-        Bar("CANF", _BASE_TS + timedelta(seconds=30), 4.21, 4.30, 4.13, 4.24, 300_000, Timeframe.SEC_10),
+        Bar("CANF", _BASE_TS + timedelta(seconds=0), 4.12, 4.22, 4.09, 4.15, 230_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CANF", _BASE_TS + timedelta(seconds=10), 4.16, 4.25, 4.10, 4.18, 240_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CANF", _BASE_TS + timedelta(seconds=20), 4.18, 4.27, 4.09, 4.21, 245_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CANF", _BASE_TS + timedelta(seconds=30), 4.21, 4.30, 4.13, 4.24, 300_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
         # Trades almost at the max-pay cap but without enough volume confirmation.
-        Bar("CANF", _BASE_TS + timedelta(seconds=40), 4.24, 4.40, 4.20, 4.36, 180_000, Timeframe.SEC_10),
+        Bar("CANF", _BASE_TS + timedelta(seconds=40), 4.24, 4.40, 4.20, 4.36, 180_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_squeeze_pullaway_context(
@@ -704,11 +704,11 @@ def test_warrior_pullaway_rejects_cap_edge_without_strong_confirm() -> None:
 
 def test_warrior_pullaway_allows_bad_tape_after_fresh_micro_base_reclaim() -> None:
     ten_sec = [
-        Bar("CANF", _BASE_TS + timedelta(seconds=0), 4.05, 4.12, 4.04, 4.09, 240_000, Timeframe.SEC_10),
-        Bar("CANF", _BASE_TS + timedelta(seconds=10), 4.08, 4.15, 4.05, 4.12, 260_000, Timeframe.SEC_10),
-        Bar("CANF", _BASE_TS + timedelta(seconds=20), 4.12, 4.18, 4.07, 4.15, 280_000, Timeframe.SEC_10),
-        Bar("CANF", _BASE_TS + timedelta(seconds=30), 4.14, 4.24, 4.08, 4.20, 330_000, Timeframe.SEC_10),
-        Bar("CANF", _BASE_TS + timedelta(seconds=40), 4.20, 4.39, 4.19, 4.32, 620_000, Timeframe.SEC_10),
+        Bar("CANF", _BASE_TS + timedelta(seconds=0), 4.05, 4.12, 4.04, 4.09, 240_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CANF", _BASE_TS + timedelta(seconds=10), 4.08, 4.15, 4.05, 4.12, 260_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CANF", _BASE_TS + timedelta(seconds=20), 4.12, 4.18, 4.07, 4.15, 280_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CANF", _BASE_TS + timedelta(seconds=30), 4.14, 4.24, 4.08, 4.20, 330_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CANF", _BASE_TS + timedelta(seconds=40), 4.20, 4.39, 4.19, 4.32, 620_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_squeeze_pullaway_context(
@@ -734,18 +734,18 @@ def test_warrior_pullaway_allows_bad_tape_after_fresh_micro_base_reclaim() -> No
 
 def test_warrior_squeeze_backtest_fast_pullaway_rejects_high_reject_chase() -> None:
     ten_sec = [
-        Bar("JRSH", _BASE_TS + timedelta(seconds=0), 3.98, 4.02, 3.93, 3.9792, 2_905, Timeframe.SEC_10),
-        Bar("JRSH", _BASE_TS + timedelta(seconds=10), 3.98, 3.98, 3.93, 3.9316, 1_204, Timeframe.SEC_10),
-        Bar("JRSH", _BASE_TS + timedelta(seconds=20), 3.93, 3.9697, 3.85, 3.85, 2_152, Timeframe.SEC_10),
-        Bar("JRSH", _BASE_TS + timedelta(seconds=30), 3.95, 4.7163, 3.85, 4.7163, 10_003, Timeframe.SEC_10),
-        Bar("JRSH", _BASE_TS + timedelta(seconds=40), 4.35, 4.98, 4.16, 4.53, 10_319, Timeframe.SEC_10),
-        Bar("JRSH", _BASE_TS + timedelta(seconds=50), 4.54, 4.57, 4.16, 4.30, 25_262, Timeframe.SEC_10),
-        Bar("JRSH", _BASE_TS + timedelta(seconds=60), 4.29, 4.32, 3.95, 4.1426, 21_981, Timeframe.SEC_10),
-        Bar("JRSH", _BASE_TS + timedelta(seconds=70), 4.16, 4.45, 4.1408, 4.24, 29_054, Timeframe.SEC_10),
-        Bar("JRSH", _BASE_TS + timedelta(seconds=80), 4.25, 4.27, 4.00, 4.12, 26_693, Timeframe.SEC_10),
-        Bar("JRSH", _BASE_TS + timedelta(seconds=90), 4.20, 4.57, 4.11, 4.5273, 55_466, Timeframe.SEC_10),
-        Bar("JRSH", _BASE_TS + timedelta(seconds=100), 4.53, 4.81, 4.40, 4.77, 129_040, Timeframe.SEC_10),
-        Bar("JRSH", _BASE_TS + timedelta(seconds=110), 4.77, 5.7005, 4.7409, 5.4897, 215_893, Timeframe.SEC_10),
+        Bar("JRSH", _BASE_TS + timedelta(seconds=0), 3.98, 4.02, 3.93, 3.9792, 2_905, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("JRSH", _BASE_TS + timedelta(seconds=10), 3.98, 3.98, 3.93, 3.9316, 1_204, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("JRSH", _BASE_TS + timedelta(seconds=20), 3.93, 3.9697, 3.85, 3.85, 2_152, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("JRSH", _BASE_TS + timedelta(seconds=30), 3.95, 4.7163, 3.85, 4.7163, 10_003, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("JRSH", _BASE_TS + timedelta(seconds=40), 4.35, 4.98, 4.16, 4.53, 10_319, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("JRSH", _BASE_TS + timedelta(seconds=50), 4.54, 4.57, 4.16, 4.30, 25_262, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("JRSH", _BASE_TS + timedelta(seconds=60), 4.29, 4.32, 3.95, 4.1426, 21_981, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("JRSH", _BASE_TS + timedelta(seconds=70), 4.16, 4.45, 4.1408, 4.24, 29_054, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("JRSH", _BASE_TS + timedelta(seconds=80), 4.25, 4.27, 4.00, 4.12, 26_693, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("JRSH", _BASE_TS + timedelta(seconds=90), 4.20, 4.57, 4.11, 4.5273, 55_466, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("JRSH", _BASE_TS + timedelta(seconds=100), 4.53, 4.81, 4.40, 4.77, 129_040, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("JRSH", _BASE_TS + timedelta(seconds=110), 4.77, 5.7005, 4.7409, 5.4897, 215_893, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
     driver = _momentum_burst_backtest_driver(ten_sec)
     driver._use_warrior_squeeze_playbook = True
@@ -767,14 +767,14 @@ def test_warrior_squeeze_backtest_fast_pullaway_rejects_high_reject_chase() -> N
 
 def test_warrior_squeeze_backtest_fast_pullaway_rejects_immediate_wide_red_fakeout() -> None:
     ten_sec = [
-        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 3.24, 3.57, 3.24, 3.536, 14_099, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 3.56, 3.7087, 3.55, 3.70, 6_998, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 3.56, 3.56, 3.54, 3.54, 500, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 3.55, 4.00, 3.51, 4.00, 11_220, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 4.03, 4.29, 3.53, 3.7233, 18_356, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 3.7225, 3.74, 3.52, 3.5395, 14_195, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 3.53, 4.38, 3.51, 4.30, 38_079, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=70), 4.24, 5.55, 4.20, 5.375, 127_967, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 3.24, 3.57, 3.24, 3.536, 14_099, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 3.56, 3.7087, 3.55, 3.70, 6_998, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 3.56, 3.56, 3.54, 3.54, 500, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 3.55, 4.00, 3.51, 4.00, 11_220, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 4.03, 4.29, 3.53, 3.7233, 18_356, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 3.7225, 3.74, 3.52, 3.5395, 14_195, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 3.53, 4.38, 3.51, 4.30, 38_079, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=70), 4.24, 5.55, 4.20, 5.375, 127_967, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
     driver = _momentum_burst_backtest_driver(ten_sec)
     driver._use_warrior_squeeze_playbook = True
@@ -796,13 +796,13 @@ def test_warrior_squeeze_backtest_fast_pullaway_rejects_immediate_wide_red_fakeo
 
 def test_warrior_level_break_rejects_late_extended_cast_style_break() -> None:
     ten_sec = [
-        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 4.83, 6.50, 4.74, 6.40, 74_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 6.45, 7.20, 6.30, 7.00, 95_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 7.10, 8.00, 7.00, 7.80, 90_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 8.32, 8.65, 8.30, 8.53, 98_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 8.44, 8.78, 8.44, 8.74, 87_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 8.72, 8.97, 8.67, 8.91, 84_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 8.94, 9.45, 8.87, 9.39, 112_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 4.83, 6.50, 4.74, 6.40, 74_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 6.45, 7.20, 6.30, 7.00, 95_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 7.10, 8.00, 7.00, 7.80, 90_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 8.32, 8.65, 8.30, 8.53, 98_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 8.44, 8.78, 8.44, 8.74, 87_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 8.72, 8.97, 8.67, 8.91, 84_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 8.94, 9.45, 8.87, 9.39, 112_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
     driver = _momentum_burst_backtest_driver(ten_sec)
     driver._use_warrior_squeeze_playbook = True
@@ -819,12 +819,12 @@ def test_warrior_level_break_rejects_late_extended_cast_style_break() -> None:
 
 def test_warrior_level_break_allows_extended_exceptional_volume_break() -> None:
     ten_sec = [
-        Bar("MBUR", _BASE_TS + timedelta(seconds=-20), 1.18, 1.22, 1.18, 1.20, 40_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=-10), 1.20, 1.24, 1.19, 1.22, 45_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 1.20, 1.60, 1.18, 1.48, 320_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 1.48, 2.25, 1.46, 2.20, 900_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 2.20, 3.50, 2.18, 3.16, 760_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 3.17, 4.08, 3.10, 3.9674, 845_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=-20), 1.18, 1.22, 1.18, 1.20, 40_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=-10), 1.20, 1.24, 1.19, 1.22, 45_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 1.20, 1.60, 1.18, 1.48, 320_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 1.48, 2.25, 1.46, 2.20, 900_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 2.20, 3.50, 2.18, 3.16, 760_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 3.17, 4.08, 3.10, 3.9674, 845_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
     driver = _momentum_burst_backtest_driver(ten_sec)
     driver._use_warrior_squeeze_playbook = True
@@ -843,11 +843,11 @@ def test_warrior_level_break_allows_extended_exceptional_volume_break() -> None:
 def test_warrior_squeeze_backtest_equal_high_pullaway_allows_clwt_style_hold() -> None:
     ten_sec = [_ten_bar(i * 10, 2.00 + i * 0.01, width_pct=0.006, volume=5_000) for i in range(10)]
     ten_sec.extend([
-        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 3.42, 3.50, 3.36, 3.47, 180_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 3.48, 3.54, 3.42, 3.52, 230_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=120), 3.51, 3.58, 3.45, 3.55, 260_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=130), 3.54, 3.59, 3.49, 3.57, 280_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=140), 3.56, 3.60, 3.50, 3.59, 310_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 3.42, 3.50, 3.36, 3.47, 180_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 3.48, 3.54, 3.42, 3.52, 230_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=120), 3.51, 3.58, 3.45, 3.55, 260_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=130), 3.54, 3.59, 3.49, 3.57, 280_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=140), 3.56, 3.60, 3.50, 3.59, 310_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ])
     driver = _momentum_burst_backtest_driver(ten_sec)
     driver._use_warrior_squeeze_playbook = True
@@ -890,8 +890,8 @@ def test_warrior_squeeze_backtest_equal_high_pullaway_allows_clwt_style_hold() -
 def test_warrior_squeeze_backtest_equal_high_pullaway_rejects_above_five() -> None:
     ten_sec = [_ten_bar(i * 10, 6.80 + i * 0.01, width_pct=0.006, volume=5_000) for i in range(10)]
     ten_sec.extend([
-        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 7.10, 7.45, 7.00, 7.34, 250_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 7.33, 7.50, 7.18, 7.42, 320_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 7.10, 7.45, 7.00, 7.34, 250_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 7.33, 7.50, 7.18, 7.42, 320_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ])
     driver = _momentum_burst_backtest_driver(ten_sec)
     driver._use_warrior_squeeze_playbook = True
@@ -918,8 +918,8 @@ def test_warrior_squeeze_backtest_equal_high_pullaway_rejects_above_five() -> No
 def test_warrior_squeeze_backtest_curl_reclaim_allows_level_starter_without_new_high() -> None:
     ten_sec = [_ten_bar(i * 10, 5.80 + i * 0.01, width_pct=0.006, volume=5_000) for i in range(10)]
     ten_sec.extend([
-        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 6.30, 7.00, 6.24, 6.88, 900_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 6.28, 6.60, 6.20, 6.52, 450_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 6.30, 7.00, 6.24, 6.88, 900_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 6.28, 6.60, 6.20, 6.52, 450_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ])
     driver = _momentum_burst_backtest_driver(ten_sec)
     driver._use_warrior_squeeze_playbook = True
@@ -963,14 +963,14 @@ def test_warrior_squeeze_backtest_curl_reclaim_allows_level_starter_without_new_
 
 def test_warrior_squeeze_curl_reclaim_rejects_wgrx_giant_expansion_bar() -> None:
     ten_sec = [
-        Bar("WGRX", _BASE_TS + timedelta(seconds=0), 3.24, 3.57, 3.24, 3.536, 14_099, Timeframe.SEC_10),
-        Bar("WGRX", _BASE_TS + timedelta(seconds=10), 3.56, 3.7087, 3.55, 3.70, 6_998, Timeframe.SEC_10),
-        Bar("WGRX", _BASE_TS + timedelta(seconds=20), 3.56, 3.56, 3.54, 3.54, 500, Timeframe.SEC_10),
-        Bar("WGRX", _BASE_TS + timedelta(seconds=30), 3.55, 4.00, 3.51, 4.00, 11_220, Timeframe.SEC_10),
-        Bar("WGRX", _BASE_TS + timedelta(seconds=40), 4.03, 4.29, 3.53, 3.7233, 18_356, Timeframe.SEC_10),
-        Bar("WGRX", _BASE_TS + timedelta(seconds=50), 3.7225, 3.74, 3.52, 3.5395, 14_195, Timeframe.SEC_10),
-        Bar("WGRX", _BASE_TS + timedelta(seconds=60), 3.53, 4.38, 3.51, 4.30, 38_079, Timeframe.SEC_10),
-        Bar("WGRX", _BASE_TS + timedelta(seconds=70), 4.24, 5.55, 4.20, 5.375, 127_967, Timeframe.SEC_10),
+        Bar("WGRX", _BASE_TS + timedelta(seconds=0), 3.24, 3.57, 3.24, 3.536, 14_099, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WGRX", _BASE_TS + timedelta(seconds=10), 3.56, 3.7087, 3.55, 3.70, 6_998, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WGRX", _BASE_TS + timedelta(seconds=20), 3.56, 3.56, 3.54, 3.54, 500, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WGRX", _BASE_TS + timedelta(seconds=30), 3.55, 4.00, 3.51, 4.00, 11_220, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WGRX", _BASE_TS + timedelta(seconds=40), 4.03, 4.29, 3.53, 3.7233, 18_356, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WGRX", _BASE_TS + timedelta(seconds=50), 3.7225, 3.74, 3.52, 3.5395, 14_195, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WGRX", _BASE_TS + timedelta(seconds=60), 3.53, 4.38, 3.51, 4.30, 38_079, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WGRX", _BASE_TS + timedelta(seconds=70), 4.24, 5.55, 4.20, 5.375, 127_967, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
     driver = _momentum_burst_backtest_driver(ten_sec)
     driver._use_warrior_squeeze_playbook = True
@@ -997,25 +997,25 @@ def test_warrior_squeeze_curl_reclaim_rejects_wgrx_giant_expansion_bar() -> None
 
 def test_warrior_failed_burst_recovery_rejects_below_prior_window_high() -> None:
     ten_sec = [
-        Bar("WGRX", _BASE_TS + timedelta(seconds=0), 3.24, 3.57, 3.24, 3.536, 14_099, Timeframe.SEC_10),
-        Bar("WGRX", _BASE_TS + timedelta(seconds=10), 3.56, 3.7087, 3.55, 3.70, 6_998, Timeframe.SEC_10),
-        Bar("WGRX", _BASE_TS + timedelta(seconds=20), 3.56, 3.56, 3.54, 3.54, 500, Timeframe.SEC_10),
-        Bar("WGRX", _BASE_TS + timedelta(seconds=30), 3.55, 4.00, 3.51, 4.00, 11_220, Timeframe.SEC_10),
-        Bar("WGRX", _BASE_TS + timedelta(seconds=40), 4.03, 4.29, 3.53, 3.7233, 18_356, Timeframe.SEC_10),
-        Bar("WGRX", _BASE_TS + timedelta(seconds=50), 3.7225, 3.74, 3.52, 3.5395, 14_195, Timeframe.SEC_10),
-        Bar("WGRX", _BASE_TS + timedelta(seconds=60), 3.53, 4.38, 3.51, 4.30, 38_079, Timeframe.SEC_10),
-        Bar("WGRX", _BASE_TS + timedelta(seconds=70), 4.24, 5.55, 4.20, 5.375, 127_967, Timeframe.SEC_10),
-        Bar("WGRX", _BASE_TS + timedelta(seconds=80), 5.35, 6.04, 4.94, 5.10, 151_609, Timeframe.SEC_10),
-        Bar("WGRX", _BASE_TS + timedelta(seconds=90), 5.05, 5.13, 4.50, 4.515, 74_410, Timeframe.SEC_10),
-        Bar("WGRX", _BASE_TS + timedelta(seconds=100), 4.51, 4.98, 4.24, 4.95, 74_497, Timeframe.SEC_10),
-        Bar("WGRX", _BASE_TS + timedelta(seconds=110), 4.9431, 5.3913, 4.8403, 5.38, 102_828, Timeframe.SEC_10),
-        Bar("WGRX", _BASE_TS + timedelta(seconds=120), 5.3556, 6.17, 5.08, 5.70, 170_765, Timeframe.SEC_10),
-        Bar("WGRX", _BASE_TS + timedelta(seconds=130), 5.67, 5.74, 5.07, 5.11, 126_551, Timeframe.SEC_10),
-        Bar("WGRX", _BASE_TS + timedelta(seconds=140), 5.10, 5.38, 5.00, 5.31, 65_476, Timeframe.SEC_10),
-        Bar("WGRX", _BASE_TS + timedelta(seconds=150), 5.31, 5.55, 5.2479, 5.285, 75_908, Timeframe.SEC_10),
-        Bar("WGRX", _BASE_TS + timedelta(seconds=160), 5.30, 5.65, 5.25, 5.54, 53_327, Timeframe.SEC_10),
-        Bar("WGRX", _BASE_TS + timedelta(seconds=170), 5.5021, 6.12, 5.47, 5.89, 132_883, Timeframe.SEC_10),
-        Bar("WGRX", _BASE_TS + timedelta(seconds=180), 5.9088, 6.49, 5.75, 6.35, 169_573, Timeframe.SEC_10),
+        Bar("WGRX", _BASE_TS + timedelta(seconds=0), 3.24, 3.57, 3.24, 3.536, 14_099, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WGRX", _BASE_TS + timedelta(seconds=10), 3.56, 3.7087, 3.55, 3.70, 6_998, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WGRX", _BASE_TS + timedelta(seconds=20), 3.56, 3.56, 3.54, 3.54, 500, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WGRX", _BASE_TS + timedelta(seconds=30), 3.55, 4.00, 3.51, 4.00, 11_220, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WGRX", _BASE_TS + timedelta(seconds=40), 4.03, 4.29, 3.53, 3.7233, 18_356, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WGRX", _BASE_TS + timedelta(seconds=50), 3.7225, 3.74, 3.52, 3.5395, 14_195, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WGRX", _BASE_TS + timedelta(seconds=60), 3.53, 4.38, 3.51, 4.30, 38_079, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WGRX", _BASE_TS + timedelta(seconds=70), 4.24, 5.55, 4.20, 5.375, 127_967, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WGRX", _BASE_TS + timedelta(seconds=80), 5.35, 6.04, 4.94, 5.10, 151_609, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WGRX", _BASE_TS + timedelta(seconds=90), 5.05, 5.13, 4.50, 4.515, 74_410, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WGRX", _BASE_TS + timedelta(seconds=100), 4.51, 4.98, 4.24, 4.95, 74_497, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WGRX", _BASE_TS + timedelta(seconds=110), 4.9431, 5.3913, 4.8403, 5.38, 102_828, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WGRX", _BASE_TS + timedelta(seconds=120), 5.3556, 6.17, 5.08, 5.70, 170_765, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WGRX", _BASE_TS + timedelta(seconds=130), 5.67, 5.74, 5.07, 5.11, 126_551, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WGRX", _BASE_TS + timedelta(seconds=140), 5.10, 5.38, 5.00, 5.31, 65_476, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WGRX", _BASE_TS + timedelta(seconds=150), 5.31, 5.55, 5.2479, 5.285, 75_908, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WGRX", _BASE_TS + timedelta(seconds=160), 5.30, 5.65, 5.25, 5.54, 53_327, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WGRX", _BASE_TS + timedelta(seconds=170), 5.5021, 6.12, 5.47, 5.89, 132_883, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WGRX", _BASE_TS + timedelta(seconds=180), 5.9088, 6.49, 5.75, 6.35, 169_573, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_failed_burst_recovery_context(
@@ -1031,7 +1031,7 @@ def test_warrior_failed_burst_recovery_rejects_below_prior_window_high() -> None
 def test_warrior_squeeze_backtest_reentry_uses_current_level_pullaway() -> None:
     ten_sec = [_ten_bar(i * 10, 2.00 + i * 0.01, width_pct=0.006, volume=5_000) for i in range(10)]
     ten_sec.extend([
-        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 3.96, 5.00, 3.94, 4.68, 792_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 3.96, 5.00, 3.94, 4.68, 792_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ])
     driver = _momentum_burst_backtest_driver(ten_sec)
     driver._use_warrior_squeeze_playbook = True
@@ -1074,8 +1074,8 @@ def test_warrior_squeeze_backtest_a_plus_reclaim_scout_does_not_arm_playbook() -
             "volume": 4_000_000,
         },
         bars=[
-            Bar("MBUR", _BASE_TS, 3.16, 3.50, 2.70, 3.16, 760_000, Timeframe.SEC_10),
-            Bar("MBUR", _BASE_TS + timedelta(seconds=10), 3.17, 4.08, 3.10, 3.97, 845_000, Timeframe.SEC_10),
+            Bar("MBUR", _BASE_TS, 3.16, 3.50, 2.70, 3.16, 760_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+            Bar("MBUR", _BASE_TS + timedelta(seconds=10), 3.17, 4.08, 3.10, 3.97, 845_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
         ],
     )
 
@@ -1102,8 +1102,8 @@ def test_warrior_squeeze_backtest_generic_a_plus_does_not_arm_playbook() -> None
             "volume": 4_000_000,
         },
         bars=[
-            Bar("MBUR", _BASE_TS, 3.16, 3.50, 2.70, 3.16, 760_000, Timeframe.SEC_10),
-            Bar("MBUR", _BASE_TS + timedelta(seconds=10), 3.17, 4.08, 3.10, 3.97, 845_000, Timeframe.SEC_10),
+            Bar("MBUR", _BASE_TS, 3.16, 3.50, 2.70, 3.16, 760_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+            Bar("MBUR", _BASE_TS + timedelta(seconds=10), 3.17, 4.08, 3.10, 3.97, 845_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
         ],
     )
 
@@ -1130,8 +1130,8 @@ def test_warrior_squeeze_backtest_near_hod_a_plus_does_not_seed_playbook() -> No
             "volume": 900_000,
         },
         bars=[
-            Bar("MBUR", _BASE_TS, 7.60, 8.70, 7.60, 8.52, 290_000, Timeframe.SEC_10),
-            Bar("MBUR", _BASE_TS + timedelta(seconds=10), 8.50, 9.74, 8.21, 8.67, 291_000, Timeframe.SEC_10),
+            Bar("MBUR", _BASE_TS, 7.60, 8.70, 7.60, 8.52, 290_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+            Bar("MBUR", _BASE_TS + timedelta(seconds=10), 8.50, 9.74, 8.21, 8.67, 291_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
         ],
     )
 
@@ -1154,7 +1154,7 @@ def test_warrior_squeeze_backtest_a_plus_reclaim_stop_stays_inside_final_guard()
             9.00,
             220_000,
             Timeframe.SEC_10,
-        ),
+         provenance=BarSource.CANONICAL_INTERVAL),
     ]
     driver = _momentum_burst_backtest_driver(ten_sec)
     driver._use_warrior_squeeze_playbook = True
@@ -1311,7 +1311,7 @@ def test_warrior_backtest_ambiguous_green_bar_takes_target_before_stop() -> None
         8.67,
         290_000,
         Timeframe.SEC_10,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
     ten_sec[-1] = bar
     driver = _momentum_burst_backtest_driver(ten_sec)
     driver._mb_bracket["MBUR"] = {
@@ -1351,7 +1351,7 @@ def test_warrior_same_bar_full_target_clears_failed_burst_state() -> None:
         8.67,
         290_000,
         Timeframe.SEC_10,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
     ten_sec[-1] = bar
     driver = _momentum_burst_backtest_driver(ten_sec)
     driver._mb_bracket["MBUR"] = {
@@ -1391,7 +1391,7 @@ def test_warrior_backtest_emergency_dump_exits_at_close() -> None:
         9.50,
         210_000,
         Timeframe.SEC_10,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
     ten_sec = [_ten_bar(i * 10, 10.00 + i * 0.01, width_pct=0.006, volume=80_000) for i in range(12)]
     ten_sec[-1] = bar
     driver = _momentum_burst_backtest_driver(ten_sec)
@@ -1506,7 +1506,7 @@ def test_backtest_timed_release_chase_uses_queued_price_not_stale_anchor() -> No
         close=3.635,
         volume=100_000,
         timeframe=Timeframe.SEC_10,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
     assert driver._timed_release_chase_reject(signal, release) is None
 
     chased = Bar(
@@ -1518,7 +1518,7 @@ def test_backtest_timed_release_chase_uses_queued_price_not_stale_anchor() -> No
         close=3.86,
         volume=100_000,
         timeframe=Timeframe.SEC_10,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
     reason = driver._timed_release_chase_reject(signal, chased)
     assert reason is not None
     assert "queued setup $3.6300" in reason
@@ -1548,7 +1548,7 @@ def test_warrior_squeeze_second_leg_reclaim_after_deep_washout() -> None:
         close=9.62,
         volume=420_000,
         timeframe=Timeframe.SEC_10,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
     driver = _momentum_burst_backtest_driver(ten_sec)
     driver._use_warrior_squeeze_playbook = True
     driver._warrior_squeeze_target_wins["MBUR"] = 1
@@ -1574,18 +1574,18 @@ def test_warrior_squeeze_second_leg_reclaim_after_deep_washout() -> None:
 
 def test_warrior_prior_runner_continuation_pullback_context_allows_controlled_reclaim() -> None:
     ten_sec = [
-        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 6.10, 6.55, 6.05, 6.45, 120_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 6.45, 7.20, 6.40, 7.08, 210_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 7.05, 7.95, 7.00, 7.72, 340_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 7.70, 8.80, 7.65, 8.45, 520_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 8.42, 8.62, 8.08, 8.18, 260_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 8.10, 8.15, 7.78, 7.92, 190_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 7.92, 8.04, 7.72, 7.86, 160_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=70), 7.86, 7.98, 7.76, 7.90, 145_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=80), 7.90, 8.06, 7.82, 8.00, 150_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=90), 8.00, 8.10, 7.88, 8.04, 170_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 8.04, 8.12, 7.90, 8.06, 180_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 8.06, 8.20, 8.00, 8.14, 260_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 6.10, 6.55, 6.05, 6.45, 120_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 6.45, 7.20, 6.40, 7.08, 210_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 7.05, 7.95, 7.00, 7.72, 340_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 7.70, 8.80, 7.65, 8.45, 520_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 8.42, 8.62, 8.08, 8.18, 260_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 8.10, 8.15, 7.78, 7.92, 190_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 7.92, 8.04, 7.72, 7.86, 160_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=70), 7.86, 7.98, 7.76, 7.90, 145_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=80), 7.90, 8.06, 7.82, 8.00, 150_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=90), 8.00, 8.10, 7.88, 8.04, 170_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 8.04, 8.12, 7.90, 8.06, 180_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 8.06, 8.20, 8.00, 8.14, 260_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
     driver = _momentum_burst_backtest_driver(ten_sec)
     driver._use_warrior_squeeze_playbook = True
@@ -1607,18 +1607,18 @@ def test_warrior_prior_runner_continuation_pullback_context_allows_controlled_re
 
 def test_warrior_prior_runner_continuation_pullback_rejects_dump_base() -> None:
     ten_sec = [
-        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 6.10, 6.55, 6.05, 6.45, 120_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 6.45, 7.20, 6.40, 7.08, 210_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 7.05, 7.95, 7.00, 7.72, 340_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 7.70, 8.80, 7.65, 8.45, 520_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 8.42, 8.62, 8.08, 8.18, 260_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 8.10, 8.15, 7.78, 7.92, 190_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 7.92, 8.04, 7.72, 7.86, 160_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=70), 8.35, 8.42, 7.76, 7.70, 360_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=80), 7.70, 8.06, 7.82, 8.00, 150_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=90), 8.00, 8.10, 7.88, 8.04, 170_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 8.04, 8.12, 7.90, 8.06, 180_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 8.06, 8.20, 8.00, 8.14, 260_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 6.10, 6.55, 6.05, 6.45, 120_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 6.45, 7.20, 6.40, 7.08, 210_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 7.05, 7.95, 7.00, 7.72, 340_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 7.70, 8.80, 7.65, 8.45, 520_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 8.42, 8.62, 8.08, 8.18, 260_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 8.10, 8.15, 7.78, 7.92, 190_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 7.92, 8.04, 7.72, 7.86, 160_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=70), 8.35, 8.42, 7.76, 7.70, 360_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=80), 7.70, 8.06, 7.82, 8.00, 150_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=90), 8.00, 8.10, 7.88, 8.04, 170_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 8.04, 8.12, 7.90, 8.06, 180_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 8.06, 8.20, 8.00, 8.14, 260_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
     driver = _momentum_burst_backtest_driver(ten_sec)
     driver._use_warrior_squeeze_playbook = True
@@ -1634,18 +1634,18 @@ def test_warrior_prior_runner_continuation_pullback_rejects_dump_base() -> None:
 
 def test_warrior_prior_runner_continuation_pullback_rejects_weak_reclaim_volume() -> None:
     ten_sec = [
-        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 6.10, 6.55, 6.05, 6.45, 120_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 6.45, 7.20, 6.40, 7.08, 210_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 7.05, 7.95, 7.00, 7.72, 340_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 7.70, 8.80, 7.65, 8.45, 520_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 8.42, 8.62, 8.08, 8.18, 260_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 8.10, 8.15, 7.78, 7.92, 190_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 7.92, 8.04, 7.72, 7.86, 160_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=70), 7.86, 7.98, 7.76, 7.90, 80_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=80), 7.90, 8.06, 7.82, 8.00, 45_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=90), 8.00, 8.10, 7.88, 8.04, 50_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 8.04, 8.12, 7.90, 8.06, 55_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 8.06, 8.20, 8.00, 8.14, 85_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 6.10, 6.55, 6.05, 6.45, 120_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 6.45, 7.20, 6.40, 7.08, 210_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 7.05, 7.95, 7.00, 7.72, 340_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 7.70, 8.80, 7.65, 8.45, 520_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 8.42, 8.62, 8.08, 8.18, 260_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 8.10, 8.15, 7.78, 7.92, 190_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 7.92, 8.04, 7.72, 7.86, 160_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=70), 7.86, 7.98, 7.76, 7.90, 80_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=80), 7.90, 8.06, 7.82, 8.00, 45_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=90), 8.00, 8.10, 7.88, 8.04, 50_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 8.04, 8.12, 7.90, 8.06, 55_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 8.06, 8.20, 8.00, 8.14, 85_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
     driver = _momentum_burst_backtest_driver(ten_sec)
     driver._use_warrior_squeeze_playbook = True
@@ -1661,20 +1661,20 @@ def test_warrior_prior_runner_continuation_pullback_rejects_weak_reclaim_volume(
 
 def test_warrior_trend_pullback_reclaim_context_allows_cast_style_base() -> None:
     ten_sec = [
-        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 6.80, 7.30, 6.76, 7.22, 180_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 7.24, 7.85, 7.20, 7.78, 260_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 7.80, 8.55, 7.74, 8.42, 330_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 8.42, 9.35, 8.35, 9.12, 440_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 9.12, 10.20, 9.00, 9.82, 620_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 9.78, 10.34, 9.62, 9.90, 520_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 9.86, 9.98, 9.18, 9.30, 240_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=70), 9.30, 9.42, 8.82, 8.96, 170_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=80), 8.96, 9.10, 8.54, 8.76, 145_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=90), 8.76, 8.98, 8.46, 8.84, 135_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 8.84, 9.08, 8.58, 8.98, 150_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 8.98, 9.16, 8.70, 9.06, 165_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=120), 9.08, 9.24, 8.86, 9.18, 185_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=130), 9.18, 9.45, 9.05, 9.39, 320_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 6.80, 7.30, 6.76, 7.22, 180_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 7.24, 7.85, 7.20, 7.78, 260_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 7.80, 8.55, 7.74, 8.42, 330_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 8.42, 9.35, 8.35, 9.12, 440_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 9.12, 10.20, 9.00, 9.82, 620_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 9.78, 10.34, 9.62, 9.90, 520_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 9.86, 9.98, 9.18, 9.30, 240_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=70), 9.30, 9.42, 8.82, 8.96, 170_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=80), 8.96, 9.10, 8.54, 8.76, 145_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=90), 8.76, 8.98, 8.46, 8.84, 135_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 8.84, 9.08, 8.58, 8.98, 150_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 8.98, 9.16, 8.70, 9.06, 165_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=120), 9.08, 9.24, 8.86, 9.18, 185_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=130), 9.18, 9.45, 9.05, 9.39, 320_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
     driver = _momentum_burst_backtest_driver(ten_sec)
     driver._use_warrior_squeeze_playbook = True
@@ -1696,27 +1696,27 @@ def test_warrior_trend_pullback_reclaim_context_allows_cast_style_base() -> None
 
 def test_warrior_high_base_reclaim_allows_sprc_style_volume_reclaim() -> None:
     ten_sec = [
-        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 7.20, 10.40, 7.10, 9.80, 480_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 9.78, 10.55, 9.40, 9.70, 220_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 9.70, 9.95, 9.30, 9.45, 110_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 9.45, 9.65, 9.10, 9.30, 92_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 9.30, 9.50, 9.05, 9.25, 75_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 9.24, 9.40, 8.92, 9.02, 68_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 9.02, 9.20, 8.74, 8.92, 64_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=70), 8.92, 9.08, 8.62, 8.86, 58_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=80), 8.86, 9.02, 8.58, 8.78, 52_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=90), 8.78, 8.96, 8.45, 8.60, 48_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 8.60, 8.86, 8.42, 8.47, 51_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 8.49, 8.52, 8.29, 8.43, 69_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=120), 8.43, 8.66, 8.42, 8.61, 35_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=130), 8.59, 8.61, 8.49, 8.55, 32_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=140), 8.57, 8.78, 8.54, 8.77, 27_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=150), 8.74, 8.80, 8.62, 8.67, 26_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=160), 8.66, 8.70, 8.62, 8.62, 10_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=170), 8.62, 8.96, 8.62, 8.93, 52_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=180), 8.89, 9.15, 8.76, 9.11, 59_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=190), 9.12, 9.39, 9.02, 9.39, 64_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=200), 9.39, 10.66, 9.25, 10.38, 356_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 7.20, 10.40, 7.10, 9.80, 480_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 9.78, 10.55, 9.40, 9.70, 220_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 9.70, 9.95, 9.30, 9.45, 110_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 9.45, 9.65, 9.10, 9.30, 92_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 9.30, 9.50, 9.05, 9.25, 75_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 9.24, 9.40, 8.92, 9.02, 68_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 9.02, 9.20, 8.74, 8.92, 64_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=70), 8.92, 9.08, 8.62, 8.86, 58_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=80), 8.86, 9.02, 8.58, 8.78, 52_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=90), 8.78, 8.96, 8.45, 8.60, 48_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 8.60, 8.86, 8.42, 8.47, 51_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 8.49, 8.52, 8.29, 8.43, 69_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=120), 8.43, 8.66, 8.42, 8.61, 35_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=130), 8.59, 8.61, 8.49, 8.55, 32_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=140), 8.57, 8.78, 8.54, 8.77, 27_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=150), 8.74, 8.80, 8.62, 8.67, 26_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=160), 8.66, 8.70, 8.62, 8.62, 10_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=170), 8.62, 8.96, 8.62, 8.93, 52_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=180), 8.89, 9.15, 8.76, 9.11, 59_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=190), 9.12, 9.39, 9.02, 9.39, 64_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=200), 9.39, 10.66, 9.25, 10.38, 356_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_high_base_reclaim_context(
@@ -1732,27 +1732,27 @@ def test_warrior_high_base_reclaim_allows_sprc_style_volume_reclaim() -> None:
 
 def test_warrior_high_base_reclaim_rejects_second_blowoff_candle() -> None:
     ten_sec = [
-        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 7.20, 10.40, 7.10, 9.80, 480_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 9.78, 10.55, 9.40, 9.70, 220_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 9.70, 9.95, 9.30, 9.45, 110_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 9.45, 9.65, 9.10, 9.30, 92_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 9.30, 9.50, 9.05, 9.25, 75_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 9.24, 9.40, 8.92, 9.02, 68_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 9.02, 9.20, 8.74, 8.92, 64_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=70), 8.92, 9.08, 8.62, 8.86, 58_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=80), 8.86, 9.02, 8.58, 8.78, 52_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=90), 8.78, 8.96, 8.45, 8.60, 48_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 8.60, 8.86, 8.42, 8.47, 51_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 8.49, 8.52, 8.29, 8.43, 69_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=120), 8.43, 8.66, 8.42, 8.61, 35_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=130), 8.59, 8.61, 8.49, 8.55, 32_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=140), 8.57, 8.78, 8.54, 8.77, 27_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=150), 8.74, 8.80, 8.62, 8.67, 26_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=160), 8.66, 8.70, 8.62, 8.62, 10_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=170), 8.62, 8.96, 8.62, 8.93, 52_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=180), 8.89, 9.15, 8.76, 9.11, 59_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=190), 9.12, 10.05, 9.02, 9.95, 226_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=200), 9.95, 10.75, 9.73, 10.47, 277_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 7.20, 10.40, 7.10, 9.80, 480_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 9.78, 10.55, 9.40, 9.70, 220_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 9.70, 9.95, 9.30, 9.45, 110_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 9.45, 9.65, 9.10, 9.30, 92_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 9.30, 9.50, 9.05, 9.25, 75_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 9.24, 9.40, 8.92, 9.02, 68_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 9.02, 9.20, 8.74, 8.92, 64_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=70), 8.92, 9.08, 8.62, 8.86, 58_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=80), 8.86, 9.02, 8.58, 8.78, 52_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=90), 8.78, 8.96, 8.45, 8.60, 48_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 8.60, 8.86, 8.42, 8.47, 51_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 8.49, 8.52, 8.29, 8.43, 69_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=120), 8.43, 8.66, 8.42, 8.61, 35_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=130), 8.59, 8.61, 8.49, 8.55, 32_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=140), 8.57, 8.78, 8.54, 8.77, 27_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=150), 8.74, 8.80, 8.62, 8.67, 26_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=160), 8.66, 8.70, 8.62, 8.62, 10_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=170), 8.62, 8.96, 8.62, 8.93, 52_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=180), 8.89, 9.15, 8.76, 9.11, 59_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=190), 9.12, 10.05, 9.02, 9.95, 226_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=200), 9.95, 10.75, 9.73, 10.47, 277_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_high_base_reclaim_context(
@@ -1766,15 +1766,15 @@ def test_warrior_high_base_reclaim_rejects_second_blowoff_candle() -> None:
 
 def test_warrior_first_impulse_scalp_allows_clean_nct_style_second_push() -> None:
     ten_sec = [
-        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 2.88, 3.25, 2.80, 3.10, 26_588, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 3.21, 3.82, 3.0799, 3.81, 74_968, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 3.84, 4.38, 3.53, 4.02, 96_448, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 4.03, 4.41, 3.96, 4.38, 98_476, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 4.38, 4.41, 4.10, 4.23, 91_192, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 4.19, 4.40, 4.00, 4.36, 67_646, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 4.34, 5.50, 4.26, 5.46, 219_123, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=70), 5.4403, 5.58, 5.09, 5.43, 155_415, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=80), 5.44, 5.90, 5.29, 5.57, 143_194, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 2.88, 3.25, 2.80, 3.10, 26_588, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 3.21, 3.82, 3.0799, 3.81, 74_968, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 3.84, 4.38, 3.53, 4.02, 96_448, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 4.03, 4.41, 3.96, 4.38, 98_476, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 4.38, 4.41, 4.10, 4.23, 91_192, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 4.19, 4.40, 4.00, 4.36, 67_646, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 4.34, 5.50, 4.26, 5.46, 219_123, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=70), 5.4403, 5.58, 5.09, 5.43, 155_415, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=80), 5.44, 5.90, 5.29, 5.57, 143_194, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_first_impulse_scalp_context(
@@ -1824,7 +1824,7 @@ def test_initial_warrior_context_prefers_clwt_fast_pullaway_over_reclaim() -> No
 
 def test_warrior_classifier_intentionally_uses_older_session_low() -> None:
     ten_sec = [
-        Bar("LOWP", _BASE_TS + timedelta(seconds=0), 1.05, 1.08, 1.00, 1.04, 80_000, Timeframe.SEC_10),
+        Bar("LOWP", _BASE_TS + timedelta(seconds=0), 1.05, 1.08, 1.00, 1.04, 80_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
     for idx in range(1, 36):
         ten_sec.append(
@@ -1837,10 +1837,10 @@ def test_warrior_classifier_intentionally_uses_older_session_low() -> None:
                 1.94,
                 20_000,
                 Timeframe.SEC_10,
-            )
+             provenance=BarSource.CANONICAL_INTERVAL)
         )
     ten_sec.append(
-        Bar("LOWP", _BASE_TS + timedelta(seconds=360), 2.05, 2.17, 2.03, 2.13, 700_000, Timeframe.SEC_10)
+        Bar("LOWP", _BASE_TS + timedelta(seconds=360), 2.05, 2.17, 2.03, 2.13, 700_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL)
     )
 
     lane = warrior_lanes.classify_warrior_trend_lane(
@@ -1854,15 +1854,15 @@ def test_warrior_classifier_intentionally_uses_older_session_low() -> None:
 
 def test_warrior_first_impulse_scalp_rejects_prior_red_breakdown() -> None:
     ten_sec = [
-        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 3.95, 4.20, 3.91, 4.05, 12_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 4.10, 4.45, 4.02, 4.32, 18_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 4.82, 4.876, 4.18, 4.34, 41_856, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 4.39, 4.4291, 4.15, 4.154, 25_674, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 4.2513, 4.42, 4.00, 4.41, 31_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 4.47, 4.48, 4.32, 4.40, 32_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 4.43, 5.25, 4.40, 5.20, 72_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=70), 5.194, 5.65, 4.92, 5.4739, 80_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=80), 5.47, 6.57, 5.42, 6.52, 183_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 3.95, 4.20, 3.91, 4.05, 12_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 4.10, 4.45, 4.02, 4.32, 18_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 4.82, 4.876, 4.18, 4.34, 41_856, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 4.39, 4.4291, 4.15, 4.154, 25_674, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 4.2513, 4.42, 4.00, 4.41, 31_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 4.47, 4.48, 4.32, 4.40, 32_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 4.43, 5.25, 4.40, 5.20, 72_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=70), 5.194, 5.65, 4.92, 5.4739, 80_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=80), 5.47, 6.57, 5.42, 6.52, 183_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_first_impulse_scalp_context(
@@ -1876,13 +1876,13 @@ def test_warrior_first_impulse_scalp_rejects_prior_red_breakdown() -> None:
 
 def test_warrior_first_impulse_scalp_rejects_prior_wide_red_fakeout() -> None:
     ten_sec = [
-        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 3.24, 3.57, 3.24, 3.536, 14_099, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 3.56, 3.7087, 3.55, 3.70, 6_998, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 3.56, 3.56, 3.54, 3.54, 500, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 3.55, 4.00, 3.51, 4.00, 11_220, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 4.03, 4.29, 3.53, 3.7233, 18_356, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 3.7225, 3.74, 3.52, 3.5395, 14_195, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 3.53, 4.38, 3.51, 4.30, 38_079, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 3.24, 3.57, 3.24, 3.536, 14_099, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 3.56, 3.7087, 3.55, 3.70, 6_998, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 3.56, 3.56, 3.54, 3.54, 500, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 3.55, 4.00, 3.51, 4.00, 11_220, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 4.03, 4.29, 3.53, 3.7233, 18_356, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 3.7225, 3.74, 3.52, 3.5395, 14_195, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 3.53, 4.38, 3.51, 4.30, 38_079, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_first_impulse_scalp_context(
@@ -1896,16 +1896,16 @@ def test_warrior_first_impulse_scalp_rejects_prior_wide_red_fakeout() -> None:
 
 def test_warrior_playbook_rejects_ehgo_style_under_rejection_high() -> None:
     ten_sec = [
-        Bar("EHGO", _BASE_TS + timedelta(seconds=0), 3.73, 4.60, 3.73, 4.15, 146_823, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=10), 4.21, 4.70, 4.00, 4.50, 99_329, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=20), 4.50, 4.80, 4.46, 4.57, 84_675, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=30), 4.56, 4.86, 4.54, 4.68, 86_313, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=40), 4.74, 4.85, 4.58, 4.59, 88_875, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=50), 4.58, 4.59, 4.06, 4.11, 66_406, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=60), 4.11, 4.21, 3.98, 4.16, 63_971, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=70), 4.16, 4.86, 4.14, 4.81, 141_220, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=80), 4.81, 5.10, 4.77, 4.78, 114_421, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=90), 4.77, 4.98, 4.72, 4.80, 77_109, Timeframe.SEC_10),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=0), 3.73, 4.60, 3.73, 4.15, 146_823, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=10), 4.21, 4.70, 4.00, 4.50, 99_329, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=20), 4.50, 4.80, 4.46, 4.57, 84_675, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=30), 4.56, 4.86, 4.54, 4.68, 86_313, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=40), 4.74, 4.85, 4.58, 4.59, 88_875, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=50), 4.58, 4.59, 4.06, 4.11, 66_406, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=60), 4.11, 4.21, 3.98, 4.16, 63_971, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=70), 4.16, 4.86, 4.14, 4.81, 141_220, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=80), 4.81, 5.10, 4.77, 4.78, 114_421, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=90), 4.77, 4.98, 4.72, 4.80, 77_109, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     assert warrior_lanes.warrior_recent_rejection_high(ten_sec) == pytest.approx(5.10)
@@ -1920,14 +1920,14 @@ def test_warrior_playbook_rejects_ehgo_style_under_rejection_high() -> None:
 
 def test_warrior_pullaway_rejects_ehgo_style_under_rejection_high() -> None:
     ten_sec = [
-        Bar("EHGO", _BASE_TS + timedelta(seconds=0), 4.50, 4.80, 4.46, 4.57, 84_675, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=10), 4.56, 4.86, 4.54, 4.68, 86_313, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=20), 4.74, 4.85, 4.58, 4.59, 88_875, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=30), 4.58, 4.59, 4.06, 4.11, 66_406, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=40), 4.11, 4.21, 3.98, 4.16, 63_971, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=50), 4.16, 4.86, 4.14, 4.81, 141_220, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=60), 4.81, 5.10, 4.77, 4.78, 114_421, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=70), 4.77, 4.98, 4.72, 4.80, 77_109, Timeframe.SEC_10),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=0), 4.50, 4.80, 4.46, 4.57, 84_675, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=10), 4.56, 4.86, 4.54, 4.68, 86_313, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=20), 4.74, 4.85, 4.58, 4.59, 88_875, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=30), 4.58, 4.59, 4.06, 4.11, 66_406, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=40), 4.11, 4.21, 3.98, 4.16, 63_971, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=50), 4.16, 4.86, 4.14, 4.81, 141_220, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=60), 4.81, 5.10, 4.77, 4.78, 114_421, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=70), 4.77, 4.98, 4.72, 4.80, 77_109, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_squeeze_pullaway_context(
@@ -1950,22 +1950,22 @@ def test_warrior_pullaway_rejects_ehgo_style_under_rejection_high() -> None:
 
 def test_warrior_pullaway_rejects_wick_through_prior_high_without_close_reclaim() -> None:
     ten_sec = [
-        Bar("EHGO", _BASE_TS + timedelta(seconds=0), 4.51, 4.88, 4.46, 4.86, 86_999, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=10), 4.86, 4.90, 4.66, 4.79, 104_505, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=20), 4.80, 4.88, 4.69, 4.70, 51_929, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=30), 4.70, 4.85, 4.64, 4.84, 42_254, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=40), 4.82, 4.90, 4.70, 4.71, 80_899, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=50), 4.71, 4.80, 4.70, 4.76, 26_370, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=60), 4.76, 4.77, 4.65, 4.65, 36_805, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=70), 4.66, 4.66, 4.27, 4.39, 39_615, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=80), 4.43, 4.82, 4.40, 4.82, 41_541, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=90), 4.82, 4.91, 4.69, 4.90, 89_749, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=100), 4.89, 4.92, 4.78, 4.80, 48_565, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=110), 4.80, 4.85, 4.71, 4.84, 30_818, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=120), 4.84, 4.88, 4.69, 4.72, 48_145, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=130), 4.68, 4.83, 4.68, 4.83, 22_726, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=140), 4.83, 4.94, 4.70, 4.78, 71_162, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=150), 4.81, 5.11, 4.81, 5.01, 113_316, Timeframe.SEC_10),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=0), 4.51, 4.88, 4.46, 4.86, 86_999, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=10), 4.86, 4.90, 4.66, 4.79, 104_505, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=20), 4.80, 4.88, 4.69, 4.70, 51_929, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=30), 4.70, 4.85, 4.64, 4.84, 42_254, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=40), 4.82, 4.90, 4.70, 4.71, 80_899, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=50), 4.71, 4.80, 4.70, 4.76, 26_370, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=60), 4.76, 4.77, 4.65, 4.65, 36_805, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=70), 4.66, 4.66, 4.27, 4.39, 39_615, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=80), 4.43, 4.82, 4.40, 4.82, 41_541, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=90), 4.82, 4.91, 4.69, 4.90, 89_749, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=100), 4.89, 4.92, 4.78, 4.80, 48_565, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=110), 4.80, 4.85, 4.71, 4.84, 30_818, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=120), 4.84, 4.88, 4.69, 4.72, 48_145, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=130), 4.68, 4.83, 4.68, 4.83, 22_726, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=140), 4.83, 4.94, 4.70, 4.78, 71_162, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=150), 4.81, 5.11, 4.81, 5.01, 113_316, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_squeeze_pullaway_context(
@@ -1988,15 +1988,15 @@ def test_warrior_pullaway_rejects_wick_through_prior_high_without_close_reclaim(
 
 def test_warrior_playbook_allows_after_reclaiming_rejection_high() -> None:
     ten_sec = [
-        Bar("EHGO", _BASE_TS + timedelta(seconds=0), 4.50, 4.80, 4.46, 4.57, 84_675, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=10), 4.56, 4.86, 4.54, 4.68, 86_313, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=20), 4.74, 4.85, 4.58, 4.59, 88_875, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=30), 4.58, 4.59, 4.06, 4.11, 66_406, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=40), 4.11, 4.21, 3.98, 4.16, 63_971, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=50), 4.16, 4.86, 4.14, 4.81, 141_220, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=60), 4.81, 5.10, 4.77, 4.78, 114_421, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=70), 4.78, 5.12, 4.76, 4.97, 80_000, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=80), 4.95, 5.18, 4.92, 5.14, 95_000, Timeframe.SEC_10),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=0), 4.50, 4.80, 4.46, 4.57, 84_675, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=10), 4.56, 4.86, 4.54, 4.68, 86_313, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=20), 4.74, 4.85, 4.58, 4.59, 88_875, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=30), 4.58, 4.59, 4.06, 4.11, 66_406, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=40), 4.11, 4.21, 3.98, 4.16, 63_971, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=50), 4.16, 4.86, 4.14, 4.81, 141_220, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=60), 4.81, 5.10, 4.77, 4.78, 114_421, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=70), 4.78, 5.12, 4.76, 4.97, 80_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=80), 4.95, 5.18, 4.92, 5.14, 95_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     assert warrior_lanes.warrior_recent_rejection_high(ten_sec) == 0.0
@@ -2004,16 +2004,16 @@ def test_warrior_playbook_allows_after_reclaiming_rejection_high() -> None:
 
 def test_warrior_first_pullback_reclaim_allows_labt_style_low_price_base() -> None:
     ten_sec = [
-        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 2.145, 2.19, 2.05, 2.18, 129_531, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 2.1796, 2.2499, 2.13, 2.1896, 165_279, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 2.1879, 2.71, 2.18, 2.60, 296_442, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 2.61, 2.64, 2.40, 2.45, 289_954, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 2.46, 2.5599, 2.42, 2.4405, 212_667, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 2.45, 2.54, 2.42, 2.44, 151_810, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 2.45, 2.50, 2.43, 2.4513, 85_321, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=70), 2.46, 2.51, 2.36, 2.40, 205_073, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=80), 2.40, 2.64, 2.3805, 2.57, 251_486, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=90), 2.56, 2.93, 2.56, 2.91, 483_408, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 2.145, 2.19, 2.05, 2.18, 129_531, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 2.1796, 2.2499, 2.13, 2.1896, 165_279, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 2.1879, 2.71, 2.18, 2.60, 296_442, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 2.61, 2.64, 2.40, 2.45, 289_954, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 2.46, 2.5599, 2.42, 2.4405, 212_667, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 2.45, 2.54, 2.42, 2.44, 151_810, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 2.45, 2.50, 2.43, 2.4513, 85_321, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=70), 2.46, 2.51, 2.36, 2.40, 205_073, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=80), 2.40, 2.64, 2.3805, 2.57, 251_486, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=90), 2.56, 2.93, 2.56, 2.91, 483_408, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_trend_playbook_context(
@@ -2034,18 +2034,18 @@ def test_warrior_first_pullback_reclaim_allows_labt_style_low_price_base() -> No
 
 def test_warrior_low_price_proof_reclaim_allows_rdgt_style_runner() -> None:
     ten_sec = [
-        Bar("RDGT", _BASE_TS + timedelta(seconds=0), 1.41, 1.43, 1.38, 1.38, 6_776, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=10), 1.3887, 1.42, 1.3803, 1.3803, 1_634, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=20), 1.38, 1.39, 1.38, 1.39, 1_144, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=30), 1.39, 1.48, 1.39, 1.45, 7_991, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=40), 1.45, 1.4668, 1.415, 1.4668, 4_366, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=50), 1.50, 1.65, 1.48, 1.56, 35_202, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=60), 1.58, 1.73, 1.50, 1.69, 159_262, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=70), 1.68, 1.9476, 1.66, 1.86, 436_328, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=80), 1.8596, 1.97, 1.79, 1.8404, 480_661, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=90), 1.86, 2.0, 1.69, 1.89, 605_247, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=100), 1.8996, 1.97, 1.88, 1.92, 140_000, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=110), 1.9204, 2.17, 1.90, 2.13, 676_131, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=0), 1.41, 1.43, 1.38, 1.38, 6_776, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=10), 1.3887, 1.42, 1.3803, 1.3803, 1_634, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=20), 1.38, 1.39, 1.38, 1.39, 1_144, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=30), 1.39, 1.48, 1.39, 1.45, 7_991, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=40), 1.45, 1.4668, 1.415, 1.4668, 4_366, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=50), 1.50, 1.65, 1.48, 1.56, 35_202, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=60), 1.58, 1.73, 1.50, 1.69, 159_262, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=70), 1.68, 1.9476, 1.66, 1.86, 436_328, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=80), 1.8596, 1.97, 1.79, 1.8404, 480_661, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=90), 1.86, 2.0, 1.69, 1.89, 605_247, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=100), 1.8996, 1.97, 1.88, 1.92, 140_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=110), 1.9204, 2.17, 1.90, 2.13, 676_131, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_trend_playbook_context(
@@ -2065,14 +2065,14 @@ def test_warrior_low_price_proof_reclaim_allows_rdgt_style_runner() -> None:
 
 def test_warrior_post_target_fresh_continuation_waits_for_graduated_reclaim() -> None:
     early = [
-        Bar("RDGT", _BASE_TS + timedelta(seconds=0), 1.86, 2.0, 1.69, 1.89, 605_247, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=10), 1.8996, 1.97, 1.88, 1.92, 140_000, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=20), 1.9204, 2.17, 1.90, 2.13, 676_131, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=30), 2.13, 2.23, 2.07, 2.20, 260_000, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=40), 2.20, 2.256, 2.16, 2.25, 170_000, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=50), 2.24, 2.27, 2.18, 2.256, 180_000, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=60), 2.25, 2.28, 2.19, 2.26, 190_000, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=70), 2.26, 2.31, 2.22, 2.30, 210_000, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=0), 1.86, 2.0, 1.69, 1.89, 605_247, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=10), 1.8996, 1.97, 1.88, 1.92, 140_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=20), 1.9204, 2.17, 1.90, 2.13, 676_131, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=30), 2.13, 2.23, 2.07, 2.20, 260_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=40), 2.20, 2.256, 2.16, 2.25, 170_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=50), 2.24, 2.27, 2.18, 2.256, 180_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=60), 2.25, 2.28, 2.19, 2.26, 190_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=70), 2.26, 2.31, 2.22, 2.30, 210_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     assert (
@@ -2085,18 +2085,18 @@ def test_warrior_post_target_fresh_continuation_waits_for_graduated_reclaim() ->
     )
 
     graduated = [
-        Bar("RDGT", _BASE_TS + timedelta(seconds=0), 3.25, 3.32, 3.24, 3.2706, 46_414, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=10), 3.2709, 3.28, 3.24, 3.2404, 16_577, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=20), 3.24, 3.25, 3.01, 3.0193, 108_709, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=30), 3.01, 3.07, 3.0, 3.0394, 86_316, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=40), 3.0394, 3.21, 3.03, 3.19, 67_830, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=50), 3.19, 3.27, 3.14, 3.26, 63_117, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=60), 3.27, 3.31, 3.22, 3.22, 62_460, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=70), 3.22, 3.3695, 3.21, 3.3499, 88_514, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=80), 3.34, 3.36, 3.30, 3.3211, 71_316, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=90), 3.33, 3.40, 3.29, 3.3705, 61_349, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=100), 3.3796, 3.83, 3.32, 3.71, 205_117, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=110), 3.71, 3.95, 3.66, 3.85, 285_769, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=0), 3.25, 3.32, 3.24, 3.2706, 46_414, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=10), 3.2709, 3.28, 3.24, 3.2404, 16_577, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=20), 3.24, 3.25, 3.01, 3.0193, 108_709, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=30), 3.01, 3.07, 3.0, 3.0394, 86_316, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=40), 3.0394, 3.21, 3.03, 3.19, 67_830, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=50), 3.19, 3.27, 3.14, 3.26, 63_117, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=60), 3.27, 3.31, 3.22, 3.22, 62_460, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=70), 3.22, 3.3695, 3.21, 3.3499, 88_514, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=80), 3.34, 3.36, 3.30, 3.3211, 71_316, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=90), 3.33, 3.40, 3.29, 3.3705, 61_349, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=100), 3.3796, 3.83, 3.32, 3.71, 205_117, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=110), 3.71, 3.95, 3.66, 3.85, 285_769, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_post_target_fresh_continuation_context(
@@ -2115,17 +2115,17 @@ def test_warrior_post_target_fresh_continuation_waits_for_graduated_reclaim() ->
 
 def test_warrior_first_pullback_reclaim_rejects_red_distribution_base() -> None:
     ten_sec = [
-        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 1.55, 1.62, 1.52, 1.60, 15_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 1.60, 1.78, 1.58, 1.74, 35_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 1.74, 2.12, 1.70, 2.02, 110_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 2.03, 2.38, 1.95, 2.10, 260_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 2.14, 2.30, 1.86, 1.91, 240_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 1.92, 2.09, 1.88, 1.98, 90_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 1.99, 2.08, 1.96, 2.05, 85_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=70), 2.05, 2.18, 2.00, 2.15, 95_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=80), 2.14, 2.28, 2.07, 2.25, 125_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=90), 2.25, 2.42, 2.18, 2.39, 165_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 2.39, 2.58, 2.34, 2.52, 220_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 1.55, 1.62, 1.52, 1.60, 15_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 1.60, 1.78, 1.58, 1.74, 35_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 1.74, 2.12, 1.70, 2.02, 110_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 2.03, 2.38, 1.95, 2.10, 260_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 2.14, 2.30, 1.86, 1.91, 240_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 1.92, 2.09, 1.88, 1.98, 90_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 1.99, 2.08, 1.96, 2.05, 85_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=70), 2.05, 2.18, 2.00, 2.15, 95_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=80), 2.14, 2.28, 2.07, 2.25, 125_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=90), 2.25, 2.42, 2.18, 2.39, 165_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 2.39, 2.58, 2.34, 2.52, 220_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_trend_playbook_context(
@@ -2139,32 +2139,32 @@ def test_warrior_first_pullback_reclaim_rejects_red_distribution_base() -> None:
 
 def test_warrior_first_pullback_reclaim_rejects_rdgt_recent_dump_reclaim() -> None:
     ten_sec = [
-        Bar("RDGT", _BASE_TS + timedelta(seconds=0), 2.64, 2.72, 2.53, 2.54, 119_321, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=10), 2.55, 2.65, 2.53, 2.6495, 69_389, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=20), 2.6505, 2.78, 2.60, 2.7595, 84_741, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=30), 2.74, 2.89, 2.69, 2.84, 172_898, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=40), 2.83, 2.90, 2.79, 2.8312, 135_941, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=50), 2.83, 2.9499, 2.83, 2.92, 108_565, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=60), 2.91, 3.00, 2.87, 2.9305, 139_691, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=70), 2.93, 2.97, 2.89, 2.94, 93_583, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=80), 2.93, 3.0716, 2.92, 3.05, 114_244, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=90), 3.0517, 3.3299, 3.05, 3.28, 189_258, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=100), 3.29, 3.45, 3.26, 3.4217, 141_525, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=110), 3.43, 3.52, 3.38, 3.43, 145_515, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=120), 3.4395, 3.45, 3.20, 3.32, 190_553, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=130), 3.3194, 3.50, 3.2805, 3.43, 152_865, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=140), 3.44, 3.65, 3.39, 3.5407, 185_348, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=150), 3.5404, 3.65, 3.22, 3.3204, 215_179, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=160), 3.32, 3.3775, 3.21, 3.2873, 125_031, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=170), 3.2717, 3.32, 3.22, 3.24, 65_027, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=180), 3.25, 3.40, 3.22, 3.30, 114_720, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=190), 3.31, 3.39, 3.2788, 3.33, 57_410, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=200), 3.32, 3.33, 3.21, 3.22, 61_665, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=210), 3.21, 3.22, 3.01, 3.08, 115_162, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=220), 3.0797, 3.17, 3.04, 3.12, 95_375, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=230), 3.13, 3.24, 3.11, 3.20, 51_794, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=240), 3.20, 3.29, 3.18, 3.27, 65_424, Timeframe.SEC_10),
-        Bar("RDGT", _BASE_TS + timedelta(seconds=250), 3.26, 3.44, 3.21, 3.421, 129_271, Timeframe.SEC_10),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=0), 2.64, 2.72, 2.53, 2.54, 119_321, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=10), 2.55, 2.65, 2.53, 2.6495, 69_389, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=20), 2.6505, 2.78, 2.60, 2.7595, 84_741, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=30), 2.74, 2.89, 2.69, 2.84, 172_898, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=40), 2.83, 2.90, 2.79, 2.8312, 135_941, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=50), 2.83, 2.9499, 2.83, 2.92, 108_565, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=60), 2.91, 3.00, 2.87, 2.9305, 139_691, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=70), 2.93, 2.97, 2.89, 2.94, 93_583, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=80), 2.93, 3.0716, 2.92, 3.05, 114_244, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=90), 3.0517, 3.3299, 3.05, 3.28, 189_258, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=100), 3.29, 3.45, 3.26, 3.4217, 141_525, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=110), 3.43, 3.52, 3.38, 3.43, 145_515, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=120), 3.4395, 3.45, 3.20, 3.32, 190_553, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=130), 3.3194, 3.50, 3.2805, 3.43, 152_865, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=140), 3.44, 3.65, 3.39, 3.5407, 185_348, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=150), 3.5404, 3.65, 3.22, 3.3204, 215_179, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=160), 3.32, 3.3775, 3.21, 3.2873, 125_031, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=170), 3.2717, 3.32, 3.22, 3.24, 65_027, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=180), 3.25, 3.40, 3.22, 3.30, 114_720, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=190), 3.31, 3.39, 3.2788, 3.33, 57_410, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=200), 3.32, 3.33, 3.21, 3.22, 61_665, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=210), 3.21, 3.22, 3.01, 3.08, 115_162, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=220), 3.0797, 3.17, 3.04, 3.12, 95_375, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=230), 3.13, 3.24, 3.11, 3.20, 51_794, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=240), 3.20, 3.29, 3.18, 3.27, 65_424, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("RDGT", _BASE_TS + timedelta(seconds=250), 3.26, 3.44, 3.21, 3.421, 129_271, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_trend_playbook_context(
@@ -2178,25 +2178,25 @@ def test_warrior_first_pullback_reclaim_rejects_rdgt_recent_dump_reclaim() -> No
 
 def test_warrior_first_pullback_reclaim_rejects_codx_style_cheap_violent_tape() -> None:
     ten_sec = [
-        Bar("CODX", _BASE_TS + timedelta(seconds=0), 1.84, 1.85, 1.77, 1.8497, 173_721, Timeframe.SEC_10),
-        Bar("CODX", _BASE_TS + timedelta(seconds=10), 1.83, 1.99, 1.83, 1.9196, 305_468, Timeframe.SEC_10),
-        Bar("CODX", _BASE_TS + timedelta(seconds=20), 1.92, 2.00, 1.90, 1.9696, 203_534, Timeframe.SEC_10),
-        Bar("CODX", _BASE_TS + timedelta(seconds=30), 1.97, 2.0999, 1.97, 2.0087, 243_320, Timeframe.SEC_10),
-        Bar("CODX", _BASE_TS + timedelta(seconds=40), 2.00, 2.01, 1.94, 1.97, 156_445, Timeframe.SEC_10),
-        Bar("CODX", _BASE_TS + timedelta(seconds=50), 1.97, 2.11, 1.97, 2.08, 283_333, Timeframe.SEC_10),
-        Bar("CODX", _BASE_TS + timedelta(seconds=60), 2.075, 2.19, 2.03, 2.14, 444_299, Timeframe.SEC_10),
-        Bar("CODX", _BASE_TS + timedelta(seconds=70), 2.14, 2.25, 2.12, 2.18, 277_712, Timeframe.SEC_10),
-        Bar("CODX", _BASE_TS + timedelta(seconds=80), 2.18, 2.19, 2.10, 2.11, 197_227, Timeframe.SEC_10),
-        Bar("CODX", _BASE_TS + timedelta(seconds=90), 2.1097, 2.1801, 2.05, 2.1596, 275_898, Timeframe.SEC_10),
-        Bar("CODX", _BASE_TS + timedelta(seconds=100), 2.16, 2.26, 2.14, 2.22, 193_633, Timeframe.SEC_10),
-        Bar("CODX", _BASE_TS + timedelta(seconds=110), 2.22, 2.2204, 2.15, 2.1774, 175_846, Timeframe.SEC_10),
-        Bar("CODX", _BASE_TS + timedelta(seconds=120), 2.17, 2.31, 2.1604, 2.18, 275_026, Timeframe.SEC_10),
-        Bar("CODX", _BASE_TS + timedelta(seconds=130), 2.17, 2.20, 2.08, 2.1495, 247_692, Timeframe.SEC_10),
-        Bar("CODX", _BASE_TS + timedelta(seconds=140), 2.1497, 2.25, 2.12, 2.19, 174_048, Timeframe.SEC_10),
-        Bar("CODX", _BASE_TS + timedelta(seconds=150), 2.1899, 2.21, 2.16, 2.17, 71_515, Timeframe.SEC_10),
-        Bar("CODX", _BASE_TS + timedelta(seconds=160), 2.1772, 2.24, 2.17, 2.2196, 148_437, Timeframe.SEC_10),
-        Bar("CODX", _BASE_TS + timedelta(seconds=170), 2.20, 2.25, 2.20, 2.2401, 139_454, Timeframe.SEC_10),
-        Bar("CODX", _BASE_TS + timedelta(seconds=180), 2.24, 2.41, 2.24, 2.35, 395_028, Timeframe.SEC_10),
+        Bar("CODX", _BASE_TS + timedelta(seconds=0), 1.84, 1.85, 1.77, 1.8497, 173_721, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CODX", _BASE_TS + timedelta(seconds=10), 1.83, 1.99, 1.83, 1.9196, 305_468, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CODX", _BASE_TS + timedelta(seconds=20), 1.92, 2.00, 1.90, 1.9696, 203_534, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CODX", _BASE_TS + timedelta(seconds=30), 1.97, 2.0999, 1.97, 2.0087, 243_320, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CODX", _BASE_TS + timedelta(seconds=40), 2.00, 2.01, 1.94, 1.97, 156_445, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CODX", _BASE_TS + timedelta(seconds=50), 1.97, 2.11, 1.97, 2.08, 283_333, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CODX", _BASE_TS + timedelta(seconds=60), 2.075, 2.19, 2.03, 2.14, 444_299, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CODX", _BASE_TS + timedelta(seconds=70), 2.14, 2.25, 2.12, 2.18, 277_712, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CODX", _BASE_TS + timedelta(seconds=80), 2.18, 2.19, 2.10, 2.11, 197_227, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CODX", _BASE_TS + timedelta(seconds=90), 2.1097, 2.1801, 2.05, 2.1596, 275_898, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CODX", _BASE_TS + timedelta(seconds=100), 2.16, 2.26, 2.14, 2.22, 193_633, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CODX", _BASE_TS + timedelta(seconds=110), 2.22, 2.2204, 2.15, 2.1774, 175_846, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CODX", _BASE_TS + timedelta(seconds=120), 2.17, 2.31, 2.1604, 2.18, 275_026, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CODX", _BASE_TS + timedelta(seconds=130), 2.17, 2.20, 2.08, 2.1495, 247_692, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CODX", _BASE_TS + timedelta(seconds=140), 2.1497, 2.25, 2.12, 2.19, 174_048, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CODX", _BASE_TS + timedelta(seconds=150), 2.1899, 2.21, 2.16, 2.17, 71_515, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CODX", _BASE_TS + timedelta(seconds=160), 2.1772, 2.24, 2.17, 2.2196, 148_437, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CODX", _BASE_TS + timedelta(seconds=170), 2.20, 2.25, 2.20, 2.2401, 139_454, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CODX", _BASE_TS + timedelta(seconds=180), 2.24, 2.41, 2.24, 2.35, 395_028, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_trend_playbook_context(
@@ -2210,16 +2210,16 @@ def test_warrior_first_pullback_reclaim_rejects_codx_style_cheap_violent_tape() 
 
 def test_warrior_first_pullback_reclaim_rejects_stair_up_without_pullback() -> None:
     ten_sec = [
-        Bar("SBFM", _BASE_TS + timedelta(seconds=0), 1.9998, 1.9999, 1.97, 1.98, 189_000, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=10), 1.9703, 2.09, 1.97, 2.07, 560_761, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=20), 2.07, 2.19, 2.05, 2.1686, 824_780, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=30), 2.17, 2.22, 2.16, 2.19, 648_427, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=40), 2.1804, 2.26, 2.17, 2.25, 633_547, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=50), 2.2498, 2.34, 2.23, 2.32, 580_510, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=60), 2.3299, 2.37, 2.30, 2.3501, 721_054, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=70), 2.3598, 2.40, 2.34, 2.38, 548_203, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=80), 2.37, 2.45, 2.37, 2.4315, 709_329, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=90), 2.43, 2.55, 2.42, 2.53, 547_063, Timeframe.SEC_10),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=0), 1.9998, 1.9999, 1.97, 1.98, 189_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=10), 1.9703, 2.09, 1.97, 2.07, 560_761, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=20), 2.07, 2.19, 2.05, 2.1686, 824_780, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=30), 2.17, 2.22, 2.16, 2.19, 648_427, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=40), 2.1804, 2.26, 2.17, 2.25, 633_547, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=50), 2.2498, 2.34, 2.23, 2.32, 580_510, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=60), 2.3299, 2.37, 2.30, 2.3501, 721_054, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=70), 2.3598, 2.40, 2.34, 2.38, 548_203, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=80), 2.37, 2.45, 2.37, 2.4315, 709_329, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=90), 2.43, 2.55, 2.42, 2.53, 547_063, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_trend_playbook_context(
@@ -2233,25 +2233,25 @@ def test_warrior_first_pullback_reclaim_rejects_stair_up_without_pullback() -> N
 
 def test_warrior_low_price_proof_reclaim_allows_sbfm_style_proof_pullback() -> None:
     ten_sec = [
-        Bar("SBFM", _BASE_TS + timedelta(seconds=0), 1.10, 1.50, 1.10, 1.25, 1_113_447, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=10), 1.25, 1.62, 1.23, 1.55, 620_000, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=20), 1.55, 1.84, 1.52, 1.80, 686_319, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=30), 1.90, 2.00, 1.89, 1.95, 799_268, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=40), 1.95, 1.97, 1.90, 1.93, 692_732, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=50), 1.93, 1.96, 1.92, 1.94, 490_068, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=60), 1.94, 1.96, 1.93, 1.96, 360_232, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=70), 1.96, 2.00, 1.94, 1.97, 755_893, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=80), 1.96, 2.06, 1.96, 2.03, 764_794, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=90), 2.04, 2.09, 2.03, 2.07, 628_559, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=100), 2.07, 2.10, 2.05, 2.07, 592_001, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=110), 2.03, 2.04, 1.94, 1.95, 491_906, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=120), 1.95, 1.95, 1.90, 1.90, 428_237, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=130), 1.90, 1.91, 1.83, 1.84, 445_711, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=140), 1.84, 1.88, 1.84, 1.87, 520_778, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=150), 1.87, 2.01, 1.86, 2.00, 563_528, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=160), 2.00, 2.05, 1.98, 2.00, 507_195, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=170), 1.97, 2.09, 1.97, 2.07, 560_761, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=180), 2.07, 2.19, 2.05, 2.17, 824_780, Timeframe.SEC_10),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=0), 1.10, 1.50, 1.10, 1.25, 1_113_447, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=10), 1.25, 1.62, 1.23, 1.55, 620_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=20), 1.55, 1.84, 1.52, 1.80, 686_319, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=30), 1.90, 2.00, 1.89, 1.95, 799_268, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=40), 1.95, 1.97, 1.90, 1.93, 692_732, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=50), 1.93, 1.96, 1.92, 1.94, 490_068, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=60), 1.94, 1.96, 1.93, 1.96, 360_232, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=70), 1.96, 2.00, 1.94, 1.97, 755_893, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=80), 1.96, 2.06, 1.96, 2.03, 764_794, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=90), 2.04, 2.09, 2.03, 2.07, 628_559, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=100), 2.07, 2.10, 2.05, 2.07, 592_001, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=110), 2.03, 2.04, 1.94, 1.95, 491_906, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=120), 1.95, 1.95, 1.90, 1.90, 428_237, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=130), 1.90, 1.91, 1.83, 1.84, 445_711, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=140), 1.84, 1.88, 1.84, 1.87, 520_778, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=150), 1.87, 2.01, 1.86, 2.00, 563_528, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=160), 2.00, 2.05, 1.98, 2.00, 507_195, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=170), 1.97, 2.09, 1.97, 2.07, 560_761, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=180), 2.07, 2.19, 2.05, 2.17, 824_780, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_trend_playbook_context(
@@ -2268,14 +2268,14 @@ def test_warrior_low_price_proof_reclaim_allows_sbfm_style_proof_pullback() -> N
 
 def test_warrior_low_price_proof_reclaim_allows_vtak_sub_two_dollar_proof() -> None:
     ten_sec = [
-        Bar("VTAK", _BASE_TS + timedelta(seconds=0), 1.10, 1.34, 1.07, 1.28, 620_000, Timeframe.SEC_10),
-        Bar("VTAK", _BASE_TS + timedelta(seconds=10), 1.28, 1.44, 1.17, 1.42, 729_165, Timeframe.SEC_10),
-        Bar("VTAK", _BASE_TS + timedelta(seconds=20), 1.42, 1.62, 1.37, 1.58, 815_248, Timeframe.SEC_10),
-        Bar("VTAK", _BASE_TS + timedelta(seconds=30), 1.58, 1.83, 1.55, 1.72, 1_020_000, Timeframe.SEC_10),
-        Bar("VTAK", _BASE_TS + timedelta(seconds=40), 1.72, 1.77, 1.63, 1.66, 380_000, Timeframe.SEC_10),
-        Bar("VTAK", _BASE_TS + timedelta(seconds=50), 1.66, 1.74, 1.61, 1.70, 340_000, Timeframe.SEC_10),
-        Bar("VTAK", _BASE_TS + timedelta(seconds=60), 1.70, 1.78, 1.66, 1.76, 360_000, Timeframe.SEC_10),
-        Bar("VTAK", _BASE_TS + timedelta(seconds=70), 1.76, 1.99, 1.74, 1.94, 1_027_863, Timeframe.SEC_10),
+        Bar("VTAK", _BASE_TS + timedelta(seconds=0), 1.10, 1.34, 1.07, 1.28, 620_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("VTAK", _BASE_TS + timedelta(seconds=10), 1.28, 1.44, 1.17, 1.42, 729_165, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("VTAK", _BASE_TS + timedelta(seconds=20), 1.42, 1.62, 1.37, 1.58, 815_248, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("VTAK", _BASE_TS + timedelta(seconds=30), 1.58, 1.83, 1.55, 1.72, 1_020_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("VTAK", _BASE_TS + timedelta(seconds=40), 1.72, 1.77, 1.63, 1.66, 380_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("VTAK", _BASE_TS + timedelta(seconds=50), 1.66, 1.74, 1.61, 1.70, 340_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("VTAK", _BASE_TS + timedelta(seconds=60), 1.70, 1.78, 1.66, 1.76, 360_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("VTAK", _BASE_TS + timedelta(seconds=70), 1.76, 1.99, 1.74, 1.94, 1_027_863, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_trend_playbook_context(
@@ -2293,24 +2293,24 @@ def test_warrior_low_price_proof_reclaim_allows_vtak_sub_two_dollar_proof() -> N
 
 def test_warrior_low_price_proof_reclaim_rejects_first_two_dollar_poke() -> None:
     ten_sec = [
-        Bar("SBFM", _BASE_TS + timedelta(seconds=0), 1.73, 1.81, 1.72, 1.77, 746_811, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=10), 1.77, 1.83, 1.76, 1.80, 619_337, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=20), 1.7935, 1.83, 1.7935, 1.8103, 527_094, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=30), 1.82, 1.82, 1.80, 1.8085, 356_479, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=40), 1.80, 1.81, 1.79, 1.8098, 176_166, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=50), 1.8081, 1.81, 1.80, 1.805, 166_932, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=60), 1.8003, 1.81, 1.71, 1.71, 215_931, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=70), 1.73, 1.77, 1.71, 1.74, 459_645, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=80), 1.7387, 1.75, 1.71, 1.7402, 278_838, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=90), 1.74, 1.90, 1.73, 1.90, 481_651, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=100), 1.90, 2.00, 1.89, 1.9503, 799_268, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=110), 1.9503, 1.97, 1.90, 1.93, 692_732, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=120), 1.93, 1.96, 1.92, 1.9397, 490_068, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=130), 1.94, 1.96, 1.93, 1.9587, 360_232, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=140), 1.96, 2.00, 1.94, 1.97, 755_893, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=150), 1.98, 2.00, 1.97, 1.98, 481_881, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=160), 1.9785, 1.98, 1.96, 1.97, 289_822, Timeframe.SEC_10),
-        Bar("SBFM", _BASE_TS + timedelta(seconds=170), 1.96, 2.06, 1.96, 2.03, 764_794, Timeframe.SEC_10),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=0), 1.73, 1.81, 1.72, 1.77, 746_811, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=10), 1.77, 1.83, 1.76, 1.80, 619_337, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=20), 1.7935, 1.83, 1.7935, 1.8103, 527_094, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=30), 1.82, 1.82, 1.80, 1.8085, 356_479, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=40), 1.80, 1.81, 1.79, 1.8098, 176_166, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=50), 1.8081, 1.81, 1.80, 1.805, 166_932, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=60), 1.8003, 1.81, 1.71, 1.71, 215_931, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=70), 1.73, 1.77, 1.71, 1.74, 459_645, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=80), 1.7387, 1.75, 1.71, 1.7402, 278_838, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=90), 1.74, 1.90, 1.73, 1.90, 481_651, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=100), 1.90, 2.00, 1.89, 1.9503, 799_268, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=110), 1.9503, 1.97, 1.90, 1.93, 692_732, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=120), 1.93, 1.96, 1.92, 1.9397, 490_068, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=130), 1.94, 1.96, 1.93, 1.9587, 360_232, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=140), 1.96, 2.00, 1.94, 1.97, 755_893, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=150), 1.98, 2.00, 1.97, 1.98, 481_881, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=160), 1.9785, 1.98, 1.96, 1.97, 289_822, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("SBFM", _BASE_TS + timedelta(seconds=170), 1.96, 2.06, 1.96, 2.03, 764_794, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_low_price_proof_reclaim_context(
@@ -2324,18 +2324,18 @@ def test_warrior_low_price_proof_reclaim_rejects_first_two_dollar_poke() -> None
 
 def test_warrior_low_price_proof_reclaim_rejects_govx_extension_without_base() -> None:
     ten_sec = [
-        Bar("GOVX", _BASE_TS + timedelta(seconds=0), 1.88, 1.93, 1.84, 1.91, 71_877, Timeframe.SEC_10),
-        Bar("GOVX", _BASE_TS + timedelta(seconds=10), 1.91, 1.93, 1.87, 1.93, 76_477, Timeframe.SEC_10),
-        Bar("GOVX", _BASE_TS + timedelta(seconds=20), 1.99, 2.00, 1.90, 1.91, 113_715, Timeframe.SEC_10),
-        Bar("GOVX", _BASE_TS + timedelta(seconds=30), 1.91, 2.01, 1.90, 1.99, 95_192, Timeframe.SEC_10),
-        Bar("GOVX", _BASE_TS + timedelta(seconds=40), 2.00, 2.04, 1.99, 2.04, 96_392, Timeframe.SEC_10),
-        Bar("GOVX", _BASE_TS + timedelta(seconds=50), 2.03, 2.10, 2.01, 2.06, 93_423, Timeframe.SEC_10),
-        Bar("GOVX", _BASE_TS + timedelta(seconds=60), 2.06, 2.06, 1.98, 1.99, 105_112, Timeframe.SEC_10),
-        Bar("GOVX", _BASE_TS + timedelta(seconds=70), 1.95, 2.04, 1.94, 2.03, 52_033, Timeframe.SEC_10),
-        Bar("GOVX", _BASE_TS + timedelta(seconds=80), 2.04, 2.07, 2.02, 2.06, 63_594, Timeframe.SEC_10),
-        Bar("GOVX", _BASE_TS + timedelta(seconds=90), 2.05, 2.27, 2.04, 2.17, 135_168, Timeframe.SEC_10),
-        Bar("GOVX", _BASE_TS + timedelta(seconds=100), 2.17, 2.23, 2.15, 2.22, 119_778, Timeframe.SEC_10),
-        Bar("GOVX", _BASE_TS + timedelta(seconds=110), 2.22, 2.30, 2.20, 2.29, 111_444, Timeframe.SEC_10),
+        Bar("GOVX", _BASE_TS + timedelta(seconds=0), 1.88, 1.93, 1.84, 1.91, 71_877, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("GOVX", _BASE_TS + timedelta(seconds=10), 1.91, 1.93, 1.87, 1.93, 76_477, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("GOVX", _BASE_TS + timedelta(seconds=20), 1.99, 2.00, 1.90, 1.91, 113_715, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("GOVX", _BASE_TS + timedelta(seconds=30), 1.91, 2.01, 1.90, 1.99, 95_192, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("GOVX", _BASE_TS + timedelta(seconds=40), 2.00, 2.04, 1.99, 2.04, 96_392, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("GOVX", _BASE_TS + timedelta(seconds=50), 2.03, 2.10, 2.01, 2.06, 93_423, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("GOVX", _BASE_TS + timedelta(seconds=60), 2.06, 2.06, 1.98, 1.99, 105_112, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("GOVX", _BASE_TS + timedelta(seconds=70), 1.95, 2.04, 1.94, 2.03, 52_033, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("GOVX", _BASE_TS + timedelta(seconds=80), 2.04, 2.07, 2.02, 2.06, 63_594, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("GOVX", _BASE_TS + timedelta(seconds=90), 2.05, 2.27, 2.04, 2.17, 135_168, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("GOVX", _BASE_TS + timedelta(seconds=100), 2.17, 2.23, 2.15, 2.22, 119_778, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("GOVX", _BASE_TS + timedelta(seconds=110), 2.22, 2.30, 2.20, 2.29, 111_444, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_low_price_proof_reclaim_context(
@@ -2349,20 +2349,20 @@ def test_warrior_low_price_proof_reclaim_rejects_govx_extension_without_base() -
 
 def test_warrior_low_price_proof_reclaim_rejects_clwt_style_post_proof_dump() -> None:
     ten_sec = [
-        Bar("CLWT", _BASE_TS + timedelta(seconds=0), 1.30, 1.42, 1.30, 1.38, 40_000, Timeframe.SEC_10),
-        Bar("CLWT", _BASE_TS + timedelta(seconds=10), 1.38, 1.46, 1.35, 1.44, 55_000, Timeframe.SEC_10),
-        Bar("CLWT", _BASE_TS + timedelta(seconds=20), 1.45, 1.60, 1.39, 1.55, 110_000, Timeframe.SEC_10),
-        Bar("CLWT", _BASE_TS + timedelta(seconds=30), 1.55, 1.82, 1.50, 1.77, 210_000, Timeframe.SEC_10),
-        Bar("CLWT", _BASE_TS + timedelta(seconds=40), 1.87, 2.1799, 1.845, 2.04, 535_094, Timeframe.SEC_10),
-        Bar("CLWT", _BASE_TS + timedelta(seconds=50), 2.04, 2.21, 1.9701, 2.20, 469_167, Timeframe.SEC_10),
-        Bar("CLWT", _BASE_TS + timedelta(seconds=60), 2.21, 2.25, 2.03, 2.08, 421_267, Timeframe.SEC_10),
-        Bar("CLWT", _BASE_TS + timedelta(seconds=70), 2.08, 2.10, 1.95, 2.02, 240_000, Timeframe.SEC_10),
-        Bar("CLWT", _BASE_TS + timedelta(seconds=80), 2.10, 2.11, 1.82, 1.8302, 474_148, Timeframe.SEC_10),
-        Bar("CLWT", _BASE_TS + timedelta(seconds=90), 1.835, 1.92, 1.65, 1.6897, 432_333, Timeframe.SEC_10),
-        Bar("CLWT", _BASE_TS + timedelta(seconds=100), 1.70, 1.84, 1.68, 1.79, 180_000, Timeframe.SEC_10),
-        Bar("CLWT", _BASE_TS + timedelta(seconds=110), 1.80, 1.98, 1.76, 1.93, 220_000, Timeframe.SEC_10),
-        Bar("CLWT", _BASE_TS + timedelta(seconds=120), 1.98, 2.25, 1.98, 2.23, 428_655, Timeframe.SEC_10),
-        Bar("CLWT", _BASE_TS + timedelta(seconds=130), 2.23, 2.44, 2.15, 2.3398, 707_284, Timeframe.SEC_10),
+        Bar("CLWT", _BASE_TS + timedelta(seconds=0), 1.30, 1.42, 1.30, 1.38, 40_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CLWT", _BASE_TS + timedelta(seconds=10), 1.38, 1.46, 1.35, 1.44, 55_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CLWT", _BASE_TS + timedelta(seconds=20), 1.45, 1.60, 1.39, 1.55, 110_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CLWT", _BASE_TS + timedelta(seconds=30), 1.55, 1.82, 1.50, 1.77, 210_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CLWT", _BASE_TS + timedelta(seconds=40), 1.87, 2.1799, 1.845, 2.04, 535_094, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CLWT", _BASE_TS + timedelta(seconds=50), 2.04, 2.21, 1.9701, 2.20, 469_167, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CLWT", _BASE_TS + timedelta(seconds=60), 2.21, 2.25, 2.03, 2.08, 421_267, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CLWT", _BASE_TS + timedelta(seconds=70), 2.08, 2.10, 1.95, 2.02, 240_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CLWT", _BASE_TS + timedelta(seconds=80), 2.10, 2.11, 1.82, 1.8302, 474_148, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CLWT", _BASE_TS + timedelta(seconds=90), 1.835, 1.92, 1.65, 1.6897, 432_333, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CLWT", _BASE_TS + timedelta(seconds=100), 1.70, 1.84, 1.68, 1.79, 180_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CLWT", _BASE_TS + timedelta(seconds=110), 1.80, 1.98, 1.76, 1.93, 220_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CLWT", _BASE_TS + timedelta(seconds=120), 1.98, 2.25, 1.98, 2.23, 428_655, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CLWT", _BASE_TS + timedelta(seconds=130), 2.23, 2.44, 2.15, 2.3398, 707_284, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_low_price_proof_reclaim_context(
@@ -2376,16 +2376,16 @@ def test_warrior_low_price_proof_reclaim_rejects_clwt_style_post_proof_dump() ->
 
 def test_warrior_first_pullback_reclaim_ignores_clwt_style_cheap_first_leg() -> None:
     ten_sec = [
-        Bar("CLWT", _BASE_TS + timedelta(seconds=0), 1.05, 1.12, 1.02, 1.10, 18_000, Timeframe.SEC_10),
-        Bar("CLWT", _BASE_TS + timedelta(seconds=10), 1.10, 1.35, 1.08, 1.30, 42_000, Timeframe.SEC_10),
-        Bar("CLWT", _BASE_TS + timedelta(seconds=20), 1.30, 1.62, 1.25, 1.55, 125_000, Timeframe.SEC_10),
-        Bar("CLWT", _BASE_TS + timedelta(seconds=30), 1.55, 1.95, 1.45, 1.70, 260_000, Timeframe.SEC_10),
-        Bar("CLWT", _BASE_TS + timedelta(seconds=40), 1.68, 1.78, 1.52, 1.56, 95_000, Timeframe.SEC_10),
-        Bar("CLWT", _BASE_TS + timedelta(seconds=50), 1.56, 1.66, 1.50, 1.58, 82_000, Timeframe.SEC_10),
-        Bar("CLWT", _BASE_TS + timedelta(seconds=60), 1.57, 1.68, 1.54, 1.64, 78_000, Timeframe.SEC_10),
-        Bar("CLWT", _BASE_TS + timedelta(seconds=70), 1.63, 1.73, 1.59, 1.70, 92_000, Timeframe.SEC_10),
-        Bar("CLWT", _BASE_TS + timedelta(seconds=80), 1.70, 1.78, 1.64, 1.74, 105_000, Timeframe.SEC_10),
-        Bar("CLWT", _BASE_TS + timedelta(seconds=90), 1.73, 1.84, 1.69, 1.80, 130_000, Timeframe.SEC_10),
+        Bar("CLWT", _BASE_TS + timedelta(seconds=0), 1.05, 1.12, 1.02, 1.10, 18_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CLWT", _BASE_TS + timedelta(seconds=10), 1.10, 1.35, 1.08, 1.30, 42_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CLWT", _BASE_TS + timedelta(seconds=20), 1.30, 1.62, 1.25, 1.55, 125_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CLWT", _BASE_TS + timedelta(seconds=30), 1.55, 1.95, 1.45, 1.70, 260_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CLWT", _BASE_TS + timedelta(seconds=40), 1.68, 1.78, 1.52, 1.56, 95_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CLWT", _BASE_TS + timedelta(seconds=50), 1.56, 1.66, 1.50, 1.58, 82_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CLWT", _BASE_TS + timedelta(seconds=60), 1.57, 1.68, 1.54, 1.64, 78_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CLWT", _BASE_TS + timedelta(seconds=70), 1.63, 1.73, 1.59, 1.70, 92_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CLWT", _BASE_TS + timedelta(seconds=80), 1.70, 1.78, 1.64, 1.74, 105_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CLWT", _BASE_TS + timedelta(seconds=90), 1.73, 1.84, 1.69, 1.80, 130_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_trend_playbook_context(
@@ -2428,7 +2428,7 @@ def test_backtest_timed_release_rejects_late_vwap_pullback_from_base() -> None:
 
     reason = driver._timed_release_chase_reject(
         signal,
-        Bar("VWAP", _BASE_TS, 4.16, 4.20, 4.14, 4.18, 20_000, Timeframe.SEC_10),
+        Bar("VWAP", _BASE_TS, 4.16, 4.20, 4.14, 4.18, 20_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     )
 
     assert reason == "late VWAP pullback release: $4.1800 too extended from base $4.0500 (max 2.5%)"
@@ -2437,10 +2437,10 @@ def test_backtest_timed_release_rejects_late_vwap_pullback_from_base() -> None:
 def test_backtest_timed_hod_reclaim_rejects_low_price_weak_close() -> None:
     ts = _BASE_TS
     bars = [
-        Bar("GOVX", ts, 2.18, 2.22, 2.16, 2.21, 106_474, Timeframe.SEC_10),
-        Bar("GOVX", ts + timedelta(seconds=10), 2.2199, 2.34, 2.21, 2.30, 141_722, Timeframe.SEC_10),
-        Bar("GOVX", ts + timedelta(seconds=20), 2.31, 2.37, 2.30, 2.3087, 163_841, Timeframe.SEC_10),
-        Bar("GOVX", ts + timedelta(seconds=30), 2.31, 2.34, 2.28, 2.32, 93_468, Timeframe.SEC_10),
+        Bar("GOVX", ts, 2.18, 2.22, 2.16, 2.21, 106_474, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("GOVX", ts + timedelta(seconds=10), 2.2199, 2.34, 2.21, 2.30, 141_722, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("GOVX", ts + timedelta(seconds=20), 2.31, 2.37, 2.30, 2.3087, 163_841, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("GOVX", ts + timedelta(seconds=30), 2.31, 2.34, 2.28, 2.32, 93_468, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
     driver = PipelineBacktestDriver(
         {"GOVX": []},
@@ -2477,9 +2477,9 @@ def test_backtest_timed_hod_reclaim_rejects_low_price_weak_close() -> None:
 def test_backtest_timed_hod_reclaim_allows_low_price_strong_close() -> None:
     ts = _BASE_TS
     bars = [
-        Bar("HOD", ts, 1.95, 2.00, 1.93, 1.98, 70_000, Timeframe.SEC_10),
-        Bar("HOD", ts + timedelta(seconds=10), 1.98, 2.04, 1.97, 2.03, 80_000, Timeframe.SEC_10),
-        Bar("HOD", ts + timedelta(seconds=20), 2.03, 2.12, 2.02, 2.11, 95_000, Timeframe.SEC_10),
+        Bar("HOD", ts, 1.95, 2.00, 1.93, 1.98, 70_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("HOD", ts + timedelta(seconds=10), 1.98, 2.04, 1.97, 2.03, 80_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("HOD", ts + timedelta(seconds=20), 2.03, 2.12, 2.02, 2.11, 95_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
     driver = PipelineBacktestDriver(
         {"HOD": []},
@@ -2701,7 +2701,7 @@ def test_backtest_rebase_preserves_named_warrior_lane_after_bad_tape() -> None:
         "entry_trigger": "warrior_smooth_10s_pullback_continuation",
         "variant_override": "warrior_smooth_10s_pullback_continuation",
     }
-    ten_sec = Bar("EHGO", _BASE_TS + timedelta(seconds=10), 5.18, 5.32, 5.12, 5.30, 120_000, Timeframe.SEC_10)
+    ten_sec = Bar("EHGO", _BASE_TS + timedelta(seconds=10), 5.18, 5.32, 5.12, 5.30, 120_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL)
 
     assert driver._momentum_burst_rebase_pending_after_reject(
         "EHGO",
@@ -2757,23 +2757,23 @@ def test_normal_fallback_third_attempt_needs_elite_score() -> None:
 
 def test_warrior_stair_step_runner_context_allows_sti_style_eight_base() -> None:
     ten_sec = [
-        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 6.95, 7.08, 6.80, 7.0778, 39_121, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 7.17, 7.39, 7.11, 7.2868, 38_786, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 7.28, 7.65, 7.26, 7.50, 64_857, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 7.45, 7.85, 7.45, 7.78, 46_763, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 7.76, 8.13, 7.73, 7.98, 95_488, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 7.98, 8.05, 7.84, 7.89, 63_975, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 7.86, 8.02, 7.70, 7.9855, 51_719, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=70), 7.98, 8.03, 7.8303, 7.88, 43_498, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=80), 7.87, 8.07, 7.82, 8.04, 33_935, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=90), 8.07, 8.23, 7.96, 7.98, 62_624, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 8.16, 8.39, 8.06, 8.23, 67_057, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 8.26, 8.35, 8.18, 8.27, 39_033, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=120), 8.00, 8.27, 7.90, 8.23, 47_045, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=130), 8.23, 8.34, 8.21, 8.26, 30_874, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=140), 8.10, 8.244, 8.0686, 8.211, 20_979, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=150), 8.08, 8.31, 8.07, 8.24, 31_315, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=160), 8.21, 8.45, 8.15, 8.38, 63_354, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 6.95, 7.08, 6.80, 7.0778, 39_121, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 7.17, 7.39, 7.11, 7.2868, 38_786, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 7.28, 7.65, 7.26, 7.50, 64_857, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 7.45, 7.85, 7.45, 7.78, 46_763, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 7.76, 8.13, 7.73, 7.98, 95_488, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 7.98, 8.05, 7.84, 7.89, 63_975, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 7.86, 8.02, 7.70, 7.9855, 51_719, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=70), 7.98, 8.03, 7.8303, 7.88, 43_498, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=80), 7.87, 8.07, 7.82, 8.04, 33_935, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=90), 8.07, 8.23, 7.96, 7.98, 62_624, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 8.16, 8.39, 8.06, 8.23, 67_057, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 8.26, 8.35, 8.18, 8.27, 39_033, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=120), 8.00, 8.27, 7.90, 8.23, 47_045, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=130), 8.23, 8.34, 8.21, 8.26, 30_874, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=140), 8.10, 8.244, 8.0686, 8.211, 20_979, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=150), 8.08, 8.31, 8.07, 8.24, 31_315, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=160), 8.21, 8.45, 8.15, 8.38, 63_354, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
     driver = _momentum_burst_backtest_driver(ten_sec)
     driver._use_warrior_squeeze_playbook = True
@@ -2802,28 +2802,28 @@ def test_warrior_stair_step_runner_context_allows_sti_style_eight_base() -> None
 
 def test_warrior_smooth_10s_pullback_continuation_allows_wnw_style_reclaim() -> None:
     ten_sec = [
-        Bar("WNW", _BASE_TS + timedelta(seconds=0), 2.99, 3.76, 2.94, 3.58, 25_367, Timeframe.SEC_10),
-        Bar("WNW", _BASE_TS + timedelta(seconds=10), 3.50, 3.58, 3.38, 3.58, 24_243, Timeframe.SEC_10),
-        Bar("WNW", _BASE_TS + timedelta(seconds=20), 3.57, 3.99, 3.45, 3.92, 24_168, Timeframe.SEC_10),
-        Bar("WNW", _BASE_TS + timedelta(seconds=30), 3.88, 4.30, 3.82, 4.22, 30_110, Timeframe.SEC_10),
-        Bar("WNW", _BASE_TS + timedelta(seconds=40), 4.25, 4.76, 4.16, 4.52, 40_560, Timeframe.SEC_10),
-        Bar("WNW", _BASE_TS + timedelta(seconds=50), 4.51, 4.71, 4.40, 4.49, 40_239, Timeframe.SEC_10),
-        Bar("WNW", _BASE_TS + timedelta(seconds=60), 4.54, 4.90, 4.49, 4.81, 38_729, Timeframe.SEC_10),
-        Bar("WNW", _BASE_TS + timedelta(seconds=70), 4.80, 5.28, 4.78, 5.26, 40_680, Timeframe.SEC_10),
-        Bar("WNW", _BASE_TS + timedelta(seconds=80), 5.26, 6.94, 5.23, 6.88, 57_582, Timeframe.SEC_10),
-        Bar("WNW", _BASE_TS + timedelta(seconds=90), 6.88, 7.00, 5.51, 5.73, 60_102, Timeframe.SEC_10),
-        Bar("WNW", _BASE_TS + timedelta(seconds=100), 5.72, 5.86, 5.25, 5.29, 40_244, Timeframe.SEC_10),
-        Bar("WNW", _BASE_TS + timedelta(seconds=110), 5.25, 5.68, 5.00, 5.62, 41_437, Timeframe.SEC_10),
-        Bar("WNW", _BASE_TS + timedelta(seconds=120), 5.62, 6.41, 5.57, 5.78, 33_596, Timeframe.SEC_10),
-        Bar("WNW", _BASE_TS + timedelta(seconds=130), 5.91, 6.13, 5.69, 5.70, 30_621, Timeframe.SEC_10),
-        Bar("WNW", _BASE_TS + timedelta(seconds=140), 5.70, 5.70, 5.33, 5.51, 31_433, Timeframe.SEC_10),
-        Bar("WNW", _BASE_TS + timedelta(seconds=150), 5.51, 5.86, 5.51, 5.71, 22_168, Timeframe.SEC_10),
-        Bar("WNW", _BASE_TS + timedelta(seconds=160), 5.71, 5.86, 5.52, 5.63, 20_968, Timeframe.SEC_10),
-        Bar("WNW", _BASE_TS + timedelta(seconds=170), 5.63, 5.79, 5.50, 5.79, 14_118, Timeframe.SEC_10),
-        Bar("WNW", _BASE_TS + timedelta(seconds=180), 5.74, 6.10, 5.73, 6.04, 32_296, Timeframe.SEC_10),
-        Bar("WNW", _BASE_TS + timedelta(seconds=190), 6.04, 6.17, 5.85, 5.85, 26_455, Timeframe.SEC_10),
-        Bar("WNW", _BASE_TS + timedelta(seconds=200), 5.86, 6.17, 5.67, 6.09, 22_684, Timeframe.SEC_10),
-        Bar("WNW", _BASE_TS + timedelta(seconds=210), 6.09, 6.44, 5.86, 6.35, 38_743, Timeframe.SEC_10),
+        Bar("WNW", _BASE_TS + timedelta(seconds=0), 2.99, 3.76, 2.94, 3.58, 25_367, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WNW", _BASE_TS + timedelta(seconds=10), 3.50, 3.58, 3.38, 3.58, 24_243, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WNW", _BASE_TS + timedelta(seconds=20), 3.57, 3.99, 3.45, 3.92, 24_168, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WNW", _BASE_TS + timedelta(seconds=30), 3.88, 4.30, 3.82, 4.22, 30_110, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WNW", _BASE_TS + timedelta(seconds=40), 4.25, 4.76, 4.16, 4.52, 40_560, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WNW", _BASE_TS + timedelta(seconds=50), 4.51, 4.71, 4.40, 4.49, 40_239, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WNW", _BASE_TS + timedelta(seconds=60), 4.54, 4.90, 4.49, 4.81, 38_729, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WNW", _BASE_TS + timedelta(seconds=70), 4.80, 5.28, 4.78, 5.26, 40_680, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WNW", _BASE_TS + timedelta(seconds=80), 5.26, 6.94, 5.23, 6.88, 57_582, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WNW", _BASE_TS + timedelta(seconds=90), 6.88, 7.00, 5.51, 5.73, 60_102, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WNW", _BASE_TS + timedelta(seconds=100), 5.72, 5.86, 5.25, 5.29, 40_244, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WNW", _BASE_TS + timedelta(seconds=110), 5.25, 5.68, 5.00, 5.62, 41_437, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WNW", _BASE_TS + timedelta(seconds=120), 5.62, 6.41, 5.57, 5.78, 33_596, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WNW", _BASE_TS + timedelta(seconds=130), 5.91, 6.13, 5.69, 5.70, 30_621, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WNW", _BASE_TS + timedelta(seconds=140), 5.70, 5.70, 5.33, 5.51, 31_433, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WNW", _BASE_TS + timedelta(seconds=150), 5.51, 5.86, 5.51, 5.71, 22_168, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WNW", _BASE_TS + timedelta(seconds=160), 5.71, 5.86, 5.52, 5.63, 20_968, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WNW", _BASE_TS + timedelta(seconds=170), 5.63, 5.79, 5.50, 5.79, 14_118, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WNW", _BASE_TS + timedelta(seconds=180), 5.74, 6.10, 5.73, 6.04, 32_296, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WNW", _BASE_TS + timedelta(seconds=190), 6.04, 6.17, 5.85, 5.85, 26_455, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WNW", _BASE_TS + timedelta(seconds=200), 5.86, 6.17, 5.67, 6.09, 22_684, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WNW", _BASE_TS + timedelta(seconds=210), 6.09, 6.44, 5.86, 6.35, 38_743, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_trend_playbook_context(
@@ -2851,15 +2851,15 @@ def test_warrior_smooth_10s_pullback_continuation_allows_wnw_style_reclaim() -> 
 
 def test_warrior_smooth_10s_pullback_continuation_rejects_first_spike() -> None:
     ten_sec = [
-        Bar("WNW", _BASE_TS + timedelta(seconds=0), 2.99, 3.76, 2.94, 3.58, 25_367, Timeframe.SEC_10),
-        Bar("WNW", _BASE_TS + timedelta(seconds=10), 3.50, 3.58, 3.38, 3.58, 24_243, Timeframe.SEC_10),
-        Bar("WNW", _BASE_TS + timedelta(seconds=20), 3.57, 3.99, 3.45, 3.92, 24_168, Timeframe.SEC_10),
-        Bar("WNW", _BASE_TS + timedelta(seconds=30), 3.88, 4.30, 3.82, 4.22, 30_110, Timeframe.SEC_10),
-        Bar("WNW", _BASE_TS + timedelta(seconds=40), 4.25, 4.76, 4.16, 4.52, 40_560, Timeframe.SEC_10),
-        Bar("WNW", _BASE_TS + timedelta(seconds=50), 4.51, 4.71, 4.40, 4.49, 40_239, Timeframe.SEC_10),
-        Bar("WNW", _BASE_TS + timedelta(seconds=60), 4.54, 4.90, 4.49, 4.81, 38_729, Timeframe.SEC_10),
-        Bar("WNW", _BASE_TS + timedelta(seconds=70), 4.80, 5.28, 4.78, 5.26, 40_680, Timeframe.SEC_10),
-        Bar("WNW", _BASE_TS + timedelta(seconds=80), 5.26, 6.94, 5.23, 6.88, 57_582, Timeframe.SEC_10),
+        Bar("WNW", _BASE_TS + timedelta(seconds=0), 2.99, 3.76, 2.94, 3.58, 25_367, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WNW", _BASE_TS + timedelta(seconds=10), 3.50, 3.58, 3.38, 3.58, 24_243, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WNW", _BASE_TS + timedelta(seconds=20), 3.57, 3.99, 3.45, 3.92, 24_168, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WNW", _BASE_TS + timedelta(seconds=30), 3.88, 4.30, 3.82, 4.22, 30_110, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WNW", _BASE_TS + timedelta(seconds=40), 4.25, 4.76, 4.16, 4.52, 40_560, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WNW", _BASE_TS + timedelta(seconds=50), 4.51, 4.71, 4.40, 4.49, 40_239, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WNW", _BASE_TS + timedelta(seconds=60), 4.54, 4.90, 4.49, 4.81, 38_729, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WNW", _BASE_TS + timedelta(seconds=70), 4.80, 5.28, 4.78, 5.26, 40_680, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("WNW", _BASE_TS + timedelta(seconds=80), 5.26, 6.94, 5.23, 6.88, 57_582, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_smooth_10s_pullback_continuation_context(
@@ -2873,24 +2873,24 @@ def test_warrior_smooth_10s_pullback_continuation_rejects_first_spike() -> None:
 
 def test_warrior_parabolic_micro_pullback_reclaim_allows_plsm_style_reclaim() -> None:
     ten_sec = [
-        Bar("PLSM", _BASE_TS + timedelta(seconds=0), 3.82, 3.98, 3.75, 3.92, 18_000, Timeframe.SEC_10),
-        Bar("PLSM", _BASE_TS + timedelta(seconds=10), 3.93, 4.08, 3.86, 4.00, 20_000, Timeframe.SEC_10),
-        Bar("PLSM", _BASE_TS + timedelta(seconds=20), 4.02, 4.20, 3.98, 4.15, 24_000, Timeframe.SEC_10),
-        Bar("PLSM", _BASE_TS + timedelta(seconds=30), 4.16, 5.20, 4.12, 5.05, 55_000, Timeframe.SEC_10),
-        Bar("PLSM", _BASE_TS + timedelta(seconds=40), 5.08, 6.70, 5.02, 6.58, 92_000, Timeframe.SEC_10),
-        Bar("PLSM", _BASE_TS + timedelta(seconds=50), 6.60, 8.40, 6.52, 8.12, 118_000, Timeframe.SEC_10),
-        Bar("PLSM", _BASE_TS + timedelta(seconds=60), 8.20, 10.60, 8.05, 10.15, 132_000, Timeframe.SEC_10),
-        Bar("PLSM", _BASE_TS + timedelta(seconds=70), 10.20, 12.35, 10.00, 12.00, 146_000, Timeframe.SEC_10),
-        Bar("PLSM", _BASE_TS + timedelta(seconds=80), 12.05, 15.20, 11.90, 14.80, 190_000, Timeframe.SEC_10),
-        Bar("PLSM", _BASE_TS + timedelta(seconds=90), 14.85, 19.50, 14.70, 18.90, 260_000, Timeframe.SEC_10),
-        Bar("PLSM", _BASE_TS + timedelta(seconds=100), 18.85, 19.20, 16.80, 17.20, 210_000, Timeframe.SEC_10),
-        Bar("PLSM", _BASE_TS + timedelta(seconds=110), 17.15, 17.55, 15.80, 16.10, 160_000, Timeframe.SEC_10),
-        Bar("PLSM", _BASE_TS + timedelta(seconds=120), 16.08, 16.65, 15.40, 15.95, 130_000, Timeframe.SEC_10),
-        Bar("PLSM", _BASE_TS + timedelta(seconds=130), 15.98, 16.45, 15.55, 16.20, 98_000, Timeframe.SEC_10),
-        Bar("PLSM", _BASE_TS + timedelta(seconds=140), 16.18, 16.55, 15.92, 16.35, 92_000, Timeframe.SEC_10),
-        Bar("PLSM", _BASE_TS + timedelta(seconds=150), 16.34, 16.60, 15.98, 16.18, 86_000, Timeframe.SEC_10),
-        Bar("PLSM", _BASE_TS + timedelta(seconds=160), 16.15, 16.70, 16.02, 16.52, 112_000, Timeframe.SEC_10),
-        Bar("PLSM", _BASE_TS + timedelta(seconds=170), 16.50, 17.05, 16.30, 16.92, 155_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=0), 3.82, 3.98, 3.75, 3.92, 18_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=10), 3.93, 4.08, 3.86, 4.00, 20_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=20), 4.02, 4.20, 3.98, 4.15, 24_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=30), 4.16, 5.20, 4.12, 5.05, 55_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=40), 5.08, 6.70, 5.02, 6.58, 92_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=50), 6.60, 8.40, 6.52, 8.12, 118_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=60), 8.20, 10.60, 8.05, 10.15, 132_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=70), 10.20, 12.35, 10.00, 12.00, 146_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=80), 12.05, 15.20, 11.90, 14.80, 190_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=90), 14.85, 19.50, 14.70, 18.90, 260_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=100), 18.85, 19.20, 16.80, 17.20, 210_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=110), 17.15, 17.55, 15.80, 16.10, 160_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=120), 16.08, 16.65, 15.40, 15.95, 130_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=130), 15.98, 16.45, 15.55, 16.20, 98_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=140), 16.18, 16.55, 15.92, 16.35, 92_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=150), 16.34, 16.60, 15.98, 16.18, 86_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=160), 16.15, 16.70, 16.02, 16.52, 112_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=170), 16.50, 17.05, 16.30, 16.92, 155_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_trend_playbook_context(
@@ -2918,12 +2918,12 @@ def test_warrior_parabolic_micro_pullback_reclaim_allows_plsm_style_reclaim() ->
 
 def test_warrior_parabolic_micro_pullback_reclaim_rejects_immediate_top_tick() -> None:
     ten_sec = [
-        Bar("PLSM", _BASE_TS + timedelta(seconds=0), 4.00, 4.25, 3.95, 4.20, 20_000, Timeframe.SEC_10),
-        Bar("PLSM", _BASE_TS + timedelta(seconds=10), 4.25, 5.10, 4.20, 5.00, 60_000, Timeframe.SEC_10),
-        Bar("PLSM", _BASE_TS + timedelta(seconds=20), 5.05, 6.80, 5.00, 6.55, 100_000, Timeframe.SEC_10),
-        Bar("PLSM", _BASE_TS + timedelta(seconds=30), 6.60, 9.25, 6.55, 9.05, 140_000, Timeframe.SEC_10),
-        Bar("PLSM", _BASE_TS + timedelta(seconds=40), 9.10, 12.80, 9.05, 12.40, 190_000, Timeframe.SEC_10),
-        Bar("PLSM", _BASE_TS + timedelta(seconds=50), 12.50, 17.80, 12.40, 17.20, 250_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=0), 4.00, 4.25, 3.95, 4.20, 20_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=10), 4.25, 5.10, 4.20, 5.00, 60_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=20), 5.05, 6.80, 5.00, 6.55, 100_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=30), 6.60, 9.25, 6.55, 9.05, 140_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=40), 9.10, 12.80, 9.05, 12.40, 190_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=50), 12.50, 17.80, 12.40, 17.20, 250_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_parabolic_micro_pullback_reclaim_context(
@@ -2937,24 +2937,24 @@ def test_warrior_parabolic_micro_pullback_reclaim_rejects_immediate_top_tick() -
 
 def test_warrior_parabolic_micro_pullback_reclaim_rejects_weak_reclaim_volume() -> None:
     ten_sec = [
-        Bar("PLSM", _BASE_TS + timedelta(seconds=0), 3.82, 3.98, 3.75, 3.92, 18_000, Timeframe.SEC_10),
-        Bar("PLSM", _BASE_TS + timedelta(seconds=10), 3.93, 4.08, 3.86, 4.00, 20_000, Timeframe.SEC_10),
-        Bar("PLSM", _BASE_TS + timedelta(seconds=20), 4.02, 4.20, 3.98, 4.15, 24_000, Timeframe.SEC_10),
-        Bar("PLSM", _BASE_TS + timedelta(seconds=30), 4.16, 5.20, 4.12, 5.05, 55_000, Timeframe.SEC_10),
-        Bar("PLSM", _BASE_TS + timedelta(seconds=40), 5.08, 6.70, 5.02, 6.58, 92_000, Timeframe.SEC_10),
-        Bar("PLSM", _BASE_TS + timedelta(seconds=50), 6.60, 8.40, 6.52, 8.12, 118_000, Timeframe.SEC_10),
-        Bar("PLSM", _BASE_TS + timedelta(seconds=60), 8.20, 10.60, 8.05, 10.15, 132_000, Timeframe.SEC_10),
-        Bar("PLSM", _BASE_TS + timedelta(seconds=70), 10.20, 12.35, 10.00, 12.00, 146_000, Timeframe.SEC_10),
-        Bar("PLSM", _BASE_TS + timedelta(seconds=80), 12.05, 15.20, 11.90, 14.80, 190_000, Timeframe.SEC_10),
-        Bar("PLSM", _BASE_TS + timedelta(seconds=90), 14.85, 19.50, 14.70, 18.90, 260_000, Timeframe.SEC_10),
-        Bar("PLSM", _BASE_TS + timedelta(seconds=100), 18.85, 19.20, 16.80, 17.20, 210_000, Timeframe.SEC_10),
-        Bar("PLSM", _BASE_TS + timedelta(seconds=110), 17.15, 17.55, 15.80, 16.10, 160_000, Timeframe.SEC_10),
-        Bar("PLSM", _BASE_TS + timedelta(seconds=120), 16.08, 16.65, 15.40, 15.95, 130_000, Timeframe.SEC_10),
-        Bar("PLSM", _BASE_TS + timedelta(seconds=130), 15.98, 16.45, 15.55, 16.20, 98_000, Timeframe.SEC_10),
-        Bar("PLSM", _BASE_TS + timedelta(seconds=140), 16.18, 16.55, 15.92, 16.35, 92_000, Timeframe.SEC_10),
-        Bar("PLSM", _BASE_TS + timedelta(seconds=150), 16.34, 16.60, 15.98, 16.18, 86_000, Timeframe.SEC_10),
-        Bar("PLSM", _BASE_TS + timedelta(seconds=160), 16.15, 16.70, 16.02, 16.52, 112_000, Timeframe.SEC_10),
-        Bar("PLSM", _BASE_TS + timedelta(seconds=170), 16.50, 17.05, 16.30, 16.92, 70_000, Timeframe.SEC_10),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=0), 3.82, 3.98, 3.75, 3.92, 18_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=10), 3.93, 4.08, 3.86, 4.00, 20_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=20), 4.02, 4.20, 3.98, 4.15, 24_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=30), 4.16, 5.20, 4.12, 5.05, 55_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=40), 5.08, 6.70, 5.02, 6.58, 92_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=50), 6.60, 8.40, 6.52, 8.12, 118_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=60), 8.20, 10.60, 8.05, 10.15, 132_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=70), 10.20, 12.35, 10.00, 12.00, 146_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=80), 12.05, 15.20, 11.90, 14.80, 190_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=90), 14.85, 19.50, 14.70, 18.90, 260_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=100), 18.85, 19.20, 16.80, 17.20, 210_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=110), 17.15, 17.55, 15.80, 16.10, 160_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=120), 16.08, 16.65, 15.40, 15.95, 130_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=130), 15.98, 16.45, 15.55, 16.20, 98_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=140), 16.18, 16.55, 15.92, 16.35, 92_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=150), 16.34, 16.60, 15.98, 16.18, 86_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=160), 16.15, 16.70, 16.02, 16.52, 112_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PLSM", _BASE_TS + timedelta(seconds=170), 16.50, 17.05, 16.30, 16.92, 70_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_parabolic_micro_pullback_reclaim_context(
@@ -2968,12 +2968,12 @@ def test_warrior_parabolic_micro_pullback_reclaim_rejects_weak_reclaim_volume() 
 
 def test_warrior_early_10s_pullback_reclaim_allows_frtt_style_pause_reclaim() -> None:
     ten_sec = [
-        Bar("FRTT", _BASE_TS + timedelta(seconds=0), 1.90, 1.90, 1.89, 1.89, 250, Timeframe.SEC_10),
-        Bar("FRTT", _BASE_TS + timedelta(seconds=10), 1.91, 1.94, 1.90, 1.92, 900, Timeframe.SEC_10),
-        Bar("FRTT", _BASE_TS + timedelta(seconds=20), 2.15, 2.24, 2.15, 2.24, 707, Timeframe.SEC_10),
-        Bar("FRTT", _BASE_TS + timedelta(seconds=30), 2.17, 2.45, 2.17, 2.4488, 12_494, Timeframe.SEC_10),
-        Bar("FRTT", _BASE_TS + timedelta(seconds=40), 2.44, 2.69, 2.44, 2.52, 45_037, Timeframe.SEC_10),
-        Bar("FRTT", _BASE_TS + timedelta(seconds=50), 2.51, 3.07, 2.32, 3.05, 38_774, Timeframe.SEC_10),
+        Bar("FRTT", _BASE_TS + timedelta(seconds=0), 1.90, 1.90, 1.89, 1.89, 250, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("FRTT", _BASE_TS + timedelta(seconds=10), 1.91, 1.94, 1.90, 1.92, 900, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("FRTT", _BASE_TS + timedelta(seconds=20), 2.15, 2.24, 2.15, 2.24, 707, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("FRTT", _BASE_TS + timedelta(seconds=30), 2.17, 2.45, 2.17, 2.4488, 12_494, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("FRTT", _BASE_TS + timedelta(seconds=40), 2.44, 2.69, 2.44, 2.52, 45_037, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("FRTT", _BASE_TS + timedelta(seconds=50), 2.51, 3.07, 2.32, 3.05, 38_774, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_trend_playbook_context(
@@ -2993,12 +2993,12 @@ def test_warrior_early_10s_pullback_reclaim_allows_frtt_style_pause_reclaim() ->
 
 def test_warrior_early_10s_pullback_reclaim_rejects_no_pause_spike() -> None:
     ten_sec = [
-        Bar("FRTT", _BASE_TS + timedelta(seconds=0), 1.90, 1.90, 1.89, 1.89, 250, Timeframe.SEC_10),
-        Bar("FRTT", _BASE_TS + timedelta(seconds=10), 1.91, 1.94, 1.90, 1.92, 900, Timeframe.SEC_10),
-        Bar("FRTT", _BASE_TS + timedelta(seconds=20), 2.15, 2.24, 2.15, 2.24, 707, Timeframe.SEC_10),
-        Bar("FRTT", _BASE_TS + timedelta(seconds=30), 2.17, 2.45, 2.17, 2.4488, 12_494, Timeframe.SEC_10),
-        Bar("FRTT", _BASE_TS + timedelta(seconds=40), 2.44, 2.69, 2.44, 2.68, 45_037, Timeframe.SEC_10),
-        Bar("FRTT", _BASE_TS + timedelta(seconds=50), 2.69, 3.07, 2.68, 3.05, 38_774, Timeframe.SEC_10),
+        Bar("FRTT", _BASE_TS + timedelta(seconds=0), 1.90, 1.90, 1.89, 1.89, 250, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("FRTT", _BASE_TS + timedelta(seconds=10), 1.91, 1.94, 1.90, 1.92, 900, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("FRTT", _BASE_TS + timedelta(seconds=20), 2.15, 2.24, 2.15, 2.24, 707, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("FRTT", _BASE_TS + timedelta(seconds=30), 2.17, 2.45, 2.17, 2.4488, 12_494, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("FRTT", _BASE_TS + timedelta(seconds=40), 2.44, 2.69, 2.44, 2.68, 45_037, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("FRTT", _BASE_TS + timedelta(seconds=50), 2.69, 3.07, 2.68, 3.05, 38_774, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_early_10s_pullback_reclaim_context(
@@ -3012,22 +3012,22 @@ def test_warrior_early_10s_pullback_reclaim_rejects_no_pause_spike() -> None:
 
 def test_warrior_failed_spike_vwap_reclaim_allows_nxts_style_reclaim() -> None:
     ten_sec = [
-        Bar("NXTS", _BASE_TS + timedelta(seconds=0), 4.80, 5.10, 4.70, 5.00, 30_000, Timeframe.SEC_10),
-        Bar("NXTS", _BASE_TS + timedelta(seconds=10), 5.00, 6.80, 4.95, 6.60, 70_000, Timeframe.SEC_10),
-        Bar("NXTS", _BASE_TS + timedelta(seconds=20), 6.60, 8.90, 6.50, 8.40, 120_000, Timeframe.SEC_10),
-        Bar("NXTS", _BASE_TS + timedelta(seconds=30), 8.35, 8.55, 7.10, 7.40, 100_000, Timeframe.SEC_10),
-        Bar("NXTS", _BASE_TS + timedelta(seconds=40), 7.40, 7.70, 6.80, 7.00, 80_000, Timeframe.SEC_10),
-        Bar("NXTS", _BASE_TS + timedelta(seconds=50), 7.05, 7.80, 7.00, 7.60, 60_000, Timeframe.SEC_10),
-        Bar("NXTS", _BASE_TS + timedelta(seconds=60), 7.70, 8.20, 7.50, 8.10, 45_000, Timeframe.SEC_10),
-        Bar("NXTS", _BASE_TS + timedelta(seconds=70), 8.10, 8.40, 7.90, 8.25, 50_000, Timeframe.SEC_10),
-        Bar("NXTS", _BASE_TS + timedelta(seconds=80), 8.20, 8.35, 7.95, 8.05, 35_000, Timeframe.SEC_10),
-        Bar("NXTS", _BASE_TS + timedelta(seconds=90), 8.05, 8.30, 7.90, 8.20, 32_000, Timeframe.SEC_10),
-        Bar("NXTS", _BASE_TS + timedelta(seconds=100), 8.20, 8.45, 8.05, 8.36, 45_000, Timeframe.SEC_10),
-        Bar("NXTS", _BASE_TS + timedelta(seconds=110), 8.35, 8.50, 8.10, 8.20, 40_000, Timeframe.SEC_10),
-        Bar("NXTS", _BASE_TS + timedelta(seconds=120), 8.20, 8.55, 8.15, 8.42, 50_000, Timeframe.SEC_10),
-        Bar("NXTS", _BASE_TS + timedelta(seconds=130), 8.40, 8.58, 8.25, 8.50, 55_000, Timeframe.SEC_10),
-        Bar("NXTS", _BASE_TS + timedelta(seconds=140), 8.50, 8.62, 8.30, 8.56, 60_000, Timeframe.SEC_10),
-        Bar("NXTS", _BASE_TS + timedelta(seconds=150), 8.62, 9.15, 8.55, 9.02, 160_000, Timeframe.SEC_10),
+        Bar("NXTS", _BASE_TS + timedelta(seconds=0), 4.80, 5.10, 4.70, 5.00, 30_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("NXTS", _BASE_TS + timedelta(seconds=10), 5.00, 6.80, 4.95, 6.60, 70_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("NXTS", _BASE_TS + timedelta(seconds=20), 6.60, 8.90, 6.50, 8.40, 120_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("NXTS", _BASE_TS + timedelta(seconds=30), 8.35, 8.55, 7.10, 7.40, 100_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("NXTS", _BASE_TS + timedelta(seconds=40), 7.40, 7.70, 6.80, 7.00, 80_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("NXTS", _BASE_TS + timedelta(seconds=50), 7.05, 7.80, 7.00, 7.60, 60_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("NXTS", _BASE_TS + timedelta(seconds=60), 7.70, 8.20, 7.50, 8.10, 45_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("NXTS", _BASE_TS + timedelta(seconds=70), 8.10, 8.40, 7.90, 8.25, 50_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("NXTS", _BASE_TS + timedelta(seconds=80), 8.20, 8.35, 7.95, 8.05, 35_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("NXTS", _BASE_TS + timedelta(seconds=90), 8.05, 8.30, 7.90, 8.20, 32_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("NXTS", _BASE_TS + timedelta(seconds=100), 8.20, 8.45, 8.05, 8.36, 45_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("NXTS", _BASE_TS + timedelta(seconds=110), 8.35, 8.50, 8.10, 8.20, 40_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("NXTS", _BASE_TS + timedelta(seconds=120), 8.20, 8.55, 8.15, 8.42, 50_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("NXTS", _BASE_TS + timedelta(seconds=130), 8.40, 8.58, 8.25, 8.50, 55_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("NXTS", _BASE_TS + timedelta(seconds=140), 8.50, 8.62, 8.30, 8.56, 60_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("NXTS", _BASE_TS + timedelta(seconds=150), 8.62, 9.15, 8.55, 9.02, 160_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_trend_playbook_context(
@@ -3048,19 +3048,19 @@ def test_warrior_failed_spike_vwap_reclaim_allows_nxts_style_reclaim() -> None:
 
 def test_warrior_failed_spike_reclaim_scalp_allows_oris_style_fast_reclaim() -> None:
     ten_sec = [
-        Bar("ORIS", _BASE_TS + timedelta(seconds=0), 2.96, 2.99, 2.96, 2.99, 862, Timeframe.SEC_10),
-        Bar("ORIS", _BASE_TS + timedelta(seconds=10), 2.99, 3.00, 2.96, 2.99, 613, Timeframe.SEC_10),
-        Bar("ORIS", _BASE_TS + timedelta(seconds=20), 2.99, 3.12, 2.98, 3.12, 2_060, Timeframe.SEC_10),
-        Bar("ORIS", _BASE_TS + timedelta(seconds=30), 3.10, 3.30, 3.10, 3.30, 5_034, Timeframe.SEC_10),
-        Bar("ORIS", _BASE_TS + timedelta(seconds=40), 3.30, 3.60, 3.14, 3.59, 20_004, Timeframe.SEC_10),
-        Bar("ORIS", _BASE_TS + timedelta(seconds=50), 3.58, 4.41, 3.52, 4.1945, 55_619, Timeframe.SEC_10),
-        Bar("ORIS", _BASE_TS + timedelta(seconds=60), 4.12, 4.30, 3.40, 3.50, 62_793, Timeframe.SEC_10),
-        Bar("ORIS", _BASE_TS + timedelta(seconds=70), 3.37, 3.50, 2.99, 3.34, 32_498, Timeframe.SEC_10),
-        Bar("ORIS", _BASE_TS + timedelta(seconds=80), 3.44, 3.84, 3.30, 3.61, 20_697, Timeframe.SEC_10),
-        Bar("ORIS", _BASE_TS + timedelta(seconds=90), 3.7079, 4.00, 3.50, 3.7644, 20_174, Timeframe.SEC_10),
-        Bar("ORIS", _BASE_TS + timedelta(seconds=100), 3.71, 3.895, 3.50, 3.79, 18_617, Timeframe.SEC_10),
-        Bar("ORIS", _BASE_TS + timedelta(seconds=110), 3.7932, 3.92, 3.50, 3.80, 28_246, Timeframe.SEC_10),
-        Bar("ORIS", _BASE_TS + timedelta(seconds=120), 3.90, 4.36, 3.82, 4.32, 51_527, Timeframe.SEC_10),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=0), 2.96, 2.99, 2.96, 2.99, 862, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=10), 2.99, 3.00, 2.96, 2.99, 613, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=20), 2.99, 3.12, 2.98, 3.12, 2_060, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=30), 3.10, 3.30, 3.10, 3.30, 5_034, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=40), 3.30, 3.60, 3.14, 3.59, 20_004, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=50), 3.58, 4.41, 3.52, 4.1945, 55_619, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=60), 4.12, 4.30, 3.40, 3.50, 62_793, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=70), 3.37, 3.50, 2.99, 3.34, 32_498, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=80), 3.44, 3.84, 3.30, 3.61, 20_697, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=90), 3.7079, 4.00, 3.50, 3.7644, 20_174, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=100), 3.71, 3.895, 3.50, 3.79, 18_617, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=110), 3.7932, 3.92, 3.50, 3.80, 28_246, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=120), 3.90, 4.36, 3.82, 4.32, 51_527, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_trend_playbook_context(
@@ -3081,21 +3081,21 @@ def test_warrior_failed_spike_reclaim_scalp_allows_oris_style_fast_reclaim() -> 
 
 def test_warrior_failed_spike_reclaim_scalp_rejects_late_dump_candle() -> None:
     ten_sec = [
-        Bar("ORIS", _BASE_TS + timedelta(seconds=0), 2.99, 3.12, 2.98, 3.12, 2_060, Timeframe.SEC_10),
-        Bar("ORIS", _BASE_TS + timedelta(seconds=10), 3.10, 3.30, 3.10, 3.30, 5_034, Timeframe.SEC_10),
-        Bar("ORIS", _BASE_TS + timedelta(seconds=20), 3.30, 3.60, 3.14, 3.59, 20_004, Timeframe.SEC_10),
-        Bar("ORIS", _BASE_TS + timedelta(seconds=30), 3.58, 4.41, 3.52, 4.1945, 55_619, Timeframe.SEC_10),
-        Bar("ORIS", _BASE_TS + timedelta(seconds=40), 4.12, 4.30, 3.40, 3.50, 62_793, Timeframe.SEC_10),
-        Bar("ORIS", _BASE_TS + timedelta(seconds=50), 3.37, 3.50, 2.99, 3.34, 32_498, Timeframe.SEC_10),
-        Bar("ORIS", _BASE_TS + timedelta(seconds=60), 3.44, 3.84, 3.30, 3.61, 20_697, Timeframe.SEC_10),
-        Bar("ORIS", _BASE_TS + timedelta(seconds=70), 3.7079, 4.00, 3.50, 3.7644, 20_174, Timeframe.SEC_10),
-        Bar("ORIS", _BASE_TS + timedelta(seconds=80), 3.71, 3.895, 3.50, 3.79, 18_617, Timeframe.SEC_10),
-        Bar("ORIS", _BASE_TS + timedelta(seconds=90), 3.7932, 3.92, 3.50, 3.80, 28_246, Timeframe.SEC_10),
-        Bar("ORIS", _BASE_TS + timedelta(seconds=100), 3.90, 4.36, 3.82, 4.32, 51_527, Timeframe.SEC_10),
-        Bar("ORIS", _BASE_TS + timedelta(seconds=110), 4.32, 4.7697, 4.00, 4.46, 62_416, Timeframe.SEC_10),
-        Bar("ORIS", _BASE_TS + timedelta(seconds=120), 4.45, 4.76, 4.00, 4.56, 50_370, Timeframe.SEC_10),
-        Bar("ORIS", _BASE_TS + timedelta(seconds=130), 4.56, 5.20, 4.43, 4.73, 63_122, Timeframe.SEC_10),
-        Bar("ORIS", _BASE_TS + timedelta(seconds=140), 5.239, 5.24, 4.60, 4.79, 72_204, Timeframe.SEC_10),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=0), 2.99, 3.12, 2.98, 3.12, 2_060, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=10), 3.10, 3.30, 3.10, 3.30, 5_034, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=20), 3.30, 3.60, 3.14, 3.59, 20_004, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=30), 3.58, 4.41, 3.52, 4.1945, 55_619, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=40), 4.12, 4.30, 3.40, 3.50, 62_793, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=50), 3.37, 3.50, 2.99, 3.34, 32_498, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=60), 3.44, 3.84, 3.30, 3.61, 20_697, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=70), 3.7079, 4.00, 3.50, 3.7644, 20_174, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=80), 3.71, 3.895, 3.50, 3.79, 18_617, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=90), 3.7932, 3.92, 3.50, 3.80, 28_246, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=100), 3.90, 4.36, 3.82, 4.32, 51_527, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=110), 4.32, 4.7697, 4.00, 4.46, 62_416, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=120), 4.45, 4.76, 4.00, 4.56, 50_370, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=130), 4.56, 5.20, 4.43, 4.73, 63_122, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("ORIS", _BASE_TS + timedelta(seconds=140), 5.239, 5.24, 4.60, 4.79, 72_204, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_failed_spike_reclaim_scalp_context(
@@ -3109,22 +3109,22 @@ def test_warrior_failed_spike_reclaim_scalp_rejects_late_dump_candle() -> None:
 
 def test_warrior_failed_spike_vwap_reclaim_rejects_wide_unstable_reclaim() -> None:
     ten_sec = [
-        Bar("CUPR", _BASE_TS + timedelta(seconds=0), 4.80, 5.10, 4.70, 5.00, 30_000, Timeframe.SEC_10),
-        Bar("CUPR", _BASE_TS + timedelta(seconds=10), 5.00, 6.80, 4.95, 6.60, 70_000, Timeframe.SEC_10),
-        Bar("CUPR", _BASE_TS + timedelta(seconds=20), 6.60, 8.90, 6.50, 8.40, 120_000, Timeframe.SEC_10),
-        Bar("CUPR", _BASE_TS + timedelta(seconds=30), 8.35, 8.55, 7.10, 7.40, 100_000, Timeframe.SEC_10),
-        Bar("CUPR", _BASE_TS + timedelta(seconds=40), 7.40, 7.70, 6.80, 7.00, 80_000, Timeframe.SEC_10),
-        Bar("CUPR", _BASE_TS + timedelta(seconds=50), 7.05, 7.80, 7.00, 7.60, 60_000, Timeframe.SEC_10),
-        Bar("CUPR", _BASE_TS + timedelta(seconds=60), 7.70, 8.20, 7.50, 8.10, 45_000, Timeframe.SEC_10),
-        Bar("CUPR", _BASE_TS + timedelta(seconds=70), 8.10, 8.40, 7.90, 8.25, 50_000, Timeframe.SEC_10),
-        Bar("CUPR", _BASE_TS + timedelta(seconds=80), 8.20, 8.35, 7.95, 8.05, 35_000, Timeframe.SEC_10),
-        Bar("CUPR", _BASE_TS + timedelta(seconds=90), 8.05, 8.30, 7.90, 8.20, 32_000, Timeframe.SEC_10),
-        Bar("CUPR", _BASE_TS + timedelta(seconds=100), 8.20, 8.45, 8.05, 8.36, 45_000, Timeframe.SEC_10),
-        Bar("CUPR", _BASE_TS + timedelta(seconds=110), 8.35, 8.50, 8.10, 8.20, 40_000, Timeframe.SEC_10),
-        Bar("CUPR", _BASE_TS + timedelta(seconds=120), 8.20, 8.55, 8.15, 8.42, 50_000, Timeframe.SEC_10),
-        Bar("CUPR", _BASE_TS + timedelta(seconds=130), 8.40, 8.58, 8.25, 8.50, 55_000, Timeframe.SEC_10),
-        Bar("CUPR", _BASE_TS + timedelta(seconds=140), 8.50, 8.62, 8.30, 8.56, 60_000, Timeframe.SEC_10),
-        Bar("CUPR", _BASE_TS + timedelta(seconds=150), 8.62, 9.40, 8.12, 9.04, 275_000, Timeframe.SEC_10),
+        Bar("CUPR", _BASE_TS + timedelta(seconds=0), 4.80, 5.10, 4.70, 5.00, 30_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CUPR", _BASE_TS + timedelta(seconds=10), 5.00, 6.80, 4.95, 6.60, 70_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CUPR", _BASE_TS + timedelta(seconds=20), 6.60, 8.90, 6.50, 8.40, 120_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CUPR", _BASE_TS + timedelta(seconds=30), 8.35, 8.55, 7.10, 7.40, 100_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CUPR", _BASE_TS + timedelta(seconds=40), 7.40, 7.70, 6.80, 7.00, 80_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CUPR", _BASE_TS + timedelta(seconds=50), 7.05, 7.80, 7.00, 7.60, 60_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CUPR", _BASE_TS + timedelta(seconds=60), 7.70, 8.20, 7.50, 8.10, 45_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CUPR", _BASE_TS + timedelta(seconds=70), 8.10, 8.40, 7.90, 8.25, 50_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CUPR", _BASE_TS + timedelta(seconds=80), 8.20, 8.35, 7.95, 8.05, 35_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CUPR", _BASE_TS + timedelta(seconds=90), 8.05, 8.30, 7.90, 8.20, 32_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CUPR", _BASE_TS + timedelta(seconds=100), 8.20, 8.45, 8.05, 8.36, 45_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CUPR", _BASE_TS + timedelta(seconds=110), 8.35, 8.50, 8.10, 8.20, 40_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CUPR", _BASE_TS + timedelta(seconds=120), 8.20, 8.55, 8.15, 8.42, 50_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CUPR", _BASE_TS + timedelta(seconds=130), 8.40, 8.58, 8.25, 8.50, 55_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CUPR", _BASE_TS + timedelta(seconds=140), 8.50, 8.62, 8.30, 8.56, 60_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CUPR", _BASE_TS + timedelta(seconds=150), 8.62, 9.40, 8.12, 9.04, 275_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_failed_spike_vwap_reclaim_context(
@@ -3138,22 +3138,22 @@ def test_warrior_failed_spike_vwap_reclaim_rejects_wide_unstable_reclaim() -> No
 
 def test_warrior_backtest_arms_failed_spike_vwap_reclaim_below_old_high() -> None:
     ten_sec = [
-        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 4.80, 5.10, 4.70, 5.00, 30_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 5.00, 6.80, 4.95, 6.60, 70_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 6.60, 8.90, 6.50, 8.40, 120_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 8.35, 8.55, 7.10, 7.40, 100_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 7.40, 7.70, 6.80, 7.00, 80_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 7.05, 7.80, 7.00, 7.60, 60_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 7.70, 8.20, 7.50, 8.10, 45_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=70), 8.10, 8.40, 7.90, 8.25, 50_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=80), 8.20, 8.35, 7.95, 8.05, 35_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=90), 8.05, 8.30, 7.90, 8.20, 32_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 8.20, 8.45, 8.05, 8.36, 45_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 8.35, 8.50, 8.10, 8.20, 40_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=120), 8.20, 8.55, 8.15, 8.42, 50_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=130), 8.40, 8.58, 8.25, 8.50, 55_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=140), 8.50, 8.62, 8.30, 8.56, 60_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=150), 8.62, 9.15, 8.55, 9.02, 160_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 4.80, 5.10, 4.70, 5.00, 30_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 5.00, 6.80, 4.95, 6.60, 70_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 6.60, 8.90, 6.50, 8.40, 120_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 8.35, 8.55, 7.10, 7.40, 100_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 7.40, 7.70, 6.80, 7.00, 80_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 7.05, 7.80, 7.00, 7.60, 60_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 7.70, 8.20, 7.50, 8.10, 45_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=70), 8.10, 8.40, 7.90, 8.25, 50_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=80), 8.20, 8.35, 7.95, 8.05, 35_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=90), 8.05, 8.30, 7.90, 8.20, 32_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 8.20, 8.45, 8.05, 8.36, 45_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 8.35, 8.50, 8.10, 8.20, 40_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=120), 8.20, 8.55, 8.15, 8.42, 50_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=130), 8.40, 8.58, 8.25, 8.50, 55_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=140), 8.50, 8.62, 8.30, 8.56, 60_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=150), 8.62, 9.15, 8.55, 9.02, 160_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
     driver = _momentum_burst_backtest_driver(ten_sec)
     driver._use_warrior_squeeze_playbook = True
@@ -3170,22 +3170,22 @@ def test_warrior_backtest_arms_failed_spike_vwap_reclaim_below_old_high() -> Non
 
 def test_warrior_failed_spike_vwap_reclaim_rejects_weak_reclaim_volume() -> None:
     ten_sec = [
-        Bar("NXTS", _BASE_TS + timedelta(seconds=0), 4.80, 5.10, 4.70, 5.00, 30_000, Timeframe.SEC_10),
-        Bar("NXTS", _BASE_TS + timedelta(seconds=10), 5.00, 6.80, 4.95, 6.60, 70_000, Timeframe.SEC_10),
-        Bar("NXTS", _BASE_TS + timedelta(seconds=20), 6.60, 8.90, 6.50, 8.40, 120_000, Timeframe.SEC_10),
-        Bar("NXTS", _BASE_TS + timedelta(seconds=30), 8.35, 8.55, 7.10, 7.40, 100_000, Timeframe.SEC_10),
-        Bar("NXTS", _BASE_TS + timedelta(seconds=40), 7.40, 7.70, 6.80, 7.00, 80_000, Timeframe.SEC_10),
-        Bar("NXTS", _BASE_TS + timedelta(seconds=50), 7.05, 7.80, 7.00, 7.60, 60_000, Timeframe.SEC_10),
-        Bar("NXTS", _BASE_TS + timedelta(seconds=60), 7.70, 8.20, 7.50, 8.10, 45_000, Timeframe.SEC_10),
-        Bar("NXTS", _BASE_TS + timedelta(seconds=70), 8.10, 8.40, 7.90, 8.25, 50_000, Timeframe.SEC_10),
-        Bar("NXTS", _BASE_TS + timedelta(seconds=80), 8.20, 8.35, 7.95, 8.05, 35_000, Timeframe.SEC_10),
-        Bar("NXTS", _BASE_TS + timedelta(seconds=90), 8.05, 8.30, 7.90, 8.20, 32_000, Timeframe.SEC_10),
-        Bar("NXTS", _BASE_TS + timedelta(seconds=100), 8.20, 8.45, 8.05, 8.36, 45_000, Timeframe.SEC_10),
-        Bar("NXTS", _BASE_TS + timedelta(seconds=110), 8.35, 8.50, 8.10, 8.20, 40_000, Timeframe.SEC_10),
-        Bar("NXTS", _BASE_TS + timedelta(seconds=120), 8.20, 8.55, 8.15, 8.42, 20_000, Timeframe.SEC_10),
-        Bar("NXTS", _BASE_TS + timedelta(seconds=130), 8.40, 8.58, 8.25, 8.50, 18_000, Timeframe.SEC_10),
-        Bar("NXTS", _BASE_TS + timedelta(seconds=140), 8.50, 8.62, 8.30, 8.56, 19_000, Timeframe.SEC_10),
-        Bar("NXTS", _BASE_TS + timedelta(seconds=150), 8.62, 9.15, 8.55, 9.02, 24_000, Timeframe.SEC_10),
+        Bar("NXTS", _BASE_TS + timedelta(seconds=0), 4.80, 5.10, 4.70, 5.00, 30_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("NXTS", _BASE_TS + timedelta(seconds=10), 5.00, 6.80, 4.95, 6.60, 70_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("NXTS", _BASE_TS + timedelta(seconds=20), 6.60, 8.90, 6.50, 8.40, 120_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("NXTS", _BASE_TS + timedelta(seconds=30), 8.35, 8.55, 7.10, 7.40, 100_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("NXTS", _BASE_TS + timedelta(seconds=40), 7.40, 7.70, 6.80, 7.00, 80_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("NXTS", _BASE_TS + timedelta(seconds=50), 7.05, 7.80, 7.00, 7.60, 60_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("NXTS", _BASE_TS + timedelta(seconds=60), 7.70, 8.20, 7.50, 8.10, 45_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("NXTS", _BASE_TS + timedelta(seconds=70), 8.10, 8.40, 7.90, 8.25, 50_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("NXTS", _BASE_TS + timedelta(seconds=80), 8.20, 8.35, 7.95, 8.05, 35_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("NXTS", _BASE_TS + timedelta(seconds=90), 8.05, 8.30, 7.90, 8.20, 32_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("NXTS", _BASE_TS + timedelta(seconds=100), 8.20, 8.45, 8.05, 8.36, 45_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("NXTS", _BASE_TS + timedelta(seconds=110), 8.35, 8.50, 8.10, 8.20, 40_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("NXTS", _BASE_TS + timedelta(seconds=120), 8.20, 8.55, 8.15, 8.42, 20_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("NXTS", _BASE_TS + timedelta(seconds=130), 8.40, 8.58, 8.25, 8.50, 18_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("NXTS", _BASE_TS + timedelta(seconds=140), 8.50, 8.62, 8.30, 8.56, 19_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("NXTS", _BASE_TS + timedelta(seconds=150), 8.62, 9.15, 8.55, 9.02, 24_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_failed_spike_vwap_reclaim_context(
@@ -3199,36 +3199,36 @@ def test_warrior_failed_spike_vwap_reclaim_rejects_weak_reclaim_volume() -> None
 
 def test_warrior_smooth_hod_reclaim_allows_bjdx_style_grinder() -> None:
     ten_sec = [
-        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 4.82, 5.18, 4.80, 5.1025, 100_470, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 5.11, 5.29, 5.06, 5.22, 127_415, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 5.23, 5.35, 5.16, 5.17, 143_424, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 5.167, 5.19, 5.04, 5.10, 69_406, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 5.0975, 5.16, 5.05, 5.083, 47_884, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 5.08, 5.22, 5.0503, 5.21, 49_502, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 5.2005, 5.26, 5.12, 5.17, 55_193, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=70), 5.1646, 5.40, 5.16, 5.30, 84_325, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=80), 5.30, 5.37, 5.19, 5.23, 72_382, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=90), 5.22, 5.33, 5.19, 5.306, 40_744, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 5.29, 5.35, 5.20, 5.2503, 62_404, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 5.2505, 5.3499, 5.22, 5.2603, 31_375, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=120), 5.2627, 5.30, 5.25, 5.30, 26_503, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=130), 5.26, 5.26, 4.97, 5.05, 103_363, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=140), 5.03, 5.24, 5.02, 5.1903, 45_316, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=150), 5.2, 5.2312, 5.09, 5.10, 28_650, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=160), 5.103, 5.14, 5.05, 5.05, 25_617, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=170), 5.067, 5.25, 5.0419, 5.1753, 40_811, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=180), 5.1759, 5.22, 5.13, 5.15, 30_030, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=190), 5.15, 5.1984, 5.13, 5.17, 15_964, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=200), 5.17, 5.26, 5.1416, 5.2042, 41_108, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=210), 5.21, 5.23, 5.16, 5.2013, 13_686, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=220), 5.2016, 5.267, 5.1618, 5.2467, 31_801, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=230), 5.23, 5.25, 5.1456, 5.151, 23_315, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=240), 5.17, 5.32, 5.1523, 5.20, 57_041, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=250), 5.2268, 5.29, 5.1701, 5.2779, 24_583, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=260), 5.27, 5.30, 5.20, 5.29, 36_932, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=270), 5.30, 5.4899, 5.2432, 5.38, 80_626, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=280), 5.39, 5.6222, 5.36, 5.52, 135_804, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=290), 5.5384, 5.78, 5.50, 5.72, 162_354, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 4.82, 5.18, 4.80, 5.1025, 100_470, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 5.11, 5.29, 5.06, 5.22, 127_415, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 5.23, 5.35, 5.16, 5.17, 143_424, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 5.167, 5.19, 5.04, 5.10, 69_406, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 5.0975, 5.16, 5.05, 5.083, 47_884, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 5.08, 5.22, 5.0503, 5.21, 49_502, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 5.2005, 5.26, 5.12, 5.17, 55_193, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=70), 5.1646, 5.40, 5.16, 5.30, 84_325, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=80), 5.30, 5.37, 5.19, 5.23, 72_382, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=90), 5.22, 5.33, 5.19, 5.306, 40_744, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 5.29, 5.35, 5.20, 5.2503, 62_404, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 5.2505, 5.3499, 5.22, 5.2603, 31_375, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=120), 5.2627, 5.30, 5.25, 5.30, 26_503, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=130), 5.26, 5.26, 4.97, 5.05, 103_363, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=140), 5.03, 5.24, 5.02, 5.1903, 45_316, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=150), 5.2, 5.2312, 5.09, 5.10, 28_650, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=160), 5.103, 5.14, 5.05, 5.05, 25_617, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=170), 5.067, 5.25, 5.0419, 5.1753, 40_811, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=180), 5.1759, 5.22, 5.13, 5.15, 30_030, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=190), 5.15, 5.1984, 5.13, 5.17, 15_964, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=200), 5.17, 5.26, 5.1416, 5.2042, 41_108, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=210), 5.21, 5.23, 5.16, 5.2013, 13_686, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=220), 5.2016, 5.267, 5.1618, 5.2467, 31_801, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=230), 5.23, 5.25, 5.1456, 5.151, 23_315, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=240), 5.17, 5.32, 5.1523, 5.20, 57_041, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=250), 5.2268, 5.29, 5.1701, 5.2779, 24_583, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=260), 5.27, 5.30, 5.20, 5.29, 36_932, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=270), 5.30, 5.4899, 5.2432, 5.38, 80_626, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=280), 5.39, 5.6222, 5.36, 5.52, 135_804, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=290), 5.5384, 5.78, 5.50, 5.72, 162_354, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_smooth_hod_reclaim_context(
@@ -3263,27 +3263,27 @@ def test_warrior_smooth_hod_reclaim_allows_bjdx_style_grinder() -> None:
 
 def test_warrior_smooth_hod_reclaim_rejects_wick_through_hod_without_close() -> None:
     ten_sec = [
-        Bar("EHGO", _BASE_TS + timedelta(seconds=0), 4.47, 4.79, 4.44, 4.57, 88_583, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=10), 4.57, 4.83, 4.56, 4.78, 73_172, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=20), 4.79, 4.80, 4.56, 4.69, 66_484, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=30), 4.68, 4.70, 4.56, 4.58, 40_885, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=40), 4.58, 4.58, 4.45, 4.51, 33_045, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=50), 4.51, 4.88, 4.46, 4.86, 86_999, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=60), 4.86, 4.90, 4.66, 4.79, 104_505, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=70), 4.80, 4.88, 4.69, 4.70, 51_929, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=80), 4.70, 4.85, 4.64, 4.84, 42_254, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=90), 4.82, 4.90, 4.70, 4.71, 80_899, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=100), 4.71, 4.80, 4.70, 4.76, 26_370, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=110), 4.76, 4.77, 4.65, 4.65, 36_805, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=120), 4.66, 4.66, 4.27, 4.39, 39_615, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=130), 4.43, 4.82, 4.40, 4.82, 41_541, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=140), 4.82, 4.91, 4.69, 4.90, 89_749, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=150), 4.89, 4.92, 4.78, 4.80, 48_565, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=160), 4.80, 4.85, 4.71, 4.84, 30_818, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=170), 4.84, 4.88, 4.69, 4.72, 48_145, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=180), 4.68, 4.83, 4.68, 4.83, 22_726, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=190), 4.83, 4.94, 4.70, 4.78, 71_162, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=200), 4.81, 5.11, 4.81, 5.01, 113_316, Timeframe.SEC_10),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=0), 4.47, 4.79, 4.44, 4.57, 88_583, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=10), 4.57, 4.83, 4.56, 4.78, 73_172, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=20), 4.79, 4.80, 4.56, 4.69, 66_484, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=30), 4.68, 4.70, 4.56, 4.58, 40_885, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=40), 4.58, 4.58, 4.45, 4.51, 33_045, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=50), 4.51, 4.88, 4.46, 4.86, 86_999, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=60), 4.86, 4.90, 4.66, 4.79, 104_505, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=70), 4.80, 4.88, 4.69, 4.70, 51_929, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=80), 4.70, 4.85, 4.64, 4.84, 42_254, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=90), 4.82, 4.90, 4.70, 4.71, 80_899, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=100), 4.71, 4.80, 4.70, 4.76, 26_370, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=110), 4.76, 4.77, 4.65, 4.65, 36_805, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=120), 4.66, 4.66, 4.27, 4.39, 39_615, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=130), 4.43, 4.82, 4.40, 4.82, 41_541, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=140), 4.82, 4.91, 4.69, 4.90, 89_749, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=150), 4.89, 4.92, 4.78, 4.80, 48_565, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=160), 4.80, 4.85, 4.71, 4.84, 30_818, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=170), 4.84, 4.88, 4.69, 4.72, 48_145, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=180), 4.68, 4.83, 4.68, 4.83, 22_726, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=190), 4.83, 4.94, 4.70, 4.78, 71_162, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=200), 4.81, 5.11, 4.81, 5.01, 113_316, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_smooth_hod_reclaim_context(
@@ -3297,26 +3297,26 @@ def test_warrior_smooth_hod_reclaim_rejects_wick_through_hod_without_close() -> 
 
 def test_warrior_smooth_hod_reclaim_rejects_flat_top_without_volume_expansion() -> None:
     ten_sec = [
-        Bar("EHGO", _BASE_TS + timedelta(seconds=0), 4.02, 4.15, 4.00, 4.14, 13_481, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=10), 4.15, 4.16, 4.06, 4.09, 23_432, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=20), 4.09, 4.23, 4.06, 4.21, 22_290, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=30), 4.24, 4.38, 4.21, 4.32, 47_456, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=40), 4.35, 4.45, 4.29, 4.42, 42_246, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=50), 4.45, 4.46, 4.40, 4.41, 38_724, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=60), 4.41, 4.97, 4.40, 4.95, 141_998, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=70), 4.97, 5.10, 4.90, 4.92, 160_503, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=80), 4.92, 4.95, 4.80, 4.94, 87_767, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=90), 4.95, 4.95, 4.86, 4.86, 52_206, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=100), 4.87, 5.19, 4.84, 5.11, 93_883, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=110), 5.10, 5.25, 5.09, 5.10, 137_820, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=120), 5.09, 5.20, 5.09, 5.10, 92_838, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=130), 5.09, 5.15, 5.09, 5.10, 62_845, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=140), 5.10, 5.20, 5.09, 5.11, 61_092, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=150), 5.13, 5.13, 5.09, 5.09, 46_258, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=160), 5.09, 5.30, 5.09, 5.24, 94_420, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=170), 5.24, 5.26, 5.19, 5.19, 48_276, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=180), 5.19, 5.21, 5.14, 5.19, 77_251, Timeframe.SEC_10),
-        Bar("EHGO", _BASE_TS + timedelta(seconds=190), 5.20, 5.30, 5.19, 5.28, 79_339, Timeframe.SEC_10),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=0), 4.02, 4.15, 4.00, 4.14, 13_481, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=10), 4.15, 4.16, 4.06, 4.09, 23_432, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=20), 4.09, 4.23, 4.06, 4.21, 22_290, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=30), 4.24, 4.38, 4.21, 4.32, 47_456, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=40), 4.35, 4.45, 4.29, 4.42, 42_246, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=50), 4.45, 4.46, 4.40, 4.41, 38_724, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=60), 4.41, 4.97, 4.40, 4.95, 141_998, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=70), 4.97, 5.10, 4.90, 4.92, 160_503, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=80), 4.92, 4.95, 4.80, 4.94, 87_767, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=90), 4.95, 4.95, 4.86, 4.86, 52_206, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=100), 4.87, 5.19, 4.84, 5.11, 93_883, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=110), 5.10, 5.25, 5.09, 5.10, 137_820, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=120), 5.09, 5.20, 5.09, 5.10, 92_838, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=130), 5.09, 5.15, 5.09, 5.10, 62_845, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=140), 5.10, 5.20, 5.09, 5.11, 61_092, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=150), 5.13, 5.13, 5.09, 5.09, 46_258, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=160), 5.09, 5.30, 5.09, 5.24, 94_420, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=170), 5.24, 5.26, 5.19, 5.19, 48_276, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=180), 5.19, 5.21, 5.14, 5.19, 77_251, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("EHGO", _BASE_TS + timedelta(seconds=190), 5.20, 5.30, 5.19, 5.28, 79_339, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_smooth_hod_reclaim_context(
@@ -3330,12 +3330,12 @@ def test_warrior_smooth_hod_reclaim_rejects_flat_top_without_volume_expansion() 
 
 def test_warrior_late_reentry_rejects_choppy_stair_step_after_win() -> None:
     ten_sec = [
-        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 13.80, 14.20, 13.60, 14.05, 90_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 14.05, 14.70, 13.88, 14.48, 110_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 14.49, 14.76, 13.89, 13.90, 120_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 13.92, 14.62, 13.86, 14.50, 95_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 14.50, 15.02, 14.19, 14.31, 130_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 14.31, 14.95, 14.23, 14.89, 81_083, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 13.80, 14.20, 13.60, 14.05, 90_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 14.05, 14.70, 13.88, 14.48, 110_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 14.49, 14.76, 13.89, 13.90, 120_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 13.92, 14.62, 13.86, 14.50, 95_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 14.50, 15.02, 14.19, 14.31, 130_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 14.31, 14.95, 14.23, 14.89, 81_083, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     reason = warrior_lanes.warrior_late_reentry_reject(
@@ -3388,7 +3388,7 @@ def test_warrior_post_target_pullback_reclaim_allows_rubi_style_reclaim() -> Non
             close,
             volume,
             Timeframe.SEC_10,
-        )
+         provenance=BarSource.CANONICAL_INTERVAL)
         for i, (open_, high, low, close, volume) in enumerate(prices)
     ]
 
@@ -3408,10 +3408,10 @@ def test_warrior_post_target_pullback_reclaim_allows_rubi_style_reclaim() -> Non
 
 def test_warrior_late_reentry_leaves_non_stair_lanes_alone() -> None:
     ten_sec = [
-        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 7.00, 7.40, 6.90, 7.35, 120_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 7.35, 7.80, 7.20, 7.60, 130_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 7.60, 8.10, 7.30, 7.50, 150_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 7.50, 7.90, 7.10, 7.20, 160_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 7.00, 7.40, 6.90, 7.35, 120_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 7.35, 7.80, 7.20, 7.60, 130_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 7.60, 8.10, 7.30, 7.50, 150_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 7.50, 7.90, 7.10, 7.20, 160_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     reason = warrior_lanes.warrior_late_reentry_reject(
@@ -3428,12 +3428,12 @@ def test_warrior_late_reentry_leaves_non_stair_lanes_alone() -> None:
 
 def test_warrior_violent_liquid_blocks_unproven_trend_reclaim() -> None:
     ten_sec = [
-        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 9.10, 9.72, 9.00, 9.55, 160_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 9.56, 10.10, 9.40, 9.82, 180_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 9.82, 10.26, 9.35, 9.48, 220_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 9.48, 9.92, 9.10, 9.30, 170_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 9.30, 10.05, 9.20, 9.88, 190_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 9.88, 10.30, 9.62, 10.20, 210_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 9.10, 9.72, 9.00, 9.55, 160_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 9.56, 10.10, 9.40, 9.82, 180_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 9.82, 10.26, 9.35, 9.48, 220_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 9.48, 9.92, 9.10, 9.30, 170_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 9.30, 10.05, 9.20, 9.88, 190_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 9.88, 10.30, 9.62, 10.20, 210_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     reason = warrior_lanes.warrior_violent_liquid_reject(
@@ -3459,12 +3459,12 @@ def test_warrior_violent_liquid_blocks_unproven_trend_reclaim() -> None:
 
 def test_warrior_violent_liquid_allows_after_target_win() -> None:
     ten_sec = [
-        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 9.10, 9.72, 9.00, 9.55, 160_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 9.56, 10.10, 9.40, 9.82, 180_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 9.82, 10.26, 9.35, 9.48, 220_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 9.48, 9.92, 9.10, 9.30, 170_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 9.30, 10.05, 9.20, 9.88, 190_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 9.88, 10.30, 9.62, 10.20, 210_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 9.10, 9.72, 9.00, 9.55, 160_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 9.56, 10.10, 9.40, 9.82, 180_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 9.82, 10.26, 9.35, 9.48, 220_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 9.48, 9.92, 9.10, 9.30, 170_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 9.30, 10.05, 9.20, 9.88, 190_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 9.88, 10.30, 9.62, 10.20, 210_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     reason = warrior_lanes.warrior_violent_liquid_reject(
@@ -3479,12 +3479,12 @@ def test_warrior_violent_liquid_allows_after_target_win() -> None:
 
 def test_warrior_halt_resume_continuation_allows_cupr_style_resume() -> None:
     ten_sec = [
-        Bar("CUPR", _BASE_TS + timedelta(seconds=0), 10.92, 10.92, 9.93, 10.92, 145_838, Timeframe.SEC_10),
-        Bar("CUPR", _BASE_TS + timedelta(seconds=10), 11.20, 12.21, 11.03, 12.04, 321_258, Timeframe.SEC_10),
-        Bar("CUPR", _BASE_TS + timedelta(seconds=20), 12.21, 12.63, 11.99, 12.63, 173_161, Timeframe.SEC_10),
-        Bar("CUPR", _BASE_TS + timedelta(seconds=320), 12.72, 13.23, 11.45, 11.45, 325_788, Timeframe.SEC_10),
-        Bar("CUPR", _BASE_TS + timedelta(seconds=330), 11.45, 13.20, 11.45, 13.09, 253_233, Timeframe.SEC_10),
-        Bar("CUPR", _BASE_TS + timedelta(seconds=340), 13.11, 13.82, 12.75, 13.67, 245_633, Timeframe.SEC_10),
+        Bar("CUPR", _BASE_TS + timedelta(seconds=0), 10.92, 10.92, 9.93, 10.92, 145_838, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CUPR", _BASE_TS + timedelta(seconds=10), 11.20, 12.21, 11.03, 12.04, 321_258, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CUPR", _BASE_TS + timedelta(seconds=20), 12.21, 12.63, 11.99, 12.63, 173_161, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CUPR", _BASE_TS + timedelta(seconds=320), 12.72, 13.23, 11.45, 11.45, 325_788, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CUPR", _BASE_TS + timedelta(seconds=330), 11.45, 13.20, 11.45, 13.09, 253_233, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CUPR", _BASE_TS + timedelta(seconds=340), 13.11, 13.82, 12.75, 13.67, 245_633, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_halt_resume_continuation_context(
@@ -3504,10 +3504,10 @@ def test_warrior_halt_resume_continuation_allows_cupr_style_resume() -> None:
 
 def test_warrior_halt_resume_continuation_rejects_single_resume_spike() -> None:
     ten_sec = [
-        Bar("CUPR", _BASE_TS + timedelta(seconds=0), 10.92, 10.92, 9.93, 10.92, 145_838, Timeframe.SEC_10),
-        Bar("CUPR", _BASE_TS + timedelta(seconds=10), 12.21, 12.63, 11.99, 12.63, 173_161, Timeframe.SEC_10),
-        Bar("CUPR", _BASE_TS + timedelta(seconds=320), 12.72, 13.23, 11.45, 11.45, 325_788, Timeframe.SEC_10),
-        Bar("CUPR", _BASE_TS + timedelta(seconds=330), 11.45, 13.20, 11.45, 13.09, 253_233, Timeframe.SEC_10),
+        Bar("CUPR", _BASE_TS + timedelta(seconds=0), 10.92, 10.92, 9.93, 10.92, 145_838, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CUPR", _BASE_TS + timedelta(seconds=10), 12.21, 12.63, 11.99, 12.63, 173_161, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CUPR", _BASE_TS + timedelta(seconds=320), 12.72, 13.23, 11.45, 11.45, 325_788, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("CUPR", _BASE_TS + timedelta(seconds=330), 11.45, 13.20, 11.45, 13.09, 253_233, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     context = warrior_lanes.warrior_halt_resume_continuation_context(
@@ -3522,20 +3522,20 @@ def test_warrior_halt_resume_continuation_rejects_single_resume_spike() -> None:
 
 def test_warrior_trend_pullback_reclaim_rejects_dump_base() -> None:
     ten_sec = [
-        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 6.80, 7.30, 6.76, 7.22, 180_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 7.24, 7.85, 7.20, 7.78, 260_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 7.80, 8.55, 7.74, 8.42, 330_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 8.42, 9.35, 8.35, 9.12, 440_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 9.12, 10.20, 9.00, 9.82, 620_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 9.78, 10.34, 9.62, 9.90, 520_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 9.86, 9.98, 9.18, 9.30, 240_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=70), 9.30, 9.42, 8.82, 8.96, 170_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=80), 9.30, 9.38, 8.42, 8.58, 390_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=90), 8.76, 8.98, 8.46, 8.84, 135_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 8.84, 9.08, 8.58, 8.98, 150_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 9.35, 9.42, 8.62, 8.78, 420_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=120), 9.08, 9.24, 8.86, 9.18, 185_000, Timeframe.SEC_10),
-        Bar("MBUR", _BASE_TS + timedelta(seconds=130), 9.18, 9.45, 9.05, 9.39, 320_000, Timeframe.SEC_10),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=0), 6.80, 7.30, 6.76, 7.22, 180_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=10), 7.24, 7.85, 7.20, 7.78, 260_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=20), 7.80, 8.55, 7.74, 8.42, 330_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=30), 8.42, 9.35, 8.35, 9.12, 440_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=40), 9.12, 10.20, 9.00, 9.82, 620_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=50), 9.78, 10.34, 9.62, 9.90, 520_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=60), 9.86, 9.98, 9.18, 9.30, 240_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=70), 9.30, 9.42, 8.82, 8.96, 170_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=80), 9.30, 9.38, 8.42, 8.58, 390_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=90), 8.76, 8.98, 8.46, 8.84, 135_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=100), 8.84, 9.08, 8.58, 8.98, 150_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=110), 9.35, 9.42, 8.62, 8.78, 420_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=120), 9.08, 9.24, 8.86, 9.18, 185_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", _BASE_TS + timedelta(seconds=130), 9.18, 9.45, 9.05, 9.39, 320_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
     driver = _momentum_burst_backtest_driver(ten_sec)
     driver._use_warrior_squeeze_playbook = True
@@ -3562,7 +3562,7 @@ def test_warrior_squeeze_rejects_midrange_weak_close_above_five() -> None:
             close=6.08,
             volume=104_000,
             timeframe=Timeframe.SEC_10,
-        ),
+         provenance=BarSource.CANONICAL_INTERVAL),
     ]
     driver = _momentum_burst_backtest_driver(ten_sec)
     driver._use_warrior_squeeze_playbook = True
@@ -3669,7 +3669,7 @@ def test_momentum_burst_hit_run_rejects_confirm_bar_that_sweeps_stop() -> None:
         close=2.50,
         volume=120_000,
         timeframe=Timeframe.SEC_10,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
     ten_sec.append(unstable)
     driver = _momentum_burst_backtest_driver(ten_sec)
     driver._use_momentum_burst_hit_run = True
@@ -3725,7 +3725,7 @@ def test_momentum_burst_hit_run_backtest_rebase_preserves_original_anchor() -> N
 
     rebased = driver._momentum_burst_rebase_pending_after_reject(
         "MBUR",
-        Bar("MBUR", now, 2.52, 2.55, 2.50, 2.54, 130_000, Timeframe.SEC_10),
+        Bar("MBUR", now, 2.52, 2.55, 2.50, 2.54, 130_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
         pending,
         "confirm bar did not break continuation high (2.55 <= 2.55)",
         now,
@@ -3759,7 +3759,7 @@ def test_momentum_burst_hit_run_backtest_rebase_is_capped() -> None:
 
     rebased = driver._momentum_burst_rebase_pending_after_reject(
         "MBUR",
-        Bar("MBUR", now, 2.54, 2.56, 2.52, 2.55, 130_000, Timeframe.SEC_10),
+        Bar("MBUR", now, 2.54, 2.56, 2.52, 2.55, 130_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
         pending,
         "confirm bar did not break continuation high (2.56 <= 2.56)",
         now,
@@ -4140,7 +4140,7 @@ def _ten_sec(symbol: str, minute: int, slot: int, close: float, *, high: float =
         close=close,
         volume=volume,
         timeframe=Timeframe.SEC_10,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
 
 
 def _live_like_driver():
@@ -4238,7 +4238,7 @@ def test_backtest_1m_cache_refreshes_partial_session(tmp_path):
             close=1.0,
             volume=1000,
             timeframe=Timeframe.MIN_1,
-        ),
+         provenance=BarSource.CANONICAL_INTERVAL),
         Bar(
             symbol="CAST",
             ts=datetime(2026, 6, 15, 23, 56, tzinfo=timezone.utc),
@@ -4248,7 +4248,7 @@ def test_backtest_1m_cache_refreshes_partial_session(tmp_path):
             close=2.0,
             volume=2000,
             timeframe=Timeframe.MIN_1,
-        ),
+         provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
     class _Feed:
@@ -4278,7 +4278,7 @@ def test_live_like_breakout_scalp_replay_can_enter_from_10s_hod_expansion():
     pipeline._final_entry_quality_reject = lambda *args, **kwargs: None  # type: ignore[method-assign]
     one_min = {
         "CAST": [
-            Bar("CAST", _BASE_TS + timedelta(minutes=idx), 1.8 + idx * 0.1, 1.9 + idx * 0.1, 1.75 + idx * 0.1, 1.85 + idx * 0.1, 200_000, Timeframe.MIN_1)
+            Bar("CAST", _BASE_TS + timedelta(minutes=idx), 1.8 + idx * 0.1, 1.9 + idx * 0.1, 1.75 + idx * 0.1, 1.85 + idx * 0.1, 200_000, Timeframe.MIN_1, provenance=BarSource.CANONICAL_INTERVAL)
             for idx in range(4)
         ]
     }
@@ -4351,7 +4351,7 @@ def test_breakout_scalp_replay_rejects_recent_10s_dump_before_breakout():
                     2.22,
                     175_000,
                     Timeframe.SEC_10,
-                ),
+                 provenance=BarSource.CANONICAL_INTERVAL),
                 _ten_sec("CAST", 0, 2, 2.47, high=2.48, low=2.20, volume=130_000),
                 _ten_sec("CAST", 0, 3, 2.60, high=2.62, low=2.50, volume=180_000),
             ]

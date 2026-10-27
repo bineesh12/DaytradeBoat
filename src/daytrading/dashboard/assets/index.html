@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Day Trading Dashboard</title>
+<style>__DASHBOARD_CSS__</style>
+</head>
+<body>
+
+<nav class="navbar">
+  <h1><span>&#9650;</span> Day Trading Bot</h1>
+  <div class="nav-status">
+    <span style="color:var(--blue)" title="All displayed timestamps use Europe/Stockholm">Swedish time · SE</span>
+    <span><span class="status-dot" id="dot-market"></span><span id="market-label">Market Closed</span></span>
+    <span class="pill" id="phase-pill" style="font-size:11px">CLOSED</span>
+    <span><span class="status-dot" id="dot-stream"></span><span id="stream-label">Stream Off</span></span>
+    <span style="color:var(--text2)">Cycle: <span id="cycle-count">0</span></span>
+    <span><span class="status-dot" id="dot-scanner"></span><span id="scanner-label">Scanner Off</span></span>
+    <span id="trade-status-pill" class="pill pill-green" style="font-size:11px">ACTIVE</span>
+  </div>
+  <div style="display:flex;gap:6px;align-items:center">
+    <button class="ctrl-btn ctrl-btn-stop" id="btn-stop" title="Pause trading — no new entries">Stop Trade</button>
+    <button class="ctrl-btn ctrl-btn-start" id="btn-start" title="Resume trading" disabled>Start Trade</button>
+    <button class="ctrl-btn ctrl-btn-close" id="btn-force-close" title="Cancel all orders + close all positions immediately">Force Close All</button>
+  </div>
+</nav>
+
+<div class="tabs">
+  <a class="tab" href="http://127.0.0.1:8081/charts" target="_blank" rel="noopener" style="text-decoration:none">Chart analysis ↗</a>
+  <div class="tab active" data-page="overview">Overview</div>
+  <div class="tab" data-page="scanner">Scanner</div>
+  <div class="tab" data-page="trades">Trades</div>
+  <div class="tab" data-page="analytics">Analytics</div>
+  <div class="tab" data-page="backtest">Backtest</div>
+  <div class="tab" data-page="journal">Journal</div>
+  <div class="tab" data-page="logs">Logs</div>
+</div>
+
+<!-- ================= OVERVIEW ================= -->
+<div class="page active" id="page-overview">
+<div class="container">
+  <div class="grid grid-4" style="margin-bottom:16px">
+    <div class="card stat-card">
+      <div class="stat-label">Total P&L</div>
+      <div class="stat-value" id="stat-pnl">$0.00</div>
+      <div class="stat-sub" id="stat-pnl-pct"></div>
+    </div>
+    <div class="card stat-card">
+      <div class="stat-label">Total Trades</div>
+      <div class="stat-value" id="stat-trades">0</div>
+      <div class="stat-sub" id="stat-winrate">0% win rate</div>
+    </div>
+    <div class="card stat-card">
+      <div class="stat-label">Scanner Hits</div>
+      <div class="stat-value text-blue" id="stat-scans">0</div>
+      <div class="stat-sub"><span id="stat-signals">0</span> signals / <span id="stat-rejected">0</span> rejected</div>
+    </div>
+    <div class="card stat-card">
+      <div class="stat-label">Account Equity</div>
+      <div class="stat-value" id="stat-equity">$0</div>
+      <div class="stat-sub">Cash: <span id="stat-cash">$0</span></div>
+    </div>
+  </div>
+
+  <div class="grid grid-2">
+    <div class="card">
+      <div class="card-header"><h3>Open Positions</h3><span class="badge pill-blue" id="pos-count">0</span></div>
+      <div id="positions-table-wrap">
+        <div class="empty"><div class="icon">&#128200;</div>No open positions</div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header"><h3>Recent Activity</h3></div>
+      <div id="activity-wrap">
+        <div class="empty"><div class="icon">&#9889;</div>Waiting for trades...</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="grid grid-2" style="margin-top:16px">
+    <div class="card">
+      <div class="card-header"><h3>Entry Checks</h3><span class="badge pill-blue" id="ov-scan-count2">0</span></div>
+      <div id="ov-scanner-wrap">
+        <div class="empty"><div class="icon">&#128269;</div>No entry checks yet</div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header"><h3>ML Model Stats</h3><span class="badge pill-purple" id="ml-status-badge">--</span></div>
+      <div id="ml-stats-wrap">
+        <div class="empty"><div class="icon">&#129302;</div>ML stats loading...</div>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- ================= SCANNER (HOD Momentum feed) ================= -->
+<div class="page" id="page-scanner">
+<div class="container">
+  <div class="grid grid-4" style="margin-bottom:16px">
+    <div class="card stat-card">
+      <div class="stat-label">HOD Alerts</div>
+      <div class="stat-value text-green" id="hod-momentum-count">0</div>
+      <div class="stat-sub">Watchlist follows this board</div>
+    </div>
+    <div class="card stat-card">
+      <div class="stat-label">Verified Signals</div>
+      <div class="stat-value text-green" id="scan-signals">0</div>
+    </div>
+    <div class="card stat-card">
+      <div class="stat-label">Pattern Hits</div>
+      <div class="stat-value text-yellow" id="scan-total">0</div>
+    </div>
+    <div class="card stat-card">
+      <div class="stat-label">Trading Watchlist</div>
+      <div class="stat-value text-blue" id="trading-watchlist-count">0</div>
+      <div class="stat-sub">HOD + Hot Watch symbols</div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-header"><h3>Entry Decisions</h3><span id="entry-baseline" style="font-size:11px;color:var(--text2)"></span></div>
+    <div id="entry-window-status" style="padding:8px 12px;color:var(--yellow)"></div>
+    <div id="entry-funnel-counts" style="padding:12px;display:flex;flex-wrap:wrap;gap:16px"></div>
+    <p style="padding:0 12px 10px;color:var(--text2);font-size:11px">Counts represent unique setups for today, including linked journal history restored after a restart. Entry Ready means queued for execution timing, not an order or fill. Watch-only patterns are separate from rejected entries. Expand a row to see its decision trail. Earlier events without a stable setup ID remain in the Journal.</p>
+    <div style="padding:0 12px 10px;display:flex;gap:8px;flex-wrap:wrap">
+      <input id="entry-setup-query" placeholder="Search symbol, pattern or rejection" aria-label="Search entry setups" style="min-width:240px">
+      <select id="entry-setup-status" aria-label="Setup status"><option value="">All decisions</option><option value="rejected">Rejected</option><option value="watch_only">Watch only</option><option value="waiting">Waiting</option><option value="confirming">Awaiting timer</option><option value="released">Timer released</option><option value="submitted">Submitted</option><option value="filled">Filled</option><option value="closed">Closed</option></select>
+      <button id="entry-setup-search" type="button">Search today</button>
+      <span id="entry-setup-summary" style="font-size:11px;color:var(--text2)"></span>
+    </div>
+    <details style="padding:0 12px 10px"><summary>Activity guard status</summary><div id="activity-guard-status"></div></details>
+    <div id="entry-decisions-wrap" style="max-height:320px;overflow:auto"></div>
+  </div>
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-header">
+      <h3>Trading Watchlist</h3>
+      <span style="font-size:11px;color:var(--text2)">Active scan universe from HOD alerts and Hot Watch — SPY is pinned for market panic</span>
+    </div>
+    <div id="trading-watchlist-wrap">
+      <div class="empty"><div class="icon">&#128203;</div>No symbols on watchlist yet</div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-header">
+      <h3>Hot Watch</h3>
+      <span style="font-size:11px;color:var(--text2)">Stocks selected for monitoring; entry decisions appear above</span>
+      <span class="badge pill-yellow" id="hot-watch-count">0</span>
+    </div>
+    <div id="candidate-worker-status" style="font-size:12px;color:var(--text2);margin-bottom:10px"></div>
+    <div id="hot-watch-wrap">
+      <div class="empty"><div class="icon">&#128293;</div>No hot-watch movers yet</div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-header">
+      <h3>HOD Momentum Scanner</h3>
+      <span style="font-size:11px;color:var(--text2)">Chg % = from today open (or vs prior close if bars truncated) · vs Close % = like TradingView day change</span>
+    </div>
+    <div class="hod-filters" id="hod-filters">
+      <button class="hod-filter-btn active" data-filter="all">All</button>
+      <button class="hod-filter-btn" data-filter="New HOD Breakout">New HOD</button>
+      <button class="hod-filter-btn" data-filter="Today HOD Breakout">Today HOD</button>
+      <button class="hod-filter-btn" data-filter="HOD Reclaim">HOD Reclaim</button>
+      <button class="hod-filter-btn" data-filter="Former Momo Stock">Former Momo</button>
+      <button class="hod-filter-btn" data-filter="Low Float - High Rel Vol">Low Float</button>
+      <button class="hod-filter-btn" data-filter="Squeeze - Up 5% in 5min">Squeeze 5%</button>
+      <button class="hod-filter-btn" data-filter="Squeeze - Up 10% in 10min">Squeeze 10%</button>
+    </div>
+    <div class="hod-momentum-scanner" id="hod-momentum-scanner-wrap">
+      <div class="empty"><div class="icon">&#128293;</div>Waiting for HOD momentum alerts...</div>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- ================= TRADES ================= -->
+<div class="page" id="page-trades">
+<div class="container">
+  <div class="grid grid-4" style="margin-bottom:16px">
+    <div class="card stat-card">
+      <div class="stat-label">Total P&L</div>
+      <div class="stat-value" id="trades-pnl">$0.00</div>
+    </div>
+    <div class="card stat-card">
+      <div class="stat-label">Winners</div>
+      <div class="stat-value text-green" id="trades-wins">0</div>
+    </div>
+    <div class="card stat-card">
+      <div class="stat-label">Losers</div>
+      <div class="stat-value text-red" id="trades-losses">0</div>
+    </div>
+    <div class="card stat-card">
+      <div class="stat-label">Win Rate</div>
+      <div class="stat-value" id="trades-winrate">0%</div>
+    </div>
+  </div>
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-header"><h3>Daily P&L by Stock</h3></div>
+    <div id="stock-summary-wrap">
+      <div class="empty"><div class="icon">&#128202;</div>No trades yet</div>
+    </div>
+  </div>
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-header">
+      <h3>Warrior Ignition Details</h3>
+      <span class="pill pill-purple" id="warrior-ignition-count">0 closed</span>
+    </div>
+    <div id="warrior-ignition-wrap">
+      <div class="empty"><div class="icon">&#9889;</div>No Warrior ignition trades yet</div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-header"><h3>Trade History</h3></div>
+    <div id="trades-table-wrap">
+      <div class="empty"><div class="icon">&#128202;</div>No trades yet</div>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- ================= ANALYTICS ================= -->
+<div class="page" id="page-analytics">
+<div class="container">
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-header">
+      <h3>Daily Scorecard</h3>
+      <span id="scorecard-verdict" class="pill pill-yellow">COLLECTING</span>
+    </div>
+    <div id="daily-scorecard-wrap">
+      <div class="empty"><div class="icon">&#128202;</div>Collecting scorecard data...</div>
+    </div>
+  </div>
+  <div class="grid grid-4" style="margin-bottom:16px">
+    <div class="card stat-card">
+      <div class="stat-label">Avg Win</div>
+      <div class="stat-value text-green" id="an-avg-win">$0.00</div>
+    </div>
+    <div class="card stat-card">
+      <div class="stat-label">Avg Loss</div>
+      <div class="stat-value text-red" id="an-avg-loss">$0.00</div>
+    </div>
+    <div class="card stat-card">
+      <div class="stat-label">Profit Factor</div>
+      <div class="stat-value" id="an-pf">0.00</div>
+    </div>
+    <div class="card stat-card">
+      <div class="stat-label">Expectancy</div>
+      <div class="stat-value" id="an-expect">$0.00</div>
+    </div>
+  </div>
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-header">
+      <h3>Missed A+ Setups</h3>
+      <span style="font-size:11px;color:var(--text2)">Blocked elite setups labeled by later price action</span>
+    </div>
+    <div id="missed-a-plus-wrap">
+      <div class="empty"><div class="icon">&#128269;</div>No blocked A+ setups labeled yet</div>
+    </div>
+  </div>
+  <div class="grid grid-2" style="margin-bottom:16px">
+    <div class="card">
+      <div class="card-header"><h3>Per-Symbol Breakdown</h3></div>
+      <div id="an-symbol-table">
+        <div class="empty"><div class="icon">&#128202;</div>No data yet</div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header"><h3>Exit Type Analysis</h3></div>
+      <div id="an-exit-table">
+        <div class="empty"><div class="icon">&#128202;</div>No data yet</div>
+      </div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-header"><h3>Equity Curve</h3></div>
+    <div id="an-equity-chart" style="height:200px;position:relative;overflow:hidden;">
+      <canvas id="equity-canvas" style="width:100%;height:100%"></canvas>
+    </div>
+  </div>
+  <div class="card" style="margin-top:16px">
+    <div class="card-header">
+      <h3>ML Learning Report</h3>
+      <div style="display:flex;gap:8px;align-items:center">
+        <span id="ml-report-day" style="font-size:11px;color:var(--text2)">Not loaded</span>
+        <button id="ml-report-refresh-btn" style="padding:6px 10px;border:1px solid var(--border);background:var(--surface2);color:var(--text);border-radius:6px;cursor:pointer">Refresh</button>
+      </div>
+    </div>
+    <div id="ml-learning-wrap">
+      <div class="empty"><div class="icon">&#129302;</div>ML learning report loading...</div>
+    </div>
+  </div>
+  <div class="card" style="margin-top:16px">
+    <div class="card-header"><h3>ML Progress</h3></div>
+    <div id="ml-progress-wrap">
+      <div class="empty"><div class="icon">&#128200;</div>ML progress loading...</div>
+    </div>
+  </div>
+  <div class="card" style="margin-top:16px">
+    <div class="card-header">
+      <h3>AI Trade Insights</h3>
+      <span id="ai-score" style="font-size:13px;color:var(--text2)"></span>
+    </div>
+    <div id="ai-insights-wrap">
+      <div class="empty"><div class="icon">&#129302;</div>AI analysis will run after 5+ trades</div>
+    </div>
+  </div>
+  <div class="grid grid-2" style="margin-top:16px">
+    <div class="card">
+      <div class="card-header"><h3>Blocked Symbols</h3></div>
+      <div id="ai-blocked-wrap">
+        <div class="empty" style="padding:12px;font-size:12px;color:var(--text2)">No symbols blocked</div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header"><h3>Auto-Adjustments</h3></div>
+      <div id="ai-adjustments-wrap">
+        <div class="empty" style="padding:12px;font-size:12px;color:var(--text2)">No adjustments yet</div>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- ================= BACKTEST ================= -->
+<div class="page" id="page-backtest">
+<div class="container bt-layout">
+  <section class="card bt-form">
+    <div class="bt-heading"><div><h2>Backtest</h2><p>See the paper trades. Check what the replay can reproduce.</p></div><span class="bt-safe">Simulation only</span></div>
+    <div class="bt-fields">
+      <label>Stock<input id="bt-symbol" placeholder="e.g. NCPL" autocomplete="off" spellcheck="false"></label>
+      <label>Trading day<input id="bt-date" type="date"></label>
+      <label class="bt-type">Test type<select id="bt-mode"><option value="paper_validation" selected>Paper validation</option><option value="historical_estimate">Historical estimate</option></select></label>
+      <button id="bt-run">Compare trades</button>
+    </div>
+    <p id="bt-recording-help" class="bt-help">Compare against a recorded paper session.</p>
+    <details class="bt-options"><summary>More options</summary><div class="bt-option-fields">
+      <label id="bt-recording-label">Recording<select id="bt-session"><option value="">Loading recordings…</option></select></label>
+      <label id="bt-start-label">Start time · Sweden<input id="bt-start-time" type="time"><small>Swedish clock for the selected US trading day; after midnight belongs to the following Swedish date. Leave blank for the full session.</small></label>
+    </div></details>
+  </section>
+  <div id="backtest-wrap"><div class="card bt-empty">Choose a stock and trading day to begin.</div></div>
+</div>
+</div>
+
+<!-- ================= LOGS ================= -->
+<div class="page" id="page-logs">
+<div class="container">
+  <div class="card">
+    <div class="card-header"><h3>Live Logs</h3></div>
+    <div class="log-panel" id="log-panel">
+      <div class="empty"><div class="icon">&#128196;</div>No log messages yet</div>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- ================= JOURNAL ================= -->
+<div class="page" id="page-journal">
+<div class="container">
+  <div class="grid grid-4" style="margin-bottom:16px">
+    <div class="card stat-card">
+      <div class="stat-label">Replay Events</div>
+      <div class="stat-value text-blue" id="jr-total">0</div>
+    </div>
+    <div class="card stat-card">
+      <div class="stat-label">Trade Events</div>
+      <div class="stat-value text-green" id="jr-trades">0</div>
+    </div>
+    <div class="card stat-card">
+      <div class="stat-label">Mistakes</div>
+      <div class="stat-value text-red" id="jr-mistakes">0</div>
+    </div>
+    <div class="card stat-card">
+      <div class="stat-label">Screenshots</div>
+      <div class="stat-value text-yellow" id="jr-shots">0</div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-header">
+      <h3>Journal Replay</h3>
+      <div style="display:flex;gap:8px;align-items:center">
+        <span id="jr-updated" style="font-size:11px;color:var(--text2)">Not loaded</span>
+        <button id="jr-refresh-btn" style="padding:6px 10px;border:1px solid var(--border);background:var(--surface2);color:var(--text1);border-radius:6px;cursor:pointer">Refresh</button>
+      </div>
+    </div>
+    <div id="journal-table-wrap">
+      <div class="empty"><div class="icon">&#128221;</div>No journal events yet</div>
+    </div>
+  </div>
+</div>
+</div>
+
+<script>__DASHBOARD_JS__</script>
+</body>
+</html>

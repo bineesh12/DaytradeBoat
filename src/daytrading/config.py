@@ -12,7 +12,8 @@ from dataclasses import dataclass
 
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    if os.environ.get("DAYTRADING_CONFIG_LOADED") != "true":
+        load_dotenv()
 except ImportError:
     pass
 

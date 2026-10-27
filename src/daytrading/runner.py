@@ -13,6 +13,18 @@ Or from command line:
 """
 
 from __future__ import annotations
+from daytrading.models import BarSource
+
+from daytrading.execution.fill_identity import report_execution
+
+from daytrading.reliability_metrics import StageMetrics, measured
+
+from daytrading.execution.fill_identity import projected, identity as fill_identity
+from daytrading.execution.durability import durable_operation
+
+from daytrading.opportunities import hit_identity
+from daytrading.strategy.scalping.micro_vwap import TEMPORARY_ENTRY_BLOCKS
+from daytrading.reporting import report_safely, reporting_failures, report_event
 
 import logging
 import os
@@ -21,6 +33,7 @@ import signal
 import sys
 import time
 from collections import defaultdict, deque, namedtuple
+from dataclasses import replace
 from datetime import datetime, timezone, timedelta
 from threading import Event, Lock, Thread
 from typing import Any, Dict, List, Optional, Sequence, Set
@@ -37,7 +50,7 @@ from daytrading.data.news_checker import NewsChecker
 from daytrading.data.watchlist_scanner import WatchlistScanner
 from daytrading.execution.alpaca_broker import AlpacaBroker
 from daytrading.execution.entry_executor import EntryExecutionContext, EntryExecutor
-from daytrading.execution.live_prices import resolve_live_prices
+from daytrading.execution.live_prices import resolve_live_prices, resolve_exit_prices, liquidation_quote
 from daytrading.execution.position_reconciler import PositionReconciler
 from daytrading.exits.manager import ExitManager, is_hit_run_strategy
 from daytrading.exits.scaler import PositionScaler, ReentryDetector
@@ -170,7 +183,16 @@ class AlpacaRunner:
         self._quote_buffer: Dict[str, deque] = {}
         self._tick_buffer: Dict[str, deque] = {}
         self._event_queue: queue.Queue = queue.Queue(maxsize=100_000)
+        self._stage_metrics = StageMetrics()
+        self._broker_io_busy = False
+        self._capture_required = False
+        self._event_enqueued_at = {}
+        self._event_metrics_lock = Lock()
+        self._event_drop_counts = defaultdict(int)
+        self._event_entry_lag_sec = 0.0
         self._shutdown = False
+        self._market_clock = None
+        self._pipeline_protection_pending = {}
         self._max_bars_per_symbol = 1000
         self._session_bar_limit = 1000  # full extended session (~4 AM–8 PM ET)
         self._max_ticks_per_symbol = 200
@@ -180,24 +202,31 @@ class AlpacaRunner:
         from daytrading.data.bar_aggregator import BarAggregator
         from daytrading.strategy.execution_timer import ExecutionTimer
         self._bar_aggregator = BarAggregator()
-        self._exec_timer = ExecutionTimer(max_wait_bars=3, enabled=True)
+        self._exec_timer = ExecutionTimer(
+            max_wait_bars=3, enabled=True, on_cancel=self._record_execution_timer_cancel,
+            on_observation=self._record_execution_timer_observation,
+            on_release=self._record_execution_timer_release,
+        )
         self._timed_signal_queue: deque = deque()
 
         self._skip_counts: Dict[str, int] = defaultdict(int)
         self._SKIP_THRESHOLD = 10  # remove after 10 consecutive skips (~10 min)
         self._CLEANUP_EVERY = 10   # run cleanup every 10 cycles
         self._new_data = Event()
+        self._market_wakeup = Event()
         self._hub = DashboardHub()
+        from daytrading.runtime_state import request_checkpoint, release_checkpoint
+        self._hub.paper_handover_callback = lambda freeze=False: request_checkpoint(self, freeze=freeze)
+        self._hub.paper_handover_release = lambda: release_checkpoint(self)
         self._journal = TradingJournal()
-        self._entry_policy = EntryPolicy(
-            guard=lambda *args, **kwargs: check_entry_quality(*args, **kwargs),
-        )
+        self._entry_policy = pipeline._entry_policy
         self._entry_executor = EntryExecutor(self._entry_policy, self._record_entry_decision)
         try:
             self._pipeline._entry_policy = self._entry_policy
         except Exception:
             pass
         self._hub.journal = self._journal
+        report_safely(self._hub.restore_entry_history)
         self._hub._broker = self._broker
         self._hub._exit_manager = self._pipeline.exit_manager
         self._watchlist_data: List[dict] = []
@@ -297,6 +326,7 @@ class AlpacaRunner:
         self._hod_watchlist_min_rel_vol = 1.0
         self._hod_watchlist_min_bar_rvol = 1.2
         self._news_pinned: Set[str] = set()
+        self._news_pinned_at: Dict[str, datetime] = {}
         self._hod_alert_store = None
         self._hod_tick_tracker = None
         self._hod_bar_scanner = None
@@ -309,6 +339,7 @@ class AlpacaRunner:
         self._hod_seed_pending: Set[str] = set()
         self._hod_seed_retries: Dict[str, int] = {}  # symbol -> retry count
         self._hod_seed_blacklist: Set[str] = set()  # symbols that always fail
+        self._hod_seed_last_attempt: Dict[str, float] = {}
         self._hod_seed_lock = Lock()
         self._hod_seed_event = Event()
         self._hod_seed_thread: Optional[Thread] = None
@@ -328,6 +359,7 @@ class AlpacaRunner:
         self._pool_refresh_thread: Optional[Thread] = None
         self._pool_candidates_ready = False
         self._after_hours_enabled = False
+        self._entry_window_checker = self._is_in_trading_window
         self._hod_hydrate_batch_max = 15
         self._bar_fetch_batch_delay_sec = 0.5
         self._hydrate_paused_until: float = 0.0
@@ -392,6 +424,119 @@ class AlpacaRunner:
         self._hod_seed_processed_this_minute = 0
         self._last_session_reset_day: Optional[str] = None
         self._nightly_analysis_day: Optional[str] = None
+        if hasattr(self._broker, "set_execution_callbacks"):
+            self._broker._strategy_admission = self._broker_strategy_admission
+            self._broker._order_audit = lambda row: self._journal.record('order_lineage', row)
+            self._broker.set_execution_callbacks(
+                self._on_conflicting_stop_fill,
+                lambda symbol: self._new_entries_blocked(symbol, "BROKER FINAL ENTRY"),
+            )
+
+        if isinstance(self._broker, AlpacaBroker):
+            self._broker._protection_breached_handler = self._on_protection_breached
+
+        if hasattr(self._broker, "set_entry_lifecycle_callbacks"):
+            self._broker.set_entry_lifecycle_callbacks(
+                self._on_entry_progress, self._on_entry_wait, self._on_entry_recovered)
+
+    def _broker_strategy_admission(self, signal, order, price):
+        policy = self._pipeline._entry_policy
+        hit = getattr(signal, 'scan_result', None)
+        if not policy.micro_pullback_only and (hit is None or hit.scanner_name not in ('micro_pullback_reclaim','prepared_reclaim_tick')):
+            return None
+        # Direct HOD/momentum/retry paths without an original micro signal fail
+        # closed. Decreasing-position orders are exempt in the broker adapter.
+        from daytrading.strategy.submission import final_check, persist
+        now = self._micro_market_now()
+        quotes = list(self._quote_buffer.get(order.symbol, ()))
+        verifier = getattr(self._pipeline, '_verifiers', {}).get(hit.scanner_name) if hit else None
+        ticks = list(getattr(verifier, '_tick_buffer', {}).get(order.symbol, ()))
+        reason,evidence = final_check(signal,order,policy=policy,
+            bars=list(self._bar_buffer.get(order.symbol, ())),quote=quotes[-1] if quotes else None,
+            ticks=ticks,now=now,limits=getattr(verifier,'limits',None),boundary='broker_submission')
+        journal = getattr(self, '_journal', None)
+        reason = persist(evidence, journal.record if journal else None, self._micro_market_now) or reason
+        if reason:
+            self._record_entry_reject(signal, stage='broker_admission', reason=reason, source='broker')
+        return reason
+
+    def _submit_partial_protected_entry(self, signal, order, bar):
+        from daytrading.execution.partial_entry import submit
+        return submit(self, signal, order, bar)
+
+    @durable_operation
+    def _on_entry_progress(self, order_id, order, fill):
+        from daytrading.execution.partial_entry import observe
+        return observe(self, order_id, order, fill)
+
+    def _drain_partial_entry_events(self):
+        from daytrading.execution.partial_entry import drain_pending_events
+        return drain_pending_events(self)
+
+    def _on_entry_wait(self, symbol):
+        from daytrading.execution.partial_entry import waiting
+        return waiting(self, symbol)
+
+    @durable_operation
+    def _on_entry_recovered(self, symbol):
+        from daytrading.execution.partial_entry import recovered
+        return recovered(self, symbol)
+
+    def _observe_final_entry_fill(self, signal, fill):
+        from daytrading.execution.partial_entry import entries, observe
+        row = entries(self).get(signal.symbol)
+        if row is not None:
+            observe(self, row.order_id, row.order, fill)
+
+    def _finish_partial_entry(self, signal):
+        from daytrading.execution.partial_entry import finish
+        return finish(self, signal)
+
+    def _retry_partial_entry_finalization(self):
+        for row in list(getattr(self, "_partial_entries", {}).values()):
+            symbol = row.order.symbol
+            if row.active_submit or symbol in getattr(self._broker, "_unsettled_orders", {}):
+                continue
+            try:
+                self._on_entry_wait(symbol)
+                self._finish_partial_entry(row.signal)
+            except Exception:
+                logger.exception("CRITICAL: first-partial finalization pending for %s; new entries blocked", symbol)
+
+    @durable_operation
+    def _on_conflicting_stop_fill(self, fill: Fill, order_id: str, remaining: float) -> None:
+        """Account for a stop execution observed while cancelling an add conflict."""
+        tracked = self._pipeline.exit_manager.tracked.get(fill.symbol)
+        position = self._pipeline.portfolio.positions.get(fill.symbol)
+        entry_price = tracked.entry_price if tracked is not None else (position.avg_price if position else 0.0)
+        from daytrading.execution.broker import apply_fill
+        # Order leaves are not position inventory. Only the unseen execution
+        # delta changes cash/inventory, before independently reporting the fill.
+        apply_fill(self._pipeline.portfolio, fill)
+        if entry_price <= 0:
+            entry_price = self._lookup_entry_price_from_orders(fill.symbol)
+        self._record_trade_exit(fill, entry_price, "broker_stop_during_cancel")
+
+    def _on_protection_breached(self, symbol, quantity, stop, price):
+        from daytrading.exits.manager import ExitIntent
+        manager = self._pipeline.exit_manager
+        if symbol not in manager.tracked:
+            manager.restore_known_lifecycle(symbol, quantity)
+        pos = manager.tracked.get(symbol)
+        if pos is None:
+            # Do not manufacture an ordinary strategy lifecycle for unknown
+            # exposure; broker reconciliation must adopt it explicitly first.
+            self._pipeline_protection_pending = getattr(self, '_pipeline_protection_pending', {})
+            self._pipeline_protection_pending[symbol] = (quantity, stop)
+            return
+        pos.remaining_qty = quantity
+        if pos.exit_intent is None or not pos.exit_intent.liquidate:
+            pos.exit_intent = ExitIntent('stop_loss: broker protection breached',
+                                         datetime.now(timezone.utc), quantity, True)
+        state = pos.micro_exit_state
+        if state is not None:
+            state.pending_reason = 'stop_loss'
+        self._quote_exit_due = True
 
     def _market_data_service(self) -> MarketDataService:
         return _ensure_market_data_service(self)
@@ -465,11 +610,22 @@ class AlpacaRunner:
             cfg.float_cache_ttl_days,
         )
 
-        pipeline = create_scalping_pipeline(
+        from daytrading.replay.engine import shared_pipeline
+        from daytrading.strategy.scalping.paper_reclaim_rollout import ENABLED as paper_reclaim_enabled
+        pipeline = shared_pipeline(
+            broker=broker,
+            prepared_reclaim_enabled=bool(cfg.alpaca_paper and paper_reclaim_enabled),
+            coordinated_micro_flow_enabled=(os.getenv("DAYTRADING_COORDINATED_MICRO_FLOW", "false").lower()=="true"),
+            unified_micro_entry_enabled=(os.getenv("DAYTRADING_UNIFIED_MICRO_ENTRY", "false").lower()=="true"),
+            micro_pullback_only_enabled=(os.getenv('DAYTRADING_MICRO_PULLBACK_ONLY', os.getenv('DAYTRADING_UNIFIED_MICRO_ENTRY', 'false')).lower()=='true'),
+            micro_minimum_room_r=float(os.getenv('DAYTRADING_MICRO_MINIMUM_ROOM_R', '1.0')),
             initial_cash=acct["cash"],
             commission_per_share=cfg.commission_per_share,
             min_price=cfg.min_price,
             max_price=cfg.max_price,
+            entry_patterns=(tuple(x.strip() for x in os.environ["DAYTRADING_ENTRY_PATTERNS"].split(",") if x.strip())
+                            if "DAYTRADING_ENTRY_PATTERNS" in os.environ else None),
+            max_entry_risk_pct=cfg.strategy.max_entry_risk_pct,
             late_pullback_max_hod_pct=cfg.strategy.late_pullback_max_hod_pct,
             late_pullback_max_hod_other_pct=cfg.strategy.late_pullback_max_hod_other_pct,
             fresh_vwap_reclaim_scout_enabled=cfg.strategy.fresh_vwap_reclaim_scout_enabled,
@@ -534,8 +690,8 @@ class AlpacaRunner:
         scanner = WatchlistScanner(
             api_key=cfg.alpaca_api_key,
             secret_key=cfg.alpaca_secret_key,
-            min_price=scanner_min_price,
-            max_price=cfg.hod_momentum_max_price,
+            min_price=cfg.min_price,
+            max_price=cfg.max_price,
             min_volume=10_000,
             premarket_min_volume=1_000 if _surge_disc else 10_000,
             min_change_pct=2.0,
@@ -586,7 +742,9 @@ class AlpacaRunner:
         runner._hod_bar_pool = hod_bar_pool
         runner._hod_watchlist_ttl_minutes = cfg.hod_momentum_watchlist_ttl_minutes
         runner._watchlist_pinned = pinned
-        runner._max_watchlist = max(1, cfg.max_watchlist_symbols)
+        runner._max_watchlist = max(1, min(cfg.max_watchlist_symbols, 30) if cfg.alpaca_feed.lower() == "iex" else cfg.max_watchlist_symbols)
+        if len(watchlist) > runner._max_watchlist:
+            raise ValueError("Initial watchlist exceeds feed subscription capacity")
         runner._scanner = scanner
         runner._sip_feed = cfg.alpaca_feed.lower() == "sip"
         runner._news_checker = news_checker
@@ -717,7 +875,15 @@ class AlpacaRunner:
                 "HOD-only mode: trading watchlist follows alert board; RT mover scanner off",
             )
 
+        from daytrading.replay.engine import attach_capture
+        attach_capture(runner, cfg)
         return runner
+
+    def _scan_discovery(self, method: str, **kwargs):
+        """Shared native discovery; SDK observations are the I/O boundary."""
+        if method not in ('scan', 'scan_candidates'):
+            raise ValueError('Unsupported discovery operation')
+        return getattr(self._scanner, method)(**kwargs)
 
     @staticmethod
     def build_float_filtered_hod_pool(
@@ -961,7 +1127,7 @@ class AlpacaRunner:
             return
         batch = need[: self._hod_hydrate_batch_max]
         logger.info("HOD bar pool: hydrating %d new symbols", len(batch))
-        self._hub.add_log("INFO", "HOD bar pool hydrating {} symbols".format(len(batch)))
+        report_safely(self._hub.add_log, "INFO", "HOD bar pool hydrating {} symbols".format(len(batch)))
         try:
             bars_by_symbol = self._fetch_session_bars(batch)
             prior_stats = self._fetch_prior_day_stats(batch)
@@ -971,6 +1137,9 @@ class AlpacaRunner:
                         BarsLoadedEvent(bars_by_symbol, prior_stats)
                     )
                 except queue.Full:
+                    engine = getattr(self, '_session_engine', None)
+                    if engine is not None:
+                        engine.recorder.fail('derived event queue overflow')
                     pass
         except Exception as exc:
             logger.warning("HOD pool hydrate failed: %s", exc)
@@ -994,14 +1163,14 @@ class AlpacaRunner:
     def _run_pool_refresh_inner(self, *, full_scan: bool = False) -> None:
         self._scanner._is_premarket = self._market_phase() == "PRE-MARKET"
         if full_scan or not self._pool_candidates_ready:
-            scan_data = self._scanner.scan()
+            scan_data = self._scan_discovery('scan')
             self._pool_candidates_ready = True
         else:
-            scan_data = self._scanner.scan_candidates()
+            scan_data = self._scan_discovery('scan_candidates')
 
         if scan_data:
             self._watchlist_data = scan_data
-            self._hub.on_watchlist_scan(scan_data)
+            report_safely(self._hub.on_watchlist_scan, scan_data)
 
         ranked = self.build_float_filtered_hod_pool(
             scan_data,
@@ -1031,7 +1200,7 @@ class AlpacaRunner:
             if need:
                 batch = need[: self._hod_hydrate_batch_max]
                 logger.info("HOD bar pool: hydrating %d new symbols", len(batch))
-                self._hub.add_log("INFO", "HOD bar pool hydrating {} symbols".format(len(batch)))
+                report_safely(self._hub.add_log, "INFO", "HOD bar pool hydrating {} symbols".format(len(batch)))
                 bars_by_symbol = self._fetch_session_bars(batch)
                 prior_stats = self._fetch_prior_day_stats(batch)
 
@@ -1040,6 +1209,9 @@ class AlpacaRunner:
                 PoolRefreshEvent(list(self._hod_bar_pool), bars_by_symbol, prior_stats)
             )
         except queue.Full:
+            engine = getattr(self, '_session_engine', None)
+            if engine is not None:
+                engine.recorder.fail('derived event queue overflow')
             pass
 
         logger.info(
@@ -1049,7 +1221,7 @@ class AlpacaRunner:
             len(added),
             len(removed),
         )
-        self._hub.add_log(
+        report_safely(self._hub.add_log,
             "INFO",
             "HOD pool refresh [{}]: {} symbols ({} added, {} removed)".format(
                 self._market_phase(), len(self._hod_bar_pool), len(added), len(removed),
@@ -1091,6 +1263,8 @@ class AlpacaRunner:
             return
         self._prune_hot_watch()
         tracked = set(self._hod_bar_pool) | set(self._watchlist) | _ensure_market_data_service(self).hot_watch_keys()
+        flow=getattr(getattr(self,'_pipeline',None),'_coordinated_micro_flow',None)
+        if flow is not None:tracked.update(flow.requested_symbols(datetime.now(timezone.utc)))
         self._hod_tick_tracker.set_tracked_symbols(tracked)
         self._hod_tick_tracker.cleanup_stale()
         self._stream.set_trade_filter(tracked)
@@ -1145,11 +1319,54 @@ class AlpacaRunner:
                 "pause_state": self._candidate_hydration_pause_state,
                 "process_batch": self._process_candidate_hydration_batch,
                 "publish_status": self._publish_candidate_hydration_status,
+                "run_step": self._candidate_hydration_step,
             },
             daemon=True,
             name="candidate-hydration",
         )
         self._candidate_hydrate_thread.start()
+
+    def _candidate_hydration_step(self):
+        """Capture queue selection and processing as one native operation."""
+        if getattr(getattr(self,'_pipeline',None),'_coordinated_micro_flow',None) is not None:
+            self._sync_micro_preparation_subscriptions()
+        service = _ensure_market_data_service(self)
+        paused, processed = service.candidate_iteration(
+            getattr(self, '_candidate_paused_for_entry', False),
+            self._candidate_hydration_pause_state,
+            self._process_candidate_hydration_batch,
+            self._publish_candidate_hydration_status)
+        self._candidate_paused_for_entry = paused
+        return processed
+
+    def _sync_micro_preparation_subscriptions(self):
+        """Worker-only data subscriptions; never promote execution eligibility."""
+        flow=getattr(getattr(self,'_pipeline',None),'_coordinated_micro_flow',None)
+        if flow is None:return False
+        paused,_=self._candidate_hydration_pause_state()
+        if paused or getattr(getattr(self,'_hub',None),'trading_paused',True) is not False:return False
+        now=datetime.now(timezone.utc)
+        prior=getattr(self,'_micro_preparation_synced_at',None)
+        if prior is not None and (now-prior).total_seconds()<1:return False
+        self._micro_preparation_synced_at=now
+        desired=set(flow.requested_symbols(now))
+        owned=set(getattr(self,'_micro_preparation_quote_owned',()))
+        native=set(getattr(self,'_watchlist_set',()))|_ensure_market_data_service(self).hot_watch_keys()|set(self._pipeline.portfolio.positions)
+        release=owned-desired-native
+        if release and not self._stream.unsubscribe_quotes(sorted(release)):
+            flow.counts['subscription_release_failures']+=1;return False
+        owned.intersection_update(desired-native)
+        additions=desired-native-owned
+        if additions:
+            try:
+                self._stream.subscribe(sorted(additions),bars=False,quotes=True,trades=False)
+                self._stream.flush_pending_subscriptions()
+            except Exception:
+                flow.counts['subscription_request_failures']+=1;return False
+            owned.update(additions)
+        self._micro_preparation_quote_owned=owned
+        self._sync_tick_tracker_pool()
+        return bool(additions or release)
 
     def _candidate_hydration_priority(self, mover: Dict) -> int:
         sym = str(mover.get("symbol", "")).upper()
@@ -1181,7 +1398,7 @@ class AlpacaRunner:
                 queued += 1
             else:
                 try:
-                    self._hub.on_candidate_hydration(dropped=1)
+                    report_safely(self._hub.on_candidate_hydration, dropped=1)
                 except Exception:
                     pass
                 logger.debug("Candidate hydration skipped/dropped %s", sym)
@@ -1190,7 +1407,7 @@ class AlpacaRunner:
                 "Candidate hydration queued %d movers from %s", queued, source,
             )
             try:
-                self._hub.on_candidate_hydration(
+                report_safely(self._hub.on_candidate_hydration,
                     queued=queued,
                     pending=_ensure_market_data_service(self).candidate_pending_size(),
                     last_source=source,
@@ -1225,7 +1442,7 @@ class AlpacaRunner:
 
     def _publish_candidate_hydration_status(self, **payload) -> None:
         try:
-            self._hub.on_candidate_hydration(**payload)
+            report_safely(self._hub.on_candidate_hydration, **payload)
         except Exception:
             pass
 
@@ -1269,7 +1486,7 @@ class AlpacaRunner:
         return vol >= 5.0 * max(baseline, 1.0)
 
     def _run_fast_scan(self) -> None:
-        """Quick rescan of cached candidates to find new movers."""
+        """Find fresh movers across eligible equities, including outside the pool."""
         if self._scanner is None:
             return
         phase = self._market_phase()
@@ -1283,7 +1500,12 @@ class AlpacaRunner:
 
         t0 = time.time()
         self._scanner._is_premarket = phase == "PRE-MARKET"
-        candidates = self._scanner.scan_candidates(readonly=True)
+        # A quiet name may have failed the previous full scan's minute-volume
+        # filter. Rescanning only that filtered list leaves its first move
+        # invisible until the ten-minute pool rebuild (SPRC, 2026-10-15).
+        # Reuse the cached eligible asset inventory, but fetch fresh snapshots
+        # across it. Do not replace the pool-refresh worker's candidate cache.
+        candidates = self._scan_discovery('scan_candidates', full_universe=True, readonly=True)
 
         current_pool = set(self._hod_bar_pool)
         surge_on = os.environ.get("DAYTRADING_VOLUME_SURGE_DISCOVERY", "").strip().lower() in (
@@ -1341,13 +1563,18 @@ class AlpacaRunner:
 
         total_new = len(new_movers)
         process_movers = new_movers[: self._fast_scan_process_max]
-        for c in new_movers:
-            self._fast_scan_known.add(c["symbol"])
-
         try:
             self._event_queue.put_nowait(FastScanEvent(process_movers))
         except queue.Full:
-            pass
+            engine = getattr(self, '_session_engine', None)
+            if engine is not None:
+                engine.recorder.fail('derived event queue overflow')
+            logger.warning("Fast discovery queue full; %d movers remain retryable", total_new)
+            return
+        # Only acknowledge the batch actually handed off. Overflow candidates
+        # and queue failures must remain discoverable on the next pass.
+        for c in process_movers:
+            self._fast_scan_known.add(c["symbol"])
 
         logger.info(
             "Fast scan: %d new movers in %.1fs, processing top %d — %s",
@@ -1356,7 +1583,7 @@ class AlpacaRunner:
             len(process_movers),
             ", ".join(c["symbol"] for c in process_movers[:10]),
         )
-        self._hub.add_log(
+        report_safely(self._hub.add_log,
             "INFO",
             "Fast scan: {} new movers, processing top {} — {}".format(
                 total_new,
@@ -1402,6 +1629,7 @@ class AlpacaRunner:
             sub2_min_day_volume=cfg.hod_sub2_momentum_min_day_volume,
             sub2_max_float=cfg.hod_sub2_momentum_max_float,
             debug=cfg.hod_scanner_debug,
+            on_qualification=self._on_hod_qualification,
         )
 
         if cfg.hod_momentum_former_momo_enabled:
@@ -1465,6 +1693,21 @@ class AlpacaRunner:
         except Exception:
             return None
 
+    def _on_hod_qualification(self, row: dict) -> None:
+        # Owner-thread callback from a fresh full HOD qualification. This does
+        # not submit/arm an entry. Watch admission keeps its existing liquidity checks.
+        if row.get('alert_name') not in getattr(self, '_hod_entry_gate_alerts', frozenset()):
+            return
+        at = self._parse_hod_alert_time(row.get('qualified_at'))
+        if at is None or at.tzinfo is None:
+            return
+        previous = self._hod_active.get(row['symbol'])
+        if previous is None or at > previous:
+            self._hod_active[row['symbol']] = at
+            if self._is_tradeable_hod_watchlist_alert(row):
+                self._hod_tradeable_alert_at[row['symbol']] = at
+            report_safely(self._journal.record, 'hod_qualification', row)
+
     def _on_hod_alerts_changed(self, alerts: List[dict]) -> None:
         gate_alerts = getattr(self, "_hod_entry_gate_alerts", frozenset())
         for row in alerts:
@@ -1490,12 +1733,12 @@ class AlpacaRunner:
                     float(row.get("bar_rvol") or 0.0),
                 )
             alert_name = row.get("alert_name", "")
-            if alert_name in gate_alerts:
+            if alert_name in gate_alerts and row.get("source") != "bar":
                 prev_active = self._hod_active.get(sym)
                 if prev_active is None or alert_ts > prev_active:
                     self._hod_active[sym] = alert_ts
             self._maybe_arm_warrior_from_hod_alert(row)
-        self._hub.on_hod_momentum_alerts(alerts)
+        report_safely(self._hub.on_hod_momentum_alerts, alerts)
         self._sync_watchlist_to_hod_alerts()
 
     def _maybe_arm_warrior_from_hod_alert(self, row: dict) -> None:
@@ -1612,7 +1855,7 @@ class AlpacaRunner:
         if ts is None:
             return False
         elapsed = (datetime.now(timezone.utc) - ts).total_seconds()
-        return elapsed < self._hod_alert_ttl_minutes * 60
+        return 0 <= elapsed < self._hod_alert_ttl_minutes * 60
 
     def _prune_hot_watch(self) -> None:
         service = _ensure_market_data_service(self)
@@ -1635,7 +1878,7 @@ class AlpacaRunner:
                     meta["reason"] = refresh_reason
                     service.hot_watch_set(sym, meta)
                     changed = True
-                    self._journal.record("hot_watch", {
+                    report_safely(self._journal.record, "hot_watch", {
                         "symbol": sym,
                         "stage": "setup_refresh",
                         "reason": refresh_reason,
@@ -1646,7 +1889,7 @@ class AlpacaRunner:
                     continue
                 service.hot_watch_delete(sym)
                 changed = True
-                self._journal.record("hot_watch", {
+                report_safely(self._journal.record, "hot_watch", {
                     "symbol": sym,
                     "stage": "expired",
                     "reason": "ttl expired",
@@ -1895,7 +2138,7 @@ class AlpacaRunner:
         return active_rows + candidate_rows[:remaining_slots]
 
     def _publish_hot_watch(self) -> None:
-        self._hub.on_hot_watch(self._hot_watch_snapshot())
+        report_safely(self._hub.on_hot_watch, self._hot_watch_snapshot())
         self._publish_warrior_watch()
 
     def _publish_warrior_watch(self) -> None:
@@ -1918,7 +2161,7 @@ class AlpacaRunner:
             scanner = signal.scan_result.scanner_name or ""
             pattern = str(signal.scan_result.criteria.get("pattern", "") or "")
         allowed = scanner in HOT_WATCH_PATTERNS or pattern in HOT_WATCH_PATTERNS
-        self._journal.record("hot_watch", {
+        report_safely(self._journal.record, "hot_watch", {
             "symbol": sym,
             "stage": "entry_gate",
             "allowed": allowed,
@@ -2041,7 +2284,7 @@ class AlpacaRunner:
             if oldest:
                 service.hot_watch_delete(oldest)
             if oldest:
-                self._journal.record("hot_watch", {
+                report_safely(self._journal.record, "hot_watch", {
                     "symbol": oldest,
                     "stage": "removed",
                     "reason": "max hot-watch symbols",
@@ -2079,7 +2322,7 @@ class AlpacaRunner:
         )
         self._ensure_streaming_symbols([sym])
         self._enqueue_hod_seed_symbols([sym])
-        self._journal.record("hot_watch", {
+        report_safely(self._journal.record, "hot_watch", {
             "symbol": sym,
             "stage": "promoted" if not already_active else "refreshed",
             "reason": reason,
@@ -2103,7 +2346,7 @@ class AlpacaRunner:
                 float(mover.get("volume", 0.0) or 0.0),
                 float(mover.get("score", 0.0) or 0.0),
             )
-            self._hub.add_log(
+            report_safely(self._hub.add_log,
                 "INFO",
                 "Hot watch +{} [{} {:.0f}m]: {}".format(
                     sym, mode, ttl_minutes, reason,
@@ -2265,25 +2508,32 @@ class AlpacaRunner:
             self._hod_seed_processed_this_minute = 0
         return max(0, self._hod_seed_max_per_minute - self._hod_seed_processed_this_minute)
 
+    def _hod_seed_step(self):
+        """One native background hydration step, also used by replay."""
+        if self._pool_refresh_in_progress or self._bar_hydrate_paused():
+            return
+        quota = self._hod_seed_rate_limit()
+        if quota <= 0:
+            return "quota"
+        batch = self._pull_hod_seed_batch(min(self._hod_seed_batch_size, quota))
+        if batch:
+            self._process_hod_seed_batch(batch)
+            self._hod_seed_processed_this_minute += len(batch)
+            return True
+
     def _hod_seed_worker_loop(self) -> None:
         while not self._shutdown:
             self._hod_seed_event.wait(timeout=2.0)
             self._hod_seed_event.clear()
             if self._shutdown:
                 break
-            if self._pool_refresh_in_progress or self._bar_hydrate_paused():
-                continue
-            quota = self._hod_seed_rate_limit()
-            if quota <= 0:
-                time.sleep(1.0)
-                continue
-            batch_size = min(self._hod_seed_batch_size, quota)
-            batch = self._pull_hod_seed_batch(batch_size)
-            if not batch:
-                continue
             try:
-                self._process_hod_seed_batch(batch)
-                self._hod_seed_processed_this_minute += len(batch)
+                processed = self._hod_seed_step()
+                if processed == "quota":
+                    time.sleep(1.0)
+                    continue
+                if not processed:
+                    continue
             except Exception as exc:
                 logger.warning("HOD seed batch failed: %s", exc)
             if self._bar_fetch_batch_delay_sec > 0:
@@ -2341,6 +2591,10 @@ class AlpacaRunner:
         """
         if self._bar_hydrate_paused():
             return
+        attempts = getattr(self, "_hod_seed_last_attempt", None)
+        if not isinstance(attempts, dict):
+            attempts = self._hod_seed_last_attempt = {}
+        now = time.monotonic()
         need: List[str] = []
         for raw in symbols:
             sym = raw.upper().strip()
@@ -2348,8 +2602,14 @@ class AlpacaRunner:
                 continue
             if sym in self._hod_seed_blacklist:
                 continue
-            if len(self._bar_buffer.get(sym, deque())) >= 10:
+            if sym in attempts and now - attempts[sym] < 60.0:
                 continue
+            if len(self._bar_buffer.get(sym, deque())) >= 10 and sym in self._prior_day_stats:
+                continue
+            # Sparse IEX sessions can legitimately contain fewer than ten bars.
+            # Record the attempt before I/O so another queued request cannot
+            # repeatedly fetch that same completed history every scanner cycle.
+            attempts[sym] = now
             need.append(sym)
         if not need:
             return
@@ -2358,19 +2618,24 @@ class AlpacaRunner:
             preview += ", ..."
         logger.info("HOD seed batch: loading %d symbols — %s", len(need), preview)
         try:
-            bars_by_symbol = self._fetch_session_bars(need)
-            prior_stats = self._fetch_prior_day_stats(need)
+            need_bars = [s for s in need if len(self._bar_buffer.get(s, deque())) < 10]
+            need_prior = [s for s in need if s not in self._prior_day_stats]
+            bars_by_symbol = self._fetch_session_bars(need_bars) if need_bars else {}
+            prior_stats = self._fetch_prior_day_stats(need_prior) if need_prior else {}
             if bars_by_symbol or prior_stats:
                 try:
                     self._event_queue.put_nowait(
                         BarsLoadedEvent(bars_by_symbol, prior_stats)
                     )
                 except queue.Full:
+                    engine = getattr(self, '_session_engine', None)
+                    if engine is not None:
+                        engine.recorder.fail('derived event queue overflow')
                     pass
             stream_syms = [s for s in need if s in self._watchlist_set]
             if stream_syms:
                 self._ensure_streaming_symbols(stream_syms)
-            failed = [s for s in need if s not in bars_by_symbol]
+            failed = [s for s in need_bars if s not in bars_by_symbol]
             if failed:
                 # Track retries — stop re-queuing symbols that always fail
                 retryable = []
@@ -2430,7 +2695,20 @@ class AlpacaRunner:
         """Symbols with a HOD alert within the watchlist TTL window."""
         now = datetime.now(timezone.utc)
         ttl_secs = self._hod_watchlist_ttl_minutes * 60
-        active: Set[str] = set(self._news_pinned)
+        # News is a discovery hint, not an exemption from watchlist expiry.
+        # A new mover/HOD admission can independently keep or re-add a symbol.
+        active: Set[str] = set()
+        news_times = getattr(self, "_news_pinned_at", {})
+        for sym in list(self._news_pinned):
+            pinned_at = news_times.get(sym)
+            age = ((now - pinned_at).total_seconds()
+                   if isinstance(pinned_at, datetime) and pinned_at.tzinfo else None)
+            if age is not None and 0 <= age < ttl_secs:
+                active.add(sym)
+            else:
+                self._news_pinned.discard(sym)
+                news_times.pop(sym, None)
+                logger.info("NEWS WATCH expired %s — needs a fresh mover/HOD admission", sym)
         tradeable_alerts = getattr(
             self,
             "_hod_tradeable_alert_at",
@@ -2483,15 +2761,15 @@ class AlpacaRunner:
         to_add = sorted(target - self._watchlist_set)
         to_remove = sorted(self._watchlist_set - target)
 
-        if to_add:
-            self._add_symbols_to_watchlist(to_add)
         if to_remove:
             self._remove_symbols_from_watchlist(to_remove)
+        if to_add:
+            self._add_symbols_to_watchlist(to_add)
         self._publish_trading_watchlist()
 
     def _publish_trading_watchlist(self) -> None:
         active_symbols = sorted(self._trade_symbol_set())
-        self._hub.on_trading_watchlist(
+        report_safely(self._hub.on_trading_watchlist,
             active_symbols,
             pinned=sorted(self._watchlist_pinned),
         )
@@ -2499,14 +2777,14 @@ class AlpacaRunner:
 
     def _publish_hod_alert_board(self) -> None:
         if self._hod_alert_store is not None:
-            self._hub.on_hod_momentum_alerts(self._hod_alert_store.snapshot())
+            report_safely(self._hub.on_hod_momentum_alerts, self._hod_alert_store.snapshot())
 
     def _ensure_streaming_symbols(self, symbols: Sequence[str]) -> None:
         """Queue live bar/quote/trade subscriptions for active symbols."""
         syms = [s.upper() for s in symbols if s]
         if not syms:
             return
-        self._stream.subscribe(syms, bars=True, quotes=True)
+        self._stream.subscribe(syms, bars=True, quotes=True, trades=True)
         if self._hod_tick_tracker:
             self._hod_tick_tracker.add_known_symbols(syms)
             self._stream.add_trade_filter_symbols(syms)
@@ -2516,6 +2794,7 @@ class AlpacaRunner:
 
     def _add_symbols_to_watchlist(self, symbols: Sequence[str]) -> None:
         new_symbols = [s for s in symbols if s not in self._watchlist_set]
+        new_symbols = new_symbols[:max(0, self._max_watchlist - len(self._watchlist))]
         if not new_symbols:
             return
         logger.info(
@@ -2526,7 +2805,7 @@ class AlpacaRunner:
         self._watchlist_set.update(new_symbols)
         self._ensure_streaming_symbols(new_symbols)
         self._enqueue_hod_seed_symbols(new_symbols)
-        self._hub.add_log("INFO", "HOD watchlist +{}".format(", ".join(new_symbols)))
+        report_safely(self._hub.add_log, "INFO", "HOD watchlist +{}".format(", ".join(new_symbols)))
 
         if self._news_checker:
             for sym in new_symbols:
@@ -2536,9 +2815,10 @@ class AlpacaRunner:
                     score, headlines = self._news_checker.get_sentiment(sym)
                     if score > 0:
                         self._news_pinned.add(sym)
+                        self._news_pinned_at[sym] = datetime.now(timezone.utc)
                         logger.info(
-                            "NEWS PIN %s: positive sentiment %.2f — keeping all day — %s",
-                            sym, score, headlines[:2],
+                            "NEWS WATCH %s: positive sentiment %.2f — expires within %.0fm — %s",
+                            sym, score, self._hod_watchlist_ttl_minutes, headlines[:2],
                         )
                 except Exception:
                     pass
@@ -2556,11 +2836,13 @@ class AlpacaRunner:
             self._quote_buffer.pop(sym, None)
             self._tick_buffer.pop(sym, None)
         if removed:
+            if hasattr(self._stream, "unsubscribe"):
+                self._stream.unsubscribe(removed)
             logger.info(
                 "WATCHLIST (no HOD alert): removed %d — %s — now %d: %s",
                 len(removed), removed, len(self._watchlist), self._watchlist,
             )
-            self._hub.add_log("INFO", "HOD watchlist -{}".format(", ".join(removed)))
+            report_safely(self._hub.add_log, "INFO", "HOD watchlist -{}".format(", ".join(removed)))
 
     def _load_prior_day_stats(self, symbols: Sequence[str]) -> None:
         if not symbols:
@@ -2787,12 +3069,49 @@ class AlpacaRunner:
             day_end = now_et.replace(hour=15, minute=30, second=0, microsecond=0)
         return day_start <= now_et <= day_end
 
+    def _is_in_pattern_scan_window(self, now_et: Optional[datetime] = None) -> bool:
+        """Observe patterns through regular close while orders use their own cutoff."""
+        now_et = now_et or self._now_et()
+        if not self._is_trading_day(now_et):
+            return False
+        start = now_et.replace(hour=4, minute=0, second=0, microsecond=0)
+        end = now_et.replace(hour=20 if getattr(self, "_after_hours_enabled", False) else 16,
+                             minute=0, second=0, microsecond=0)
+        return start <= now_et < end
+
+    def _micro_market_now(self):
+        clock = getattr(self, '_market_clock', None)
+        return clock.now() if clock is not None else None
+
+    def _start_market_clock(self):
+        if 'micro_pullback_reclaim' not in self._pipeline._verifiers:
+            return
+        from daytrading.data.market_clock import MarketClock
+        self._market_clock = MarketClock()
+        read = self._broker.client.get_clock
+        def refresh():
+            success = self._market_clock.synchronize(read)
+            status = self._market_clock.status()
+            engine = getattr(self, '_session_engine', None)
+            if engine is not None:
+                engine.capture_fact('clock_calibration', status)
+            logger.info('Market clock calibration: synchronized=%s offset=%s rtt=%s',
+                        success, status['offset_seconds'], status['round_trip_seconds'])
+        refresh()
+        def worker():
+            while not self._shutdown:
+                for _ in range(60):
+                    if self._shutdown:return
+                    time.sleep(1)
+                refresh()
+        Thread(target=worker,daemon=True,name='market-clock-calibration').start()
+
     def _connect_stream(self) -> None:
         """Connect the WebSocket stream."""
         self._stream.on_bar(self._on_bar)
         self._stream.on_quote(self._on_quote)
         self._stream.on_trade(self._on_stream_trade)
-        self._stream.subscribe(self._watchlist, bars=True, quotes=True)
+        self._stream.subscribe(self._watchlist, bars=True, quotes=True, trades=True)
         # Subscribe to SPY bars for market panic detection
         self._stream.subscribe(["SPY"], bars=True, quotes=False)
 
@@ -2803,7 +3122,9 @@ class AlpacaRunner:
             logger.info("HOD tick tape active — SIP trades for HOD breakout detection")
 
         import os, time as _time
-        _lock = os.path.join(os.path.dirname(__file__), ".stream_lock")
+        from daytrading.ml.artifacts import data_root
+        data_root().mkdir(parents=True, exist_ok=True)
+        _lock = str(data_root() / ".stream_lock")
         if os.path.exists(_lock):
             try:
                 age = _time.time() - os.path.getmtime(_lock)
@@ -2825,6 +3146,31 @@ class AlpacaRunner:
 
         self._stream.start(background=True)
 
+    def _wire_session_context(self) -> None:
+        if getattr(self._pipeline,'_coordinated_micro_flow',None) is not None and hasattr(self._broker,'set_entry_deadline_clock'):
+            self._broker.set_entry_deadline_clock(self._micro_market_now)
+        # Wire multi-timeframe support into the pipeline
+        self._pipeline._execution_timer = self._exec_timer
+        self._pipeline._bar_aggregator = self._bar_aggregator
+        for scanner in self._pipeline._scanners:
+            if hasattr(scanner, '_bar_aggregator'):
+                scanner._bar_aggregator = self._bar_aggregator
+            if getattr(scanner,'flow',None) is not None:
+                scanner._now=self._micro_market_now
+            if hasattr(scanner, '_clock_ready'):
+                scanner._clock_ready = lambda:self._micro_market_now() is not None
+        # Give verifiers access to the 5-min bar aggregator
+        for v in self._pipeline._verifiers.values():
+            if hasattr(v, '_clock_ready'):
+                v._clock_ready = lambda:self._micro_market_now() is not None
+            if hasattr(v, '_bar_aggregator'):
+                v._bar_aggregator = self._bar_aggregator
+            if hasattr(v, '_tick_buffer'):
+                v._tick_buffer = self._tick_buffer
+            if hasattr(v, '_quote_buffer'):
+                v._quote_buffer = self._quote_buffer
+
+
     def run(self) -> None:
         """Main loop: load history -> stream -> run cycles until shutdown."""
         self._setup_signals()
@@ -2841,7 +3187,7 @@ class AlpacaRunner:
             acct = self._broker.get_account()
             self._account_equity = float(acct.get("equity") or 0.0)
             self._account_equity_at = time.monotonic()
-            self._hub.on_startup(acct["cash"], acct["equity"], acct["buying_power"])
+            report_safely(self._hub.on_startup, acct["cash"], acct["equity"], acct["buying_power"])
             self._hub.starting_cash = acct["equity"]
             self._hub.total_pnl = 0.0
             logger.info(
@@ -2853,13 +3199,19 @@ class AlpacaRunner:
 
         # Load today's trade history into Recent Activity (P&L already set from equity)
         self._sync_trade_history()
+        from daytrading.execution.durability import initialize
+        from daytrading.ml.artifacts import data_root
+        initialize(self, data_root())
+        if getattr(self, '_execution_recovery_required', False):
+            self._service_broker_sync()
+
+        self._next_position_sync_at = time.monotonic()+3.0
 
         # Initialize AI Trade Analyzer
-        from daytrading.analytics.trade_analyzer import TradeAnalyzer
-        self._trade_analyzer = TradeAnalyzer(min_trades=3, max_block_trades=3)
+        self._initialize_trade_analysis()
 
         if self._watchlist_data:
-            self._hub.on_watchlist_scan(self._watchlist_data)
+            report_safely(self._hub.on_watchlist_scan, self._watchlist_data)
 
         self._publish_hot_watch()
         self._publish_trading_watchlist()
@@ -2867,7 +3219,7 @@ class AlpacaRunner:
 
         # Push market phase immediately so dashboard shows correct status
         phase = self._market_phase()
-        self._hub.on_market_status(phase != "CLOSED", False, phase)
+        report_safely(self._hub.on_market_status, phase != "CLOSED", False, phase)
 
         # Sync existing Alpaca positions into pipeline (survives restarts)
         self._sync_alpaca_positions()
@@ -2890,17 +3242,8 @@ class AlpacaRunner:
         if self._hod_bar_pool:
             self._hydrate_hod_bar_pool()
 
-        # Wire multi-timeframe support into the pipeline
-        self._pipeline._execution_timer = self._exec_timer
-        self._pipeline._bar_aggregator = self._bar_aggregator
-        # Give verifiers access to the 5-min bar aggregator
-        for v in self._pipeline._verifiers.values():
-            if hasattr(v, '_bar_aggregator'):
-                v._bar_aggregator = self._bar_aggregator
-            if hasattr(v, '_tick_buffer'):
-                v._tick_buffer = self._tick_buffer
-            if hasattr(v, '_quote_buffer'):
-                v._quote_buffer = self._quote_buffer
+        self._start_market_clock()
+        self._wire_session_context()
 
         # 2. Initial classification with historical data
         if self._bar_buffer:
@@ -2926,15 +3269,14 @@ class AlpacaRunner:
                 "Will auto-connect when trading hours begin."
             )
 
-        self._hub.on_market_status(phase != "CLOSED", stream_connected, phase)
+        report_safely(self._hub.on_market_status, phase != "CLOSED", stream_connected, phase)
 
         # 4. Main cycle loop
         # Runs on new bar data OR every poll_interval seconds (for pre-market/low-activity)
         poll_interval = 30.0  # run scanner every 30s even without new bars
         logger.info("Pipeline running — scanning every %.0fs (Ctrl+C to stop)", poll_interval)
-        cycle_count = 0
+        self._initialize_session_loop()
         last_market_check = 0.0
-        last_cycle_time = time.time()
         last_market_phase = phase
         if phase == "OPEN":
             self._last_session_reset_day = self._now_et().date().isoformat()
@@ -2943,66 +3285,7 @@ class AlpacaRunner:
             while not self._shutdown:
                 now_ts = time.time()
 
-                # Trading window: 4:00 AM ET through 3:30 PM (or 8:00 PM if after-hours on).
-                now_et = self._now_et()
-                in_trading_window = self._is_in_trading_window(now_et)
-                self._maybe_daily_session_reset(now_et, self._market_phase())
-                if getattr(self, "_after_hours_enabled", False):
-                    flatten_after = now_et.replace(
-                        hour=20, minute=0, second=0, microsecond=0,
-                    )
-                else:
-                    flatten_after = now_et.replace(
-                        hour=15, minute=30, second=0, microsecond=0,
-                    )
-
-                if not in_trading_window and not getattr(self, '_eod_flattened', False):
-                    if now_et > flatten_after and self._is_trading_day(now_et):
-                        tracked = self._pipeline.exit_manager.tracked
-                        if tracked:
-                            flatten_label = (
-                                "8:00 PM ET" if getattr(self, "_after_hours_enabled", False)
-                                else "3:30 PM ET"
-                            )
-                            logger.info(
-                                "%s — FLATTENING %d positions (no overnight holds)",
-                                flatten_label, len(tracked),
-                            )
-                            self._hub.add_log(
-                                "WARNING", "{} — closing all positions".format(flatten_label),
-                            )
-                            try:
-                                flatten_ts = datetime.now(timezone.utc)
-                                positions_to_log = {
-                                    sym: pos for sym, pos in tracked.items()
-                                }
-                                for sym in list(tracked.keys()):
-                                    self._clear_broker_stop(sym)
-                                    self._pipeline.exit_manager.untrack(sym)
-                                self._broker.close_all_positions()
-                                for sym, pos in positions_to_log.items():
-                                    alpaca_pos = self._broker.get_positions().get(sym)
-                                    exit_px = float(alpaca_pos["current_price"]) if alpaca_pos else pos.entry_price
-                                    qty = pos.remaining_qty or pos.original_qty
-                                    flatten_fill = Fill(
-                                        symbol=sym,
-                                        side=Side.SELL,
-                                        quantity=qty,
-                                        price=exit_px,
-                                        ts=flatten_ts,
-                                        commission=0.0,
-                                    )
-                                    self._record_trade_exit(
-                                        flatten_fill, pos.entry_price, "eod_flatten",
-                                    )
-                                    logger.info(
-                                        "EOD FLATTEN %s: entry=%.2f exit=%.2f qty=%.0f",
-                                        sym, pos.entry_price, exit_px, qty,
-                                    )
-                            except Exception as exc:
-                                logger.error("Error flattening positions: %s", exc)
-                        self._eod_flattened = True
-                        self._news_pinned.clear()
+                now_et, in_trading_window, in_pattern_window = self._session_iteration_context()
 
                 self._maybe_run_after_market_training(now_et, self._market_phase())
 
@@ -3016,7 +3299,7 @@ class AlpacaRunner:
                     if phase != last_market_phase:
                         logger.info("Market phase: %s", phase)
                     last_market_phase = phase
-                    self._hub.on_market_status(
+                    report_safely(self._hub.on_market_status,
                         phase != "CLOSED", stream_connected, phase,
                     )
                     if not stream_connected and phase != "CLOSED":
@@ -3026,89 +3309,274 @@ class AlpacaRunner:
                         )
                         self._connect_stream()
                         stream_connected = True
-                        self._hub.on_market_status(True, True, phase)
+                        report_safely(self._hub.on_market_status, True, True, phase)
 
-                wait_timeout = self._cycle_interval
-                next_entry_timeout = self._exec_timer.seconds_until_next_timeout()
-                if next_entry_timeout is not None:
-                    wait_timeout = min(wait_timeout, max(0.25, next_entry_timeout))
-                got_data = self._new_data.wait(timeout=wait_timeout)
+                wait_timeout = self._event_wait_timeout()
+                got_data = self._wait_for_market_events(wait_timeout)
                 if self._shutdown:
                     break
 
                 # Drain all events from the queue into main-thread-owned buffers
-                got_events = self._drain_events()
-                if got_events:
-                    got_data = True
-
-                loop_elapsed = time.time() - now_ts
-                if loop_elapsed > 5:
-                    logger.warning(
-                        "Main loop slow: %.1fs (got_data=%s)", loop_elapsed, got_data,
-                    )
-
-                # Always check exits every second for open positions
-                # This prevents stop-loss slippage from 30s cycle gaps
-                if self._pipeline.exit_manager.tracked:
-                    self._check_exits_only()
-
-                # Execute any timed entries that the 10-sec timer released
-                while self._timed_signal_queue:
-                    try:
-                        sig = self._timed_signal_queue.popleft()
-                        self._execute_timed_signal(sig)
-                    except IndexError:
-                        break
-
-                # Also check for execution timer timeouts
-                for timed_sig in self._exec_timer.check_timeouts():
-                    self._execute_timed_signal(timed_sig)
-
-                timed_entry_pending = self._has_pending_timed_entry()
-                if (
-                    in_trading_window
-                    and not timed_entry_pending
-                    and self._deferred_fast_scan_movers
-                ):
-                    movers = self._take_deferred_fast_scan_movers([])
-                    self._enqueue_candidate_hydration(
-                        movers,
-                        source="deferred fast scan",
-                    )
-
-                # Process instant breakout scalps from HOD tick alerts
-                if in_trading_window and not timed_entry_pending:
-                    self._process_breakout_scalps()
-                    self._process_momentum_burst_scalps()
-
-                should_run = False
-                if timed_entry_pending:
-                    if got_data:
-                        self._new_data.clear()
-                elif got_data:
-                    self._new_data.clear()
-                    should_run = True
-                elif now_ts - last_cycle_time >= poll_interval and self._bar_buffer:
-                    should_run = True
-
-                if should_run:
-                    cycle_count += 1
-                    last_cycle_time = now_ts
-                    if in_trading_window:
-                        self._run_one_cycle(cycle_count)
-                    else:
-                        # Outside trading window: still check exits but no new entries
-                        if self._pipeline.exit_manager.tracked:
-                            self._check_exits_only()
-                        self._hub.on_cycle_heartbeat(
-                            cycle_count,
-                            "new-entry pipeline paused by time window",
-                        )
+                self._process_market_turn(now_ts, got_data, in_trading_window, in_pattern_window)
         except KeyboardInterrupt:
             logger.info("Keyboard interrupt received")
         finally:
             self._shutdown_gracefully()
 
+    def _enforce_session_window(self, now_et: datetime, in_trading_window: bool) -> None:
+        """Shared native end-of-window protection/flattening boundary."""
+        if getattr(self, "_after_hours_enabled", False):
+            flatten_after = now_et.replace(
+                hour=20, minute=0, second=0, microsecond=0,
+            )
+        else:
+            flatten_after = now_et.replace(
+                hour=15, minute=30, second=0, microsecond=0,
+            )
+
+        if not in_trading_window and not getattr(self, '_eod_flattened', False):
+            if now_et > flatten_after and self._is_trading_day(now_et):
+                tracked = self._pipeline.exit_manager.tracked
+                if tracked:
+                    flatten_label = (
+                        "8:00 PM ET" if getattr(self, "_after_hours_enabled", False)
+                        else "3:30 PM ET"
+                    )
+                    logger.info(
+                        "%s — FLATTENING %d positions (no overnight holds)",
+                        flatten_label, len(tracked),
+                    )
+                    report_safely(self._hub.add_log,
+                        "WARNING", "{} — closing all positions".format(flatten_label),
+                    )
+                    try:
+                        from daytrading.exits.manager import ExitIntent
+                        flatten_ts = datetime.now(timezone.utc)
+                        for pos in tracked.values():
+                            if pos.exit_intent is None or not pos.exit_intent.liquidate:
+                                pos.exit_intent = ExitIntent('eod_flatten', flatten_ts, pos.remaining_qty, True)
+                        self._check_exits_only()
+                    except Exception as exc:
+                        logger.error("Error flattening positions: %s", exc)
+                self._eod_flattened = True
+                self._news_pinned.clear()
+                self._news_pinned_at.clear()
+
+    def _session_iteration_context(self):
+        """Shared clock/calendar boundary for paper and causal replay."""
+        self._service_position_refresh()
+        self._maybe_rollover_execution_store()
+        self._maybe_clear_execution_recovery()
+        sync_now = time.monotonic()
+        if sync_now >= getattr(self, '_next_position_sync_at', float('inf')):
+            self._service_broker_sync()
+            self._next_position_sync_at = time.monotonic()+3.0
+        now_et = self._now_et()
+        phase = self._market_phase()
+        self._maybe_daily_session_reset(now_et, phase)
+        in_trading_window = self._is_in_trading_window(now_et)
+        in_pattern_window = self._is_in_pattern_scan_window(now_et)
+        self._enforce_session_window(now_et, in_trading_window)
+        return now_et, in_trading_window, in_pattern_window
+
+    def _initialize_session_loop(self) -> None:
+        self._session_cycle_count = 0
+        self._session_last_cycle_time = time.time()
+
+    def _event_wait_timeout(self) -> float:
+        """Do not sleep with FIFO inputs remaining after a bounded drain."""
+        if not self._event_queue.empty():
+            return 0.0
+        timeout = self._cycle_interval
+        pending_refresh = getattr(self._broker, 'position_refresh_pending', None)
+        if callable(pending_refresh) and pending_refresh():
+            timeout = min(timeout, .05)  # Completion wakeup plus bounded no-tape fallback.
+        due = self._exec_timer.seconds_until_next_timeout()
+        timeout=min(timeout,max(0.25,due)) if due is not None else timeout
+        if (getattr(getattr(self,'_pipeline',None),'_coordinated_micro_flow',None) is not None
+                and getattr(getattr(self,'_hub',None),'trading_paused',True) is False):
+            books=[book for scanner in self._pipeline._scanners
+                   if (book:=getattr(scanner,'vwap_retries',None)) is not None
+                   and getattr(book,'flow',None) is not None]
+            # Unknown adapters keep the old path. Native empty books have no
+            # due time; avoid a clock observation that cannot change timeout.
+            if any(getattr(book,'rows',None) is None or book.rows for book in books):
+                now=self._micro_market_now()
+                if now is not None and self._is_in_pattern_scan_window(now.astimezone(ET)):
+                    for book in books:
+                        micro_due=book.seconds_until_due(now)
+                        if micro_due is not None:timeout=min(timeout,max(.001,micro_due))
+        return timeout
+
+    def _wait_for_market_events(self, timeout: float) -> bool:
+        """Wake on tape ingress without labelling a quote as a new minute bar."""
+        wakeup = getattr(self, '_market_wakeup', None)
+        if wakeup is None:
+            return self._new_data.wait(timeout=timeout)
+        # The complete handover adapter services its main-thread checkpoint
+        # through wait(). Preserve that hook before switching to tape wakeups.
+        got_data = self._new_data.wait(timeout=0)
+        # Clear before checking the FIFO: an event racing either check remains
+        # in the queue or sets this event before wait, so no wakeup is lost.
+        wakeup.clear()
+        if self._event_queue.empty():
+            wakeup.wait(timeout=timeout)
+        # Quote-by-quote wakeups otherwise keep the state-audited Python loop
+        # CPU-bound and starve its own receiver. Give it at most 10ms to collect
+        # a tiny fresh burst, only when fully flat/protection-clear. Never batch
+        # an aged/large FIFO or already-known bar/pending execution work. Every
+        # event stays in FIFO; the replay clock uses the same sleep boundary.
+        if (not got_data and not self._new_data.is_set()
+                and getattr(self, '_flat_tape_collection_safe', lambda: False)()
+                and self._fresh_small_tape_batch()):
+            time.sleep(0.010)
+        return got_data or self._new_data.is_set()
+
+    def _fresh_small_tape_batch(self) -> bool:
+        with self._event_queue.mutex:
+            if not 0 < len(self._event_queue.queue) <= 16:
+                return False
+            first = self._event_queue.queue[0]
+        enqueued = getattr(self, '_event_enqueued_at', {}).get(id(first))
+        if enqueued is None:
+            return False
+        return 0 <= time.monotonic() - enqueued <= 0.025
+
+    def _flat_tape_collection_safe(self) -> bool:
+        pipeline = getattr(self, '_pipeline', None)
+        if pipeline is None or getattr(getattr(self, '_hub', None), 'trading_paused', True) is not False:
+            return False
+        if (pipeline.exit_manager.tracked
+                or any(not pos.is_flat for pos in pipeline.portfolio.positions.values())
+                or getattr(self, '_partial_entries', {})
+                or getattr(self, '_pipeline_protection_pending', {})
+                or getattr(self, '_timed_signal_queue', ())
+                or getattr(self._exec_timer, 'pending_symbols', ())
+                or getattr(self, '_micro_dispatch_due', False)
+                or getattr(self._broker, '_safety_blocked', False) is True
+                or getattr(self._broker, '_position_sync_stale', False) is True):
+            return False
+        return True
+
+    def _process_market_turn(self, now_ts: float, got_data: bool,
+                             in_trading_window: bool, in_pattern_window: bool) -> None:
+        """One bounded FIFO/protection turn for both paper and replay.
+
+        Every original ingress, clock, external response and decision remains
+        recorded. Check complete state once after the existing drain/heartbeat
+        pair, rather than hashing it twice while they share the same thread.
+        The 128-event bound and early micro/protection yields are unchanged.
+        """
+        got_events = self._drain_events()
+        self._session_step(now_ts, got_data, got_events, in_trading_window, in_pattern_window,
+                           not self._event_queue.empty())
+
+    def _session_step(self, now_ts: float, got_data: bool, got_events: bool,
+                      in_trading_window: bool, in_pattern_window: bool,
+                      market_backlog: bool = False) -> None:
+        """One shared paper/replay heartbeat; all decisions use native state."""
+        poll_interval = 30.0
+        # Consume only the scheduling notification. The original scanner's due
+        # flag and confirmation evidence remain untouched until scanned.
+        fresh_priority = market_backlog and self._should_yield_for_micro()
+        self._micro_dispatch_due = False
+        self._latch_exit_timeouts()
+        self._service_position_refresh()
+        if any(getattr(getattr(s, 'vwap_retries', None), 'blocked', {}) for s in self._pipeline._scanners):
+            self._wake_confirmed_setups(self._entry_block_reason(None, 'RETRY_WAKE'), self._micro_market_now())
+        self._publish_runtime_metrics()
+        if getattr(self._broker, "_safety_blocked", False) is True:
+            if self._broker.recover_order_safety():
+                self._push_positions_from_alpaca()
+        self._retry_partial_entry_finalization()
+        self._retry_pipeline_protection()
+        if got_events:
+            got_data = True
+
+        loop_elapsed = time.time() - now_ts
+        if loop_elapsed > 5:
+            logger.warning(
+                "Main loop slow: %.1fs (got_data=%s)", loop_elapsed, got_data,
+            )
+
+        # Always check exits every second for open positions
+        # This prevents stop-loss slippage from 30s cycle gaps
+        self._quote_exit_due = False
+        if self._pipeline.exit_manager.tracked:
+            self._check_exits_only()
+
+        # Execute any timed entries that the 10-sec timer released
+        pending_gate_due = self._pending_entry_recheck_due()
+        while self._timed_signal_queue:
+            try:
+                self._dispatch_next_timed_signal()
+            except IndexError:
+                break
+
+        # Also check for execution timer timeouts
+        self._check_execution_timeouts()
+
+        # A bounded FIFO slice must return to protection/exits/timeouts even
+        # under a burst. Avoid spending catch-up time on broad discovery scans
+        # using a partially drained market frontier. Retain bar work for the
+        # first caught-up cycle; fresh original micro evidence keeps priority.
+        if market_backlog and not fresh_priority:
+            self._deferred_cycle_data = getattr(self, '_deferred_cycle_data', False) or got_data
+            self._backlog_maintenance_steps = getattr(self, '_backlog_maintenance_steps', 0) + 1
+            return
+        got_data = got_data or getattr(self, '_deferred_cycle_data', False)
+        self._deferred_cycle_data = False
+
+        timed_entry_pending = self._has_pending_timed_entry()
+        if (
+            in_trading_window
+            and not timed_entry_pending
+            and self._deferred_fast_scan_movers
+        ):
+            movers = self._take_deferred_fast_scan_movers([])
+            self._enqueue_candidate_hydration(
+                movers,
+                source="deferred fast scan",
+            )
+
+        # Process instant breakout scalps from HOD tick alerts
+        if in_trading_window and not timed_entry_pending:
+            self._process_breakout_scalps()
+            self._process_momentum_burst_scalps()
+
+        should_run = False
+        if timed_entry_pending:
+            if got_data:
+                self._new_data.clear()
+        elif got_data or pending_gate_due:
+            self._new_data.clear()
+            should_run = True
+        elif now_ts - self._session_last_cycle_time >= poll_interval and self._bar_buffer:
+            should_run = True
+
+        if should_run:
+            self._micro_scan_due = False  # Full cycle includes the micro scanner.
+            self._session_cycle_count += 1
+            self._session_last_cycle_time = now_ts
+            if in_pattern_window:
+                self._run_one_cycle(self._session_cycle_count, allow_entries=in_trading_window)
+            else:
+                # Outside trading window: still check exits but no new entries
+                if self._pipeline.exit_manager.tracked:
+                    self._check_exits_only()
+                report_safely(self._hub.on_cycle_heartbeat,
+                    self._session_cycle_count,
+                    "pattern scanning closed by time window; new entries closed",
+                )
+        elif ((getattr(self, '_micro_scan_due', False) or any(
+                  getattr(s,'needs_recheck',False) is True for s in self._pipeline._scanners))
+              and not timed_entry_pending
+              and in_pattern_window):
+            self._micro_scan_due = False
+            self._session_cycle_count += 1
+            # Preserve the normal scanners' cadence and retained setups.
+            self._run_one_cycle(self._session_cycle_count, allow_entries=in_trading_window,
+                                only_scanners=frozenset({'micro_pullback_reclaim', 'prepared_reclaim_tick'}))
     def _sync_trade_history(self) -> None:
         """Load today's closed orders into the dashboard and set daily P&L.
 
@@ -3123,6 +3591,9 @@ class AlpacaRunner:
             from daytrading.models import Fill, Side
 
             acct = self._broker.client.get_account()
+            scope = getattr(acct, 'id', None)
+            if scope is not None:
+                self._broker._account_scope = str(scope)
             alpaca_daily_pnl = float(acct.equity) - float(acct.last_equity)
 
             today_start = datetime.utcnow().replace(
@@ -3139,6 +3610,28 @@ class AlpacaRunner:
             )
             orders = self._broker.client.get_orders(filter=req)
 
+            if len(orders) >= 500:
+                self._execution_recovery_required = True
+                raise ValueError('Startup broker history may be truncated')
+            self._session_has_fills = any(float(o.filled_qty or 0)>0 and self._order_is_from_current_session(o) for o in orders)
+            self._legacy_synced_order_ids = {str(o.id) for o in orders}
+            self._legacy_sync_watermarks = {}
+            for observed in orders:
+                qty = float(observed.filled_qty or 0)
+                cost = qty*float(observed.filled_avg_price or 0)
+                if qty <= 0 or cost <= 0:
+                    continue
+                side = getattr(observed.side, 'value', observed.side)
+                side = 'buy' if 'buy' in str(side) else 'sell'
+                oid = str(observed.id)
+                self._legacy_sync_watermarks[oid] = (qty, cost)
+                scope = getattr(self._broker, '_account_scope', '')
+                key = (observed.symbol, side, scope+'/'+oid if scope else oid)
+                for owner, name in ((self, 'exit_report'), (self._pipeline, 'realized'),
+                                    (self._pipeline.portfolio, 'inventory'), (self._pipeline.portfolio, 'cash'),
+                                    (self._pipeline.exit_manager, 'exit_state')):
+                    states = owner.__dict__.setdefault('_fill_projections', {})
+                    states.setdefault(name, {})[key] = (qty, cost)
             buy_count = 0
             sell_count = 0
             # Build holdings from ALL orders (including prev days)
@@ -3163,9 +3656,9 @@ class AlpacaRunner:
                     all_holdings[o.symbol].append((qty, price))
                     if is_today:
                         side = Side.BUY
-                        fill = Fill(symbol=o.symbol, side=side, quantity=qty,
-                                    price=price, ts=fill_time, commission=0.0)
-                        self._hub.on_fill(fill, "entry")
+                        from daytrading.execution.fill_identity import observation
+                        fill = observation(o,o.symbol,side,fill_time,account_id=getattr(self._broker,'_account_scope',''))
+                        report_safely(self._hub.on_fill, fill, "entry")
                         buy_count += 1
                 else:
                     # LIFO match against all holdings (including overnight)
@@ -3188,9 +3681,9 @@ class AlpacaRunner:
 
                     entry_price = matched_cost / matched_qty if matched_qty > 0 else 0.0
                     side = Side.SELL
-                    fill = Fill(symbol=o.symbol, side=side, quantity=qty,
-                                price=price, ts=fill_time, commission=0.0)
-                    self._hub.on_exit_fill(fill, entry_price=entry_price,
+                    from daytrading.execution.fill_identity import observation
+                    fill = observation(o,o.symbol,side,fill_time,account_id=getattr(self._broker,'_account_scope',''))
+                    report_safely(self._hub.on_exit_fill, fill, entry_price=entry_price,
                                            skip_pnl_accum=True)
                     sell_count += 1
 
@@ -3220,8 +3713,11 @@ class AlpacaRunner:
         This ensures the bot won't re-enter stocks it already holds after a restart,
         and that stop losses are active for all existing positions.
         """
+        alpaca_positions = {}
         try:
             alpaca_positions = self._broker.get_positions()
+            if getattr(self._broker, "_position_sync_stale", False) is True:
+                return
             self._cleanup_accidental_shorts(alpaca_positions)
             rec = self._reconciler.reconcile(
                 alpaca_positions,
@@ -3245,21 +3741,56 @@ class AlpacaRunner:
 
     def _push_positions_from_alpaca(self) -> None:
         """Reconcile portfolio + exit manager with Alpaca (broker is source of truth)."""
+        if self._position_snapshot_uncertain():
+            return
+        epoch = getattr(self, "_entry_reconcile_epoch", 0)
         try:
+            before_read = self._position_reconcile_stamp()
+            context = self._position_refresh_context()
+            binder = getattr(self._broker, 'bind_position_refresh_owner', None)
+            if callable(binder):binder(context, getattr(self, '_market_wakeup', None))
             alpaca_positions = self._broker.get_positions()
+            if getattr(self, "_partial_entries", {}) or epoch != getattr(self, "_entry_reconcile_epoch", 0):
+                invalidate = getattr(self._broker, '_invalidate_position_cache', None)
+                if callable(invalidate):
+                    invalidate()
+                return  # SDK response crossed a partial-entry lifecycle boundary.
+            if getattr(self._broker, '_position_sync_stale', False) is True:
+                return
+            if before_read != self._position_reconcile_stamp():
+                invalidate = getattr(self._broker, '_invalidate_position_cache', None)
+                if callable(invalidate):
+                    invalidate()
+                return  # Never apply a broker snapshot across an entry/exit fill.
             self._cleanup_accidental_shorts(alpaca_positions)
             self._reconciler.reconcile(
                 alpaca_positions,
                 self._pipeline.portfolio,
                 self._pipeline.exit_manager,
             )
+            context = self._position_refresh_context()
+            acknowledge = getattr(self._broker, 'acknowledge_position_context', None)
+            if callable(acknowledge):acknowledge(context)
             prices = {
                 sym: float(data.get("current_price", data["avg_entry"]))
                 for sym, data in alpaca_positions.items()
             }
-            self._hub.on_position_update(self._pipeline.portfolio.positions, prices)
+            report_safely(self._hub.on_position_update, self._pipeline.portfolio.positions, prices)
         except Exception as exc:
+            invalidate = getattr(self._broker, "_invalidate_position_cache", None)
+            if callable(invalidate):invalidate()
             logger.debug("Position sync error: %s", exc)
+
+    def _position_reconcile_stamp(self):
+        """Local economic state before an asynchronous broker-position read."""
+        portfolio = self._pipeline.portfolio
+        return (
+            portfolio.cash,
+            tuple(sorted((sym, pos.quantity, pos.avg_price, getattr(pos, 'entry_ts', None))
+                         for sym, pos in portfolio.positions.items())),
+            tuple(sorted((sym, pos.remaining_qty, pos.entry_price, getattr(pos, 'entry_ts', None))
+                         for sym, pos in self._pipeline.exit_manager.tracked.items())),
+        )
 
     def _cleanup_accidental_shorts(self, broker_positions: Dict[str, dict]) -> None:
         """Cover unexpected broker shorts in this long-only strategy."""
@@ -3297,7 +3828,7 @@ class AlpacaRunner:
                 )
                 logger.error(msg)
                 if hasattr(self, "_hub"):
-                    self._hub.add_log("ERROR", msg)
+                    report_safely(self._hub.add_log, "ERROR", msg)
                 continue
 
             price = float(
@@ -3310,7 +3841,7 @@ class AlpacaRunner:
                 msg = f"ACCIDENTAL SHORT {symbol}: no valid cover price for {cover_qty:.0f} shares"
                 logger.error(msg)
                 if hasattr(self, "_hub"):
-                    self._hub.add_log("ERROR", msg)
+                    report_safely(self._hub.add_log, "ERROR", msg)
                 continue
 
             order = Order(symbol=symbol, side=Side.BUY, quantity=cover_qty)
@@ -3322,7 +3853,7 @@ class AlpacaRunner:
                 low=price,
                 close=price,
                 volume=0,
-            )
+             provenance=BarSource.PRICE_MARK)
             logger.warning(
                 "ACCIDENTAL SHORT COVER %s: buying %.0f shares to flatten broker short",
                 symbol, cover_qty,
@@ -3335,7 +3866,7 @@ class AlpacaRunner:
                 )
                 logger.error(msg)
                 if hasattr(self, "_hub"):
-                    self._hub.add_log("ERROR", msg)
+                    report_safely(self._hub.add_log, "ERROR", msg)
                 continue
 
             try:
@@ -3362,9 +3893,9 @@ class AlpacaRunner:
             )
             logger.warning(msg)
             if hasattr(self, "_hub"):
-                self._hub.add_log("WARNING", msg)
+                report_safely(self._hub.add_log, "WARNING", msg)
             if hasattr(self, "_journal"):
-                self._journal.record(
+                report_safely(self._journal.record,
                     "short_cleanup",
                     {
                         "symbol": symbol,
@@ -3394,8 +3925,101 @@ class AlpacaRunner:
             bars=bars,
         )
 
+    def _exit_prices(self, symbols: Sequence[str]) -> Dict[str, float]:
+        """Fresh bid/ask only. A failed price read never clears exit intent."""
+        quotes, bars = self._price_buffers_snapshot()
+        for symbol, quote in getattr(self, '_rest_exit_quotes', {}).items():
+            quotes.setdefault(symbol, []).append(quote)
+        tracked = self._pipeline.exit_manager.tracked
+        sides = {symbol: pos.side for symbol, pos in tracked.items()}
+        for symbol, pos in self._pipeline.portfolio.positions.items():
+            if symbol not in sides and not pos.is_flat:
+                sides[symbol] = Side.BUY if pos.quantity > 0 else Side.SELL
+        details = {}
+        now = self._micro_market_now() or datetime.now(timezone.utc)
+        prices = resolve_exit_prices(symbols, sides=sides, now=now,
+            quotes=quotes, bars=bars, diagnostics=details)
+        missing = [symbol for symbol in symbols if symbol not in prices]
+        reader = getattr(getattr(self, '_hist', None), 'get_latest_quotes', None)
+        if missing and callable(reader) and time.monotonic() >= getattr(self, '_exit_quote_retry_at', 0.):
+            self._exit_quote_retry_at = time.monotonic() + 1.
+            try:
+                fetched = reader(missing)
+                # Age is checked after the request, including transport delay.
+                now = self._micro_market_now() or datetime.now(timezone.utc)
+                cache = self.__dict__.setdefault('_rest_exit_quotes', {})
+                for symbol, quote in fetched.items():
+                    if symbol not in missing:
+                        continue
+                    quotes.setdefault(symbol, []).append(quote)
+                    if quote.ts.tzinfo is not None and (symbol not in cache or quote.ts >= cache[symbol].ts):
+                        cache[symbol] = quote
+                    guard = getattr(self._broker, '_slippage_guard', None)
+                    if liquidation_quote(quote, symbol, sides.get(symbol), now) is not None and guard is not None:
+                        guard.update_quote(quote)
+            except Exception as exc:
+                logger.warning('Exit awaiting fresh quotes for %s: %s', missing, exc)
+            prices = resolve_exit_prices(symbols, sides=sides, now=now, quotes=quotes, diagnostics=details)
+        self._exit_price_evidence = details
+        self._broker._exit_quote_evidence = details
+        return prices
+
+    def _latch_exit_timeouts(self):
+        """Checkpoint deadlines before any potentially blocking broker/price I/O."""
+        manager = self._pipeline.exit_manager
+        changed = manager.latch_timeouts(self._micro_market_now() or datetime.now(timezone.utc))
+        store = getattr(self, '_execution_store', None)
+        if changed and store is not None:
+            store.before_broker(dict(kind='timeout_intent', symbols=changed))
+        return changed
+
+    def _quote_exit_check_due(self, quote: Quote) -> bool:
+        """Cheap local scheduling only; no broker calls or exit-state mutation."""
+        if quote.symbol in getattr(self, '_partial_entries', {}):
+            return False  # Dedicated first-partial protection owns this state.
+        manager = self._pipeline.exit_manager
+        pos = manager._positions.get(quote.symbol)
+        if pos is None:
+            return False
+        if any(q.ts.tzinfo is not None and quote.ts.tzinfo is not None and q.ts > quote.ts
+               for q in self._quote_buffer.get(quote.symbol, ())):
+            return False  # Late ingress is retained, but cannot rewind the mark.
+        now = self._micro_market_now() or datetime.now(timezone.utc)
+        price = liquidation_quote(quote, quote.symbol, pos.side, now)
+        return price is not None and manager.quote_exit_due(quote.symbol, price)
+
     def _has_pending_timed_entry(self) -> bool:
         return bool(self._exec_timer.pending_symbols or self._timed_signal_queue)
+
+    def _publish_pending_entry_events(self):
+        book = getattr(self._pipeline, "pending_entries", None)
+        if book is None:
+            return
+        for hit, status, reason in book.drain_events():
+            signal = TradeSignal(symbol=hit.symbol, action=SignalAction.ENTER_LONG, quantity=0,
+                                 entry_price=hit.bars[-1].close, scan_result=hit)
+            decision = self._entry_policy.decision(symbol=hit.symbol, stage="pending_entry",
+                passed=status in ("confirming", "submitted"), signal=signal, reason=reason,
+                metadata={"status": status, "ttl_seconds": book.ttl_seconds})
+            self._record_entry_decision(decision, source="pending_entry")
+
+    def _pending_entry_recheck_due(self):
+        book = getattr(self._pipeline, "pending_entries", None)
+        if book is None:
+            return False
+        now = datetime.now(timezone.utc)
+        for symbol, row in list(book.rows.items()) + list(book.inflight.items()):
+            reason = row.invalid
+            if self._hub.trading_paused or not self._entry_window_checker():
+                reason = "new entries paused or trading window closed"
+            elif now >= row.expires:
+                reason = "pending setup expired after {}s".format(book.ttl_seconds)
+            if reason:
+                book.finish(symbol, "cancelled", reason)
+                self._exec_timer.cancel(symbol, reason=reason)
+                self._timed_signal_queue = deque(s for s in self._timed_signal_queue if s.symbol != symbol)
+        self._publish_pending_entry_events()
+        return book.due(datetime.now(timezone.utc))
 
     def _defer_fast_scan_movers(self, movers: List[Dict]) -> None:
         if not movers:
@@ -3435,17 +4059,38 @@ class AlpacaRunner:
         symbol: str,
         qty: float,
         stop_loss: Optional[float],
-    ) -> None:
+    ) -> bool:
         """Mark pending broker sync and place a broker-held stop order."""
         self._reconciler.mark_entry_pending(symbol)
         if not stop_loss or qty <= 0 or not hasattr(self._broker, "place_protective_stop"):
-            return
-        old_id = self._reconciler.pop_broker_stop_id(symbol)
-        if old_id:
-            self._broker.cancel_order_by_id(old_id)
-        oid = self._broker.place_protective_stop(symbol, qty, stop_loss)
+            return False
+        pending = getattr(self, '_pipeline_protection_pending', None)
+        if pending is None:
+            pending = self._pipeline_protection_pending = {}
+        pending[symbol] = (qty, stop_loss)
+        old_id = self._reconciler.get_broker_stop_id(symbol)
+        if hasattr(self._broker, "get_protective_stop_id"):
+            old_id = self._broker.get_protective_stop_id(symbol) or old_id
+        try:
+            reconcile = getattr(self._broker, 'reconcile_protective_stop', None)
+            if callable(reconcile) and (old_id or symbol in getattr(self._broker, '_failed_stop_updates', {})):
+                oid = reconcile(symbol, qty, stop_loss, known_id=old_id)
+            elif old_id and hasattr(self._broker, "replace_protective_stop"):
+                oid = self._broker.replace_protective_stop(symbol, old_id, qty, stop_loss)
+            else:
+                oid = self._broker.place_protective_stop(symbol, qty, stop_loss)
+        except Exception:
+            # The entry fill is already real. Keep accounting/reporting it while
+            # protection remains queued and all further entries are blocked.
+            logger.exception('Protective stop failed for %s; retry pending', symbol)
+            oid = None
         if oid:
             self._reconciler.set_broker_stop_id(symbol, oid)
+            pending.pop(symbol, None)
+        else:
+            report_safely(self._hub.add_log, 'ERROR',
+                'PROTECTION PENDING {}: retrying stop for {} shares; new entries blocked'.format(symbol, qty))
+        return bool(oid)
 
     def _on_position_opened(
         self,
@@ -3457,19 +4102,53 @@ class AlpacaRunner:
         cycle_num: Optional[int] = None,
     ) -> None:
         """Register exits, mark broker pending, place broker-held stop."""
+        book = getattr(self._pipeline, "pending_entries", None)
+        if book is not None:
+            book.finish(signal.symbol, "submitted", "entry filled through existing execution path")
         now = datetime.now(timezone.utc)
+        try:
+            from daytrading.ml.data_collector import bind_candidate_to_trade
+            bind_candidate_to_trade(signal.symbol, fill.ts)
+        except Exception:
+            logger.debug("Candidate/fill binding failed", exc_info=True)
         if signal.symbol not in self._pipeline.exit_manager.tracked:
             self._pipeline.exit_manager.register_from_signal(
-                signal, now, fill_price=fill.price,
+                signal, now, fill_price=fill.price, fill_quantity=fill.quantity,
             )
-        self._pipeline._original_sizes[signal.symbol] = signal.quantity
+        self._pipeline._original_sizes[signal.symbol] = fill.quantity
         tracked = self._pipeline.exit_manager.tracked.get(signal.symbol)
+        if tracked is not None:
+            tracked.entry_order_id = fill.order_id
         stop = (tracked.stop_loss if tracked else None) or signal.stop_loss
         self._arm_broker_protection(signal.symbol, fill.quantity, stop)
+        report_event(getattr(self, "_hub", None), "on_opportunity_fill", signal, fill)
         # Setup consumed — drop its chase anchor so a future setup re-anchors.
         if getattr(self, "_timed_entry_anchor", None) is not None:
             self._timed_entry_anchor.pop(signal.symbol, None)
         self._push_positions_from_alpaca()
+
+    def _retry_pipeline_protection(self) -> None:
+        pending = getattr(self, "_pipeline_protection_pending", {})
+        if not pending:
+            return
+        try:
+            positions = self._broker.get_positions()
+            if getattr(self._broker, "_position_sync_stale", False):
+                return
+        except Exception:
+            return
+        for symbol in list(pending):
+            qty = float(positions.get(symbol, {}).get("qty", 0))
+            if qty <= 0:
+                pending.pop(symbol, None)
+                continue
+            tracked = self._pipeline.exit_manager.tracked.get(symbol)
+            stop = tracked.stop_loss if tracked else pending[symbol][1]
+            try:
+                if self._arm_broker_protection(symbol, qty, stop):
+                    pending.pop(symbol, None)
+            except Exception:
+                logger.warning("Protection retry still pending for %s", symbol)
 
     def _refresh_broker_stop(self, symbol: str) -> None:
         """Update broker stop after partial exit or stop step-up."""
@@ -3479,17 +4158,28 @@ class AlpacaRunner:
         if not hasattr(self._broker, "replace_protective_stop"):
             return
         old_id = self._reconciler.get_broker_stop_id(symbol)
-        new_id = self._broker.replace_protective_stop(
-            symbol, old_id, tracked.remaining_qty, tracked.stop_loss,
-        )
+        if hasattr(self._broker, "get_protective_stop_id"):
+            old_id = self._broker.get_protective_stop_id(symbol) or old_id
+        reconcile = getattr(self._broker, 'reconcile_protective_stop', None)
+        if callable(reconcile):
+            new_id = reconcile(symbol, tracked.remaining_qty, tracked.stop_loss, known_id=old_id)
+        else:
+            new_id = self._broker.replace_protective_stop(
+                symbol, old_id, tracked.remaining_qty, tracked.stop_loss,
+            )
         if new_id:
             self._reconciler.set_broker_stop_id(symbol, new_id)
 
     def _clear_broker_stop(self, symbol: str) -> None:
-        oid = self._reconciler.pop_broker_stop_id(symbol)
+        oid = self._reconciler.get_broker_stop_id(symbol)
         if oid and hasattr(self._broker, "cancel_order_by_id"):
-            self._broker.cancel_order_by_id(oid)
+            acknowledged = self._broker.cancel_order_by_id(oid)
+            if acknowledged is False:
+                return
+        self._reconciler.pop_broker_stop_id(symbol)
 
+    @durable_operation
+    @projected("exit_report")
     def _record_trade_exit(
         self,
         fill: Fill,
@@ -3498,16 +4188,11 @@ class AlpacaRunner:
         *,
         strategy: str = "",
         cycle_num: Optional[int] = None,
+        remaining_quantity: Optional[float] = None,
     ) -> float:
         """Single path for P&L, journal, dashboard, and broker stop cleanup."""
         fill_ts = fill.ts.isoformat() if hasattr(fill.ts, "isoformat") else str(fill.ts)
-        fill_key = (
-            fill.symbol,
-            fill.side.value,
-            round(float(fill.quantity), 4),
-            round(float(fill.price), 4),
-            fill_ts,
-        )
+        fill_key = fill_identity(fill)
         recorded_exit_fill_keys = getattr(self, "_recorded_exit_fill_keys", None)
         if recorded_exit_fill_keys is None:
             recorded_exit_fill_keys = set()
@@ -3518,15 +4203,47 @@ class AlpacaRunner:
                 fill.symbol, fill.quantity, fill.price,
             )
             return 0.0
-        recorded_exit_fill_keys.add(fill_key)
-        if len(recorded_exit_fill_keys) > 1000:
-            self._recorded_exit_fill_keys = set(list(recorded_exit_fill_keys)[-500:])
+        manager = self._pipeline.exit_manager
+        if remaining_quantity is not None:
+            from daytrading.execution.fill_identity import delta
+            states = getattr(manager, '_fill_projections', {}).get('exit_state', {})
+            unseen, _, _ = delta(fill, states)
+            tracked_before = manager.tracked.get(fill.symbol)
+            if tracked_before is None and remaining_quantity > 0:
+                manager.restore_known_lifecycle(fill.symbol, remaining_quantity)
+                tracked_before = manager.tracked.get(fill.symbol)
+            if unseen is not None and tracked_before is not None:
+                tracked_before.remaining_qty = max(0., remaining_quantity)+unseen.quantity
+                state = tracked_before.micro_exit_state
+                if state is not None:
+                    state.quantity = state.sold + tracked_before.remaining_qty
+        manager.commit_coordinated_exit_fill(fill)
 
         pnl = 0.0
+        portfolio = getattr(self._pipeline, "portfolio", None)
+        tracked = self._pipeline.exit_manager.tracked.get(fill.symbol)
+        if remaining_quantity is not None:
+            remaining = max(0.0, float(remaining_quantity))
+            if tracked is not None:
+                tracked.remaining_qty = remaining
+        elif portfolio is not None:
+            position = portfolio.positions.get(fill.symbol)
+            remaining = abs(position.quantity) if position is not None else 0.0
+            if tracked is not None:
+                tracked.remaining_qty = remaining
+        else:
+            remaining = tracked.remaining_qty if tracked is not None else 0.0
         if entry_price > 0:
-            pnl = self._pipeline.record_realized_exit(
-                fill.symbol, entry_price, fill.price, fill.quantity,
-            )
+            # A pipeline exit already booked this same fill before reporting it.
+            # Reuse its amount for journal/dashboard, without booking risk twice.
+            accounted = getattr(self._pipeline, "_realized_exit_fills", {})
+            if fill_key in accounted:
+                pnl = accounted[fill_key]
+            else:
+                pnl = self._pipeline.record_realized_exit(
+                    fill.symbol, entry_price, fill.price, fill.quantity,
+                    remaining_quantity=remaining, fill_key=fill_key,
+                )
         tracked_for_exit = self._pipeline.exit_manager.tracked.get(fill.symbol)
         if str(getattr(tracked_for_exit, "entry_trigger", "") or "") == "warrior_ignition":
             try:
@@ -3568,8 +4285,8 @@ class AlpacaRunner:
                 )
         except Exception:
             pass
-        self._hub.on_exit_fill(fill, entry_price=entry_price)
-        self._hub.add_log(
+        report_safely(self._hub.on_exit_fill, fill, entry_price=entry_price, reason=reason)
+        report_safely(self._hub.add_log,
             "INFO",
             "EXIT {} {} {:.0f} @ ${:.2f}".format(
                 fill.side.value.upper(), fill.symbol, fill.quantity, fill.price,
@@ -3593,7 +4310,20 @@ class AlpacaRunner:
                 "phase": self._market_phase(),
                 "cycle": cycle_num,
             }
-        self._journal.record("trade_exit", payload, ts=fill.ts)
+        if fill.order_id:
+            import hashlib, json
+            payload.update(order_id=fill.order_id,account_id=fill.account_id,cumulative_quantity=fill.cumulative_quantity,
+                           cumulative_notional=fill.cumulative_notional)
+            payload['execution_event_id'] = hashlib.sha256(json.dumps(fill_key,separators=(',',':')).encode()).hexdigest()
+        store = getattr(self, '_execution_store', None)
+        if store is not None and fill.order_id:
+            engine = getattr(self, '_session_engine', None)
+            if engine is not None:
+                engine.capture_decision('trade_exit', payload, fill.ts)
+            store.queue_report(payload['execution_event_id'], payload, fill.ts)
+            store.retry_reports()
+        else:
+            report_safely(self._journal.record, "trade_exit", payload, ts=fill.ts)
 
         if strategy in (
             "breakout_scalp",
@@ -3605,7 +4335,7 @@ class AlpacaRunner:
             try:
                 block_reason = self._record_momentum_burst_hit_run_pnl(fill.symbol, pnl)
                 if block_reason:
-                    self._hub.add_log(
+                    report_safely(self._hub.add_log,
                         "WARN",
                         "MOMENTUM BURST HIT-RUN {} stopped for day: {}".format(
                             fill.symbol, block_reason,
@@ -3727,13 +4457,17 @@ class AlpacaRunner:
                 or portfolio_pos.quantity <= 0
             )
         )
-        if tracked is None or tracked.remaining_qty <= 0 or broker_should_be_flat:
+        if remaining <= 0 or broker_should_be_flat:
             self._pipeline.exit_manager.untrack(fill.symbol)
             if hasattr(self, "_reconciler"):
                 self._reconciler.clear_pending(fill.symbol)
             self._clear_broker_stop(fill.symbol)
-        else:
+        elif tracked is not None:
             self._refresh_broker_stop(fill.symbol)
+        else:
+            self._execution_recovery_required = True
+        report_event(getattr(self, "_hub", None), "on_opportunity_exit", fill.symbol, tracked is None or tracked.remaining_qty <= 0 or broker_should_be_flat)
+        recorded_exit_fill_keys.add(fill_key)
         return pnl
 
     def _record_momentum_burst_hit_run_pnl(self, symbol: str, pnl: float) -> Optional[str]:
@@ -3875,26 +4609,88 @@ class AlpacaRunner:
             fill_time = fill_time.astimezone(timezone.utc).replace(tzinfo=None)
         return fill_time >= self._session_start_utc()
 
+    @durable_operation
     def _check_new_fills(self) -> None:
         """Check Alpaca for recently filled orders not yet in the dashboard."""
+        if getattr(self, "_partial_entries", {}):
+            return
+        self._fill_sync_complete = False
+        epoch = getattr(self, "_entry_reconcile_epoch", 0)
+        if not hasattr(self, '_legacy_synced_order_ids'):
+            self._legacy_synced_order_ids = set(getattr(self, '_last_synced_order_ids', set()))
         try:
             from alpaca.trading.requests import GetOrdersRequest
             from alpaca.trading.enums import QueryOrderStatus
             from daytrading.models import Fill, Side
 
-            req = GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=10)
+            req = GetOrdersRequest(status=QueryOrderStatus.CLOSED, after=self._session_start_utc(), limit=500)
             orders = self._broker.client.get_orders(filter=req)
+            if getattr(self, "_partial_entries", {}) or epoch != getattr(self, "_entry_reconcile_epoch", 0):
+                return
+            if len(orders) >= 500:
+                logger.error("Fill accounting deferred: broker order query may be truncated")
+                return
+            # Closed orders arrive newest first. Recover quantity after each
+            # execution backwards from the actual broker position, then book
+            # oldest first so partials finish one position rather than many.
+            orders = sorted(reversed(orders), key=lambda o: o.filled_at or o.submitted_at)
+            current = [o for o in orders if self._order_is_from_current_session(o)]
+            remaining_after = {}
+            entry_costs = {}
+            inventory = {}
+            for row in current:
+                qty = float(row.filled_qty or 0)
+                px = float(row.filled_avg_price or 0)
+                if qty <= 0 or px <= 0:
+                    continue
+                held, avg = inventory.get(row.symbol, (0.0, 0.0))
+                side = row.side.value if hasattr(row.side, 'value') else str(row.side)
+                if "buy" in side:
+                    inventory[row.symbol] = (held + qty, (held * avg + qty * px) / (held + qty))
+                else:
+                    if held >= qty and avg > 0:
+                        entry_costs[str(row.id)] = avg
+                    inventory[row.symbol] = (max(0.0, held - qty), avg if held > qty else 0.0)
+            if current:
+                positions = self._broker.get_positions()
+                if getattr(self._broker, '_position_sync_stale', False) is True:
+                    return
+                if getattr(self, "_partial_entries", {}) or epoch != getattr(self, "_entry_reconcile_epoch", 0):
+                    return
+                quantities = {sym: float(row.get("qty", 0)) for sym, row in positions.items()}
+                for row in reversed(current):
+                    qty = float(row.filled_qty or 0)
+                    if qty <= 0:
+                        continue
+                    after = quantities.get(row.symbol, 0.0)
+                    remaining_after[str(row.id)] = max(0.0, after)
+                    side = row.side.value if hasattr(row.side, 'value') else str(row.side)
+                    quantities[row.symbol] = after - qty if "buy" in side else after + qty
 
             for o in orders:
+                if getattr(self, "_partial_entries", {}) or epoch != getattr(self, "_entry_reconcile_epoch", 0):
+                    return
                 oid = str(o.id)
-                if oid in self._last_synced_order_ids:
-                    continue
+                if oid in self._legacy_synced_order_ids:
+                    # Old flat-only checkpoints carry IDs without quantities.
+                    # Retain the compatibility filter until an explicit broker
+                    # migration supplies cumulative watermarks.
+                    watermark = getattr(self, '_legacy_sync_watermarks', {}).get(oid)
+                    if watermark is None:
+                        continue
+                    old_qty, old_cost = watermark
+                    qty_now = float(o.filled_qty or 0)
+                    cost_now = qty_now*float(o.filled_avg_price or 0)
+                    if qty_now <= old_qty:
+                        if qty_now == old_qty and abs(cost_now-old_cost) > 1e-7:
+                            raise ValueError('Legacy broker fill cost corrected; reconcile')
+                        continue
                 if not self._order_is_from_current_session(o):
                     self._last_synced_order_ids.add(oid)
                     continue
 
                 status_val = o.status.value if hasattr(o.status, 'value') else str(o.status)
-                if status_val != "filled":
+                if status_val not in ("filled", "canceled", "cancelled", "expired"):
                     self._last_synced_order_ids.add(oid)
                     continue
 
@@ -3906,20 +4702,37 @@ class AlpacaRunner:
                     continue
 
                 side = Side.BUY if "buy" in side_val else Side.SELL
-                fill = Fill(
-                    symbol=o.symbol, side=side, quantity=qty,
-                    price=price, ts=o.filled_at or o.submitted_at,
-                    commission=0.0,
-                )
+                from daytrading.execution.fill_identity import observation
+                fill = observation(o, o.symbol, side, o.filled_at or o.submitted_at,
+                                   account_id=getattr(self._broker, '_account_scope', ''),
+                                   execution_reason='broker_stop' if 'stop' in str(getattr(getattr(o, 'type', ''), 'value', getattr(o, 'type', ''))) else '')
+                from daytrading.execution.broker import apply_cash_observation
+                if side is Side.BUY:
+                    from daytrading.execution.fill_identity import delta
+                    unseen, _, _ = delta(fill, getattr(self._pipeline.portfolio, '_fill_projections', {}).get('cash', {}))
+                    manager = self._pipeline.exit_manager
+                    retired = getattr(manager, '_retired_positions', {}).get(o.symbol)
+                    if unseen is not None and retired is not None and retired.closed_at is not None and fill.ts >= retired.closed_at:
+                        if fill.order_id == retired.entry_order_id:
+                            retired.remaining_qty = unseen.quantity
+                            retired.exit_intent.quantity += unseen.quantity
+                            if retired.micro_exit_state is not None:
+                                retired.micro_exit_state.quantity = retired.micro_exit_state.sold+unseen.quantity
+                            manager._positions[o.symbol] = retired
+                            manager._fill_reconciliation_required = True
+                        else:
+                            manager._retired_positions.pop(o.symbol, None)
+                        getattr(manager, '_residual_confirmation_pending', {}).pop(o.symbol, None)
+                apply_cash_observation(self._pipeline.portfolio, fill)
 
                 if "buy" in side_val:
-                    self._hub.on_fill(fill, "entry")
-                    self._hub.add_log("INFO", "ENTRY {} {} {:.0f} @ ${:.2f}".format(
+                    report_safely(self._hub.on_fill, fill, "entry")
+                    report_safely(self._hub.add_log, "INFO", "ENTRY {} {} {:.0f} @ ${:.2f}".format(
                         "BUY", o.symbol, qty, price))
                 else:
-                    entry_price = 0.0
+                    entry_price = entry_costs.get(oid, 0.0)
                     tracked = self._pipeline.exit_manager.tracked
-                    if o.symbol in tracked:
+                    if entry_price == 0.0 and o.symbol in tracked:
                         entry_price = tracked[o.symbol].entry_price
                     if entry_price == 0.0:
                         pos = self._pipeline.portfolio.positions.get(o.symbol)
@@ -3929,31 +4742,118 @@ class AlpacaRunner:
                         entry_price = self._lookup_entry_price_from_orders(o.symbol)
                     self._record_trade_exit(
                         fill, entry_price, "broker_fill_sync",
+                        remaining_quantity=remaining_after[oid],
                     )
                     self._push_positions_from_alpaca()
 
                 self._last_synced_order_ids.add(oid)
+            self._fill_sync_complete = True
         except Exception as exc:
-            logger.debug("Fill sync error: %s", exc)
+            self._execution_recovery_required = True
+            logger.warning("Fill sync requires reconciliation: %s", exc)
 
     def _position_sync_loop(self) -> None:
         """Background thread: push position + account + trade updates every 3 seconds."""
-        tick = 0
-        while not self._shutdown:
-            time.sleep(3)
-            if self._shutdown:
-                break
-            self._push_positions_from_alpaca()
-            self._check_new_fills()
-            tick += 1
-            if tick % 5 == 0:
-                try:
-                    acct = self._broker.get_account()
-                    self._hub.on_account_update(
-                        acct["cash"], acct["equity"], acct["buying_power"],
-                    )
-                except Exception:
-                    pass
+        # Scheduling is owned by the recorded main-loop clock. No background
+        # flag can silently alter replayed broker/risk processing order.
+        return
+
+    @durable_operation
+    def _service_broker_sync(self):
+        from daytrading.execution.durability import session_day
+        store = getattr(self, '_execution_store', None)
+        if store is not None:
+            store.retry_reports()
+        self._broker.recover_order_safety()
+        self._check_new_fills()
+        self._push_positions_from_alpaca()
+        if store is not None and store.day != session_day():
+            # The next owner boundary can roll over after fresh adoption. Never
+            # switch a store inside this old store's still-open operation.
+            self._execution_recovery_required = True
+        if (getattr(self, '_fill_sync_complete', False)
+                and getattr(self._broker, '_safety_blocked', False) is not True
+                and getattr(self._broker, '_position_sync_stale', False) is not True
+                and not getattr(self, '_partial_entries', {})
+                and not getattr(self, '_pipeline_protection_pending', {})
+                and not getattr(getattr(self, '_execution_store', None), 'failed', False)
+                and (store is None or store.day == session_day())):
+            self._execution_recovery_required = False
+
+    def _maybe_rollover_execution_store(self):
+        """Revisit normal rollover after adoption, without another broker read."""
+        from daytrading.execution.durability import session_day, initialize
+        store = getattr(self, '_execution_store', None)
+        day = session_day()
+        if store is None or store.day == day:
+            return False
+        self._execution_recovery_required = True
+        current = getattr(self._broker, 'position_snapshot_current', None)
+        broker_positions = getattr(self._broker, '_pos_cache', None)
+        flat = not self._pipeline.exit_manager.tracked and not any(
+            not p.is_flat for p in self._pipeline.portfolio.positions.values())
+        if (getattr(self._broker, '_paper', False) is not True
+                or not flat or store.depth or store.failed or store.invalid_restore
+                or getattr(self, '_last_session_reset_day', None) != day
+                or not getattr(self, '_fill_sync_complete', False)
+                or self._position_snapshot_uncertain()
+                or getattr(self, '_pipeline_protection_pending', {})
+                or getattr(self, '_legacy_fill_checkpoint', False)
+                or any(getattr(owner, '_fill_reconciliation_required', False) for owner in
+                       (self, self._pipeline, self._pipeline.portfolio, self._pipeline.exit_manager))
+                or not isinstance(broker_positions, dict) or broker_positions
+                or not callable(current) or not current()):
+            return False
+        from daytrading.ml.artifacts import data_root
+        try:
+            initialize(self, data_root(), preserve_current=True)
+        except Exception as exc:
+            # Keep the current protection process and previous bindings alive.
+            # A conflict or failed write is a block, never permission to reset.
+            reason = type(exc).__name__ + ': ' + str(exc)
+            if reason != getattr(self, '_execution_rollover_error', None):
+                logger.error('Execution session rollover refused: %s', reason)
+            self._execution_rollover_error = reason
+            return False
+        self._execution_rollover_error = None
+        logger.info('Execution session rollover %s -> %s; current owner state preserved', store.day, day)
+        return True
+
+    def _maybe_clear_execution_recovery(self):
+        """Settle the existing block at the same fresh owner boundary."""
+        if not getattr(self, '_execution_recovery_required', False):
+            return False
+        from daytrading.execution.durability import session_day
+        store = getattr(self, '_execution_store', None)
+        if store is None:
+            return False
+        with store.lock:
+            current = getattr(self._broker, 'position_snapshot_current', None)
+            if (getattr(self, '_execution_store', None) is not store
+                    or store.day != session_day() or store.depth
+                    or store.failed or store.invalid_restore
+                    or not getattr(self, '_fill_sync_complete', False)
+                    or self._position_snapshot_uncertain()
+                    or getattr(self, '_pipeline_protection_pending', {})
+                    or getattr(self, '_legacy_fill_checkpoint', False)
+                    or any(getattr(owner, '_fill_reconciliation_required', False) for owner in
+                           (self, self._pipeline, self._pipeline.portfolio, self._pipeline.exit_manager))
+                    or not callable(current) or not current()):
+                return False
+            try:
+                undelivered = store.db.execute('SELECT count(*) FROM report_outbox WHERE delivered=0').fetchone()[0]
+            except Exception as exc:
+                store.failed = True
+                reason = type(exc).__name__ + ': ' + str(exc)
+                if reason != getattr(self, '_execution_recovery_error', None):
+                    logger.error('Execution recovery remains blocked: %s', reason)
+                self._execution_recovery_error = reason
+                return False
+            if undelivered:
+                return False
+            self._execution_recovery_required = False
+            self._execution_recovery_error = None
+            return True
 
     def _maybe_daily_session_reset(
         self,
@@ -4001,6 +4901,8 @@ class AlpacaRunner:
         if hasattr(self, '_hod_bar_scanner') and self._hod_bar_scanner:
             try:
                 self._hod_bar_scanner._gapper_fired.clear()
+                self._hod_bar_scanner._qualification_watermarks.clear()
+                self._hod_bar_scanner._bar_cooldown_keys.clear()
             except Exception:
                 pass
         if hasattr(self, '_hod_tick_tracker') and self._hod_tick_tracker:
@@ -4012,9 +4914,17 @@ class AlpacaRunner:
         # Clear HOD seed retry state
         self._hod_seed_retries.clear()
         self._hod_seed_blacklist.clear()
+        if isinstance(getattr(self, "_hod_seed_last_attempt", None), dict):
+            self._hod_seed_last_attempt.clear()
         with self._hod_seed_lock:
             self._hod_seed_queue.clear()
             self._hod_seed_pending.clear()
+
+        # News discovery hints belong to the prior session too.
+        for attr in ("_news_pinned", "_news_pinned_at"):
+            value = getattr(self, attr, None)
+            if value:
+                value.clear()
 
         # Clear per-symbol timed-entry chase anchors for the new day
         if getattr(self, "_timed_entry_anchor", None):
@@ -4071,10 +4981,17 @@ class AlpacaRunner:
 
         # Reset daily P&L tracking
         self._pipeline._daily_pnl = 0.0
+        if hasattr(self._pipeline, "_symbol_entry_counts"):
+            self._pipeline._symbol_entry_counts.clear()
+        self._pipeline._circuit_breaker_tripped = False
+        if getattr(self._pipeline, "pending_entries", None) is not None:
+            self._pipeline.pending_entries.clear()
         self._pipeline._daily_losers.clear()
         if hasattr(self._pipeline, "_daily_loss_counts"):
             self._pipeline._daily_loss_counts.clear()
         self._recorded_exit_fill_keys.clear()
+        # Pipeline exit identities and unfinished trade totals survive daily
+        # reset, preventing delayed reports from booking an old fill twice.
 
         # Reset EOD flatten flag
         self._eod_flattened = False
@@ -4100,7 +5017,8 @@ class AlpacaRunner:
 
         try:
             self._hub.reset_daily_overview()
-            self._hub.add_log("INFO", "Daily overview reset for {}".format(
+            report_safely(self._hub.restore_entry_history)
+            report_safely(self._hub.add_log, "INFO", "Daily overview reset for {}".format(
                 day_key or self._now_et().date().isoformat()))
         except Exception:
             pass
@@ -4179,11 +5097,111 @@ class AlpacaRunner:
         except Exception as exc:
             logger.error("Failed to load history: %s", exc)
 
+    @measured('enqueue')
+    def _enqueue_market_event(self, event) -> bool:
+        engine = getattr(self, '_session_engine', None)
+        if not hasattr(self, "_event_metrics_lock"):
+            self._event_metrics_lock = Lock()
+            self._event_enqueued_at = {}
+            self._event_drop_counts = defaultdict(int)
+        with self._event_metrics_lock:
+            self._event_enqueued_at[id(event)] = time.monotonic()
+            try:
+                self._event_queue.put_nowait(event)
+            except queue.Full:
+                self._event_enqueued_at.pop(id(event), None)
+                self._event_drop_counts[type(event).__name__] += 1
+                if engine is not None:
+                    engine.recorder.fail('paper event queue dropped '+type(event).__name__)
+                return False
+            wakeup = getattr(self, '_market_wakeup', None)
+            if wakeup is not None:
+                wakeup.set()
+        return True
+
+    def _publish_runtime_metrics(self) -> None:
+        transport_connected = getattr(self._stream, "is_connected", None)
+        if isinstance(transport_connected, bool):
+            # Do not change the loop's separate "stream started" flag: its
+            # existing worker owns reconnection, even while disconnected.
+            if getattr(self._hub, "stream_connected", None) != transport_connected:
+                phase = getattr(self._hub, "market_phase", "CLOSED")
+                report_safely(self._hub.on_market_status, phase != "CLOSED", transport_connected, phase)
+        with self._event_metrics_lock:
+            drops = dict(self._event_drop_counts)
+        metrics = {
+            "reliability_pipeline": (self._stage_metrics.status() if hasattr(self, '_stage_metrics') else {}),
+            "journal_recording": (self._journal._stage_metrics.status()
+                if isinstance(getattr(getattr(self, '_journal', None), '_stage_metrics', None), StageMetrics) else {}),
+            "broker_protection": (self._broker.protection_status() if hasattr(self._broker, 'protection_status') else {}),
+            "session_recording": (getattr(self,"_session_engine",None).recorder.status() if getattr(self,"_session_engine",None) else {"state":"unavailable"}),
+            "reporting_failures": reporting_failures(),
+            "queue_depth": self._event_queue.qsize(),
+            "dropped_events": drops,
+            "event_queue_lag_seconds": round(getattr(self, "_event_entry_lag_sec", 0.0), 3),
+            "micro_dispatch": {"mode": "fresh completed 10s boundary; flat, protection-clear only",
+                               "fifo_yields": getattr(self, "_micro_dispatch_yields", 0)},
+            "exit_pricing": {"mode": "fresh liquidation bid/ask; protection fallback retained",
+                             "quote_threshold_yields": getattr(self, "_quote_exit_yields", 0),
+                             "last_checks": getattr(self, "_exit_price_evidence", {})},
+            "last_order_latency_seconds": round(getattr(self._broker, "_last_order_latency_sec", 0.0), 3),
+            "partial_entry_protection": {s: {"filled_quantity": r.quantity, "order_id": r.order_id,
+                "cancel_for_protection": r.cancel_for_protection, "exit_reason": r.exit_reason,
+                "monitor": "native market queue during buy/cancel polling"}
+                for s, r in getattr(self, "_partial_entries", {}).items()},
+            "broker_recovery_pending": getattr(self._broker, "_safety_blocked", False) is True or bool(getattr(self, "_pipeline_protection_pending", {})),
+            "feed": getattr(self._stream, "_feed_str", "unknown"),
+            "transport_connected": transport_connected if isinstance(transport_connected, bool) else None,
+            "last_session_reset_day": getattr(self, "_last_session_reset_day", None),
+            "daily_risk": {
+                "realized_pnl": round(float(getattr(self._pipeline, "_daily_pnl", 0)), 2),
+                "entry_counts": dict(getattr(self._pipeline, "_symbol_entry_counts", {})),
+                "loss_counts": dict(getattr(self._pipeline, "_daily_loss_counts", {})),
+                "loss_count_unit": "completed_position",
+                "unfinished_trade_realized_pnl": {symbol: round(values[0], 2) for symbol, values in
+                    dict(getattr(self._pipeline, "_realized_trade_legs", {})).items()},
+                "circuit_breaker": bool(getattr(self._pipeline, "_circuit_breaker_tripped", False)),
+            },
+            "pending_vwap_entries": sum(row.hit.scanner_name == "vwap_pullback" for row in
+                getattr(getattr(self._pipeline, "pending_entries", None), "rows", {}).values()),
+            "pending_hod_entries": sum(row.hit.scanner_name == "hod_reclaim" for row in
+                getattr(getattr(self._pipeline, "pending_entries", None), "rows", {}).values()),
+            "hod_pullback_watch": {"enabled": hasattr(getattr(self._pipeline,"pending_entries",None),"timer_cancel"),
+                                   "ttl_seconds": getattr(getattr(self._pipeline,"pending_entries",None),"ttl_seconds",60),
+                                   "maximum_retries": 1},
+            "guard_handover": getattr(self, "_paper_handover_restore", None),
+            "market_clock": (self._market_clock.status() if getattr(self,'_market_clock',None) is not None
+                             else {'synchronized':False,'error':'not configured'}),
+            "micro_pullback": {
+                "enabled": 'micro_pullback_reclaim' in self._pipeline._verifiers,
+                "paper_only": True,
+                "vwap_rechecks": {s.name:s.vwap_retries.status() for s in self._pipeline._scanners if s.name == "micro_pullback_reclaim"},
+                "coordinated_flow": (self._pipeline._coordinated_micro_flow.status() if getattr(self._pipeline,'_coordinated_micro_flow',None) is not None else {'enabled':False}),
+                "unified_micro_entry": bool(getattr(self._pipeline,"_unified_micro_entry",False)),
+                "coordinated_micro_exit": {"enabled":bool(getattr(self._pipeline,"_unified_micro_entry",False)), "policy":"half at 1R; breakeven after fill; two completed post-entry 10s lows minus one cent; 60s maximum hold"},
+                "confirmation": 'completed 10s; earlier completed-minute impulse',
+                "candidates": sum(getattr(s, 'candidates', 0) for s in self._pipeline._scanners
+                                  if s.name == 'micro_pullback_reclaim'),
+                "detector_rejections": {s.name: dict(s.rejections) for s in self._pipeline._scanners
+                                        if s.name == 'micro_pullback_reclaim'},
+                "last_rejections": {k:v for s in self._pipeline._scanners if s.name == 'micro_pullback_reclaim'
+                                    for k,v in s.last_rejection.items()},
+            },
+            "vwap_pullback_reference": next((s.session_vwap_status() for s in self._pipeline._scanners
+                if s.name == "vwap_pullback" and getattr(s,"accepts_session_context",False) is True), {}),
+            "prepared_reclaim": next((s.status() for s in self._pipeline._scanners if s.name == "prepared_reclaim_tick"), {"enabled": False}),
+            "activity_guard": self._pipeline.trade_guard.halt_tracker.activity_snapshot(),
+        }
+        self._hub.runtime_metrics = metrics
+        self._hub.loaded_symbols = sum(bool(bars) for symbol, bars in self._bar_buffer.items() if symbol != "SPY")
+        self._hub.baseline = {"price_min": self._entry_policy.min_price, "price_max": self._entry_policy.max_price,
+                              "entry_patterns": sorted(self._pipeline._verifiers), "feed": metrics["feed"],
+                              "entry_window_open": self._is_in_trading_window(),
+                              "pattern_scan_window_open": self._is_in_pattern_scan_window(),
+                              "after_hours_enabled": getattr(self, "_after_hours_enabled", False)}
+
     def _on_bar(self, bar: Bar) -> None:
         """Callback from stream — push bar event to queue."""
-        if bar.symbol == "SPY":
-            self._pipeline.trade_guard.market_panic.update_spy_bar(bar)
-            return
         if bar.ts is not None:
             try:
                 age = (datetime.now(timezone.utc) - bar.ts).total_seconds()
@@ -4191,25 +5209,87 @@ class AlpacaRunner:
                     return
             except Exception:
                 pass
-        try:
-            self._event_queue.put_nowait(BarEvent(bar.symbol, bar))
+        if self._enqueue_market_event(BarEvent(bar.symbol, bar)):
             self._new_data.set()
-        except queue.Full:
-            pass
+
+    def _process_spy_bar(self, bar: Bar) -> None:
+        self._pipeline.trade_guard.market_panic.update_spy_bar(bar)
 
     def _on_quote(self, quote: Quote) -> None:
         """Callback from stream — push quote event to queue."""
-        try:
-            self._event_queue.put_nowait(QuoteEvent(quote.symbol, quote))
-        except queue.Full:
-            pass
+        self._enqueue_market_event(QuoteEvent(quote.symbol, quote))
 
     def _on_stream_trade(self, tick: Tick) -> None:
         """Callback from stream — push trade event to queue."""
+        self._enqueue_market_event(TradeEvent(tick.symbol, tick))
+
+    def _drain_broker_io_events(self):
+        """Pump FIFO tape during SDK waits, without submitting another order."""
+        from daytrading.replay.engine import recorded_market_dequeue
+        previous = getattr(self, '_broker_io_busy', False)
+        self._broker_io_busy = True
         try:
-            self._event_queue.put_nowait(TradeEvent(tick.symbol, tick))
-        except queue.Full:
-            pass
+            self._latch_exit_timeouts()
+            for _ in range(128):
+                try:
+                    event, enqueued = recorded_market_dequeue(self)
+                except queue.Empty:
+                    break
+                if enqueued is not None:
+                    self._event_entry_lag_sec = max(0., time.monotonic()-enqueued)
+                self._process_market_event(event)
+                # Preserve adverse observations and original time deadlines
+                # during a transport wait. This reducer only latches requests;
+                # another order cannot conflict with the in-flight request.
+                symbol = getattr(event, 'symbol', '')
+                manager = self._pipeline.exit_manager
+                pos = manager.tracked.get(symbol)
+                if pos is not None and symbol not in getattr(self, '_partial_entries', {}):
+                    payload = getattr(event, 'quote', None) or getattr(event, 'tick', None)
+                    if payload is not None:
+                        now = datetime.now(timezone.utc)
+                        age = (now-payload.ts).total_seconds()
+                        price = (payload.bid if isinstance(event, QuoteEvent) and 0 < payload.bid < payload.ask
+                                 else payload.price if isinstance(event, TradeEvent) else 0.)
+                        if price > 0 and 0 <= age <= 10:
+                            before = pos.exit_intent
+                            signals = manager.check_exits({symbol:price}, now)
+                            if signals:
+                                self._quote_exit_due = True
+                            if pos.exit_intent is not before:
+                                store = getattr(self, '_execution_store', None)
+                                if store is not None:
+                                    store.before_broker(dict(kind='risk_intent', symbol=symbol))
+            # A symbol need not trade exactly on its time deadline. Use only
+            # existing fresh buffered quotes; never perform nested SDK I/O.
+            manager = self._pipeline.exit_manager
+            if manager.tracked:
+                now = datetime.now(timezone.utc)
+                prices = {}
+                before = {symbol:pos.exit_intent for symbol,pos in manager.tracked.items()}
+                for symbol,pos in manager.tracked.items():
+                    state=pos.micro_exit_state
+                    if (state is not None and symbol not in getattr(self, '_partial_entries', {})
+                            and state.remaining > 0 and (now-state.entered_at).total_seconds() >= state.plan.max_hold_seconds
+                            and (pos.exit_intent is None or not pos.exit_intent.liquidate)):
+                        from daytrading.exits.manager import ExitIntent
+                        state.pending_reason='time_exit'
+                        pos.exit_intent=ExitIntent('time_exit: coordinated_micro:time_exit: '+pos.reason,
+                                                   now,pos.remaining_qty,True)
+                    rows = self._quote_buffer.get(symbol, ())
+                    if symbol in getattr(self, '_partial_entries', {}) or not rows:
+                        continue
+                    q = rows[-1]
+                    if 0 <= (now-q.ts).total_seconds() <= 10 and 0 < q.bid < q.ask:
+                        prices[symbol] = q.bid
+                if prices and manager.check_exits(prices, now):
+                    self._quote_exit_due = True
+                store = getattr(self, '_execution_store', None)
+                if store is not None and any(pos.exit_intent is not before.get(symbol)
+                        for symbol,pos in manager.tracked.items()):
+                    store.before_broker(dict(kind='risk_intent', symbols=sorted(prices)))
+        finally:
+            self._broker_io_busy = previous
 
     def _drain_events(self) -> bool:
         """Drain all pending events from the queue into local buffers.
@@ -4220,92 +5300,187 @@ class AlpacaRunner:
         """
         got_bars = False
         drained = 0
-        max_drain = 5000
+        max_drain = 128
+        self._event_entry_lag_sec = 0.0
+        from daytrading.replay.engine import recorded_market_dequeue
         while drained < max_drain:
             try:
-                evt = self._event_queue.get_nowait()
+                evt, enqueued_at = recorded_market_dequeue(self)
             except queue.Empty:
                 break
             drained += 1
+            if enqueued_at is not None:
+                self._event_entry_lag_sec = max(self._event_entry_lag_sec, time.monotonic() - enqueued_at)
 
-            if isinstance(evt, BarEvent):
-                buf = self._bar_buffer.get(evt.symbol)
+            got_bars = self._process_market_event(evt) or got_bars
+
+            if getattr(self, '_quote_exit_due', False):
+                # Keep this exact eligible quote at the FIFO frontier. Orders
+                # run once through the normal session heartbeat, never on the
+                # streaming thread or once per quote inside a long drain.
+                self._quote_exit_yields = getattr(self, '_quote_exit_yields', 0) + 1
+                break
+
+            if self._should_yield_for_micro():
+                # Return through the existing protection/exit/entry workflow.
+                # No callback orders, coalescing, drops or FIFO reordering.
+                self._micro_dispatch_yields = getattr(self, '_micro_dispatch_yields', 0) + 1
+                break
+
+        if drained >= max_drain:
+            logger.debug(
+                "Event drain capped at %d events; leaving backlog for next loop",
+                max_drain,
+            )
+        elif drained > 2500:
+            logger.info("Drained %d events from queue", drained)
+        return got_bars
+
+    def _should_yield_for_micro(self) -> bool:
+        """Prioritize fresh micro checks only while flat and protection clear."""
+        if getattr(self, '_micro_dispatch_due', False) is not True:
+            return False
+        if getattr(getattr(self, '_hub', None), 'trading_paused', True) is not False:
+            return False
+        if self._has_pending_timed_entry():
+            return False
+        if getattr(self, '_partial_entries', {}) or getattr(self, '_pipeline_protection_pending', {}):
+            return False
+        if getattr(self._broker, '_safety_blocked', False) is True:
+            return False
+        if self._pipeline.exit_manager.tracked:
+            return False
+        return not any(not position.is_flat for position in self._pipeline.portfolio.positions.values())
+
+    @measured('native_event')
+    def _process_market_event(self, evt) -> bool:
+        """Shared native event kernel for paper and source-pinned replay."""
+        got_bars = False
+        if isinstance(evt, BarEvent):
+            if evt.symbol == 'SPY':
+                self._process_spy_bar(evt.bar)
+                return True
+            buf = self._bar_buffer.get(evt.symbol)
+            if buf is None:
+                buf = deque(maxlen=self._max_bars_per_symbol)
+                self._bar_buffer[evt.symbol] = buf
+            buf.append(evt.bar)
+            self._seed_hod_session(evt.symbol)
+            got_bars = True
+
+        elif isinstance(evt, QuoteEvent):
+            buf = self._quote_buffer.get(evt.symbol)
+            if buf is None:
+                buf = deque(maxlen=200)
+                self._quote_buffer[evt.symbol] = buf
+            buf.append(evt.quote)
+            if self._quote_exit_check_due(evt.quote):
+                self._quote_exit_due = True
+            self._pipeline.trade_guard.slippage.update_quote(evt.quote)
+            pending = getattr(self._pipeline, "pending_entries", None)
+            if pending is not None:
+                pending.mark(evt.symbol, evt.quote.bid if 0 < evt.quote.bid < evt.quote.ask else None,
+                             evt.quote.ts, quote=True)
+
+        elif isinstance(evt, TradeEvent):
+            tick = evt.tick
+            pending = getattr(self._pipeline, "pending_entries", None)
+            if pending is not None:
+                pending.mark(tick.symbol, tick.price, tick.ts, dirty=False)
+            if self._hod_tick_tracker is not None:
+                self._hod_tick_tracker.on_trade(tick)
+            flow=getattr(self._pipeline,'_coordinated_micro_flow',None)
+            if tick.symbol in self._watchlist_set or self.is_hot_watch_active(tick.symbol) or (flow is not None and flow.is_prepared(tick.symbol,tick.ts)):
+                self._pipeline.trade_guard.halt_tracker.update_price(
+                    tick.symbol, tick.price, tick.ts,
+                    observed_at=datetime.now(timezone.utc),
+                )
+                buf = self._tick_buffer.get(tick.symbol)
                 if buf is None:
-                    buf = deque(maxlen=self._max_bars_per_symbol)
-                    self._bar_buffer[evt.symbol] = buf
-                buf.append(evt.bar)
-                self._seed_hod_session(evt.symbol)
-                got_bars = True
+                    buf = deque(maxlen=self._max_ticks_per_symbol)
+                    self._tick_buffer[tick.symbol] = buf
+                buf.append(tick)
+                # Tick-based early entry: catch fast movers near the base before a
+                # 10s bar can confirm. Gated on symbols with a pending timed entry
+                # (small set). The chase/spread guards still run at the execute path.
+                if tick.symbol in self._exec_timer.pending_symbols:
+                    ready_sig = self._exec_timer.on_tick(tick)
+                    if ready_sig is not None:
+                        self._timed_signal_queue.append(ready_sig)
 
-            elif isinstance(evt, QuoteEvent):
-                buf = self._quote_buffer.get(evt.symbol)
-                if buf is None:
-                    buf = deque(maxlen=200)
-                    self._quote_buffer[evt.symbol] = buf
-                buf.append(evt.quote)
-                self._pipeline.trade_guard.slippage.update_quote(evt.quote)
+                # Tick-level trailing stop for open positions (post-half only)
+                tracked_pos = (None if tick.symbol in getattr(self, "_partial_entries", {}) else
+                               self._pipeline.exit_manager._positions.get(tick.symbol))
+                if tracked_pos and tracked_pos.remaining_qty > 0 and tracked_pos.breakeven_locked:
+                    if tick.price > tracked_pos.highest_price:
+                        tracked_pos.highest_price = tick.price
+                    # Only trail on ticks AFTER half-sell (let pre-half winners run to target)
+                    if tracked_pos.sold_half:
+                        trail_stop = self._tick_trail_stop_for(tracked_pos)
+                        if trail_stop > tracked_pos.stop_loss:
+                            tracked_pos.stop_loss = trail_stop
+                        if tick.price <= tracked_pos.stop_loss:
+                            self._instant_trail_exit(tick.symbol, tick.price)
 
-            elif isinstance(evt, TradeEvent):
-                tick = evt.tick
-                if self._hod_tick_tracker is not None:
-                    self._hod_tick_tracker.on_trade(tick)
-                if tick.symbol in self._watchlist_set or self.is_hot_watch_active(tick.symbol):
-                    self._pipeline.trade_guard.halt_tracker.update_price(
-                        tick.symbol, tick.price, tick.ts,
-                    )
-                    buf = self._tick_buffer.get(tick.symbol)
-                    if buf is None:
-                        buf = deque(maxlen=self._max_ticks_per_symbol)
-                        self._tick_buffer[tick.symbol] = buf
-                    buf.append(tick)
-                    # Tick-based early entry: catch fast movers near the base before a
-                    # 10s bar can confirm. Gated on symbols with a pending timed entry
-                    # (small set). The chase/spread guards still run at the execute path.
-                    if tick.symbol in self._exec_timer.pending_symbols:
-                        ready_sig = self._exec_timer.on_tick(tick)
-                        if ready_sig is not None:
-                            self._execute_timed_signal(ready_sig)
-
-                    # Tick-level trailing stop for open positions (post-half only)
-                    tracked_pos = self._pipeline.exit_manager._positions.get(tick.symbol)
-                    if tracked_pos and tracked_pos.remaining_qty > 0 and tracked_pos.breakeven_locked:
-                        if tick.price > tracked_pos.highest_price:
-                            tracked_pos.highest_price = tick.price
-                        # Only trail on ticks AFTER half-sell (let pre-half winners run to target)
-                        if tracked_pos.sold_half:
-                            trail_stop = self._tick_trail_stop_for(tracked_pos)
-                            if trail_stop > tracked_pos.stop_loss:
-                                tracked_pos.stop_loss = trail_stop
-                            if tick.price <= tracked_pos.stop_loss:
-                                self._instant_trail_exit(tick.symbol, tick.price)
-
-                    # Tape pressure profit-protection exit (pre- and post-half)
-                    if tracked_pos and tracked_pos.remaining_qty > 0:
-                        if (
-                            not self._uses_runner_core_management(tracked_pos)
-                            and tick.price > tracked_pos.entry_price
+                # Tape pressure profit-protection exit (pre- and post-half)
+                if tracked_pos and tracked_pos.remaining_qty > 0:
+                    if (
+                        not self._uses_runner_core_management(tracked_pos)
+                        and getattr(tracked_pos,'micro_exit_state',None) is None
+                        and tick.price > tracked_pos.entry_price
+                    ):
+                        hold_secs = (datetime.now(timezone.utc) - tracked_pos.entry_ts).total_seconds()
+                        tick_list = list(self._tick_buffer.get(tick.symbol, []))
+                        quote_list = list(self._quote_buffer.get(tick.symbol, []))
+                        if self._tape_pressure.check(
+                            tick_list, quote_list,
+                            tracked_pos.entry_price, tick.price, hold_secs,
                         ):
-                            hold_secs = (datetime.now(timezone.utc) - tracked_pos.entry_ts).total_seconds()
-                            tick_list = list(self._tick_buffer.get(tick.symbol, []))
-                            quote_list = list(self._quote_buffer.get(tick.symbol, []))
-                            if self._tape_pressure.check(
-                                tick_list, quote_list,
-                                tracked_pos.entry_price, tick.price, hold_secs,
-                            ):
-                                self._tape_pressure_exit(tick.symbol, tick.price)
+                            self._tape_pressure_exit(tick.symbol, tick.price)
 
-                    completed_10s = self._bar_aggregator.on_tick(tick)
-                    if completed_10s is not None:
-                        if tick.symbol in self._pipeline.exit_manager._positions:
-                            self._check_10s_candle_exit(tick.symbol, completed_10s)
-                        ready_sig = self._exec_timer.on_10s_bar(completed_10s)
-                        if ready_sig is not None:
-                            self._timed_signal_queue.append(ready_sig)
+                completed_10s = self._bar_aggregator.on_tick(tick)
+                if completed_10s is not None:
+                    if 'micro_pullback_reclaim' in self._pipeline._verifiers:
+                        self._micro_scan_due = True
+                        # Read inside the recorded native event operation. Old
+                        # or future tape drains normally during catch-up; the
+                        # strategy's existing freshness gates remain unchanged.
+                        age = (datetime.now(timezone.utc) - tick.ts).total_seconds()
+                        self._micro_dispatch_due = 0 <= age <= 1.0
+                    if pending is not None:
+                        pending.mark(tick.symbol, stamp=tick.ts)
+                    if (tick.symbol in self._pipeline.exit_manager._positions
+                            and tick.symbol not in getattr(self, "_partial_entries", {})):
+                        self._check_10s_candle_exit(tick.symbol, completed_10s)
+                    ready_sig = self._exec_timer.on_10s_bar(completed_10s)
+                    if ready_sig is not None:
+                        self._timed_signal_queue.append(ready_sig)
 
-            elif isinstance(evt, BarsLoadedEvent):
+        elif isinstance(evt, BarsLoadedEvent):
+            today_et = self._now_et().date()
+            loaded_any = False
+            for symbol, symbol_bars in evt.bars_by_symbol.items():
+                today_bars = [
+                    b for b in symbol_bars
+                    if b.ts is None or self._bar_is_today(b, today_et)
+                ]
+                if today_bars:
+                    self._bar_buffer[symbol] = deque(
+                        today_bars[-self._max_bars_per_symbol:],
+                        maxlen=self._max_bars_per_symbol,
+                    )
+                    loaded_any = True
+            if evt.prior_day_stats:
+                self._prior_day_stats.update(evt.prior_day_stats)
+            for sym in evt.bars_by_symbol:
+                self._seed_hod_session(sym)
+            got_bars = got_bars or loaded_any
+
+        elif isinstance(evt, PoolRefreshEvent):
+            self._hod_bar_pool = list(evt.new_pool)
+            if evt.bars:
                 today_et = self._now_et().date()
-                loaded_any = False
-                for symbol, symbol_bars in evt.bars_by_symbol.items():
+                for symbol, symbol_bars in evt.bars.items():
                     today_bars = [
                         b for b in symbol_bars
                         if b.ts is None or self._bar_is_today(b, today_et)
@@ -4315,53 +5490,60 @@ class AlpacaRunner:
                             today_bars[-self._max_bars_per_symbol:],
                             maxlen=self._max_bars_per_symbol,
                         )
-                        loaded_any = True
-                if evt.prior_day_stats:
-                    self._prior_day_stats.update(evt.prior_day_stats)
-                for sym in evt.bars_by_symbol:
-                    self._seed_hod_session(sym)
-                got_bars = got_bars or loaded_any
-
-            elif isinstance(evt, PoolRefreshEvent):
-                self._hod_bar_pool = list(evt.new_pool)
-                if evt.bars:
-                    today_et = self._now_et().date()
-                    for symbol, symbol_bars in evt.bars.items():
-                        today_bars = [
-                            b for b in symbol_bars
-                            if b.ts is None or self._bar_is_today(b, today_et)
-                        ]
-                        if today_bars:
-                            self._bar_buffer[symbol] = deque(
-                                today_bars[-self._max_bars_per_symbol:],
-                                maxlen=self._max_bars_per_symbol,
-                            )
-                if evt.prior_day_stats:
-                    self._prior_day_stats.update(evt.prior_day_stats)
-                self._fast_scan_known = set(self._hod_bar_pool)
-                self._sync_tick_tracker_pool()
-                logger.info(
-                    "HOD pool refresh [%s]: %d symbols",
-                    self._market_phase(), len(self._hod_bar_pool),
-                )
-
-            elif isinstance(evt, FastScanEvent):
-                if self._has_pending_timed_entry():
-                    self._defer_fast_scan_movers(evt.new_movers)
-                    continue
-                movers = self._take_deferred_fast_scan_movers(evt.new_movers)
-                self._enqueue_candidate_hydration(
-                    movers,
-                    source="fast scan event",
-                )
-
-        if drained >= max_drain:
-            logger.warning(
-                "Event drain capped at %d events; leaving backlog for next loop",
-                max_drain,
+            if evt.prior_day_stats:
+                self._prior_day_stats.update(evt.prior_day_stats)
+            self._fast_scan_known = set(self._hod_bar_pool)
+            self._sync_tick_tracker_pool()
+            logger.info(
+                "HOD pool refresh [%s]: %d symbols",
+                self._market_phase(), len(self._hod_bar_pool),
             )
-        elif drained > 2500:
-            logger.info("Drained %d events from queue", drained)
+
+        elif isinstance(evt, FastScanEvent):
+            if self._has_pending_timed_entry():
+                self._defer_fast_scan_movers(evt.new_movers)
+                return False
+            movers = self._take_deferred_fast_scan_movers(evt.new_movers)
+            self._enqueue_candidate_hydration(
+                movers,
+                source="fast scan event",
+            )
+        flow=getattr(getattr(self,'_pipeline',None),'_coordinated_micro_flow',None)
+        if flow is not None:
+            if isinstance(evt,BarEvent):
+                flow.prepare(evt.symbol,list(self._bar_buffer.get(evt.symbol,())),datetime.now(timezone.utc))
+            elif isinstance(evt,(BarsLoadedEvent,PoolRefreshEvent)):
+                loaded=evt.bars_by_symbol if isinstance(evt,BarsLoadedEvent) else evt.bars or {}
+                for symbol in loaded:flow.prepare(symbol,list(self._bar_buffer.get(symbol,())),datetime.now(timezone.utc))
+        if isinstance(evt, (TradeEvent, QuoteEvent, BarEvent)):
+            micro_event_now = self._micro_market_now()
+            for s in getattr(getattr(self, '_pipeline', None), '_scanners', ()):
+                observer = getattr(s, 'observe_native', None)
+                if isinstance(evt, TradeEvent) and callable(observer):
+                    observer(evt.tick, micro_event_now)
+                book = getattr(s, 'vwap_retries', None)
+                if book is not None:
+                    if getattr(book,'flow',None) is not None:
+                        book.mark(evt.tick if isinstance(evt, TradeEvent) else evt.quote if isinstance(evt, QuoteEvent) else evt.bar,now=micro_event_now)
+                    else:
+                        book.mark(evt.tick if isinstance(evt, TradeEvent) else evt.quote if isinstance(evt, QuoteEvent) else evt.bar)
+        if isinstance(evt, (TradeEvent, QuoteEvent)) and evt.symbol in getattr(self, '_watchlist_set', ()):
+            scanners = getattr(getattr(self, '_pipeline', None), '_scanners', ())
+            scanner = next((s for s in scanners if s.name == "prepared_reclaim_tick"), None)
+            if scanner is not None:
+                scanner.observe(evt.tick if isinstance(evt, TradeEvent) else evt.quote,
+                                list(self._bar_buffer.get(evt.symbol, ())),
+                                eligible_symbols=self._watchlist_set)
+                if scanner.needs_recheck:
+                    self._micro_scan_due = True
+                    # A first executable prepared reclaim is not a completed
+                    # candle. Give its original pending evidence the same safe
+                    # FIFO boundary as a fresh completed micro confirmation.
+                    # Never promote an old/future event or extend its deadline.
+                    if getattr(scanner, 'pending', {}).get(evt.symbol) is not None:
+                        observed = evt.tick.ts if isinstance(evt, TradeEvent) else evt.quote.ts
+                        if 0 <= (datetime.now(timezone.utc) - observed).total_seconds() <= 1.0:
+                            self._micro_dispatch_due = True
         return got_bars
 
     @staticmethod
@@ -4402,7 +5584,7 @@ class AlpacaRunner:
                     reason="fast scan mover",
                 )
             else:
-                self._journal.record("hot_watch", {
+                report_safely(self._journal.record, "hot_watch", {
                     "symbol": sym,
                     "stage": "rejected",
                     "reason": hot_reject,
@@ -4446,7 +5628,7 @@ class AlpacaRunner:
             self._sync_tick_tracker_pool()
             if skipped_fresh:
                 try:
-                    self._hub.on_candidate_hydration(skipped_fresh=skipped_fresh)
+                    report_safely(self._hub.on_candidate_hydration, skipped_fresh=skipped_fresh)
                 except Exception:
                     pass
             return 0
@@ -4456,7 +5638,7 @@ class AlpacaRunner:
             len(hydrate_symbols),
             ", ".join(hydrate_symbols[:10]),
         )
-        self._hub.add_log(
+        report_safely(self._hub.add_log,
             "INFO",
             "Candidate hydrate {} HOD movers — {}".format(
                 len(hydrate_symbols), ", ".join(hydrate_symbols[:10]),
@@ -4478,6 +5660,9 @@ class AlpacaRunner:
                             BarsLoadedEvent(bars_by_symbol, prior_stats)
                         )
                     except queue.Full:
+                        engine = getattr(self, '_session_engine', None)
+                        if engine is not None:
+                            engine.recorder.fail('derived event queue overflow')
                         logger.warning("Event queue full; dropped candidate bars")
             else:
                 today_et = self._now_et().date()
@@ -4501,12 +5686,13 @@ class AlpacaRunner:
 
         if skipped_fresh:
             try:
-                self._hub.on_candidate_hydration(skipped_fresh=skipped_fresh)
+                report_safely(self._hub.on_candidate_hydration, skipped_fresh=skipped_fresh)
             except Exception:
                 pass
         self._sync_tick_tracker_pool()
         return loaded_count
 
+    @durable_operation
     def _check_exits_only(self) -> None:
         """Fast exit check every second using live Alpaca prices.
 
@@ -4518,7 +5704,8 @@ class AlpacaRunner:
             if not tracked:
                 return
 
-            prices = self._live_prices(list(tracked.keys()))
+            self._latch_exit_timeouts()
+            prices = self._exit_prices([s for s in tracked if s not in getattr(self, "_partial_entries", {})])
             if not prices:
                 return
 
@@ -4533,6 +5720,15 @@ class AlpacaRunner:
             }
             entry_strategies = {
                 sym: getattr(pos, "entry_strategy", "") or ""
+                for sym, pos in self._pipeline.exit_manager._positions.items()
+            }
+            # check_exits optimistically changes quantity/partial flags and can
+            # untrack a full exit before any broker fill. Keep the original
+            # objects and fill-dependent flags until execution is confirmed.
+            exit_tracking = {
+                sym: (pos, pos.remaining_qty, pos.sold_half,
+                      getattr(pos, "current_step", 0),
+                      getattr(pos, "breakeven_locked", False))
                 for sym, pos in self._pipeline.exit_manager._positions.items()
             }
 
@@ -4552,7 +5748,7 @@ class AlpacaRunner:
                     low=prices.get(sig.symbol, 0),
                     close=prices.get(sig.symbol, 0),
                     volume=0, ts=now,
-                )
+                 provenance=BarSource.PRICE_MARK)
                 fill, status = self._submit_fast_exit_order(order, bar)
                 try:
                     from daytrading.ml.shadow_collector import log_execution_quality
@@ -4580,7 +5776,6 @@ class AlpacaRunner:
                         ep, pnl, self._pipeline._daily_pnl,
                     )
                     # Seed recent order IDs so _check_new_fills won't duplicate
-                    self._seed_recent_order_ids()
                     self._push_positions_from_alpaca()
                     self._pipeline.set_cooldown(fill.symbol)
                 else:
@@ -4631,22 +5826,32 @@ class AlpacaRunner:
                             "MARKET EXIT %s %s %.0f @ %.4f (entry=%.4f, P&L=$%.2f)",
                             fill2.side.value, fill2.symbol, fill2.quantity, fill2.price, ep, pnl,
                         )
-                        self._seed_recent_order_ids()
                         self._push_positions_from_alpaca()
                         self._pipeline.set_cooldown(fill2.symbol)
                     else:
-                        logger.error(
-                            "CRITICAL: MARKET EXIT also failed for %s — position unprotected!",
+                        previous = exit_tracking.get(sig.symbol)
+                        if previous is not None:
+                            tracked_pos, qty, sold_half, step, locked = previous
+                            position = self._pipeline.portfolio.positions.get(sig.symbol)
+                            actual_qty = abs(float(position.quantity)) if position else 0.0
+                            tracked_pos.remaining_qty = min(float(qty), actual_qty)
+                            tracked_pos.sold_half = sold_half
+                            tracked_pos.current_step = step
+                            tracked_pos.breakeven_locked = locked
+                            # Keep all observed price history and any tightened
+                            # stop. Never widen protection to undo a failed sale.
+                            if tracked_pos.remaining_qty > 0:
+                                self._pipeline.exit_manager._positions[sig.symbol] = tracked_pos
+                                report_safely(self._refresh_broker_stop, sig.symbol)
+                        report_safely(self._journal.record, "exit_execution_failure", {
+                            "symbol": sig.symbol, "reason": sig.reason,
+                            "quantity": sig.quantity, "status": str(status2),
+                            "tracking_retained": sig.symbol in self._pipeline.exit_manager._positions,
+                        }, ts=now)
+                        logger.warning(
+                            "FAST EXIT retries failed for %s; retaining actual inventory and exit tracking",
                             sig.symbol,
                         )
-                    # Rollback half-sell state if both orders failed
-                    if not fill2:
-                        tracked_pos = self._pipeline.exit_manager._positions.get(sig.symbol)
-                        if tracked_pos and tracked_pos.sold_half and tracked_pos.remaining_qty > 0:
-                            tracked_pos.sold_half = False
-                            tracked_pos.remaining_qty += sig.quantity
-                            tracked_pos.stop_loss = tracked_pos.entry_price - tracked_pos.risk_per_share
-                            tracked_pos.breakeven_locked = False
         except Exception as exc:
             logger.warning("Fast exit check error: %s", exc)
 
@@ -4660,6 +5865,11 @@ class AlpacaRunner:
         order = self._clamp_fast_exit_order_to_broker_position(order)
         if order is None:
             return None, OrderStatus.CANCELLED
+        if getattr(self._broker, 'requires_fresh_exit_quotes', False) is True:
+            fresh = self._fresh_exit_request(order)
+            if fresh is None:
+                return None, OrderStatus.NEW
+            order, bar = fresh
 
         old_wait = getattr(self._broker, "_max_wait", None)
         try:
@@ -4669,6 +5879,15 @@ class AlpacaRunner:
         finally:
             if old_wait is not None:
                 self._broker._max_wait = old_wait
+
+    def _fresh_exit_request(self, order):
+        prices = self._exit_prices([order.symbol])
+        if order.symbol not in prices:
+            return None
+        price = prices[order.symbol]
+        stamp = datetime.fromisoformat(self._exit_price_evidence[order.symbol]['quote_ts'])
+        return (replace(order, limit_price=price, liquidation_quote_ts=stamp),
+                Bar(order.symbol, stamp, price, price, price, price, 0, provenance=BarSource.PRICE_MARK))
 
     def _broker_has_compatible_exit_position(self, symbol: str, side: Side) -> bool:
         """Return whether Alpaca still shows quantity compatible with an exit side."""
@@ -4683,6 +5902,8 @@ class AlpacaRunner:
         except Exception as exc:
             logger.warning("FAST EXIT %s: broker position recheck failed: %s", symbol, exc)
             return True
+        if getattr(self._broker, '_position_sync_stale', False) is True:
+            return True  # Uncertain is not broker-confirmed flat; retain exit intent.
         pos = broker_positions.get(symbol)
         if not pos:
             return False
@@ -4715,6 +5936,8 @@ class AlpacaRunner:
             logger.warning("FAST EXIT %s: broker position refresh failed: %s", order.symbol, exc)
             return order
 
+        if getattr(self._broker, '_position_sync_stale', False) is True:
+            return order  # Same conservative path as an unavailable SDK read.
         pos = broker_positions.get(order.symbol)
         if not pos:
             logger.warning(
@@ -4748,17 +5971,17 @@ class AlpacaRunner:
             "FAST EXIT %s: clamping exit quantity %.0f → %d from fresh broker qty %.0f",
             order.symbol, order.quantity, available_qty, broker_qty,
         )
-        return Order(
-            symbol=order.symbol,
-            side=order.side,
-            quantity=float(available_qty),
-            limit_price=order.limit_price,
-            stop_price=order.stop_price,
-            client_order_id=order.client_order_id,
-        )
+        return replace(order, quantity=float(available_qty))
 
     def _submit_protective_exit_order(self, order: Order, bar: Bar, label: str):
         """Submit a protective exit and escalate when the first limit misses."""
+        from daytrading.exits.manager import ExitIntent
+        tracked = self._pipeline.exit_manager.tracked.get(order.symbol)
+        if tracked is not None and tracked.exit_intent is None:
+            tracked.exit_intent = ExitIntent(label, bar.ts, tracked.remaining_qty, True)
+        if getattr(self, '_broker_io_busy', False):
+            self._quote_exit_due = True
+            return None, OrderStatus.NEW
         fill, status = self._submit_fast_exit_order(order, bar)
         if fill:
             return fill, status
@@ -4776,6 +5999,11 @@ class AlpacaRunner:
             return None, status
 
         if hasattr(self._broker, "submit_urgent_exit"):
+            if getattr(self._broker, 'requires_fresh_exit_quotes', False) is True:
+                fresh = self._fresh_exit_request(order)
+                if fresh is None:
+                    return None, OrderStatus.NEW
+                order, bar = fresh
             return self._broker.submit_urgent_exit(
                 order, bar, self._pipeline.portfolio,
             )
@@ -4788,6 +6016,7 @@ class AlpacaRunner:
         )
         return self._submit_fast_exit_order(fallback_order, bar)
 
+    @durable_operation
     def _instant_trail_exit(self, symbol: str, price: float) -> None:
         """Immediately exit a position when the tick-level trailing stop is hit."""
         try:
@@ -4795,6 +6024,16 @@ class AlpacaRunner:
 
             pos = self._pipeline.exit_manager._positions.get(symbol)
             if pos is None or pos.remaining_qty <= 0:
+                return
+
+            state=getattr(pos,'micro_exit_state',None)
+            if state is not None:
+                # One fill-aware exit owner: latch this observed breach and
+                # yield into the normal main-thread exit workflow. A cancelled
+                # or partial liquidation cannot disappear on a quote bounce.
+                state.stop=max(state.stop,pos.stop_loss or state.stop)
+                state.pending_reason='stop_loss'
+                self._quote_exit_due=True
                 return
 
             qty = pos.remaining_qty
@@ -4810,23 +6049,23 @@ class AlpacaRunner:
             bar = Bar(
                 symbol=symbol, open=price, high=price,
                 low=price, close=price, volume=0, ts=now,
-            )
+             provenance=BarSource.PRICE_MARK)
             fill, status = self._submit_protective_exit_order(order, bar, "TICK TRAIL EXIT")
             if fill:
                 apply_fill(self._pipeline.portfolio, fill)
-                pos.remaining_qty = 0
                 strategy = pos.reason if hasattr(pos, "reason") else ""
                 pnl = self._record_trade_exit(
                     fill, entry_price, "tick_trailing_stop",
                     strategy=strategy,
                 )
-                self._pipeline.exit_manager.untrack(symbol)
+                if pos.remaining_qty <= 0:
+                    self._pipeline.exit_manager.untrack(symbol)
                 logger.info(
                     "TICK TRAIL EXIT %s %.0f @ $%.4f (entry=$%.4f, high=$%.4f, P&L=$%.2f)",
                     symbol, fill.quantity, fill.price, entry_price,
                     pos.highest_price, pnl,
                 )
-                self._hub.add_log(
+                report_safely(self._hub.add_log,
                     "INFO",
                     "TICK TRAIL EXIT {} {:.0f} @ ${:.2f} (P&L ${:.2f})".format(
                         symbol, fill.quantity, fill.price, pnl),
@@ -4846,6 +6085,9 @@ class AlpacaRunner:
         already paid the first partial, so the remaining shares get wider room
         to catch CHAI/VERU-style continuation.
         """
+        state=getattr(tracked_pos,'micro_exit_state',None)
+        if state is not None and state.plan.policy=='coordinated_structure':
+            return max(state.stop,tracked_pos.stop_loss or state.stop)
         trail_pct = 0.01
         if getattr(tracked_pos, "runner_confirmed", False):
             trail_pct = float(getattr(tracked_pos, "runner_trail_pct", 0.03) or 0.03)
@@ -4861,6 +6103,7 @@ class AlpacaRunner:
             and getattr(tracked_pos, "remaining_qty", 0) > 0
         )
 
+    @durable_operation
     def _tape_pressure_exit(self, symbol: str, price: float) -> None:
         """Exit a position when tape pressure detects selling — protect profit."""
         try:
@@ -4883,23 +6126,23 @@ class AlpacaRunner:
             bar = Bar(
                 symbol=symbol, open=price, high=price,
                 low=price, close=price, volume=0, ts=now,
-            )
+             provenance=BarSource.PRICE_MARK)
             fill, status = self._submit_protective_exit_order(order, bar, "TAPE PRESSURE EXIT")
             if fill:
                 apply_fill(self._pipeline.portfolio, fill)
-                pos.remaining_qty = 0
                 strategy = pos.reason if hasattr(pos, "reason") else ""
                 pnl = self._record_trade_exit(
                     fill, entry_price, "tape_pressure_sell",
                     strategy=strategy,
                 )
-                self._pipeline.exit_manager.untrack(symbol)
+                if pos.remaining_qty <= 0:
+                    self._pipeline.exit_manager.untrack(symbol)
                 logger.info(
                     "TAPE PRESSURE EXIT %s %.0f @ $%.4f (entry=$%.4f, high=$%.4f, P&L=$%.2f)",
                     symbol, fill.quantity, fill.price, entry_price,
                     pos.highest_price, pnl,
                 )
-                self._hub.add_log(
+                report_safely(self._hub.add_log,
                     "INFO",
                     "TAPE PRESSURE EXIT {} {:.0f} @ ${:.2f} (P&L ${:.2f})".format(
                         symbol, fill.quantity, fill.price, pnl),
@@ -4919,6 +6162,20 @@ class AlpacaRunner:
         """
         try:
             from daytrading.execution.broker import apply_fill
+
+            # Pending buys retain the dedicated first-partial local protection
+            # owner. Never place/replace a competing sell stop while the buy
+            # remainder is still being cancelled and reconciled.
+            if symbol in getattr(self,'_partial_entries',{}):
+                return
+
+            completed=self._bar_aggregator.get_completed_10s(symbol,count=1)
+            closed_at=(completed[-1].closed_at if completed and
+                       completed[-1].bar.ts==bar_10s.ts else None)
+            if self._pipeline.exit_manager.update_coordinated_10s(
+                    symbol,bar_10s,datetime.now(timezone.utc),closed_at=closed_at):
+                report_safely(self._refresh_broker_stop,symbol)
+                return
 
             pos = self._pipeline.exit_manager._positions.get(symbol)
             if pos is None or pos.remaining_qty <= 0:
@@ -4970,23 +6227,23 @@ class AlpacaRunner:
             bar = Bar(
                 symbol=symbol, open=price, high=price,
                 low=price, close=price, volume=0, ts=now,
-            )
+             provenance=BarSource.PRICE_MARK)
             fill, status = self._submit_protective_exit_order(order, bar, "RED 10s EXIT")
             if fill:
                 apply_fill(self._pipeline.portfolio, fill)
-                pos.remaining_qty = 0
                 strategy = pos.reason if hasattr(pos, "reason") else ""
                 pnl = self._record_trade_exit(
                     fill, entry_price, "red_10s_candle",
                     strategy=strategy,
                 )
-                self._pipeline.exit_manager.untrack(symbol)
+                if pos.remaining_qty <= 0:
+                    self._pipeline.exit_manager.untrack(symbol)
                 logger.info(
                     "RED 10s EXIT %s %.0f @ $%.4f (entry=$%.4f, 10s close=$%.4f < prev low=$%.4f, P&L=$%.2f)",
                     symbol, fill.quantity, fill.price, entry_price,
                     bar_10s.close, prev_bar.low, pnl,
                 )
-                self._hub.add_log(
+                report_safely(self._hub.add_log,
                     "INFO",
                     "RED 10s EXIT {} {:.0f} @ ${:.2f} (P&L ${:.2f})".format(
                         symbol, fill.quantity, fill.price, pnl),
@@ -5025,8 +6282,8 @@ class AlpacaRunner:
             self._pipeline.missed_a_plus.update_prices(
                 universe, now=datetime.now(timezone.utc),
             )
-            self._hub.on_missed_a_plus(self._pipeline.missed_a_plus_report())
-            self._hub.on_scanner_near_miss(self._pipeline.scanner_near_miss_summary())
+            report_safely(self._hub.on_missed_a_plus, self._pipeline.missed_a_plus_report())
+            report_safely(self._hub.on_scanner_near_miss, self._pipeline.scanner_near_miss_summary())
         except Exception:
             pass
 
@@ -5057,12 +6314,44 @@ class AlpacaRunner:
     ) -> None:
         """Persist one compact structured funnel record for entry debugging."""
         try:
+            book = getattr(getattr(self, "_pipeline", None), "pending_entries", None)
+            if book is not None and (decision.stage == "order" or decision.stage.endswith("_order")):
+                if str(decision.metadata.get("status", "")).lower() in ("new", "accepted", "filled", "partially_filled"):
+                    book.finish(decision.symbol, "submitted", "handed to existing order path")
             payload = decision.to_payload()
+            payload["ts"] = decision.ts.isoformat()
             payload["source"] = source
+            checker = getattr(self, "_float_checker", None)
+            if checker and hasattr(checker, "get_float_metadata"):
+                payload.setdefault("metadata", {})["float_data"] = checker.get_float_metadata(decision.symbol)
             payload["market_phase"] = self._market_phase()
-            self._journal.record("entry_decision", payload, ts=decision.ts)
+            report_event(getattr(self, "_hub", None), "on_entry_decision", payload)
+            report_safely(self._journal.record, "entry_decision", payload, ts=decision.ts)
         except Exception:
             pass
+
+    def _record_execution_timer_observation(self, signal: TradeSignal, observation: dict) -> None:
+        """Persist actual live micro-candles so timing decisions are replayable."""
+        payload = dict(observation, symbol=signal.symbol,
+                       pattern=signal.scan_result.scanner_name if signal.scan_result else "")
+        payload["opportunity_id"] = hit_identity(signal.scan_result)[0] if signal.scan_result else ""
+        report_safely(self._journal.record, "execution_timer_bar", payload)
+
+    def _record_execution_timer_cancel(self, signal: TradeSignal, reason: str) -> None:
+        """Keep timer cancellations visible alongside other entry decisions."""
+        self._record_entry_reject(
+            signal,
+            stage="execution_timer",
+            reason=reason,
+            source="execution_timer",
+            metadata={"status": "cancelled", "timeframe": "10s"},
+        )
+
+    def _record_execution_timer_release(self, signal: TradeSignal) -> None:
+        self._record_entry_decision(self._entry_policy.decision(
+            symbol=signal.symbol, signal=signal, stage='execution_confirmation', passed=True,
+            reason='Execution timer released setup; final execution checks still apply',
+        ), source='execution_timer')
 
     def _record_entry_reject(
         self,
@@ -5074,6 +6363,14 @@ class AlpacaRunner:
         price: float = 0.0,
         metadata: Optional[dict] = None,
     ) -> EntryDecision:
+        from daytrading.execution.origin import entry_refused
+        entry_refused(reason)  # No effect once an entry SDK request has started.
+        book = getattr(getattr(self, "_pipeline", None), "pending_entries", None)
+        if book is not None and stage in ("timed_entry_chase", "timed_entry_final_guard", "execution_timer"):
+            if stage == "execution_timer":
+                book.timer_cancel(signal, reason, datetime.now(timezone.utc))
+            else:
+                book.reject(signal.scan_result, reason, datetime.now(timezone.utc))
         executor = _ensure_entry_executor(self)
         return executor.reject(
             symbol=signal.symbol,
@@ -5108,14 +6405,129 @@ class AlpacaRunner:
             on_position_opened=self._on_position_opened,
             market_phase=self._market_phase,
             seed_recent_order_ids=self._seed_recent_order_ids,
+            quote_buffer=getattr(self, '_quote_buffer', {}),
+            market_now=self._micro_market_now,
+            market_entry_window=lambda when:self._is_in_trading_window(when.astimezone(ET)),
+            submit_entry=self._submit_partial_protected_entry,
+            finish_entry=self._finish_partial_entry,
+            observe_entry=self._observe_final_entry_fill,
+            entry_pending=lambda symbol: symbol in getattr(self, "_partial_entries", {}) and
+                bool(getattr(self._broker, "_unsettled_orders", {}).get(symbol)),
         )
 
+    def _dispatch_next_timed_signal(self) -> None:
+        self._execute_timed_signal(self._timed_signal_queue.popleft())
+
+    def _check_execution_timeouts(self) -> None:
+        for timed_sig in self._exec_timer.check_timeouts():
+            self._execute_timed_signal(timed_sig)
+
+    @durable_operation
     def _execute_timed_signal(self, signal: TradeSignal) -> None:
         """Execute a deferred signal that the execution timer released."""
+        book = getattr(getattr(self, "_pipeline", None), "pending_entries", None)
+        if book is not None and signal.symbol in book.inflight:
+            self._pending_entry_recheck_due()
+            if signal.symbol not in book.inflight:
+                return
+            quotes = list(self._quote_buffer.get(signal.symbol, []))
+            quote = quotes[-1] if quotes else None
+            now = datetime.now(timezone.utc)
+            if quote is None or not (0 < quote.bid < quote.ask) or not (0 <= (now-quote.ts).total_seconds() <= 5):
+                self._record_entry_reject(signal, stage="timed_entry_chase", source="pending_entry",
+                    reason="waiting for fresh valid quote (max age 5s)")
+                self._publish_pending_entry_events()
+                return
+            retry_reject = book.execution_reject(signal, quote, now,
+                max_risk_pct=self._pipeline._max_entry_risk_pct,
+                max_dollar_risk=self._pipeline._max_dollar_risk_per_trade)
+            if retry_reject:
+                self._record_entry_reject(signal, stage="timed_entry_chase", source="pending_entry",
+                                         reason=retry_reject)
+                self._publish_pending_entry_events()
+                return
         _ensure_entry_executor(self).execute_timed_signal(
             self._entry_execution_context(),
             signal,
         )
+
+    def _dispatch_confirmed_entry(self, signal: TradeSignal) -> None:
+        hit = signal.scan_result
+        if hit is None or hit.scanner_name not in ('micro_pullback_reclaim', 'prepared_reclaim_tick'):
+            self._exec_timer.queue(signal)
+            return
+        # This completed trigger already supplies confirmation. Never wait for
+        # another candle or resubmit the same trigger after an order timeout.
+        seen = getattr(self, '_micro_consumed_setups', None)
+        if seen is None:
+            seen = self._micro_consumed_setups = {}
+        setup = hit.criteria.get('event_setup_id') if hit.scanner_name == 'prepared_reclaim_tick' else hit.criteria.get('micro_setup_id')
+        pipeline = getattr(self, '_pipeline', None)
+        scanner = next((s for s in getattr(pipeline, '_scanners', ()) if s.name == hit.scanner_name), None)
+        book = getattr(scanner, 'vwap_retries', None)
+        blocker = self._entry_block_reason(signal.symbol, 'MICRO_DISPATCH') if hasattr(self, '_hub') and hasattr(self, '_broker') else None
+        if blocker and book is not None:
+            if blocker in TEMPORARY_ENTRY_BLOCKS:
+                book.hold_confirmed(hit, blocker, self._micro_market_now())
+            self._record_entry_reject(signal, stage='global_entry_control', source=hit.scanner_name, reason=blocker)
+            return
+        used = seen.setdefault(signal.symbol, deque(maxlen=120))
+        if not setup or setup in used or (book is not None and setup in book.terminal):
+            self._record_entry_reject(signal, stage='micro_confirmation', source='micro_pullback',
+                                      reason='missing or already consumed micro confirmation')
+            return
+        if signal.symbol in self._exec_timer.pending_symbols:
+            self._record_entry_reject(signal, stage='micro_confirmation', source='micro_pullback',
+                                      reason='another entry is already awaiting confirmation')
+            return
+        used.append(setup)
+        self._record_entry_decision(self._entry_policy.decision(
+            symbol=signal.symbol, stage='micro_confirmation', passed=True, signal=signal,
+            metadata={'confirmation': ('original trade/quote reclaim; no second timer' if hit.scanner_name == 'prepared_reclaim_tick' else 'original completed 10s; no second timer')}), source=hit.scanner_name)
+        count_before = getattr(getattr(self, "_pipeline", None), "_symbol_entry_counts", {}).get(signal.symbol, 0)
+        submission_epoch = getattr(self, '_entry_reconcile_epoch', 0)
+        from daytrading.execution.origin import entry_attempt
+        with entry_attempt(signal) as outcome:
+            self._execute_timed_signal(signal)
+        report_safely(getattr(getattr(self,'_journal',None),'record',lambda *a:None),
+                      'micro_entry_attempt',dict(outcome))
+        retained_this_attempt = False
+        if book is not None and outcome['state']=='not_submitted':
+            from daytrading.strategy.scalping.micro_failure import temporary
+            from daytrading.execution.entry_outcome import recovery_code
+            recovery = recovery_code(outcome.get('recovery'))
+            if outcome['reason'] in TEMPORARY_ENTRY_BLOCKS:
+                retained_this_attempt = book.hold_confirmed(hit,outcome['reason'],self._micro_market_now())
+            elif recovery is not None:
+                # Typed no-SDK refusal, never inferred from diagnostic wording.
+                book.decide(hit,recovery,self._micro_market_now())
+                retained_this_attempt = signal.symbol in book.rows
+            elif temporary(outcome['reason']):
+                # Partial-entry bookkeeping increments its reconciliation
+                # epoch even for an explicit no-SDK refusal. Retain the hit,
+                # not the old signal; current portfolio/risk is re-evaluated.
+                book.decide(hit,outcome['reason'],self._micro_market_now())
+                retained_this_attempt = signal.symbol in book.rows
+        if (book is not None and submission_epoch == getattr(self, '_entry_reconcile_epoch', 0)
+                and hasattr(self, '_broker')):
+            blocker = self._entry_block_reason(signal.symbol, 'MICRO_DISPATCH_OUTCOME')
+            if blocker in TEMPORARY_ENTRY_BLOCKS and outcome['state']=='not_submitted':
+                retained_this_attempt = book.hold_confirmed(hit, blocker, self._micro_market_now())
+        pipeline = getattr(self, "_pipeline", None)
+        scanner = next((s for s in getattr(pipeline, "_scanners", ()) if s.name == hit.scanner_name), None)
+        book = getattr(scanner, "vwap_retries", None)
+        if book is not None and signal.symbol in book.rows:
+            from daytrading.strategy.scalping.micro_vwap import identity
+            if (retained_this_attempt and outcome['state']=='not_submitted'
+                    and identity(book.rows[signal.symbol]) == setup
+                    and getattr(pipeline, "_symbol_entry_counts", {}).get(signal.symbol, 0) == count_before
+                    and signal.symbol not in getattr(self, "_partial_entries", {})
+                    and not getattr(self._broker, "_unsettled_orders", {}).get(signal.symbol)
+                    and outcome['state']!='sdk_started'):
+                used.remove(setup)
+        if book is not None and setup in used:
+            book.finish(hit, 'submission_or_terminal_execution_outcome', self._micro_market_now())
+            self._flush_micro_control_evidence()
 
     def _timed_entry_chase_reject(
         self,
@@ -5221,12 +6633,18 @@ class AlpacaRunner:
             ).format(live, (live - original) / original * 100.0, original, max_chase_pct * 100.0)
 
         quotes = list(self._quote_buffer.get(signal.symbol, []))
-        recent_quotes = [q for q in quotes[-3:] if q.ask > q.bid > 0]
+        from daytrading.strategy.entry_spread import get_policy,check as spread_check,current as current_spread
+        from daytrading.strategy.entry_checks import diagnostics
+        policy=get_policy();trace=diagnostics(hit)
+        micro=hit is not None and hit.scanner_name in ('micro_pullback_reclaim','prepared_reclaim_tick')
+        check_now=self._micro_market_now() if micro else datetime.now(timezone.utc)
+        if micro and not current_spread(trace,'execution_current_spread',quotes[-1] if quotes else None,check_now):
+            return 'execution_current_spread: fresh current quote exceeds configured normal spread limit'
+        recent_quotes = [q for q in quotes[-policy.execution_recent_samples:] if q.ask > q.bid > 0]
         if recent_quotes:
             avg_spread = sum(q.ask - q.bid for q in recent_quotes) / len(recent_quotes)
             avg_mid = sum((q.ask + q.bid) / 2.0 for q in recent_quotes) / len(recent_quotes)
             avg_spread_pct = avg_spread / avg_mid * 100.0 if avg_mid > 0 else 0.0
-            max_spread = 0.9 if live < 5.0 else 0.6
             criteria = hit.criteria if hit is not None else {}
             avg_depth = sum(min(q.bid_size, q.ask_size) for q in recent_quotes) / len(recent_quotes)
             day_volume = 0.0
@@ -5257,9 +6675,11 @@ class AlpacaRunner:
                 latest_volume=latest_volume,
                 distance_from_hod=distance_from_hod,
                 quote_depth=avg_depth,
-                normal_pct_limit=0.005,
+                normal_pct_limit=get_policy().normal_pct,
                 setup_score=float(getattr(hit, "score", 0.0) or 0.0) if hit is not None else 0.0,
             )
+            if micro:
+                spread_check(trace,'execution_recent_spread',spread=avg_spread,price=avg_mid or live,now=check_now,quote=recent_quotes[-1],window={'source':'last quote updates','samples':len(recent_quotes),'start':recent_quotes[0].ts.isoformat(),'end':recent_quotes[-1].ts.isoformat()})
             if not spread_decision.ok:
                 return "spread {:.2f}% ({:.2f}c) rejected: {}".format(
                     avg_spread_pct, avg_spread * 100.0,
@@ -5420,6 +6840,18 @@ class AlpacaRunner:
         into the signal criteria as ``setup_anchor`` so the execution timer's
         early-strength release measures from the same level.
         """
+        hit=signal.scan_result
+        if (hit is not None and hit.criteria.get('_unified_micro_entry')
+                and hit.scanner_name in ('micro_pullback_reclaim','prepared_reclaim_tick')):
+            # Already-confirmed typed setups own an immutable per-setup anchor.
+            # The ordinary per-symbol timer anchor must neither overwrite that
+            # evidence nor leak an older setup's anchor into a new reclaim.
+            e=hit.criteria.get('_event_evidence')
+            w=hit.confirmation_window
+            original=(e.anchor if e is not None else w.bars[-1].bar.close if w and w.bars else 0.)
+            if original<=0 or hit.criteria.get('setup_anchor')!=original:
+                return 0.  # Typed final identity/price validation fails closed.
+            return float(original)
         sym = signal.symbol
         now = time.monotonic()
         ttl = float(getattr(self, "_timed_entry_anchor_ttl_sec", 300.0) or 0.0)
@@ -5590,6 +7022,10 @@ class AlpacaRunner:
 
         criteria = signal.scan_result.criteria if signal and signal.scan_result else {}
         scanner_name = signal.scan_result.scanner_name if signal and signal.scan_result else ""
+        micro_now = self._micro_market_now() if scanner_name in ('micro_pullback_reclaim', 'prepared_reclaim_tick') else None
+        if scanner_name in ('micro_pullback_reclaim', 'prepared_reclaim_tick') and getattr(self,'_market_clock',None) is not None and micro_now is None:
+            return executor.reject(symbol=symbol, stage=stage, source=source, signal=signal,
+                reason='clock_alignment: fresh broker clock calibration required')
         if signal is None:
             inferred_pattern = str(criteria.get("pattern") or scanner_name or source or "")
             inferred_criteria = {"pattern": inferred_pattern}
@@ -5612,7 +7048,7 @@ class AlpacaRunner:
                     criteria=inferred_criteria,
                 ),
             )
-        return executor.evaluate_quality(
+        decision = executor.evaluate_quality(
             signal,
             bars=bars,
             stage=stage,
@@ -5623,7 +7059,12 @@ class AlpacaRunner:
             float_shares=float_shares,
             ticks=list(self._tick_buffer.get(symbol, [])),
             quotes=list(self._quote_buffer.get(symbol, [])),
+            now=micro_now,
         )
+        callback = getattr(getattr(self, "_pipeline", None), "_micro_vwap_decision", None)
+        if callable(callback) and scanner_name in ("micro_pullback_reclaim", "prepared_reclaim_tick"):
+            callback(signal.scan_result, decision.reject_reason, micro_now)
+        return decision
 
     @staticmethod
     def _resolve_entry_float_shares(float_checker: object, symbol: str) -> Optional[float]:
@@ -5692,6 +7133,12 @@ class AlpacaRunner:
         fallback_bar: Bar,
     ) -> tuple[Optional[Fill], OrderStatus]:
         """One controlled retry for fast HOD squeezes that outrun the first limit."""
+        if (
+            first_status is OrderStatus.NEW
+            or getattr(getattr(self, "_broker", None), "_safety_blocked", False) is True
+            or getattr(getattr(self, "_broker", None), "_conflict_fill_during_cancel", False) is True
+        ):
+            return None, first_status
         try:
             live = self._live_prices([signal.symbol]).get(signal.symbol)
             if live is None or live <= 0:
@@ -5717,7 +7164,7 @@ class AlpacaRunner:
                 close=live,
                 volume=fallback_bar.volume,
                 ts=datetime.now(timezone.utc),
-            )
+             provenance=BarSource.ROLLING_SNAPSHOT)
             try:
                 criteria = signal.scan_result.criteria if signal.scan_result is not None else {}
                 spread_size_factor = float(criteria.get("spread_size_factor") or 1.0)
@@ -6037,12 +7484,12 @@ class AlpacaRunner:
                     "QUICK SCALP ENTRY %s %.0f @ $%.4f stop=$%.2f target=$%.2f %s",
                     sym, fill.quantity, fill.price, stop_price, target_price, rr_note,
                 )
-                self._hub.on_fill(fill, "entry", strategy=fill_strategy)
-                self._hub.add_log(
+                report_safely(self._hub.on_fill, fill, "entry", strategy=fill_strategy)
+                report_safely(self._hub.add_log,
                     "INFO",
                     "QUICK SCALP {} {:.0f} @ ${:.2f}".format(sym, fill.quantity, fill.price),
                 )
-                self._journal.record("trade_fill", {
+                report_execution(self._journal, "trade_fill", {
                     "symbol": sym,
                     "side": fill.side.value,
                     "quantity": fill.quantity,
@@ -6052,7 +7499,7 @@ class AlpacaRunner:
                     "strategy": fill_strategy,
                     "execution_method": "instant_breakout",
                     "market_context": {"phase": self._market_phase()},
-                }, ts=fill.ts)
+                }, fill)
                 self._seed_recent_order_ids()
                 break
             logger.warning("BREAKOUT SCALP order not filled %s (status=%s)", sym, status)
@@ -6221,22 +7668,160 @@ class AlpacaRunner:
             return False
         return (time.monotonic() - fired_at) <= ttl_sec
 
-    def _new_entries_blocked(self, symbol: Optional[str], source: str) -> bool:
-        """Return True when global controls should block any new entry path."""
+    def _entry_block_reason(self, symbol: Optional[str], source: str) -> Optional[str]:
+        """Exact fail-closed reason shared by all entry paths."""
+        broker = getattr(self, "_broker", None)
+        stored_day = getattr(self, '_execution_session_day', None)
+        if stored_day is not None:
+            now_et = self._now_et()
+            current_day = (now_et.date() if now_et.hour >= 4 else (now_et-timedelta(days=1)).date()).isoformat()
+            if stored_day != current_day:
+                return 'execution_session_day'
+        if getattr(self, '_broker_io_busy', False):
+            return 'broker_io_busy'
+        engine = getattr(self, '_session_engine', None)
+        if getattr(self, '_capture_required', False) and engine is None:
+            return 'capture_missing'
+        if engine is not None:
+            recorder = engine.recorder
+            if recorder._failed or recorder._closed or not recorder._thread.is_alive():
+                if not recorder._failed:
+                    recorder.fail('recorder writer unavailable for new entries')
+                return 'recorder_unavailable'
+        if getattr(self, '_legacy_fill_checkpoint', False):
+            return 'legacy_fill_checkpoint'
+        if getattr(getattr(getattr(self, '_pipeline', None), 'exit_manager', None), '_residual_confirmation_pending', {}):
+            return 'residual_confirmation_pending'
+        if getattr(self, '_execution_recovery_required', False):
+            return 'execution_recovery_pending'
+        if any(getattr(owner, '_fill_reconciliation_required', False) is True
+               for owner in (self, getattr(self, '_pipeline', None), getattr(getattr(self, '_pipeline', None), 'portfolio', None), getattr(getattr(self, '_pipeline', None), 'exit_manager', None))):
+            return 'fill_reconciliation_pending'
+        window_check = getattr(self, "_entry_window_checker", None)
+        if window_check is not None and not window_check():
+            return 'entry_window_closed'
+        if getattr(self, "_pipeline_protection_pending", {}):
+            return 'protection_pending'
+        if any(row.quantity > 0 and not row.active_submit
+               for row in getattr(self, "_partial_entries", {}).values()):
+            return 'partial_entry_pending'
+        if getattr(self, "_event_entry_lag_sec", 0.0) > float(os.getenv("DAYTRADING_MAX_ENTRY_EVENT_LAG_SEC", "2.0")):
+            logger.warning("%s blocked — event queue is stale", source)
+            return 'event_queue_stale'
+        if getattr(getattr(self, "_stream", None), "_subscription_error", False) is True:
+            return 'subscription_error'
+        if getattr(broker, "_safety_blocked", False) is True or getattr(broker, "_position_sync_stale", False) is True:
+            logger.warning("%s blocked — broker order/protection reconciliation pending", source)
+            return 'broker_safety_pending' if getattr(broker, '_safety_blocked', False) is True else 'broker_position_sync_stale'
         if getattr(self._hub, "trading_paused", False):
             if symbol:
                 logger.info("%s skip %s — trading paused", source, symbol)
             else:
                 logger.info("%s skip — trading paused", source)
-            return True
+            return 'trading_paused'
         if getattr(self._pipeline, "_circuit_breaker_tripped", False):
             pnl = getattr(self._pipeline, "_daily_pnl", 0.0)
             if symbol:
                 logger.warning("%s block %s — circuit breaker daily P&L $%.2f", source, symbol, pnl)
             else:
                 logger.warning("%s block — circuit breaker daily P&L $%.2f", source, pnl)
-            return True
-        return False
+            return 'circuit_breaker'
+        return None
+
+    def _new_entries_blocked(self, symbol: Optional[str], source: str) -> bool:
+        reason = self._entry_block_reason(symbol, source)
+        if reason:
+            from daytrading.execution.origin import entry_refused
+            entry_refused(reason)
+        previous = getattr(self, '_last_global_entry_block', None)
+        if reason != previous:
+            self._last_global_entry_block = reason
+            report_safely(getattr(getattr(self, '_journal', None), 'record', lambda *a: None),
+                'entry_global_control', dict(reason=reason, previous=previous, source=source,
+                    symbol=symbol, at=datetime.now(timezone.utc).isoformat()))
+        return reason is not None
+
+    def _position_refresh_context(self):
+        broker = self._broker
+        return (getattr(self, '_entry_reconcile_epoch', 0),
+                bool(getattr(self, '_partial_entries', {})), self._position_reconcile_stamp(),
+                tuple(sorted((symbol, tuple(ids)) for symbol, ids in
+                             getattr(broker, '_unsettled_orders', {}).items())),
+                bool(getattr(broker, '_cancel_unconfirmed', False)),
+                tuple(sorted(getattr(broker, '_unconfirmed_cancels', ()))),
+                bool(getattr(broker, '_safety_blocked', False)))
+
+    def _position_snapshot_uncertain(self):
+        """An empty snapshot cannot settle an in-flight economic operation."""
+        return bool(getattr(self, '_partial_entries', {})
+                    or getattr(self._broker, '_unsettled_orders', {})
+                    or getattr(self._broker, '_cancel_unconfirmed', ())
+                    or getattr(self._broker, '_unconfirmed_cancels', ())
+                    or getattr(self._broker, '_safety_blocked', False))
+
+    def _service_position_refresh(self):
+        """Adopt completed IO before decisions, never wait/start a broker request."""
+        context = self._position_refresh_context()
+        binder = getattr(self._broker, 'bind_position_refresh_owner', None)
+        adopter = getattr(self._broker, 'adopt_completed_positions', None)
+        if not callable(binder) or not callable(adopter):
+            return
+        binder(context, getattr(self, '_market_wakeup', None))
+        if self._position_snapshot_uncertain():
+            self._flush_micro_control_evidence()
+            return  # Order/fill reconciliation owns uncertain inventory.
+        if adopter():
+            self._push_positions_from_alpaca()
+        self._flush_micro_control_evidence()
+
+    def _wake_confirmed_setups(self, blocker, now):
+        if now is None:return
+        for scanner in getattr(self._pipeline, '_scanners', ()):
+            book = getattr(scanner, 'vwap_retries', None)
+            if book is not None:
+                book.wake_confirmed(blocker, now)
+
+    def _service_confirmed_micro_readiness(self, result, cycle_num):
+        """One bounded priority check between reporting items, on the owner.
+
+        Never preempt unsettled economic work or resume a stored TradeSignal.
+        An ordinary micro-only cycle re-verifies the immutable original hit.
+        """
+        if getattr(self, '_micro_readiness_active', False):return
+        if any(getattr(result, name, ()) for name in
+                ('fills', 'exit_fills', 'scale_up_fills', 'reentry_fills', 'deferred_signals')):return
+        books=[getattr(s, 'vwap_retries', None) for s in self._pipeline._scanners]
+        if not any(book is not None and book.blocked for book in books):return
+        self._service_position_refresh()
+        blocker=self._entry_block_reason(None, 'CONFIRMED_MICRO_WAKE')
+        if blocker:return
+        now=self._micro_market_now()
+        if now is None:return
+        self._micro_readiness_active=True
+        try:
+            # Include adverse ticks queued while reporting. Their original receipt
+            # lag and all current position/protection controls still gate entries.
+            self._drain_events()
+            blocker=self._entry_block_reason(None, 'CONFIRMED_MICRO_WAKE')
+            self._wake_confirmed_setups(blocker, self._micro_market_now())
+            if blocker is None and any(book is not None and book.dirty for book in books):
+                self._run_one_cycle(cycle_num, allow_entries=True,
+                    only_scanners=frozenset({'micro_pullback_reclaim','prepared_reclaim_tick'}))
+        finally:
+            self._micro_readiness_active=False
+            self._flush_micro_control_evidence()
+
+    def _flush_micro_control_evidence(self):
+        record = getattr(getattr(self, '_journal', None), 'record', None)
+        if not callable(record):return
+        pop = getattr(self._broker, 'pop_position_refresh_events', None)
+        if callable(pop):
+            for row in pop():report_safely(record, 'position_refresh', row)
+        for scanner in getattr(self._pipeline, '_scanners', ()):
+            book = getattr(scanner, 'vwap_retries', None)
+            outbox = getattr(book, 'transitions', None)
+            if outbox is not None:
+                while outbox:report_safely(record, 'micro_retry_transition', outbox.popleft())
 
     def _quick_scalp_tick_rr(
         self,
@@ -9075,12 +10660,12 @@ class AlpacaRunner:
                 if (entry_context and entry_context.get("entry_trigger") == "warrior_ignition")
                 else strategy_label
             )
-            self._hub.on_fill(fill, "entry", strategy=hub_strategy)
-            self._hub.add_log(
+            report_safely(self._hub.on_fill, fill, "entry", strategy=hub_strategy)
+            report_safely(self._hub.add_log,
                 "INFO",
                 "{} {} {:.0f} @ ${:.2f}".format(log_label, sym, fill.quantity, fill.price),
             )
-            self._journal.record("trade_fill", {
+            report_execution(self._journal, "trade_fill", {
                 "symbol": sym,
                 "side": fill.side.value,
                 "quantity": fill.quantity,
@@ -9090,7 +10675,7 @@ class AlpacaRunner:
                 "strategy": strategy_label,
                 "execution_method": "momentum_burst_hit_run" if hit_run else "momentum_burst_new_high",
                 "market_context": {"phase": self._market_phase()},
-            }, ts=fill.ts)
+            }, fill)
             self._seed_recent_order_ids()
             return fill
 
@@ -9313,6 +10898,18 @@ class AlpacaRunner:
 
         return None
 
+    def _initialize_trade_analysis(self) -> None:
+        """Keep the existing startup analyzer inside the recorded kernel."""
+        from daytrading.analytics.trade_analyzer import TradeAnalyzer
+        from daytrading.replay.engine import recorded_analysis_trades, install_scoped_clocks
+        # This module is lazy-loaded on a real cold startup. Install its scoped
+        # clock before constructing the analyzer, not at the next operation.
+        install_scoped_clocks()
+        self._trade_analyzer = TradeAnalyzer(min_trades=3, max_block_trades=3)
+        # Record the real starting observation without running or changing
+        # analytical decisions. Later analyses capture their own current list.
+        recorded_analysis_trades(self)
+
     def _run_trade_analysis(self) -> None:
         """Run AI trade analysis on recent trades and apply adjustments."""
         if self._trade_analyzer is None:
@@ -9320,7 +10917,8 @@ class AlpacaRunner:
         try:
             from daytrading.analytics.trade_analyzer import TradeRecord as ATR
 
-            hub_trades = list(self._hub.trades)
+            from daytrading.replay.engine import recorded_analysis_trades
+            hub_trades = recorded_analysis_trades(self)
             records = []
             for t in hub_trades:
                 if t.trade_type != "exit":
@@ -9336,20 +10934,20 @@ class AlpacaRunner:
 
             for sym in result.blocked_symbols:
                 self._pipeline.set_cooldown(sym)
-                self._hub.add_log("AI", "BLOCKED {}: {}".format(
+                report_safely(self._hub.add_log, "AI", "BLOCKED {}: {}".format(
                     sym, self._trade_analyzer.blocked_symbols.get(sym, "")))
 
             if "position_size" in result.adjusted_params:
                 new_size = result.adjusted_params["position_size"]
-                self._hub.add_log("AI", "Position size adjusted to {:.0f} shares".format(new_size))
+                report_safely(self._hub.add_log, "AI", "Position size adjusted to {:.0f} shares".format(new_size))
 
             if "cooldown_seconds" in result.adjusted_params:
                 new_cd = int(result.adjusted_params["cooldown_seconds"])
                 self._pipeline._cooldown_seconds = new_cd
-                self._hub.add_log("AI", "Cooldown increased to {}s".format(new_cd))
+                report_safely(self._hub.add_log, "AI", "Cooldown increased to {}s".format(new_cd))
 
             if "min_momentum_quality" in result.adjusted_params:
-                self._hub.add_log("AI", "Momentum quality threshold raised to {:.0f}".format(
+                report_safely(self._hub.add_log, "AI", "Momentum quality threshold raised to {:.0f}".format(
                     result.adjusted_params["min_momentum_quality"]))
 
             self._hub.ai_analysis = self._trade_analyzer.snapshot()
@@ -9358,7 +10956,7 @@ class AlpacaRunner:
 
             for ins in result.insights:
                 level = "WARNING" if ins.severity in ("critical", "warning") else "INFO"
-                self._hub.add_log(level, "AI: {}".format(ins.message))
+                report_safely(self._hub.add_log, level, "AI: {}".format(ins.message))
 
         except Exception as exc:
             logger.warning("Trade analysis error: %s", exc)
@@ -9423,8 +11021,24 @@ class AlpacaRunner:
                     if b.ts is None or self._bar_is_today(b, today_et)
                 ]
                 if today_bars:
+                    # This request returns only the latest 30 minutes. Replacing
+                    # the buffer would forget earlier session highs, volume and
+                    # VWAP context whenever a quiet symbol needs a refresh.
+                    # REST corrections replace overlapping minutes, while newer
+                    # streamed bars and the rest of today's history are retained.
+                    by_ts = {
+                        b.ts: b for b in self._bar_buffer.get(sym, ())
+                        if b.ts is None or self._bar_is_today(b, today_et)
+                    }
+                    by_ts.update({b.ts: b for b in today_bars})
+                    merged_bars = sorted(
+                        (b for stamp, b in by_ts.items() if stamp is not None),
+                        key=lambda b: b.ts,
+                    )
+                    if None in by_ts:
+                        merged_bars.append(by_ts[None])
                     self._bar_buffer[sym] = deque(
-                        today_bars[-self._max_bars_per_symbol:],
+                        merged_bars[-self._max_bars_per_symbol:],
                         maxlen=self._max_bars_per_symbol,
                     )
                     refreshed += 1
@@ -9436,6 +11050,7 @@ class AlpacaRunner:
         except Exception as exc:
             logger.debug("Watchlist bar refresh error: %s", exc)
 
+    @measured("ml_shadow_maintenance")
     def _update_ml_shadow(self, bar_universe: dict) -> None:
         """Feed latest prices to ML monitor and check shadow outcomes."""
         try:
@@ -9455,10 +11070,20 @@ class AlpacaRunner:
                 update_deferred_outcomes,
             )
             from daytrading.ml.data_collector import update_deferred_entry_outcomes
-            entry_labeled = update_deferred_entry_outcomes(bar_universe)
-            if entry_labeled:
-                logger.info("ML ENTRY LABELS: labeled %d deferred entry candidates", entry_labeled)
-            update_deferred_outcomes(bar_universe)
+            # These advisory labels require a 180-second future observation.
+            # Reading/re-writing all historical JSONL files on every quote-led
+            # micro scan blocks the same thread that handles protection/tape.
+            # Keep per-cycle price/exit observations below, but bound historical
+            # learning-file maintenance to once per 30 seconds. No model,
+            # feature, entry/exit formula or risk threshold is changed here.
+            shadow_now = time.monotonic()
+            last_labels = getattr(self, '_last_shadow_label_maintenance', None)
+            if last_labels is None or shadow_now - last_labels >= 30.0:
+                self._last_shadow_label_maintenance = shadow_now
+                entry_labeled = update_deferred_entry_outcomes(bar_universe)
+                if entry_labeled:
+                    logger.info("ML ENTRY LABELS: labeled %d deferred entry candidates", entry_labeled)
+                update_deferred_outcomes(bar_universe)
             tracked = self._pipeline.exit_manager.tracked
             for sym, pos in tracked.items():
                 bars = bar_universe.get(sym) or list(self._bar_buffer.get(sym, []))
@@ -9482,14 +11107,15 @@ class AlpacaRunner:
             pass
 
     def _inject_recent_trade_bars(self, bar_universe: dict) -> None:
-        """Append a live synthetic 1m bar when REST bars are stale but tape is fresh.
+        """Provide a transient rolling snapshot; never append it to minute history.
 
         Alpaca's historical bars can lag or return the last completed bar for thin
-        names. If we have fresh trade prints from the WebSocket, use them to keep
-        entry checks from rejecting a still-active HOD/watchlist symbol as stale.
+        names. Fresh WebSocket prints can supply a diagnostic price snapshot,
+        but cannot repair missing canonical history or make an entry eligible.
         """
         now_ts = datetime.now(timezone.utc)
         injected = 0
+        snapshots = self._rolling_trade_snapshots = {}
         for sym in list(self._watchlist_set):
             if sym in self._watchlist_pinned:
                 continue
@@ -9511,7 +11137,7 @@ class AlpacaRunner:
             ticks = list(self._tick_buffer.get(sym, []))
             recent_ticks = [
                 t for t in ticks
-                if t.ts is not None and (now_ts - t.ts).total_seconds() <= 60
+                if t.ts is not None and t.ts.tzinfo is not None and 0 <= (now_ts - t.ts).total_seconds() <= 60
             ]
             if not recent_ticks:
                 continue
@@ -9528,28 +11154,37 @@ class AlpacaRunner:
                 low=min(prices),
                 close=prices[-1],
                 volume=sum(t.size for t in recent_ticks if t.size > 0),
-            )
-            bars.append(live_bar)
-            bar_universe[sym] = list(bars)
+             provenance=BarSource.ROLLING_SNAPSHOT)
+            snapshots[sym] = live_bar  # diagnostic/display value, never entry history
             injected += 1
 
         if injected:
-            logger.info("LIVE BAR INJECT: refreshed %d stale watchlist symbols from tape", injected)
+            logger.info("LIVE SNAPSHOT: %d stale histories have tape marks; canonical history still required", injected)
 
-    def _run_one_cycle(self, cycle_num: int) -> None:
+    @durable_operation
+    @measured('decision_cycle')
+    def _run_one_cycle(self, cycle_num: int, *, allow_entries: bool = True,
+                       only_scanners=None) -> None:
         """Execute one pipeline cycle with current buffered data.
 
         Also injects live Alpaca prices for open positions that have
         no bars in the buffer, so the exit manager can always check
         stops/targets/trails — even for dead stocks with no new bars.
         """
+        self._service_position_refresh()
+        blocked = self._new_entries_blocked(None, 'PIPELINE') if allow_entries else False
+        blocker = getattr(self, '_last_global_entry_block', None) if blocked else None
+        allow_entries = allow_entries and not blocked
+        if any(getattr(getattr(s, 'vwap_retries', None), 'blocked', {}) for s in self._pipeline._scanners):
+            self._wake_confirmed_setups(blocker or (None if allow_entries else 'entries_disabled'), self._micro_market_now())
         if self._stream.is_running:
             try:
                 self._stream.flush_pending_subscriptions()
             except Exception:
                 pass
 
-        self._refresh_watchlist_bars()
+        if only_scanners is None:
+            self._refresh_watchlist_bars()
 
         bar_universe = {s: list(b) for s, b in self._bar_buffer.items() if b}
         quotes = {s: list(q) for s, q in self._quote_buffer.items() if q}
@@ -9574,7 +11209,7 @@ class AlpacaRunner:
         if open_syms:
             try:
                 now_ts = datetime.now(timezone.utc)
-                live = self._live_prices(list(open_syms))
+                live = self._exit_prices(list(open_syms))
                 for sym, price in live.items():
                     if price <= 0:
                         continue
@@ -9582,7 +11217,7 @@ class AlpacaRunner:
                         symbol=sym, open=price, high=price,
                         low=price, close=price, volume=0,
                         ts=now_ts,
-                    )
+                     provenance=BarSource.PRICE_MARK)
                     if sym in trade_universe:
                         trade_universe[sym].append(live_bar)
                     else:
@@ -9595,7 +11230,7 @@ class AlpacaRunner:
                 pass
 
         if not trade_universe and not bar_universe:
-            self._hub.on_cycle_heartbeat(cycle_num, "no bars yet")
+            report_safely(self._hub.on_cycle_heartbeat, cycle_num, "no bars yet")
             return
 
         now = datetime.now(timezone.utc)
@@ -9610,17 +11245,24 @@ class AlpacaRunner:
         try:
             if self._hub.trading_paused:
                 logger.debug("Trading paused — skipping cycle %d", cycle_num)
-                self._hub.on_cycle_heartbeat(cycle_num, "trading paused")
+                report_safely(self._hub.on_cycle_heartbeat, cycle_num, "trading paused")
                 return
             if trade_universe:
                 if self._pipeline._router is not None:
                     self._pipeline._router.classifier.is_premarket = (
                         self._market_phase() == "PRE-MARKET"
                     )
+                window_open = bool(self._entry_window_checker())
                 result = self._pipeline.run_cycle(
                     trade_universe, now=now, quotes=quotes, ticks=ticks,
+                    allow_entries=allow_entries and window_open,
+                    entry_blocker=blocker or ('entry_window_closed' if not window_open else
+                        (None if allow_entries else 'entries_disabled')),
+                    **({'only_scanners': only_scanners} if only_scanners is not None else {}),
+                    **({'market_now': self._micro_market_now()} if getattr(self,'_market_clock',None) is not None else {}),
                 )
                 result._entry_prices = entry_prices
+                self._flush_micro_control_evidence()
                 self._process_result(
                     result, cycle_num, trade_universe,
                     hod_bar_count=len(bar_universe),
@@ -9632,11 +11274,12 @@ class AlpacaRunner:
                 self._run_trade_analysis()
         except Exception as exc:
             logger.error("Cycle %d error: %s", cycle_num, exc, exc_info=True)
-            self._hub.add_log("ERROR", "Cycle {} error: {}".format(cycle_num, exc))
+            report_safely(self._hub.add_log, "ERROR", "Cycle {} error: {}".format(cycle_num, exc))
 
         # ML shadow mode: update prices and check outcomes
         self._update_ml_shadow(bar_universe)
 
+    @measured('cycle_reporting')
     def _process_result(
         self,
         result: PipelineResult,
@@ -9645,27 +11288,35 @@ class AlpacaRunner:
         *,
         hod_bar_count: int = 0,
     ) -> None:
-        """Log events and push them to the dashboard."""
-        for decision in getattr(result, "entry_decisions", []) or []:
-            try:
-                # Skip watch-only rows — shadow scanners (momentum_burst,
-                # bull_flag, level_breakout_watch) log "collecting data, not live
-                # A+" every cycle. They are monitoring chatter, not real entry
-                # attempts, and would dominate the funnel and bloat the journal.
-                if self._is_watch_only_decision(decision):
-                    continue
-                payload = dict(decision)
-                payload["source"] = payload.get("source") or "pipeline"
-                payload["market_phase"] = self._market_phase()
-                payload["cycle"] = cycle_num
-                self._journal.record("entry_decision", payload)
-            except Exception:
-                pass
-
+        """Protect fills first; reporting must never interrupt order management."""
+        new_fills = list(result.fills) + list(result.scale_up_fills) + list(result.reentry_fills)
+        for symbol in dict.fromkeys(fill.symbol for fill in new_fills):
+            tracked = self._pipeline.exit_manager.tracked.get(symbol)
+            if tracked and tracked.remaining_qty > 0 and tracked.stop_loss:
+                try:
+                    self._arm_broker_protection(symbol, tracked.remaining_qty, tracked.stop_loss)
+                except Exception:
+                    self._broker._safety_blocked = True
+                    pending = getattr(self, "_pipeline_protection_pending", None)
+                    if not isinstance(pending, dict):
+                        pending = self._pipeline_protection_pending = {}
+                    pending[symbol] = (tracked.remaining_qty, tracked.stop_loss)
+                    logger.exception("Protective stop failed for %s; new entries blocked", symbol)
+        # Exit P&L, timer cancellation and remaining stop size also precede reporting.
+        entry_prices = getattr(result, "_entry_prices", {})
+        for fill in result.exit_fills:
+            tracked = self._pipeline.exit_manager.tracked.get(fill.symbol)
+            position = self._pipeline.portfolio.positions.get(fill.symbol)
+            entry_price = entry_prices.get(fill.symbol, 0.0) or (tracked.entry_price if tracked else 0.0) or (position.avg_price if position else 0.0)
+            self._record_trade_exit(fill, entry_price, result.exit_reasons.get(fill.symbol, ""),
+                                    strategy=result.entry_strategies.get(fill.symbol, ""), cycle_num=cycle_num)
         # Push classifications to dashboard
         for sym, regime in result.regimes.items():
-            self._hub.on_classification(sym, regime)
-            self._journal.record("classification", {
+            symbol_bars = universe.get(sym, [])
+            report_safely(self._hub.on_classification,
+                sym, regime, price=symbol_bars[-1].close if symbol_bars else 0.0,
+            )
+            report_safely(self._journal.record, "classification", {
                 "symbol": sym,
                 "style": regime.style.value,
                 "confidence": regime.confidence,
@@ -9681,26 +11332,30 @@ class AlpacaRunner:
 
         # Push scanner hits with rejection reasons
         rejections = self._pipeline.scan_rejections
+        decisions_by_id = {row.get("opportunity_id"): row for row in result.entry_decisions if row.get("opportunity_id")}
         for hit in result.scan_hits:
-            is_verified = hit.symbol not in rejections
-            reject_reason = rejections.get(hit.symbol)
+            decision = decisions_by_id.get(hit_identity(hit)[0])
+            is_verified = bool(decision.get("passed")) if decision else hit.symbol not in rejections
+            reject_reason = (decision.get("reason") or None) if decision else rejections.get(hit.symbol)
             self._maybe_arm_momentum_burst_scalp(hit)
-            self._hub.on_scan_hit(hit, verified=is_verified, reject_reason=reject_reason)
+            report_safely(self._hub.on_scan_hit, hit, verified=is_verified, reject_reason=reject_reason)
             if self.is_hot_watch_active(hit.symbol):
-                self._journal.record("hot_watch", {
+                report_safely(self._journal.record, "hot_watch", {
                     "symbol": hit.symbol,
                     "stage": "pattern_found",
                     "scanner": hit.scanner_name,
                     "score": hit.score,
                     "verified": is_verified,
                     "reject_reason": reject_reason,
-                    "criteria": dict(hit.criteria),
+                    "criteria": {k:v for k,v in hit.criteria.items() if k != "_event_evidence"},
                 })
-            self._journal.record("scan_hit", {
+            report_safely(self._journal.record, "scan_hit", {
                 "symbol": hit.symbol,
                 "scanner": hit.scanner_name,
+                "opportunity_id": hit_identity(hit)[0],
+                "bar_ts": hit_identity(hit)[1],
                 "score": hit.score,
-                "criteria": dict(hit.criteria),
+                "criteria": {k:v for k,v in hit.criteria.items() if k != "_event_evidence"},
                 "verified": is_verified,
                 "reject_reason": reject_reason,
                 "candle_snapshot": self._journal.candle_snapshot(hit.bars, limit=30),
@@ -9708,18 +11363,40 @@ class AlpacaRunner:
             if reject_reason:
                 if "stale data" in str(reject_reason).lower():
                     self._request_priority_bar_refresh(hit.symbol)
-                self._journal.record("mistake", {
+                report_safely(self._journal.record, "mistake", {
                     "symbol": hit.symbol,
                     "kind": "scan_rejection",
                     "reason": reject_reason,
                     "scanner": hit.scanner_name,
                 })
 
+        self._service_confirmed_micro_readiness(result, cycle_num)
+
+        for decision in getattr(result, "entry_decisions", []) or []:
+            try:
+                # Skip watch-only rows — shadow scanners (momentum_burst,
+                # bull_flag, level_breakout_watch) log "collecting data, not live
+                # A+" every cycle. They are monitoring chatter, not real entry
+                # attempts, and would dominate the funnel and bloat the journal.
+                payload = dict(decision)
+                payload.setdefault("ts", datetime.now(timezone.utc).isoformat())
+                payload["source"] = payload.get("source") or "pipeline"
+                checker = getattr(self, "_float_checker", None)
+                if checker and hasattr(checker, "get_float_metadata"):
+                    payload.setdefault("metadata", {})["float_data"] = checker.get_float_metadata(payload["symbol"])
+                payload["market_phase"] = self._market_phase()
+                payload["cycle"] = cycle_num
+                report_event(getattr(self, "_hub", None), "on_entry_decision", payload)
+                if not self._is_watch_only_decision(decision):
+                    report_safely(self._journal.record, "entry_decision", payload)
+            except Exception:
+                pass
+
         # Push signals + news sentiment
         for sig in result.signals:
-            self._hub.on_signal(sig)
+            report_safely(self._hub.on_signal, sig)
             sig_bars = universe.get(sig.symbol, [])
-            self._journal.record("signal", {
+            report_safely(self._journal.record, "signal", {
                 "symbol": sig.symbol,
                 "action": sig.action.value,
                 "quantity": sig.quantity,
@@ -9728,13 +11405,13 @@ class AlpacaRunner:
                 "take_profit": sig.take_profit,
                 "reason": sig.reason,
                 "strategy": sig.scan_result.scanner_name if sig.scan_result else "",
-                "criteria": dict(sig.scan_result.criteria) if sig.scan_result else {},
+                "criteria": {k:v for k,v in sig.scan_result.criteria.items() if k != "_event_evidence"} if sig.scan_result else {},
                 "candle_snapshot": self._journal.candle_snapshot(sig_bars, limit=40),
             })
             if self._news_checker:
                 try:
                     score, headlines = self._news_checker.get_sentiment(sig.symbol)
-                    self._hub.on_news(sig.symbol, score, headlines)
+                    report_safely(self._hub.on_news, sig.symbol, score, headlines)
                 except Exception:
                     pass
 
@@ -9745,10 +11422,13 @@ class AlpacaRunner:
                 "[Cycle %d] ENTRY %s %s %.0f @ $%.2f",
                 cycle_num, f.side.value.upper(), f.symbol, f.quantity, f.price,
             )
-            self._hub.on_fill(f, "entry", strategy=strategy)
-            self._hub.add_log("INFO", "ENTRY {} {} {:.0f} @ ${:.2f}".format(
+            sig = next((s for s in result.signals if s.symbol == f.symbol), None)
+            if sig is not None:
+                report_event(self._hub, "on_opportunity_fill", sig, f)
+            report_safely(self._hub.on_fill, f, "entry", strategy=strategy)
+            report_safely(self._hub.add_log, "INFO", "ENTRY {} {} {:.0f} @ ${:.2f}".format(
                 f.side.value.upper(), f.symbol, f.quantity, f.price))
-            self._journal.record("trade_fill", {
+            report_execution(self._journal, "trade_fill", {
                 "symbol": f.symbol,
                 "side": f.side.value,
                 "quantity": f.quantity,
@@ -9760,37 +11440,7 @@ class AlpacaRunner:
                     "phase": self._market_phase(),
                     "cycle": cycle_num,
                 },
-            }, ts=f.ts)
-            tracked = self._pipeline.exit_manager.tracked.get(f.symbol)
-            if tracked and tracked.stop_loss:
-                self._arm_broker_protection(
-                    f.symbol, f.quantity, tracked.stop_loss,
-                )
-
-        # Push exit fills
-        entry_prices = getattr(result, '_entry_prices', {})
-        for f in result.exit_fills:
-            logger.info(
-                "[Cycle %d] EXIT %s %s %.0f @ $%.2f",
-                cycle_num, f.side.value.upper(), f.symbol, f.quantity, f.price,
-            )
-            entry_price = entry_prices.get(f.symbol, 0.0)
-            if entry_price == 0.0:
-                tracked = self._pipeline.exit_manager.tracked
-                if f.symbol in tracked:
-                    entry_price = tracked[f.symbol].entry_price
-            if entry_price == 0.0:
-                pos = self._pipeline.portfolio.positions.get(f.symbol)
-                if pos:
-                    entry_price = pos.avg_price
-            exit_reason = result.exit_reasons.get(f.symbol, "")
-            self._record_trade_exit(
-                f,
-                entry_price,
-                exit_reason,
-                strategy=result.entry_strategies.get(f.symbol, ""),
-                cycle_num=cycle_num,
-            )
+            }, f)
 
         # Push scale-up fills
         if hasattr(result, 'scale_up_fills') and result.scale_up_fills:
@@ -9800,10 +11450,10 @@ class AlpacaRunner:
                     "[Cycle %d] SCALE UP %s %s +%.0f @ $%.2f",
                     cycle_num, f.side.value.upper(), f.symbol, f.quantity, f.price,
                 )
-                self._hub.on_fill(f, "scale_up", strategy=strategy)
-                self._hub.add_log("INFO", "SCALE UP {} +{:.0f} @ ${:.2f}".format(
+                report_safely(self._hub.on_fill, f, "scale_up", strategy=strategy)
+                report_safely(self._hub.add_log, "INFO", "SCALE UP {} +{:.0f} @ ${:.2f}".format(
                     f.symbol, f.quantity, f.price))
-                self._journal.record("trade_fill", {
+                report_execution(self._journal, "trade_fill", {
                     "symbol": f.symbol,
                     "side": f.side.value,
                     "quantity": f.quantity,
@@ -9811,7 +11461,7 @@ class AlpacaRunner:
                     "ts": f.ts,
                     "trade_type": "scale_up",
                     "strategy": strategy,
-                }, ts=f.ts)
+                }, f)
 
         # Push re-entry fills
         if hasattr(result, 'reentry_fills') and result.reentry_fills:
@@ -9821,10 +11471,10 @@ class AlpacaRunner:
                     "[Cycle %d] RE-ENTRY %s %s %.0f @ $%.2f",
                     cycle_num, f.side.value.upper(), f.symbol, f.quantity, f.price,
                 )
-                self._hub.on_fill(f, "reentry", strategy=strategy)
-                self._hub.add_log("INFO", "RE-ENTRY {} {:.0f} @ ${:.2f}".format(
+                report_safely(self._hub.on_fill, f, "reentry", strategy=strategy)
+                report_safely(self._hub.add_log, "INFO", "RE-ENTRY {} {:.0f} @ ${:.2f}".format(
                     f.symbol, f.quantity, f.price))
-                self._journal.record("trade_fill", {
+                report_execution(self._journal, "trade_fill", {
                     "symbol": f.symbol,
                     "side": f.side.value,
                     "quantity": f.quantity,
@@ -9832,7 +11482,7 @@ class AlpacaRunner:
                     "ts": f.ts,
                     "trade_type": "reentry",
                     "strategy": strategy,
-                }, ts=f.ts)
+                }, f)
 
         # Queue deferred signals into execution timer (10-sec micro-entry).
         # Pin the per-symbol chase anchor on first defer so re-queues of a
@@ -9840,32 +11490,32 @@ class AlpacaRunner:
         for sig in getattr(result, 'deferred_signals', []):
             fallback_reject = self._warrior_normal_fallback_reject(sig)
             if fallback_reject:
-                self._hub.on_rejected()
-                self._journal.record("mistake", {
+                report_safely(self._hub.on_rejected, )
+                report_safely(self._journal.record, "mistake", {
                     "kind": "risk_rejection",
                     "symbol": sig.symbol,
                     "reason": fallback_reject,
                     "cycle": cycle_num,
                     "phase": self._market_phase(),
                 })
-                self._hub.add_log("INFO", "SKIP {}: {}".format(sig.symbol, fallback_reject))
+                report_safely(self._hub.add_log, "INFO", "SKIP {}: {}".format(sig.symbol, fallback_reject))
                 logger.info("WARRIOR FALLBACK REJECT %s: %s", sig.symbol, fallback_reject)
                 continue
             overtrade_reject = self._normal_fallback_overtrade_reject(sig)
             if overtrade_reject:
-                self._hub.on_rejected()
-                self._journal.record("mistake", {
+                report_safely(self._hub.on_rejected, )
+                report_safely(self._journal.record, "mistake", {
                     "kind": "risk_rejection",
                     "symbol": sig.symbol,
                     "reason": overtrade_reject,
                     "cycle": cycle_num,
                     "phase": self._market_phase(),
                 })
-                self._hub.add_log("INFO", "SKIP {}: {}".format(sig.symbol, overtrade_reject))
+                report_safely(self._hub.add_log, "INFO", "SKIP {}: {}".format(sig.symbol, overtrade_reject))
                 logger.info("NORMAL FALLBACK OVERTRADE REJECT %s: %s", sig.symbol, overtrade_reject)
                 continue
             self._timed_entry_chase_anchor(sig)
-            self._exec_timer.queue(sig)
+            self._dispatch_confirmed_entry(sig)
 
         # Seed order IDs from pipeline fills to prevent duplicate pushes
         if result.fills or result.exit_fills:
@@ -9881,8 +11531,8 @@ class AlpacaRunner:
 
         # Push rejected count with details
         for detail in result.rejection_details:
-            self._hub.on_rejected()
-            self._journal.record("mistake", {
+            report_safely(self._hub.on_rejected, )
+            report_safely(self._journal.record, "mistake", {
                 "kind": "risk_rejection",
                 "symbol": detail.get("symbol", ""),
                 "reason": detail.get("reason", ""),
@@ -9895,7 +11545,10 @@ class AlpacaRunner:
         max_loss_per_position = 100.0
         prices = {sym: bars[-1].close for sym, bars in universe.items() if bars}
         try:
-            alpaca_positions = self._broker.get_positions()
+            # A flat local portfolio has no position for this max-loss loop to
+            # evaluate. Background broker reconciliation remains unchanged; any
+            # tracked/partial/unsettled exposure still gets this live request.
+            alpaca_positions = self._cycle_safety_positions()
             for sym, pdata in alpaca_positions.items():
                 live_price = float(pdata.get("current_price", 0))
                 if live_price > 0:
@@ -9914,27 +11567,15 @@ class AlpacaRunner:
                     "MAX LOSS TRIGGERED %s: P&L=$%.2f (limit=$%.0f) — force closing",
                     sym, unrealized, max_loss_per_position,
                 )
-                self._hub.add_log("WARNING", "MAX LOSS {} P&L=${:.2f} — force closing".format(sym, unrealized))
+                report_safely(self._hub.add_log, "WARNING", "MAX LOSS {} P&L=${:.2f} — force closing".format(sym, unrealized))
                 try:
-                    actual_qty = int(alpaca_positions.get(sym, {}).get("qty", 0))
-                    if actual_qty <= 0:
-                        logger.info("FORCE CLOSE %s — already closed on Alpaca", sym)
-                        pos.quantity = 0.0
-                        self._pipeline.exit_manager.untrack(sym)
-                        continue
-
-                    from alpaca.trading.requests import LimitOrderRequest
-                    from alpaca.trading.enums import OrderSide, TimeInForce
-                    self._broker._cancel_open_orders_for(sym)
-                    limit_price = round(price * 0.995, 2)
-                    req = LimitOrderRequest(
-                        symbol=sym, qty=actual_qty, side=OrderSide.SELL,
-                        time_in_force=TimeInForce.DAY,
-                        limit_price=limit_price,
-                        extended_hours=True,
-                    )
-                    self._broker.client.submit_order(order_data=req)
-                    logger.info("FORCE CLOSE submitted: limit sell %s %d @ $%.2f", sym, actual_qty, limit_price)
+                    from daytrading.exits.manager import ExitIntent
+                    tracked = self._pipeline.exit_manager.tracked.get(sym)
+                    if tracked is not None:
+                        if tracked.exit_intent is None or not tracked.exit_intent.liquidate:
+                            tracked.exit_intent = ExitIntent('max_loss_force_close', datetime.now(timezone.utc),
+                                                             tracked.remaining_qty, True)
+                        self._check_exits_only()
                 except Exception as exc:
                     logger.error("Failed to force close %s: %s", sym, exc)
 
@@ -9942,20 +11583,20 @@ class AlpacaRunner:
         if result.fills or result.exit_fills:
             self._push_positions_from_alpaca()
         else:
-            self._hub.on_position_update(self._pipeline.portfolio.positions, prices)
+            report_safely(self._hub.on_position_update, self._pipeline.portfolio.positions, prices)
 
         try:
             self._pipeline.missed_a_plus.update_prices(
                 universe, now=datetime.now(timezone.utc),
             )
-            self._hub.on_missed_a_plus(self._pipeline.missed_a_plus_report())
-            self._hub.on_scanner_near_miss(self._pipeline.scanner_near_miss_summary())
+            report_safely(self._hub.on_missed_a_plus, self._pipeline.missed_a_plus_report())
+            report_safely(self._hub.on_scanner_near_miss, self._pipeline.scanner_near_miss_summary())
         except Exception:
             pass
 
         # Cycle complete
-        self._hub.on_cycle_complete(cycle_num, result)
-        self._journal.record("market_regime", {
+        report_safely(self._hub.on_cycle_complete, cycle_num, result)
+        report_safely(self._journal.record, "market_regime", {
             "cycle": cycle_num,
             "phase": self._market_phase(),
             "symbols": {
@@ -9970,7 +11611,7 @@ class AlpacaRunner:
                 for sym, reg in result.regimes.items()
             },
         })
-        self._journal.record("cycle", {
+        report_safely(self._journal.record, "cycle", {
             "cycle": cycle_num,
             "phase": self._market_phase(),
             "symbols_scanned": len(result.regimes),
@@ -9999,7 +11640,7 @@ class AlpacaRunner:
             len(result.signals),
             len(result.fills),
         )
-        self._hub.add_log("INFO", summary)
+        report_safely(self._hub.add_log, "INFO", summary)
         logger.info(summary)
 
         # Track consecutive skips and prune stale watchlist symbols
@@ -10014,6 +11655,17 @@ class AlpacaRunner:
 
         bar_for_hod = {s: list(b) for s, b in self._bar_buffer.items() if b}
         self._refresh_hod_momentum_alerts(bar_for_hod, result)
+
+    def _cycle_safety_positions(self) -> dict:
+        """Avoid a blocking REST safety-price request only when fully flat."""
+        if (self._pipeline.exit_manager.tracked
+                or any(not pos.is_flat for pos in self._pipeline.portfolio.positions.values())
+                or getattr(self, '_partial_entries', {})
+                or getattr(self, '_pipeline_protection_pending', {})
+                or getattr(self._broker, '_safety_blocked', False) is True
+                or getattr(self._broker, '_position_sync_stale', False) is True):
+            return self._broker.get_positions()
+        return {}
 
     def _track_warrior_normal_fallback_state(
         self,
@@ -10153,12 +11805,18 @@ class AlpacaRunner:
                 if hit.symbol not in rejections:
                     verified_syms.add(hit.symbol)
 
+        from daytrading.data.bar_provenance import completed_minutes
+        from daytrading.indicators.core import relative_volume_last
+        from math import isfinite
         rel_vols = {}
-        if result:
-            for sym, reg in result.regimes.items():
-                rel_vols[sym] = reg.relative_volume
-
         scan_universe = self._expand_hod_universe(universe)
+        for sym, source in scan_universe.items():
+            completed = completed_minutes(source, now=now)
+            if len(completed) >= 3:
+                period = min(20, len(completed)-1)
+                value = relative_volume_last(completed, period=period)
+                if isfinite(value):
+                    rel_vols[sym] = value
 
         bars_5m = {}
         if self._bar_aggregator:
@@ -10184,6 +11842,7 @@ class AlpacaRunner:
             verified_symbols=verified_syms,
             rejections=rejections,
             is_premarket=(self._market_phase() == "PRE-MARKET"),
+            now=now,
         )
 
         # Mark gapper symbols in tick tracker for near-HOD reclaim detection
@@ -10236,6 +11895,8 @@ class AlpacaRunner:
                 self._watchlist.remove(sym)
                 self._watchlist_set.discard(sym)
                 self._skip_counts.pop(sym, None)
+                self._news_pinned.discard(sym)
+                getattr(self, "_news_pinned_at", {}).pop(sym, None)
                 self._bar_buffer.pop(sym, None)
                 self._quote_buffer.pop(sym, None)
                 self._tick_buffer.pop(sym, None)
@@ -10293,7 +11954,7 @@ class AlpacaRunner:
             phase,
         )
         try:
-            self._hub.add_log("INFO", f"After-market ML training started for {day_key}")
+            report_safely(self._hub.add_log, "INFO", f"After-market ML training started for {day_key}")
         except Exception:
             pass
         self._run_nightly_analysis()
@@ -10326,28 +11987,27 @@ class AlpacaRunner:
                         "NIGHTLY PROBLEM [%s]: %s",
                         p["severity"], p["problem"],
                     )
-                self._hub.add_log("INFO", f"Nightly report ready: {md_path}")
+                report_safely(self._hub.add_log, "INFO", f"Nightly report ready: {md_path}")
         except Exception as exc:
             logger.error("NIGHTLY ANALYST failed: %s", exc)
 
         # Log ML monitor summary for the day
         self._log_ml_daily_summary()
 
-        # Nightly Warrior-ignition retrain (adaptive loop): retrain on cached +
-        # paper-logged candidates, validate out-of-sample, and DEPLOY ONLY IF it
-        # beats the current model. Wrapped so a failure never breaks the nightly.
+        # Optional nightly research writes candidates/reports only. Promotion
+        # always requires the separate explicit offline command.
         try:
             from daytrading.strategy.warrior_ignition_retrain import retrain
-            res = retrain(deploy=True)
+            res = retrain(deploy=False) if os.getenv("DAYTRADING_NIGHTLY_ML_RETRAIN", "false").lower() in ("1", "true", "yes") else {"status": "disabled", "rows": 0}
             if res.get("status") == "ok":
                 msg = (
                     "IGNITION RETRAIN: {} candidates, OOS {:.0%}->{:.0%}, {}".format(
                         res["rows"], res["current_oos"], res["retrained_oos"],
-                        "DEPLOYED new model" if res["deployed"] else "kept current (no improvement)",
+                        "candidate passed gates; review before promotion" if res["improved"] else "promotion blocked: {}".format(res.get("promotion_reason")),
                     )
                 )
                 logger.info(msg)
-                self._hub.add_log("INFO", msg)
+                report_safely(self._hub.add_log, "INFO", msg)
             else:
                 logger.info("IGNITION RETRAIN: %s (rows=%s)", res.get("status"), res.get("rows"))
         except Exception as exc:
@@ -10377,17 +12037,19 @@ class AlpacaRunner:
                 return
             summary = monitor.get_summary_line()
             logger.info("ML DAILY: %s", summary)
-            self._hub.add_log("INFO", f"ML Daily: {summary}")
+            report_safely(self._hub.add_log, "INFO", f"ML Daily: {summary}")
             stats = monitor.stats
             if stats.model_disabled:
                 logger.warning("ML MODEL was auto-disabled today: %s", stats.disable_reason)
-                self._hub.add_log("WARN", f"ML model disabled: {stats.disable_reason}")
+                report_safely(self._hub.add_log, "WARN", f"ML model disabled: {stats.disable_reason}")
             monitor.reset_daily()
         except Exception as exc:
             logger.debug("ML daily summary error: %s", exc)
 
     def _retrain_ml_model(self) -> None:
         """Retrain XGBoost model with collected data after market close."""
+        if os.getenv("DAYTRADING_NIGHTLY_ML_RETRAIN", "false").lower() not in ("1", "true", "yes"):
+            return
         try:
             from daytrading.ml.data_collector import count_labeled
             labeled = count_labeled()
@@ -10398,11 +12060,11 @@ class AlpacaRunner:
                 from daytrading.ml.train import train
                 trained = train()
                 if trained:
-                    logger.info("ML RETRAIN: complete — model updated for tomorrow")
-                    self._hub.add_log("INFO", f"ML model retrained ({labeled} samples)")
+                    logger.info("ML RETRAIN: candidate/report saved; active model unchanged")
+                    report_safely(self._hub.add_log, "INFO", f"ML model retrained ({labeled} samples)")
                 else:
                     logger.info("ML RETRAIN: skipped — trainer did not write a model")
-                    self._hub.add_log("INFO", "ML retrain skipped — not enough usable data")
+                    report_safely(self._hub.add_log, "INFO", "ML retrain skipped — not enough usable data")
         except Exception as exc:
             logger.warning("ML RETRAIN failed: %s", exc)
 
@@ -10415,12 +12077,13 @@ class AlpacaRunner:
             trained = [name for name, ok in results.items() if ok]
             if trained:
                 logger.info("ML SHADOW RETRAIN: trained %s", ", ".join(trained))
-                self._hub.add_log("INFO", "ML shadow trained: {}".format(", ".join(trained)))
+                report_safely(self._hub.add_log, "INFO", "ML shadow trained: {}".format(", ".join(trained)))
             else:
                 logger.info("ML SHADOW RETRAIN: no advisory models trained")
         except Exception as exc:
             logger.warning("ML SHADOW RETRAIN failed: %s", exc)
 
+    @durable_operation
     def _shutdown_gracefully(self) -> None:
         """Clean shutdown: stop scanner, stream, optionally close positions."""
         if getattr(self, '_did_shutdown', False):
@@ -10428,6 +12091,15 @@ class AlpacaRunner:
         self._did_shutdown = True
 
         logger.info("Shutting down...")
+        if self._close_at_eod:
+            from daytrading.exits.manager import ExitIntent
+            at = datetime.now(timezone.utc)
+            for pos in self._pipeline.exit_manager.tracked.values():
+                if pos.exit_intent is None or not pos.exit_intent.liquidate:
+                    pos.exit_intent = ExitIntent('shutdown_flatten', at, pos.remaining_qty, True)
+            self._check_exits_only()
+            if self._pipeline.exit_manager.tracked:
+                logger.warning('Shutdown retains pending liquidation/protection for unfilled inventory')
 
         self._pool_refresh_event.set()
 
@@ -10437,19 +12109,14 @@ class AlpacaRunner:
         self._stream.stop()
 
         import os, time as _time
-        _lock = os.path.join(os.path.dirname(__file__), ".stream_lock")
+        from daytrading.ml.artifacts import data_root
+        data_root().mkdir(parents=True, exist_ok=True)
+        _lock = str(data_root() / ".stream_lock")
         try:
             with open(_lock, "w") as f:
                 f.write(str(_time.time()))
         except Exception:
             pass
-
-        if self._close_at_eod:
-            logger.info("Closing all positions (end-of-day safety)...")
-            try:
-                self._broker.close_all_positions()
-            except Exception as exc:
-                logger.error("Error closing positions: %s", exc)
 
         # print final state
         try:

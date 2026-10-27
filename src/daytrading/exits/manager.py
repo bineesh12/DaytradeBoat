@@ -21,10 +21,12 @@ Exit Indicators (Warrior Trading Momentum Strategy):
 
 from __future__ import annotations
 
+from daytrading.execution.fill_identity import projected, identity as fill_identity
+
 import logging
 import statistics
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
 
 from daytrading.models import ExitReason, Side, SignalAction, TradeSignal
@@ -108,6 +110,18 @@ class ExitTier:
 
 
 @dataclass
+class ExitIntent:
+    reason: str
+    requested_at: datetime
+    quantity: float
+    liquidate: bool
+    filled: float = 0.0
+    # A deadline can expire without a usable mark. Preserve the existing
+    # ordinary profit/extension conditions when a fresh price becomes available.
+    validate_timeout_price: bool = False
+
+
+@dataclass
 class TrackedPosition:
     """An open position being monitored with the stepping stop system."""
 
@@ -119,11 +133,13 @@ class TrackedPosition:
     entry_ts: Optional[datetime] = None
     stop_loss: Optional[float] = None
     max_hold_seconds: Optional[int] = None
+    timeout_due_at: Optional[datetime] = None
     reason: str = ""
     entry_strategy: str = ""
     entry_pattern: str = ""
     entry_trigger: str = ""
     entry_score: float = 0.0
+    micro_exit_state: object = None  # explicit opt-in immutable plan; legacy paths unchanged
 
     tiers: List[ExitTier] = field(default_factory=list)
 
@@ -187,6 +203,10 @@ class TrackedPosition:
     # stop it; a smooth name trails tight.
     _recent_ranges: List[float] = field(default_factory=list)
     _max_ranges: int = 10
+
+    exit_intent: Optional[ExitIntent] = None
+    closed_at: Optional[datetime] = None
+    entry_order_id: str = ""
 
     def record_bar_range(self, range_pct: float) -> None:
         if range_pct <= 0:
@@ -335,6 +355,8 @@ class ExitManager:
         pos._range_high = pos.entry_price
         pos._range_low = pos.entry_price
         pos._range_start_ts = entry_time
+        self.__dict__.setdefault('_retired_positions', {}).pop(pos.symbol, None)
+        self.__dict__.setdefault('_residual_confirmation_pending', {}).pop(pos.symbol, None)
         self._positions[pos.symbol] = pos
         target = pos.first_target_price if pos.first_target_price > 0 else pos.entry_price + 0.20
         logger.info(
@@ -417,14 +439,33 @@ class ExitManager:
 
     def register_from_signal(
         self, signal: TradeSignal, ts: datetime, fill_price: float = 0.0,
+        *, fill_quantity: Optional[float] = None,
     ) -> None:
         """Convert a filled TradeSignal into a tracked position.
         
         Uses fill_price (actual execution price) if provided, otherwise
         falls back to signal.entry_price.
         """
-        side = Side.BUY if signal.action is SignalAction.ENTER_LONG else Side.SELL
+        side = Side.BUY if signal.action in (
+            SignalAction.ENTER_LONG, SignalAction.REENTER_LONG, SignalAction.SCALE_UP_LONG,
+        ) else Side.SELL
         actual_price = fill_price if fill_price > 0 else signal.entry_price
+        actual_quantity = signal.quantity if fill_quantity is None else fill_quantity
+        if actual_quantity <= 0:
+            raise ValueError("Cannot register an empty fill")
+        from daytrading.exits.coordinated_micro import from_signal, MicroExitState
+        micro_plan = from_signal(signal)
+        if micro_plan is not None:
+            micro_state = MicroExitState.from_observed_fill(micro_plan, actual_price, actual_quantity, ts)
+            self.track(TrackedPosition(
+                symbol=signal.symbol, side=side, quantity=actual_quantity,
+                remaining_qty=actual_quantity, entry_price=actual_price, entry_ts=ts,
+                stop_loss=micro_plan.stop, risk_per_share=actual_price-micro_plan.stop,
+                first_target_price=micro_state.target, max_hold_seconds=micro_plan.max_hold_seconds,
+                reason=signal.reason, entry_strategy=signal.scan_result.scanner_name,
+                entry_pattern=str(signal.scan_result.criteria.get('pattern') or ''),
+                micro_exit_state=micro_state))
+            return
 
         # Use the signal's stop loss (set by pattern scanner) — don't override
         stop_loss = signal.stop_loss
@@ -447,8 +488,8 @@ class ExitManager:
             target_risk = effective_risk
             if effective_risk < min_risk:
                 target_risk = min_risk
-            if signal.quantity > 0 and self._max_unrealized_loss > 0:
-                max_risk = self._max_unrealized_loss / signal.quantity
+            if self._max_unrealized_loss > 0:
+                max_risk = self._max_unrealized_loss / actual_quantity
                 if target_risk > max_risk:
                     target_risk = max_risk
             if abs(target_risk - effective_risk) >= 0.005:
@@ -487,8 +528,8 @@ class ExitManager:
         self.track(TrackedPosition(
             symbol=signal.symbol,
             side=side,
-            quantity=signal.quantity,
-            remaining_qty=signal.quantity,
+            quantity=actual_quantity,
+            remaining_qty=actual_quantity,
             entry_price=actual_price,
             entry_ts=ts,
             stop_loss=stop_loss,
@@ -503,6 +544,150 @@ class ExitManager:
             first_target_price=planned_first_target,
         ))
 
+    @projected('exit_state')
+    def commit_coordinated_exit_fill(self, fill):
+        pos = self._positions.get(fill.symbol)
+        if pos is None:
+            return
+        expected_side = Side.SELL if pos.side is Side.BUY else Side.BUY
+        if fill.side is not expected_side:
+            return
+        # Compatibility for replay/simulated fills without broker identity.
+        key = fill_identity(fill)
+        seen = self.__dict__.setdefault('_committed_exit_keys', set())
+        if key in seen:
+            return
+        state = pos.micro_exit_state
+        if fill.execution_reason == 'broker_stop':
+            if pos.exit_intent is None or not pos.exit_intent.liquidate:
+                pos.exit_intent = ExitIntent('stop_loss: broker protective stop', fill.ts, pos.remaining_qty, True)
+            if state is not None:
+                state.pending_reason = 'stop_loss'
+        if state is not None:
+            if not state.commit_fill(fill):
+                return
+            pos.remaining_qty = state.remaining
+            pos.sold_half = state.target_filled >= state.partial_quantity
+            pos.breakeven_locked = pos.sold_half
+            pos.stop_loss = max(pos.stop_loss or 0., state.stop)
+        else:
+            pos.remaining_qty = max(0., pos.remaining_qty-fill.quantity)
+        intent = pos.exit_intent
+        if intent is not None:
+            intent.filled += fill.quantity
+            if not intent.liquidate and intent.filled >= intent.quantity-1e-8:
+                if state is None:
+                    pos.sold_half = True
+                    self._maybe_confirm_runner(pos, fill.price)
+                    self._apply_post_partial_stop(pos)
+                pos.exit_intent = None
+        seen.add(key)
+        if pos.remaining_qty <= 0:
+            # Retain lifecycle identity until a fresh broker reconciliation can
+            # prove flat. A residual is never adopted with a new timer/policy.
+            pos.closed_at = fill.ts
+            self.__dict__.setdefault('_retired_positions', {})[fill.symbol] = pos
+            self.untrack(fill.symbol)
+
+    def restore_known_lifecycle(self, symbol, quantity):
+        pos = self.__dict__.setdefault('_retired_positions', {}).get(symbol)
+        if pos is None or pos.exit_intent is None or not pos.exit_intent.liquidate:
+            return False
+        if pos.exit_intent.filled >= pos.exit_intent.quantity-1e-8:
+            # An order fully accounted as sold is not permission to sell again
+            # against a lagging position response. Resolve the contradictory
+            # residual with broker fill facts or repeated fresh flat reads.
+            self.__dict__.setdefault('_residual_confirmation_pending', {})[symbol] = quantity
+            return True
+        pos.remaining_qty = quantity
+        if pos.micro_exit_state is not None:
+            pos.micro_exit_state.quantity = pos.micro_exit_state.sold + quantity
+        self._positions[symbol] = pos
+        return True
+
+    def update_coordinated_10s(self, symbol, bar, now, closed_at=None):
+        pos=self._positions.get(symbol)
+        state=getattr(pos,'micro_exit_state',None)
+        if state is None:return False
+        if state.plan.policy=='coordinated_structure':
+            state.on_completed_bar(bar,observed_at=now,closed_at=closed_at)
+            pos.stop_loss=max(pos.stop_loss or 0.,state.stop)
+        return True
+
+    @staticmethod
+    def _hard_stop_hit(pos, price):
+        return pos.stop_loss is not None and (
+            (pos.side is Side.BUY and price <= pos.stop_loss) or
+            (pos.side is not Side.BUY and price >= pos.stop_loss))
+
+    @staticmethod
+    def _unrealized_loss(pos, price):
+        move = pos.entry_price-price if pos.side is Side.BUY else price-pos.entry_price
+        return max(0., move)*pos.remaining_qty
+
+    def pending_entry_protection_reason(self, symbol, price):
+        """Pure initial protection check; no unexecuted profit/step mutations."""
+        pos = self._positions.get(symbol)
+        if pos is None or pos.remaining_qty <= 0:
+            return None
+        if self._max_unrealized_loss > 0 and self._unrealized_loss(pos, price) >= self._max_unrealized_loss:
+            return ExitReason.STOP_LOSS
+        if self._hard_stop_hit(pos, price):
+            return ExitReason.STOP_LOSS
+        return None
+
+    def quote_exit_due(self, symbol, price):
+        """Pure scheduling hint for existing stops and first targets.
+
+        Generate no signals and mutate no position here. The normal main-thread
+        exit check remains the sole decision/execution path. Candle/time/trailing
+        calculations retain their existing heartbeat and trade-event cadence.
+        """
+        pos = self._positions.get(symbol)
+        if pos is None or pos.remaining_qty <= 0:
+            return False
+        if self.pending_entry_protection_reason(symbol, price) is not None:
+            return True
+        if self._step_trail_exit or pos.side is not Side.BUY or pos.sold_half:
+            return False
+        if pos.remaining_qty > 1 and self._uses_quick_scalp_partial(pos):
+            if price >= pos.entry_price * (1 + QUICK_SCALP_PARTIAL_PCT):
+                return True
+        return pos.first_target_price > 0 and price >= pos.first_target_price
+
+    def latch_timeouts(self, now: datetime) -> List[str]:
+        """Persist due deadlines without obtaining or inventing an order price.
+
+        Ordinary stale exits retain their price-dependent exceptions. A due
+        intent remains provisional until the normal policy sees a fresh mark.
+        Coordinated micro maximum holds are unconditional deadlines.
+        """
+        if now.tzinfo is None:
+            raise ValueError('Timeout latching requires an aware clock')
+        changed = []
+        for symbol, pos in self._positions.items():
+            state = pos.micro_exit_state
+            if pos.remaining_qty <= 0 or (pos.exit_intent and (pos.exit_intent.liquidate or state is None)):
+                continue
+            if state is not None:
+                due = state.entered_at + timedelta(seconds=state.plan.max_hold_seconds)
+                reason = 'time_exit: coordinated_micro:time_exit: ' + pos.reason
+            elif pos.entry_ts and not pos.sold_half and not pos.breakeven_locked:
+                seconds = 300 if pos.trend_strength >= .8 else 240 if pos.trend_strength >= .6 else 180
+                due = pos.entry_ts + timedelta(seconds=seconds)
+                reason = 'time_exit: stale_timeout {}s: {}'.format(seconds, pos.reason)
+            else:
+                continue
+            if now < due:
+                continue
+            pos.timeout_due_at = due
+            pos.exit_intent = ExitIntent(reason, now, pos.remaining_qty, True,
+                                        validate_timeout_price=state is None)
+            if state is not None:
+                state.pending_reason = 'time_exit'
+            changed.append(symbol)
+        return changed
+
     def check_exits(
         self,
         prices: Dict[str, float],
@@ -513,6 +698,7 @@ class ExitManager:
             now = now.replace(tzinfo=timezone.utc)
         else:
             now = now.astimezone(timezone.utc)
+        self.latch_timeouts(now)
         exits: List[TradeSignal] = []
 
         for symbol, pos in list(self._positions.items()):
@@ -541,6 +727,48 @@ class ExitManager:
         now: datetime,
     ) -> List[TradeSignal]:
         is_long = pos.side is Side.BUY
+        intent = pos.exit_intent
+        if intent is not None:
+            if intent.validate_timeout_price:
+                # Re-run the ordinary policy, including stop priority and the
+                # original profitable/near-target exceptions. A price outage
+                # must not silently change the strategy's timeout semantics.
+                pos.exit_intent = None
+                signals = self._check_position(pos, price, now)
+                selected = pos.exit_intent
+                if selected is not None and 'stale_timeout ' in selected.reason:
+                    selected.requested_at = intent.requested_at
+                return signals
+            if not intent.liquidate:
+                # Keep the unfilled target balance, while evaluating the same
+                # stop/time policy as before. A target request must not mask a
+                # 60s micro timeout or force a sale after price leaves target.
+                pos.exit_intent = None
+                signals = self._check_position(pos, price, now)
+                selected = pos.exit_intent
+                if selected is not None and selected.liquidate:
+                    return signals
+                pos.exit_intent = intent
+                outstanding = min(pos.remaining_qty, intent.quantity-intent.filled)
+                return [replace(sig, quantity=outstanding, reason=intent.reason)
+                        for sig in signals if outstanding > 0]
+            if pos.remaining_qty > 0:
+                return [TradeSignal(symbol=pos.symbol,
+                    action=SignalAction.EXIT_LONG if is_long else SignalAction.EXIT_SHORT,
+                    quantity=pos.remaining_qty, entry_price=price, reason=intent.reason)]
+            return []
+        state=pos.micro_exit_state
+        if state is not None:
+            # Fill-aware path: requests do not decrement inventory, mark a
+            # partial paid or move to breakeven. Actual fills commit separately.
+            state.stop=max(state.stop,pos.stop_loss or state.stop)
+            decision=state.decide(price,now)
+            if decision is None:return []
+            qty,reason=decision
+            return [self._make_exit(pos,qty,price,
+                ExitReason.TAKE_PROFIT if reason=='partial_1r' else
+                ExitReason.TIME_EXIT if reason=='time_exit' else ExitReason.STOP_LOSS,
+                detail='coordinated_micro:'+reason)]
 
         # --- step-trail exit (overrides the rest when enabled) ---
         # Ride while price keeps clearing step_trail_pct steps up; cut the moment
@@ -557,7 +785,6 @@ class ExitManager:
             if price <= pos.stop_loss:
                 reason = ExitReason.TRAILING_STOP if steps > 0 else ExitReason.STOP_LOSS
                 sig = self._make_exit(pos, pos.remaining_qty, price, reason)
-                pos.remaining_qty = 0
                 return [sig]
             return []
 
@@ -582,10 +809,7 @@ class ExitManager:
         # --- software dollar stop: do not wait for a wide broker stop if
         # the position has already exceeded the intended dollar risk.
         if self._max_unrealized_loss > 0 and pos.remaining_qty > 0:
-            if is_long:
-                unrealized_loss = max(0.0, pos.entry_price - price) * pos.remaining_qty
-            else:
-                unrealized_loss = max(0.0, price - pos.entry_price) * pos.remaining_qty
+            unrealized_loss = self._unrealized_loss(pos, price)
             if unrealized_loss >= self._max_unrealized_loss:
                 logger.info(
                     "DOLLAR STOP %s @ %.4f | unrealized loss $%.2f >= $%.2f "
@@ -594,7 +818,6 @@ class ExitManager:
                     pos.entry_price, int(pos.remaining_qty), pos.stop_loss or 0.0,
                 )
                 sig = self._make_exit(pos, pos.remaining_qty, price, ExitReason.STOP_LOSS)
-                pos.remaining_qty = 0
                 return [sig]
 
         # --- emergency dump candle: flatten hit-run / Warrior positions.
@@ -629,7 +852,6 @@ class ExitManager:
                 pos.entry_price,
             )
             sig = self._make_exit(pos, pos.remaining_qty, price, ExitReason.STOP_LOSS)
-            pos.remaining_qty = 0
             return [sig]
 
         # --- failed follow-through exit for fast Warrior scalps.
@@ -681,20 +903,17 @@ class ExitManager:
                     pos.avg_bar_volume,
                 )
                 sig = self._make_exit(pos, pos.remaining_qty, price, ExitReason.STOP_LOSS)
-                pos.remaining_qty = 0
                 return [sig]
 
         # --- hard stop loss: exit all shares ---
         if pos.stop_loss is not None:
-            if (is_long and price <= pos.stop_loss) or \
-               (not is_long and price >= pos.stop_loss):
+            if self._hard_stop_hit(pos, price):
                 reason = ExitReason.STOP_LOSS if pos.current_step == 0 and not pos.sold_half else ExitReason.TRAILING_STOP
                 logger.info(
                     "STOP HIT %s @ %.4f (stop=%.4f, step=%d, entry=%.4f, sold_half=%s)",
                     pos.symbol, price, pos.stop_loss, pos.current_step, pos.entry_price, pos.sold_half,
                 )
                 sig = self._make_exit(pos, pos.remaining_qty, price, reason)
-                pos.remaining_qty = 0
                 return [sig]
 
         # --- Exit #3: Extension bar — sell into spike (15%+ gain) ---
@@ -706,7 +925,6 @@ class ExitManager:
                     pos.symbol, price, gain_pct * 100, pos.entry_price,
                 )
                 sig = self._make_exit(pos, pos.remaining_qty, price, ExitReason.TAKE_PROFIT)
-                pos.remaining_qty = 0
                 return [sig]
 
         # --- Quick scalp partial: sell half at +1% before moving to breakeven ---
@@ -726,10 +944,6 @@ class ExitManager:
                     quick_partial_price, partial_qty, int(pos.remaining_qty),
                     pos.entry_price,
                 )
-                pos.sold_half = True
-                pos.remaining_qty -= partial_qty
-                self._maybe_confirm_runner(pos, price)
-                self._apply_post_partial_stop(pos)
                 sig = self._make_exit(pos, partial_qty, price, ExitReason.TAKE_PROFIT)
                 return [sig]
 
@@ -742,17 +956,12 @@ class ExitManager:
                         pos.symbol, price, pos.first_target_price, pos.remaining_qty,
                     )
                     sig = self._make_exit(pos, pos.remaining_qty, price, ExitReason.TAKE_PROFIT)
-                    pos.remaining_qty = 0
                     return [sig]
                 partial_qty = self._first_partial_qty(pos)
                 logger.info(
                     "HALF SELL %s @ %.4f | hit 1:1 target %.4f | selling %d of %d shares, moving stop to breakeven %.4f",
                     pos.symbol, price, pos.first_target_price, partial_qty, int(pos.remaining_qty), pos.entry_price,
                 )
-                pos.sold_half = True
-                pos.remaining_qty -= partial_qty
-                self._maybe_confirm_runner(pos, price)
-                self._apply_post_partial_stop(pos)
                 sig = self._make_exit(pos, partial_qty, price, ExitReason.TAKE_PROFIT)
                 return [sig]
 
@@ -802,7 +1011,6 @@ class ExitManager:
                     pos.last_bar_volume, pos.avg_bar_volume, vol_ratio,
                 )
                 sig = self._make_exit(pos, pos.remaining_qty, price, ExitReason.STOP_LOSS)
-                pos.remaining_qty = 0
                 return [sig]
 
         # --- Volume exhaustion exit: green bars with declining volume → momentum fading ---
@@ -817,7 +1025,6 @@ class ExitManager:
                         gain_pct * 100, hold_secs, pos.entry_price,
                     )
                     sig = self._make_exit(pos, pos.remaining_qty, price, ExitReason.TAKE_PROFIT)
-                    pos.remaining_qty = 0
                     return [sig]
 
         # --- stepping stop: check if price crossed the next step level ---
@@ -919,7 +1126,6 @@ class ExitManager:
                 )
                 reason = ExitReason.TAKE_PROFIT if price > pos.entry_price else ExitReason.STOP_LOSS
                 sig = self._make_exit(pos, pos.remaining_qty, price, reason)
-                pos.remaining_qty = 0
                 return [sig]
 
         # --- stale exit: no movement toward target within timeout → exit ---
@@ -947,9 +1153,10 @@ class ExitManager:
                         "STALE EXIT %s @ %.4f | held %.0fs, never reached breakeven (timeout=%ds, trend=%.2f, entry=%.4f)",
                         pos.symbol, price, hold_secs, stale_timeout, pos.trend_strength, pos.entry_price,
                     )
-                    reason = ExitReason.TAKE_PROFIT if price > pos.entry_price else ExitReason.STOP_LOSS
-                    sig = self._make_exit(pos, pos.remaining_qty, price, reason)
-                    pos.remaining_qty = 0
+                    sig = self._make_exit(
+                        pos, pos.remaining_qty, price, ExitReason.TIME_EXIT,
+                        detail="stale_timeout {}s".format(stale_timeout),
+                    )
                     return [sig]
 
         # --- range-bound exit: if price chops in tight range ---
@@ -976,7 +1183,6 @@ class ExitManager:
                         int(range_width / TICK), pos.sold_half,
                     )
                     sig = self._make_exit(pos, pos.remaining_qty, price, ExitReason.TAKE_PROFIT)
-                    pos.remaining_qty = 0
                     return [sig]
             else:
                 pos._range_high = price
@@ -991,14 +1197,20 @@ class ExitManager:
         qty: float,
         price: float,
         reason: ExitReason,
+        *,
+        detail: str = "",
     ) -> TradeSignal:
         action = SignalAction.EXIT_LONG if pos.side is Side.BUY else SignalAction.EXIT_SHORT
+        text = "{}: {}{}".format(reason.value, detail + ": " if detail else "", pos.reason)
+        if pos.exit_intent is None:
+            pos.exit_intent = ExitIntent(text, pos._last_price_update or datetime.now(timezone.utc),
+                                         qty, qty >= pos.remaining_qty-1e-8)
         return TradeSignal(
             symbol=pos.symbol,
             action=action,
             quantity=qty,
             entry_price=price,
-            reason="{}: {}".format(reason.value, pos.reason),
+            reason=text,
         )
 
     @staticmethod

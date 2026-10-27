@@ -1,4 +1,5 @@
 from __future__ import annotations
+from daytrading.models import BarSource
 
 import json
 from datetime import datetime, timedelta, timezone
@@ -29,7 +30,7 @@ def _bar(symbol: str = "OLOX", close: float = 10.0, minutes_ago: int = 0) -> Bar
         low=close * 0.98,
         close=close,
         volume=100_000,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
 
 
 @pytest.fixture()

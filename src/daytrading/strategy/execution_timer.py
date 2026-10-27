@@ -17,9 +17,10 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from daytrading.models import Bar, SignalAction, Tick, TradeSignal
+from daytrading.reporting import report_safely
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,7 @@ class PendingEntry:
     require_micro_signal: bool = False
     last_bar: Optional[Bar] = None
     tick_confirm: int = 0   # consecutive qualifying ticks (for tick entry trigger)
+    reclaim_tick_price: Optional[float] = None
 
 
 class ExecutionTimer:
@@ -61,6 +63,9 @@ class ExecutionTimer:
         tick_entry_enabled: bool = False,
         tick_entry_confirm_count: int = 2,
         tick_entry_max_above_anchor: float = 0.02,
+        on_cancel: Optional[Callable[[TradeSignal, str], None]] = None,
+        on_observation: Optional[Callable[[TradeSignal, dict], None]] = None,
+        on_release: Optional[Callable[[TradeSignal], None]] = None,
     ) -> None:
         self._max_wait = max_wait_bars
         self._enabled = enabled
@@ -68,6 +73,9 @@ class ExecutionTimer:
         self._tick_entry_enabled = bool(tick_entry_enabled)
         self._tick_entry_confirm_count = max(1, int(tick_entry_confirm_count))
         self._tick_entry_max_above_anchor = float(tick_entry_max_above_anchor)
+        self._on_cancel = on_cancel
+        self._on_observation = on_observation
+        self._on_release = on_release
 
     @property
     def pending_symbols(self) -> List[str]:
@@ -164,7 +172,12 @@ class ExecutionTimer:
             and price >= anchor * 0.985                                  # not broken down
             and (vwap is None or vwap <= 0 or price >= vwap * 1.003)      # holding VWAP
         )
+        if pending.require_pullback_reclaim:
+            level = (self._breakout_reclaim_level(pending.signal)
+                     or self._criteria_float(crit, 'close') or pending.signal.entry_price)
+            qualifies = qualifies and price >= level
         pending.tick_confirm = pending.tick_confirm + 1 if qualifies else 0
+        pending.reclaim_tick_price = price if qualifies else None
         if pending.tick_confirm >= self._tick_entry_confirm_count:
             logger.info(
                 "EXEC_TIMER: %s — tick early entry confirmed (%d ticks @ %.4f, anchor=%.4f), executing",
@@ -178,6 +191,32 @@ class ExecutionTimer:
         sym = bar.symbol
         pending = self._pending.get(sym)
         if pending is None:
+            return None
+
+        hit = pending.signal.scan_result
+        retry = bool(hit and hit.criteria.get("_pending_hod_retry"))
+        started_before_queue = bar.ts < pending.queued_at
+        if self._on_observation is not None:
+            evaluated = replace(pending, bars_seen=pending.bars_seen+1,
+                saw_red=pending.saw_red or bar.close < bar.open,
+                best_price=min(pending.best_price if pending.best_price is not None else bar.low, bar.low))
+            report_safely(self._on_observation, pending.signal, {
+                "queued_at": pending.queued_at.isoformat(), "bar_start": bar.ts.isoformat(),
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+                "open": bar.open, "high": bar.high, "low": bar.low,
+                "close": bar.close, "volume": bar.volume,
+                "bars_seen_before": pending.bars_seen,
+                "started_before_queue": started_before_queue,
+                "ignored_pre_signal_bar": retry and started_before_queue,
+                "pullback_reclaim_pass": self._passes_pullback_reclaim_confirmation(evaluated, bar),
+                "early_strength_pass": self._allows_early_strength_release(evaluated, bar),
+                "intrabar_dip_seen": self._had_intrabar_dip(evaluated, bar),
+                "active_tape_pass": self._has_active_10s_tape(pending.signal, bar),
+                "hard_failure": self._pullback_confirmation_failure(evaluated, bar),
+            })
+        # A retained HOD setup must confirm on new evidence. Keep the existing
+        # wall-clock timeout; do not extend it to compensate for partial bars.
+        if retry and started_before_queue:
             return None
 
         pending.bars_seen += 1
@@ -199,7 +238,7 @@ class ExecutionTimer:
                 "EXEC_TIMER: %s — 10s confirmation failed: %s; cancelling",
                 sym, confirmation_failure,
             )
-            self.cancel(sym)
+            self.cancel(sym, reason=confirmation_failure)
             return None
 
         if self._allows_early_strength_release(pending, bar):
@@ -301,7 +340,9 @@ class ExecutionTimer:
                     "EXEC_TIMER: %s — max wait reached without favorable 10s entry, cancelling to avoid chase",
                     sym,
                 )
-                self.cancel(sym)
+                self.cancel(sym, reason="no favorable confirmation after {} 10s {}".format(
+                    pending.bars_seen, "candle" if pending.bars_seen == 1 else "candles",
+                ))
                 return None
             logger.info(
                 "EXEC_TIMER: %s — max wait reached (%d bars), executing at market",
@@ -324,6 +365,10 @@ class ExecutionTimer:
             age = (now - pending.queued_at).total_seconds()
             max_wait_seconds = self._timeout_seconds(pending)
             if age >= max_wait_seconds:
+                if pending.require_pullback_reclaim and (pending.last_bar is None or
+                        not self._passes_pullback_reclaim_confirmation(pending, pending.last_bar)):
+                    self.cancel(sym, reason='no required original-reference reclaim before {:.0f}s timeout'.format(max_wait_seconds))
+                    continue
                 if pending.require_micro_signal:
                     if self._allows_elite_fallback(pending):
                         logger.warning(
@@ -373,20 +418,22 @@ class ExecutionTimer:
                         "EXEC_TIMER: %s — timeout after %.0fs with no favorable 10s entry, cancelling to avoid chase",
                         sym, age,
                     )
-                    self.cancel(sym)
+                    self.cancel(sym, reason="no favorable 10s confirmation before {:.0f}s timeout".format(max_wait_seconds))
                     continue
                 logger.warning(
                     "EXEC_TIMER: %s — timeout after %.0fs with no 10s bars, forcing execution",
                     sym, age,
                 )
                 released.append(self._release(sym))
-        return released
+        return [signal for signal in released if signal is not None]
 
-    def cancel(self, symbol: str) -> None:
+    def cancel(self, symbol: str, *, reason: str = "pending entry cancelled by runtime") -> None:
         """Remove a pending signal (e.g., if conditions changed)."""
-        if symbol in self._pending:
-            del self._pending[symbol]
-            logger.info("EXEC_TIMER: cancelled pending entry for %s", symbol)
+        pending = self._pending.pop(symbol, None)
+        if pending is not None:
+            logger.info("EXEC_TIMER: cancelled pending entry for %s — %s", symbol, reason)
+            if self._on_cancel is not None:
+                report_safely(self._on_cancel, pending.signal, reason)
 
     @staticmethod
     def _timeout_seconds(pending: PendingEntry) -> float:
@@ -399,17 +446,28 @@ class ExecutionTimer:
         symbol: str,
         *,
         scout_reason: Optional[str] = None,
-    ) -> TradeSignal:
-        pending = self._pending.pop(symbol)
+    ) -> Optional[TradeSignal]:
+        pending = self._pending[symbol]
+        if pending.require_pullback_reclaim:
+            bar_ok = pending.last_bar is not None and self._passes_pullback_reclaim_confirmation(pending, pending.last_bar)
+            tick_ok = pending.reclaim_tick_price is not None and pending.tick_confirm >= self._tick_entry_confirm_count
+            if not (bar_ok or tick_ok):
+                return None
+        self._pending.pop(symbol)
         if not scout_reason:
+            if self._on_release is not None:
+                report_safely(self._on_release, pending.signal)
             return pending.signal
         scout_qty = max(1, int(float(pending.signal.quantity or 0) * 0.35))
         scout_qty = min(scout_qty, 75)
-        return replace(
+        signal = replace(
             pending.signal,
             quantity=float(scout_qty),
             reason="{} | {}".format(pending.signal.reason, scout_reason),
         )
+        if self._on_release is not None:
+            report_safely(self._on_release, signal)
+        return signal
 
     @staticmethod
     def _had_intrabar_dip(pending: PendingEntry, bar: Bar) -> bool:
@@ -509,7 +567,7 @@ class ExecutionTimer:
         setup_price = ExecutionTimer._criteria_float(criteria, "close")
         if setup_price is None or setup_price <= 0:
             setup_price = float(pending.signal.entry_price or 0.0)
-        if breakout_level is None and setup_price > 0 and close < setup_price * 0.995:
+        if breakout_level is None and setup_price > 0 and close < setup_price:
             return False
 
         if breakout_level is not None and breakout_level > 0:

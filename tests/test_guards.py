@@ -1,6 +1,7 @@
 """Tests for risk guards — false breakouts, liquidity traps, halts, market panic, slippage."""
 
 from __future__ import annotations
+from daytrading.models import BarSource
 
 from datetime import datetime, timedelta, timezone
 
@@ -42,7 +43,7 @@ def _bar(
         close=close,
         volume=volume,
         timeframe=Timeframe.MIN_1,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
 
 
 def _signal(symbol: str = "TST", price: float = 5.0) -> TradeSignal:
@@ -282,15 +283,17 @@ class TestHaltTracker:
         tracker.update_price("TST", 5.00, _ts(40))
         result = tracker.check("TST", _ts(45))
         assert result is not None
-        assert "HALTED" in result
+        assert "LOW ACTIVITY" in result
 
     def test_post_halt_gap_detection(self) -> None:
         tracker = HaltTracker(resume_cooldown_secs=60)
         tracker.update_price("TST", 5.00, _ts(0))
         # Price freezes
         tracker.update_price("TST", 5.00, _ts(40))
-        # Now a big gap = halt resumed
+        # A gap alone is insufficient; require sustained fresh trades.
         tracker.update_price("TST", 5.50, _ts(80))
+        tracker.update_price("TST", 5.50, _ts(81))
+        tracker.update_price("TST", 5.50, _ts(82))
         result = tracker.check("TST", _ts(85))
         assert result is not None
         assert "cooldown" in result
@@ -325,7 +328,7 @@ class TestMarketPanicDetector:
             close=close,
             volume=1_000_000,
             timeframe=Timeframe.MIN_1,
-        )
+         provenance=BarSource.CANONICAL_INTERVAL)
 
     def test_no_panic_normal_market(self) -> None:
         detector = MarketPanicDetector(panic_drop_pct=0.5, lookback_bars=5)

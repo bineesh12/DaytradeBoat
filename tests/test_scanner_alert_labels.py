@@ -1,3 +1,4 @@
+from daytrading.models import BarSource
 """Tests for HOD Momentum scanner alert labels."""
 
 from datetime import datetime, timezone
@@ -19,7 +20,7 @@ def _bar(i: int, close: float, vol: float = 50_000) -> Bar:
         low=close - 0.1,
         close=close,
         volume=vol,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
 
 
 def test_low_float_high_rel_vol_alert() -> None:

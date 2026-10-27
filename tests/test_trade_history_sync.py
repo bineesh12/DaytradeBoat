@@ -41,6 +41,9 @@ def _order(
 def _runner_with_orders(orders: list[SimpleNamespace]) -> AlpacaRunner:
     runner = AlpacaRunner.__new__(AlpacaRunner)
     runner._hub = DashboardHub()
+    from daytrading.exits.manager import ExitManager
+    from daytrading.models import PortfolioState
+    runner._pipeline = SimpleNamespace(exit_manager=ExitManager(),portfolio=PortfolioState(cash=10000))
     runner._last_synced_order_ids = set()
     runner._broker = SimpleNamespace(
         client=SimpleNamespace(
@@ -53,10 +56,6 @@ def _runner_with_orders(orders: list[SimpleNamespace]) -> AlpacaRunner:
 
 def _runner_for_fill_sync(orders: list[SimpleNamespace]) -> AlpacaRunner:
     runner = _runner_with_orders(orders)
-    runner._pipeline = SimpleNamespace(
-        exit_manager=SimpleNamespace(tracked={}),
-        portfolio=SimpleNamespace(positions={}),
-    )
     runner._record_trade_exit = lambda *args, **kwargs: None
     runner._push_positions_from_alpaca = lambda: None
     return runner

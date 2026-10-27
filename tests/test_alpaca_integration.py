@@ -10,6 +10,7 @@ Verifies:
 """
 
 from __future__ import annotations
+from daytrading.models import BarSource
 
 import threading
 import logging
@@ -172,7 +173,7 @@ class TestAlpacaBroker:
 
         order = Order(symbol="AAPL", side=Side.BUY, quantity=100, limit_price=5.00)
         bar = Bar(symbol="AAPL", ts=datetime.now(timezone.utc),
-                  open=5.0, high=5.1, low=4.9, close=5.0, volume=10000)
+                  open=5.0, high=5.1, low=4.9, close=5.0, volume=10000, provenance=BarSource.CANONICAL_INTERVAL)
         portfolio = PortfolioState(cash=25000)
 
         fill, status = broker._wait_for_fill("test-id", order)
@@ -274,7 +275,7 @@ class TestAlpacaBroker:
             low=4.9,
             close=4.95,
             volume=10000,
-        )
+         provenance=BarSource.CANONICAL_INTERVAL)
         fill, status = broker.submit(order, bar, PortfolioState(cash=25000))
 
         assert status is OrderStatus.FILLED
@@ -317,7 +318,7 @@ class TestAlpacaBroker:
             low=9.9,
             close=10.0,
             volume=10000,
-        )
+         provenance=BarSource.CANONICAL_INTERVAL)
 
         fill, status = broker.submit(order, bar, PortfolioState(cash=25000))
 
@@ -357,7 +358,7 @@ class TestAlpacaBroker:
             low=1.98,
             close=2.02,
             volume=20_000,
-        )
+         provenance=BarSource.CANONICAL_INTERVAL)
 
         fill, status = broker.submit(order, bar, PortfolioState(cash=25000))
 
@@ -397,7 +398,7 @@ class TestAlpacaBroker:
             low=1.97,
             close=2.02,
             volume=150_000,
-        )
+         provenance=BarSource.CANONICAL_INTERVAL)
 
         fill, status = broker.submit(order, bar, PortfolioState(cash=25000))
 
@@ -411,7 +412,7 @@ class TestAlpacaBroker:
 
         order = Order(symbol="AAPL", side=Side.BUY, quantity=0)
         bar = Bar(symbol="AAPL", ts=datetime.now(timezone.utc),
-                  open=5.0, high=5.1, low=4.9, close=5.0, volume=10000)
+                  open=5.0, high=5.1, low=4.9, close=5.0, volume=10000, provenance=BarSource.CANONICAL_INTERVAL)
         portfolio = PortfolioState(cash=25000)
 
         fill, status = broker.submit(order, bar, portfolio)
@@ -458,7 +459,7 @@ class TestAlpacaHistoricalFeed:
             low=float(mock_bar.low),
             close=float(mock_bar.close),
             volume=float(mock_bar.volume),
-        )
+         provenance=BarSource.CANONICAL_INTERVAL)
 
         assert bar.symbol == "AAPL"
         assert bar.close == 5.05

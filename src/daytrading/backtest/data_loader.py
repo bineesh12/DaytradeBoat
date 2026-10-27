@@ -10,7 +10,10 @@ from typing import Dict, Iterable, List, Sequence
 from daytrading.config import Settings
 from daytrading.data.alpaca_feed import AlpacaHistoricalFeed
 from daytrading.market_calendar import ET
-from daytrading.models import Bar, Tick, Timeframe
+from daytrading.ml.artifacts import atomic_json
+from pathlib import Path
+
+from daytrading.models import Bar, BarSource, Tick, Timeframe
 
 
 def parse_timestamp(value: str) -> datetime:
@@ -47,6 +50,7 @@ def load_bars_csv(path: str, *, symbol: str | None = None) -> Dict[str, List[Bar
                     close=float(row.get("close") or row.get("c") or 0.0),
                     volume=float(row.get("volume") or row.get("v") or 0.0),
                     timeframe=Timeframe(row.get("timeframe") or "1m"),
+                    provenance=BarSource(row.get("provenance") or "unknown"),
                 )
             )
     return {
@@ -95,6 +99,7 @@ def _bar_to_dict(bar: Bar) -> dict:
         "close": bar.close,
         "volume": bar.volume,
         "timeframe": bar.timeframe.value,
+        "provenance": getattr(bar.provenance,"value",bar.provenance),
     }
 
 
@@ -108,6 +113,7 @@ def _bar_from_dict(item: dict) -> Bar:
         close=float(item.get("close") or 0.0),
         volume=float(item.get("volume") or 0.0),
         timeframe=Timeframe(item.get("timeframe") or "1m"),
+        provenance=BarSource(item.get("provenance") or "unknown"),
     )
 
 
@@ -160,6 +166,7 @@ def aggregate_ticks_to_10s_bars(
                 close=prices[-1],
                 volume=sum(float(t.size or 0.0) for t in ordered),
                 timeframe=Timeframe.SEC_10,
+                provenance=BarSource.CANONICAL_INTERVAL,
             ))
         if bars:
             result[symbol] = bars
@@ -198,6 +205,8 @@ def fetch_alpaca_bars_for_day(
     if not sym:
         raise ValueError("symbol is required")
     session_day = date.fromisoformat(day) if isinstance(day, str) else day
+    cfg = settings or Settings()
+    selected_feed = getattr(getattr(feed, "_feed", None), "value", cfg.alpaca_feed).lower()
     cache_root = cache_dir or os.environ.get(
         "DAYTRADING_BACKTEST_CACHE_DIR",
         os.path.join("data", "backtest_cache"),
@@ -209,10 +218,9 @@ def fetch_alpaca_bars_for_day(
         with open(cache_path, encoding="utf-8") as fh:
             payload = json.load(fh)
         bars = [_bar_from_dict(item) for item in payload.get("bars", [])]
-        if _bars_cover_session(bars, end):
+        if payload.get("feed") == selected_feed and payload.get("adjustment") == "split" and (payload.get("complete") or _bars_cover_session(bars, end)):
             return {sym: bars}
 
-    cfg = settings or Settings()
     if feed is None:
         if not cfg.alpaca_api_key or not cfg.alpaca_secret_key:
             raise ValueError("missing Alpaca credentials for backtest fetch")
@@ -226,12 +234,14 @@ def fetch_alpaca_bars_for_day(
     result = feed.get_bars([sym], timeframe="1Min", start=start, end=end, limit=2000)
     bars = sorted(result.get(sym, []), key=lambda b: b.ts)
     if bars:
-        with open(cache_path, "w", encoding="utf-8") as fh:
-            json.dump({
+        atomic_json(Path(cache_path), {
                 "symbol": sym,
                 "date": session_day.isoformat(),
+                "feed": selected_feed,
+                "adjustment": "split",
+                "complete": datetime.now(timezone.utc) >= end,
                 "bars": [_bar_to_dict(bar) for bar in bars],
-            }, fh)
+        })
     return {sym: bars} if bars else {}
 
 
@@ -248,6 +258,8 @@ def fetch_alpaca_10s_bars_for_day(
     if not sym:
         raise ValueError("symbol is required")
     session_day = date.fromisoformat(day) if isinstance(day, str) else day
+    cfg = settings or Settings()
+    selected_feed = getattr(getattr(feed, "_feed", None), "value", cfg.alpaca_feed).lower()
     cache_root = cache_dir or os.environ.get(
         "DAYTRADING_BACKTEST_CACHE_DIR",
         os.path.join("data", "backtest_cache"),
@@ -259,10 +271,9 @@ def fetch_alpaca_10s_bars_for_day(
         with open(cache_path, encoding="utf-8") as fh:
             payload = json.load(fh)
         bars = [_bar_from_dict(item) for item in payload.get("bars", [])]
-        if bars and bars[-1].ts >= end - timedelta(minutes=5):
+        if payload.get("feed") == selected_feed and bars and (payload.get("complete") or bars[-1].ts >= end - timedelta(minutes=5)):
             return {sym: bars}
 
-    cfg = settings or Settings()
     if feed is None:
         if not cfg.alpaca_api_key or not cfg.alpaca_secret_key:
             raise ValueError("missing Alpaca credentials for backtest trade fetch")
@@ -282,7 +293,7 @@ def fetch_alpaca_10s_bars_for_day(
                 _fetch_ticks_window(window_start, midpoint, depth + 1)
                 + _fetch_ticks_window(midpoint, window_end, depth + 1)
             )
-        return rows
+        return [tick for tick in rows if window_start <= tick.ts < window_end]
 
     ticks: Dict[str, List[Tick]] = {sym: []}
     chunk_start = start
@@ -293,11 +304,12 @@ def fetch_alpaca_10s_bars_for_day(
     ticks[sym] = sorted(ticks.get(sym, []), key=lambda t: t.ts)
     bars = sorted(aggregate_ticks_to_10s_bars(ticks).get(sym, []), key=lambda b: b.ts)
     if bars:
-        with open(cache_path, "w", encoding="utf-8") as fh:
-            json.dump({
+        atomic_json(Path(cache_path), {
                 "symbol": sym,
                 "date": session_day.isoformat(),
                 "source": "historical_trades",
+                "feed": selected_feed,
+                "complete": datetime.now(timezone.utc) >= end,
                 "bars": [_bar_to_dict(bar) for bar in bars],
-            }, fh)
+        })
     return {sym: bars} if bars else {}

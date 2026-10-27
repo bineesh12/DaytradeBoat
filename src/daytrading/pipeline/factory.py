@@ -6,7 +6,7 @@ factories can be added later once scalping is proven.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Sequence
 
 from daytrading.classifier.regime import MarketRegimeClassifier
 from daytrading.classifier.router import AdaptiveRouter, StyleConfig
@@ -57,6 +57,13 @@ def create_scalping_pipeline(
     level_breakout_scout_enabled: bool = False,
     level_breakout_scout_min_session_move_pct: float = 3.0,
     momentum_burst_live_enabled: bool = False,
+    entry_patterns: Optional[Sequence[str]] = None,
+    prepared_reclaim_enabled: bool = False,
+    unified_micro_entry_enabled: bool = False,
+    micro_pullback_only_enabled: Optional[bool] = None,
+    micro_minimum_room_r: float = 1.0,
+    coordinated_micro_flow_enabled: bool = False,
+    max_entry_risk_pct: float = 0.06,
     level_capped_entry_enabled: bool = False,
 
     # Runner back-half trail (post-partial). Wider rides continuation runners
@@ -243,6 +250,20 @@ def create_scalping_pipeline(
         "shallow_stair_continuation": pattern_verifier,
         "early_vwap_reclaim_scout": pattern_verifier,
     }
+    if entry_patterns is not None and 'micro_pullback_reclaim' in entry_patterns:
+        if getattr(broker, '_paper', False) is not True:
+            raise ValueError('micro_pullback_reclaim automatic execution requires PAPER broker')
+        from daytrading.strategy.scalping.micro_pullback_runtime import MicroPullbackScanner, MicroPullbackVerifier
+        from daytrading.strategy.scalping.micro_pullback import MicroRiskLimits
+        micro_flow = None
+        if coordinated_micro_flow_enabled:
+            from daytrading.strategy.scalping.micro_flow import MicroFlowCollector
+            micro_flow = MicroFlowCollector()
+        all_scanners.append(MicroPullbackScanner(flow=micro_flow))
+        live_verifiers['micro_pullback_reclaim'] = MicroPullbackVerifier(MicroRiskLimits(
+            min_price=min_price, max_price=max_price,
+            max_dollar_risk=pattern_max_dollar_risk, max_order_shares=max_order_shares,
+            max_stop_pct=max_entry_risk_pct), float_checker, flow=micro_flow)
     if momentum_burst_live_enabled:
         live_verifiers["momentum_burst"] = pattern_verifier
         # The engine classifies A+ vs watch-only from module-level sets, so adding
@@ -254,6 +275,38 @@ def create_scalping_pipeline(
         _engine.WATCH_ONLY_SCANNERS = frozenset(
             s for s in _engine.WATCH_ONLY_SCANNERS if s != "momentum_burst"
         )
+
+    if unified_micro_entry_enabled and (not prepared_reclaim_enabled or not coordinated_micro_flow_enabled):
+        raise ValueError('unified micro entry requires both PAPER micro paths and coordinated evidence')
+    if prepared_reclaim_enabled:
+        if getattr(broker, "_paper", False) is not True:
+            raise ValueError("prepared reclaim automatic execution requires PAPER broker")
+        if entry_patterns is None or "micro_pullback_reclaim" not in entry_patterns:
+            raise ValueError("prepared reclaim requires explicit existing micro entry policy")
+        from daytrading.strategy.scalping.event_reclaim import NAME, EventReclaimScanner, EventReclaimVerifier
+        limits = live_verifiers["micro_pullback_reclaim"].limits
+        all_scanners.append(EventReclaimScanner(flow=micro_flow if unified_micro_entry_enabled else None))
+        live_verifiers[NAME] = EventReclaimVerifier(limits, float_checker, flow=micro_flow if unified_micro_entry_enabled else None)
+        if unified_micro_entry_enabled:
+            for name in (NAME,"micro_pullback_reclaim"):
+                live_verifiers[name].entry_profile=True
+            for scanner in all_scanners:
+                if scanner.name=="micro_pullback_reclaim":scanner.entry_profile=True
+        entry_patterns = tuple(entry_patterns) + (NAME,)
+    from daytrading.strategy.entry_admission import MICRO_ROUTES
+    micro_only = unified_micro_entry_enabled if micro_pullback_only_enabled is None else micro_pullback_only_enabled
+    if micro_only:
+        if not coordinated_micro_flow_enabled or not unified_micro_entry_enabled:
+            raise ValueError('micro-only entries require unified coordinated micro evidence')
+        if not 0 < micro_minimum_room_r < float('inf'):
+            raise ValueError('micro minimum room R must be finite and positive')
+        entry_patterns = tuple(name for name in (entry_patterns or ()) if name in MICRO_ROUTES)
+    if entry_patterns is not None:
+        allowed = set(entry_patterns)
+        unknown = allowed - set(live_verifiers)
+        if unknown:
+            raise ValueError("Unknown entry patterns: " + ", ".join(sorted(unknown)))
+        live_verifiers = {name: verifier for name, verifier in live_verifiers.items() if name in allowed}
 
     scalp_config = StyleConfig(
         scanners=all_scanners,
@@ -303,7 +356,7 @@ def create_scalping_pipeline(
     ))
 
     # --- Pipeline ---
-    return TradingPipeline(
+    pipeline = TradingPipeline(
         scanners=all_scanners,
         verifiers=live_verifiers,
         broker=broker,
@@ -320,8 +373,8 @@ def create_scalping_pipeline(
             step_trail_pct=step_trail_pct,
         ),
         router=router,
-        scaler=runner_readd_scaler,
-        reentry_detector=reentry_detector,
+        scaler=runner_readd_scaler if entry_patterns is None else None,
+        reentry_detector=reentry_detector if entry_patterns is None else None,
         max_positions=max_positions,
         max_position_shares=max_position_shares,
         max_order_shares=max_order_shares,
@@ -331,3 +384,32 @@ def create_scalping_pipeline(
         daily_loser_blacklist_max_losses=daily_loser_blacklist_max_losses,
         level_capped_entry_enabled=level_capped_entry_enabled,
     )
+
+    pipeline._unified_micro_entry = bool(unified_micro_entry_enabled)
+    pipeline._micro_pullback_only = bool(micro_only)
+    pipeline._micro_minimum_room_r = float(micro_minimum_room_r)
+    pipeline._entry_policy.micro_pullback_only = bool(micro_only)
+    pipeline._entry_policy.minimum_room_r = float(micro_minimum_room_r)
+    def final_admission(signal, order, price):
+        hit = getattr(signal, 'scan_result', None)
+        if not micro_only and (hit is None or hit.scanner_name not in MICRO_ROUTES):
+            return None
+        from daytrading.strategy.submission import final_check, persist
+        verifier = pipeline._verifiers.get(hit.scanner_name) if hit else None
+        quotes = getattr(verifier, '_quote_buffer', {}).get(order.symbol, ())
+        clock = getattr(broker, '_entry_deadline_clock', None) or (lambda:getattr(pipeline, '_market_now', None))
+        reason,evidence = final_check(signal,order,policy=pipeline._entry_policy,
+            bars=hit.bars if hit else (),quote=quotes[-1] if quotes else None,
+            ticks=getattr(verifier,'_tick_buffer',{}).get(order.symbol,()),
+            now=clock(),limits=getattr(verifier,'limits',None),boundary='pipeline_broker_submission')
+        return persist(evidence,getattr(pipeline,'_entry_evidence_recorder',None),clock) or reason
+    broker._strategy_admission = final_admission
+    pipeline._entry_policy.entry_patterns = frozenset(entry_patterns) if entry_patterns is not None else None
+    pipeline._entry_policy.min_price = min_price
+    pipeline._entry_policy.max_price = max_price
+    if coordinated_micro_flow_enabled:
+        if 'micro_pullback_reclaim' not in live_verifiers:
+            raise ValueError('coordinated flow requires the existing PAPER micro pattern')
+        pipeline._coordinated_micro_flow = micro_flow
+        pipeline._entry_policy.micro_flow_provider = micro_flow.quote_samples
+    return pipeline

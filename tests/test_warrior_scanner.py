@@ -1,6 +1,7 @@
 """Tests for Warrior-mode: decoupled squeeze alerts and tape-hot detection."""
 
 from __future__ import annotations
+from daytrading.models import BarSource
 
 import time
 from datetime import datetime, timezone
@@ -22,7 +23,7 @@ def _bar(sym: str, close: float, ts_hour: int = 14, volume: int = 100_000) -> Ba
         low=close * 0.94,
         close=close,
         volume=volume,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
 
 
 def _today_bars(sym: str, close: float, count: int = 20) -> List[Bar]:
@@ -36,7 +37,7 @@ def _today_bars(sym: str, close: float, count: int = 20) -> List[Bar]:
             low=close * 0.9 + (close * 0.09 * i / count),
             close=close * 0.9 + (close * 0.1 * (i + 1) / count),
             volume=100_000,
-        ))
+         provenance=BarSource.CANONICAL_INTERVAL))
     return bars
 
 
@@ -64,7 +65,7 @@ class TestDecoupledSqueeze:
                 low=p - 0.02,
                 close=p,
                 volume=100_000,
-            ))
+             provenance=BarSource.CANONICAL_INTERVAL))
         # Last bar: 6% spike from 5 bars ago
         bars[-1] = Bar(
             symbol="SQZ",
@@ -74,7 +75,7 @@ class TestDecoupledSqueeze:
             low=bars[-2].close,
             close=bars[-6].close * 1.06,
             volume=500_000,
-        )
+         provenance=BarSource.CANONICAL_INTERVAL)
 
         class FakeFloat:
             def get_float(self, sym):

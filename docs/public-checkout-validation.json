@@ -1,0 +1,24 @@
+{
+  "scope": "Published application-only offline regression subset; not full private qualification or automatic-entry approval.",
+  "source_core": "1ee6c69bf48eb600503ce6cf12f55b597ade332f07133fbba96a93653f6dee43",
+  "passed": 2052,
+  "skipped": 21,
+  "failures": 0,
+  "deselected_private_fixture_cases": 8,
+  "ignored_private_fixture_modules": 4,
+  "ignored_separate_research_modules": 4,
+  "release_probe_cases_in_subset": 2,
+  "release_probe_failures": 0,
+  "network": "Denied before application imports; credentials removed; temporary runtime directories.",
+  "command": "PYTHONHASHSEED=0 python -B tools/test_offline.py",
+  "tested_python": "3.11.15",
+  "tested_packages": {
+    "pytest": "8.3.5",
+    "alpaca-py": "0.44.0",
+    "Flask": "3.0.3",
+    "requests": "2.34.2"
+  },
+  "dependency_lockfile": false,
+  "failed_portability_trials": "Two prior publication-copy trials exposed missing local references and private fixture selection. Those failed logs are retained locally. Final run uses portable frozen references and explicit dataset/research exclusions; application source and assertions unchanged.",
+  "deployment_or_automatic_entries_enabled": false
+}

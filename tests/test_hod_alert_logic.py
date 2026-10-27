@@ -1,3 +1,4 @@
+from daytrading.models import BarSource
 """Document and verify each HOD Momentum alert label condition."""
 
 from datetime import datetime, timezone
@@ -21,7 +22,7 @@ def _1m(i: int, o: float, h: float, c: float, vol: float = 50_000) -> Bar:
         low=o - 0.1,
         close=c,
         volume=vol,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
 
 
 def test_new_hod_breakout_flag_only_when_requested() -> None:

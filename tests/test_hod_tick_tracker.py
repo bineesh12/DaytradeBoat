@@ -1,3 +1,4 @@
+from daytrading.models import BarSource
 """Tests for HODTickTracker on live trades."""
 
 from datetime import datetime, timezone
@@ -28,7 +29,7 @@ def _bar(i: int, high: float, vol: float = 100_000) -> Bar:
         low=high - 0.2,
         close=high - 0.05,
         volume=vol,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
 
 
 def test_new_hod_emits_tick_alert_after_bar_seed() -> None:

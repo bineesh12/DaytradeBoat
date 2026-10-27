@@ -1,4 +1,5 @@
 from __future__ import annotations
+from daytrading.models import BarSource
 
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
@@ -62,6 +63,7 @@ class _QuickScalpRunner:
     _capital_aware_quantity = AlpacaRunner._capital_aware_quantity
     _current_equity = AlpacaRunner._current_equity
     _new_entries_blocked = AlpacaRunner._new_entries_blocked
+    _entry_block_reason = AlpacaRunner._entry_block_reason
     _quick_scalp_allows_extreme_hod_runner_alert = staticmethod(
         AlpacaRunner._quick_scalp_allows_extreme_hod_runner_alert
     )
@@ -130,22 +132,22 @@ class _QuickScalpRunner:
 
 def _nxts_failed_spike_reclaim_bars(symbol: str = "NXTS") -> list[Bar]:
     return [
-        Bar(symbol, TS + timedelta(seconds=0), 4.80, 5.10, 4.70, 5.00, 30_000, Timeframe.SEC_10),
-        Bar(symbol, TS + timedelta(seconds=10), 5.00, 6.80, 4.95, 6.60, 70_000, Timeframe.SEC_10),
-        Bar(symbol, TS + timedelta(seconds=20), 6.60, 8.90, 6.50, 8.40, 120_000, Timeframe.SEC_10),
-        Bar(symbol, TS + timedelta(seconds=30), 8.35, 8.55, 7.10, 7.40, 100_000, Timeframe.SEC_10),
-        Bar(symbol, TS + timedelta(seconds=40), 7.40, 7.70, 6.80, 7.00, 80_000, Timeframe.SEC_10),
-        Bar(symbol, TS + timedelta(seconds=50), 7.05, 7.80, 7.00, 7.60, 60_000, Timeframe.SEC_10),
-        Bar(symbol, TS + timedelta(seconds=60), 7.70, 8.20, 7.50, 8.10, 45_000, Timeframe.SEC_10),
-        Bar(symbol, TS + timedelta(seconds=70), 8.10, 8.40, 7.90, 8.25, 50_000, Timeframe.SEC_10),
-        Bar(symbol, TS + timedelta(seconds=80), 8.20, 8.35, 7.95, 8.05, 35_000, Timeframe.SEC_10),
-        Bar(symbol, TS + timedelta(seconds=90), 8.05, 8.30, 7.90, 8.20, 32_000, Timeframe.SEC_10),
-        Bar(symbol, TS + timedelta(seconds=100), 8.20, 8.45, 8.05, 8.36, 45_000, Timeframe.SEC_10),
-        Bar(symbol, TS + timedelta(seconds=110), 8.35, 8.50, 8.10, 8.20, 40_000, Timeframe.SEC_10),
-        Bar(symbol, TS + timedelta(seconds=120), 8.20, 8.55, 8.15, 8.42, 50_000, Timeframe.SEC_10),
-        Bar(symbol, TS + timedelta(seconds=130), 8.40, 8.58, 8.25, 8.50, 55_000, Timeframe.SEC_10),
-        Bar(symbol, TS + timedelta(seconds=140), 8.50, 8.62, 8.30, 8.56, 60_000, Timeframe.SEC_10),
-        Bar(symbol, TS + timedelta(seconds=150), 8.62, 9.15, 8.55, 9.02, 160_000, Timeframe.SEC_10),
+        Bar(symbol, TS + timedelta(seconds=0), 4.80, 5.10, 4.70, 5.00, 30_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar(symbol, TS + timedelta(seconds=10), 5.00, 6.80, 4.95, 6.60, 70_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar(symbol, TS + timedelta(seconds=20), 6.60, 8.90, 6.50, 8.40, 120_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar(symbol, TS + timedelta(seconds=30), 8.35, 8.55, 7.10, 7.40, 100_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar(symbol, TS + timedelta(seconds=40), 7.40, 7.70, 6.80, 7.00, 80_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar(symbol, TS + timedelta(seconds=50), 7.05, 7.80, 7.00, 7.60, 60_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar(symbol, TS + timedelta(seconds=60), 7.70, 8.20, 7.50, 8.10, 45_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar(symbol, TS + timedelta(seconds=70), 8.10, 8.40, 7.90, 8.25, 50_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar(symbol, TS + timedelta(seconds=80), 8.20, 8.35, 7.95, 8.05, 35_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar(symbol, TS + timedelta(seconds=90), 8.05, 8.30, 7.90, 8.20, 32_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar(symbol, TS + timedelta(seconds=100), 8.20, 8.45, 8.05, 8.36, 45_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar(symbol, TS + timedelta(seconds=110), 8.35, 8.50, 8.10, 8.20, 40_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar(symbol, TS + timedelta(seconds=120), 8.20, 8.55, 8.15, 8.42, 50_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar(symbol, TS + timedelta(seconds=130), 8.40, 8.58, 8.25, 8.50, 55_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar(symbol, TS + timedelta(seconds=140), 8.50, 8.62, 8.30, 8.56, 60_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar(symbol, TS + timedelta(seconds=150), 8.62, 9.15, 8.55, 9.02, 160_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
 
@@ -173,9 +175,9 @@ def test_warrior_squeeze_live_a_plus_reclaim_stop_stays_inside_final_guard() -> 
     runner._warrior_squeeze_min_reclaim_price = 3.50
     runner._warrior_squeeze_rejection_high["MBUR"] = 4.00
     bars = [
-        Bar("MBUR", TS, 7.90, 8.00, 7.86, 7.96, 120_000, Timeframe.SEC_10),
-        Bar("MBUR", TS + timedelta(seconds=10), 8.05, 8.20, 8.00, 8.15, 180_000, Timeframe.SEC_10),
-        Bar("MBUR", TS + timedelta(seconds=20), 8.55, 9.10, 8.35, 9.00, 220_000, Timeframe.SEC_10),
+        Bar("MBUR", TS, 7.90, 8.00, 7.86, 7.96, 120_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", TS + timedelta(seconds=10), 8.05, 8.20, 8.00, 8.15, 180_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", TS + timedelta(seconds=20), 8.55, 9.10, 8.35, 9.00, 220_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
     runner._bar_aggregator = SimpleNamespace()
     runner._momentum_burst_recent_10s = lambda symbol, count=6: bars[-count:]
@@ -213,7 +215,7 @@ def _bar(
         close=close,
         volume=volume,
         timeframe=Timeframe.MIN_1,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
 
 
 def _add_clean_execution_context(runner: _QuickScalpRunner, symbol: str = "OLOX") -> None:
@@ -624,7 +626,7 @@ def test_quick_scalp_rejects_red_10s_confirmation() -> None:
         close=8.04,
         volume=22_000,
         timeframe=Timeframe.SEC_10,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
     runner._bar_aggregator = SimpleNamespace(
         get_latest_10s=lambda symbol, count=2: [red_bar],
     )
@@ -645,7 +647,7 @@ def test_quick_scalp_allows_green_expanding_10s_confirmation() -> None:
         close=8.04,
         volume=18_000,
         timeframe=Timeframe.SEC_10,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
     latest = Bar(
         symbol="OLOX",
         ts=datetime.now(timezone.utc),
@@ -655,7 +657,7 @@ def test_quick_scalp_allows_green_expanding_10s_confirmation() -> None:
         close=8.14,
         volume=24_000,
         timeframe=Timeframe.SEC_10,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
     runner._bar_aggregator = SimpleNamespace(
         get_latest_10s=lambda symbol, count=2: [previous, latest],
     )
@@ -674,7 +676,7 @@ def test_breakout_scalp_rejects_weak_close_10s_confirmation() -> None:
         close=8.04,
         volume=24_000,
         timeframe=Timeframe.SEC_10,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
     latest = Bar(
         symbol="OLOX",
         ts=datetime.now(timezone.utc),
@@ -684,7 +686,7 @@ def test_breakout_scalp_rejects_weak_close_10s_confirmation() -> None:
         close=8.08,
         volume=25_000,
         timeframe=Timeframe.SEC_10,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
     runner._bar_aggregator = SimpleNamespace(
         get_latest_10s=lambda symbol, count=2: [previous, latest],
     )
@@ -705,7 +707,7 @@ def test_breakout_scalp_rejects_faded_10s_confirmation_volume() -> None:
         close=8.04,
         volume=60_000,
         timeframe=Timeframe.SEC_10,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
     latest = Bar(
         symbol="OLOX",
         ts=datetime.now(timezone.utc),
@@ -715,7 +717,7 @@ def test_breakout_scalp_rejects_faded_10s_confirmation_volume() -> None:
         close=8.14,
         volume=20_000,
         timeframe=Timeframe.SEC_10,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
     runner._bar_aggregator = SimpleNamespace(
         get_latest_10s=lambda symbol, count=2: [previous, latest],
     )
@@ -736,7 +738,7 @@ def test_breakout_scalp_rejects_violent_confirmation_without_high_close() -> Non
         close=9.55,
         volume=130_000,
         timeframe=Timeframe.SEC_10,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
     latest = Bar(
         symbol="OLOX",
         ts=datetime.now(timezone.utc),
@@ -746,7 +748,7 @@ def test_breakout_scalp_rejects_violent_confirmation_without_high_close() -> Non
         close=10.69,
         volume=291_000,
         timeframe=Timeframe.SEC_10,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
     runner._bar_aggregator = SimpleNamespace(
         get_latest_10s=lambda symbol, count=4: [previous, latest],
     )
@@ -767,7 +769,7 @@ def test_breakout_scalp_rejects_recent_dump_before_breakout() -> None:
         close=2.35,
         volume=90_000,
         timeframe=Timeframe.SEC_10,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
     dump = Bar(
         symbol="OLOX",
         ts=datetime.now(timezone.utc) - timedelta(seconds=20),
@@ -777,7 +779,7 @@ def test_breakout_scalp_rejects_recent_dump_before_breakout() -> None:
         close=2.22,
         volume=175_000,
         timeframe=Timeframe.SEC_10,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
     previous = Bar(
         symbol="OLOX",
         ts=datetime.now(timezone.utc) - timedelta(seconds=10),
@@ -787,7 +789,7 @@ def test_breakout_scalp_rejects_recent_dump_before_breakout() -> None:
         close=2.47,
         volume=130_000,
         timeframe=Timeframe.SEC_10,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
     latest = Bar(
         symbol="OLOX",
         ts=datetime.now(timezone.utc),
@@ -797,7 +799,7 @@ def test_breakout_scalp_rejects_recent_dump_before_breakout() -> None:
         close=2.60,
         volume=180_000,
         timeframe=Timeframe.SEC_10,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
     runner._bar_aggregator = SimpleNamespace(
         get_latest_10s=lambda symbol, count=4: [older, dump, previous, latest],
     )
@@ -818,7 +820,7 @@ def test_breakout_scalp_allows_wide_candle_with_high_close_and_no_prior_dump() -
         close=4.37,
         volume=180_000,
         timeframe=Timeframe.SEC_10,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
     previous = Bar(
         symbol="OLOX",
         ts=datetime.now(timezone.utc) - timedelta(seconds=10),
@@ -828,7 +830,7 @@ def test_breakout_scalp_allows_wide_candle_with_high_close_and_no_prior_dump() -
         close=4.73,
         volume=450_000,
         timeframe=Timeframe.SEC_10,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
     latest = Bar(
         symbol="OLOX",
         ts=datetime.now(timezone.utc),
@@ -838,7 +840,7 @@ def test_breakout_scalp_allows_wide_candle_with_high_close_and_no_prior_dump() -
         close=5.17,
         volume=725_000,
         timeframe=Timeframe.SEC_10,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
     runner._bar_aggregator = SimpleNamespace(
         get_latest_10s=lambda symbol, count=4: [older, previous, latest],
     )
@@ -894,7 +896,7 @@ def _smooth_bars(sym: str, close: float = 2.20) -> list:
     # ~1.4% per-bar range — tight tape where a stop holds
     return [
         Bar(symbol=sym, ts=TS, open=close - 0.005, high=close + 0.015,
-            low=close - 0.015, close=close, volume=300_000)
+            low=close - 0.015, close=close, volume=300_000, provenance=BarSource.CANONICAL_INTERVAL)
         for _ in range(6)
     ]
 
@@ -903,7 +905,7 @@ def _gappy_bars(sym: str, close: float = 2.20) -> list:
     # ~13% per-bar range — violent tape where a stop slips (VSME-style)
     return [
         Bar(symbol=sym, ts=TS, open=close - 0.10, high=close + 0.15,
-            low=close - 0.15, close=close, volume=600_000)
+            low=close - 0.15, close=close, volume=600_000, provenance=BarSource.CANONICAL_INTERVAL)
         for _ in range(6)
     ]
 
@@ -1008,7 +1010,7 @@ def _momentum_burst_hit(symbol: str = "MBUR", high: float = 2.40) -> ScanResult:
             close=high - 0.02,
             volume=250_000,
             timeframe=Timeframe.MIN_1,
-        )
+         provenance=BarSource.CANONICAL_INTERVAL)
         for idx in range(3, 0, -1)
     ]
     return ScanResult(
@@ -1083,7 +1085,7 @@ def test_warrior_live_10s_watches_first_cheap_spike_without_entry() -> None:
     runner = _QuickScalpRunner()
     runner._warrior_squeeze_enabled = True
     runner._warrior_squeeze_min_reclaim_price = 2.0
-    bar = Bar("MBUR", TS, 1.25, 1.70, 1.20, 1.62, 120_000, Timeframe.SEC_10)
+    bar = Bar("MBUR", TS, 1.25, 1.70, 1.20, 1.62, 120_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL)
 
     runner._maybe_arm_warrior_squeeze_from_10s("MBUR", bar, time.monotonic())
 
@@ -1108,7 +1110,7 @@ def test_warrior_squeeze_rejects_first_high_volume_shooting_star() -> None:
             close=bar.close,
             volume=60_000,
             timeframe=bar.timeframe,
-        )
+         provenance=BarSource.CANONICAL_INTERVAL)
         for bar in base_hit.bars[:-1]
     ] + [
         Bar(
@@ -1120,7 +1122,7 @@ def test_warrior_squeeze_rejects_first_high_volume_shooting_star() -> None:
             close=2.34,
             volume=220_000,
             timeframe=Timeframe.MIN_1,
-        )
+         provenance=BarSource.CANONICAL_INTERVAL)
     ]
     hit = ScanResult(
         symbol="MBUR",
@@ -1170,15 +1172,15 @@ def test_warrior_multi_symbol_loop_keeps_target_wins_dict() -> None:
     runner._momentum_burst_session_anchor_high = {"AAA": 3.00, "BBB": 3.00}
     runner._bar_buffer = {
         "AAA": deque([
-            Bar("AAA", now - timedelta(minutes=1), 2.10, 2.30, 2.05, 2.22, 150_000, Timeframe.MIN_1)
+            Bar("AAA", now - timedelta(minutes=1), 2.10, 2.30, 2.05, 2.22, 150_000, Timeframe.MIN_1, provenance=BarSource.CANONICAL_INTERVAL)
         ]),
         "BBB": deque([
-            Bar("BBB", now - timedelta(minutes=1), 2.10, 2.30, 2.05, 2.22, 150_000, Timeframe.MIN_1)
+            Bar("BBB", now - timedelta(minutes=1), 2.10, 2.30, 2.05, 2.22, 150_000, Timeframe.MIN_1, provenance=BarSource.CANONICAL_INTERVAL)
         ]),
     }
     runner._bar_aggregator = _Bars10([
-        Bar("AAA", now - timedelta(seconds=10), 2.38, 2.40, 2.36, 2.39, 75_000, Timeframe.SEC_10),
-        Bar("AAA", now, 2.39, 2.55, 2.38, 2.52, 125_000, Timeframe.SEC_10),
+        Bar("AAA", now - timedelta(seconds=10), 2.38, 2.40, 2.36, 2.39, 75_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("AAA", now, 2.39, 2.55, 2.38, 2.52, 125_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ])
     runner._warrior_squeeze_target_wins = {}
     runner._warrior_squeeze_last_target_at = {}
@@ -1228,13 +1230,13 @@ def _momentum_burst_trade_runner() -> _QuickScalpRunner:
     runner._bar_buffer = {
         sym: deque([
             Bar(sym, now - timedelta(minutes=4 - idx), 1.80 + idx * 0.15, 1.90 + idx * 0.15,
-                1.75 + idx * 0.15, 1.85 + idx * 0.15, 250_000, Timeframe.MIN_1)
+                1.75 + idx * 0.15, 1.85 + idx * 0.15, 250_000, Timeframe.MIN_1, provenance=BarSource.CANONICAL_INTERVAL)
             for idx in range(5)
         ])
     }
     runner._bar_aggregator = _Bars10([
-        Bar(sym, now - timedelta(seconds=10), 2.38, 2.40, 2.36, 2.39, 75_000, Timeframe.SEC_10),
-        Bar(sym, now, 2.39, 2.55, 2.38, 2.52, 125_000, Timeframe.SEC_10),
+        Bar(sym, now - timedelta(seconds=10), 2.38, 2.40, 2.36, 2.39, 75_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar(sym, now, 2.39, 2.55, 2.38, 2.52, 125_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ])
     for i in range(12):
         runner._tick_buffer[sym].append(
@@ -1284,7 +1286,7 @@ def test_momentum_burst_cycle_arms_then_fires_on_confirmation_bar() -> None:
 
     # Next 10s bar confirms the breakout with continuation and a strong close.
     runner._bar_aggregator.append(
-        Bar("MBUR", now + timedelta(seconds=10), 2.53, 2.62, 2.52, 2.59, 130_000, Timeframe.SEC_10)
+        Bar("MBUR", now + timedelta(seconds=10), 2.53, 2.62, 2.52, 2.59, 130_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL)
     )
     runner._process_momentum_burst_scalps()
 
@@ -1305,7 +1307,7 @@ def test_momentum_burst_hit_run_keeps_window_after_confirmed_entry() -> None:
 
     runner._process_momentum_burst_scalps()
     runner._bar_aggregator.append(
-        Bar("MBUR", now + timedelta(seconds=10), 2.53, 2.62, 2.52, 2.59, 130_000, Timeframe.SEC_10)
+        Bar("MBUR", now + timedelta(seconds=10), 2.53, 2.62, 2.52, 2.59, 130_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL)
     )
     runner._process_momentum_burst_scalps()
 
@@ -1343,8 +1345,8 @@ def test_warrior_squeeze_entry_is_tagged_and_reduced_starter_size() -> None:
         }
     }
     runner._bar_aggregator = _Bars10([
-        Bar("MBUR", now - timedelta(seconds=10), 2.70, 3.50, 2.70, 3.16, 760_000, Timeframe.SEC_10),
-        Bar("MBUR", now, 3.17, 4.08, 3.10, 3.9674, 845_000, Timeframe.SEC_10),
+        Bar("MBUR", now - timedelta(seconds=10), 2.70, 3.50, 2.70, 3.16, 760_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", now, 3.17, 4.08, 3.10, 3.9674, 845_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ])
     runner._process_momentum_burst_scalps()
 
@@ -1385,8 +1387,8 @@ def test_warrior_squeeze_size_factor_does_not_stack_with_violent_hit_run() -> No
         }
     }
     runner._bar_aggregator = _Bars10([
-        Bar("MBUR", now - timedelta(seconds=10), 2.70, 3.50, 2.70, 3.16, 760_000, Timeframe.SEC_10),
-        Bar("MBUR", now, 3.17, 4.08, 3.10, 3.9674, 845_000, Timeframe.SEC_10),
+        Bar("MBUR", now - timedelta(seconds=10), 2.70, 3.50, 2.70, 3.16, 760_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", now, 3.17, 4.08, 3.10, 3.9674, 845_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ])
     runner._process_momentum_burst_scalps()
 
@@ -1415,10 +1417,10 @@ def test_warrior_squeeze_pullaway_starter_buys_capped_reclaim_level() -> None:
         }
     }
     runner._bar_aggregator = _Bars10([
-        Bar("MBUR", now - timedelta(seconds=30), 3.46, 3.56, 3.45, 3.53, 260_000, Timeframe.SEC_10),
-        Bar("MBUR", now - timedelta(seconds=20), 3.54, 3.62, 3.49, 3.58, 320_000, Timeframe.SEC_10),
-        Bar("MBUR", now - timedelta(seconds=10), 3.58, 3.70, 3.50, 3.64, 760_000, Timeframe.SEC_10),
-        Bar("MBUR", now, 3.65, 4.08, 3.56, 3.97, 845_000, Timeframe.SEC_10),
+        Bar("MBUR", now - timedelta(seconds=30), 3.46, 3.56, 3.45, 3.53, 260_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", now - timedelta(seconds=20), 3.54, 3.62, 3.49, 3.58, 320_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", now - timedelta(seconds=10), 3.58, 3.70, 3.50, 3.64, 760_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", now, 3.65, 4.08, 3.56, 3.97, 845_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ])
 
     runner._process_momentum_burst_scalps()
@@ -1443,8 +1445,8 @@ def test_warrior_squeeze_clwt_fast_pullaway_does_not_need_slow_proof_hold() -> N
     runner._warrior_squeeze_rejection_reason["MBUR"] = "high-volume shooting-star rejection"
     now = runner._test_now
     bars = [
-        Bar("MBUR", now - timedelta(seconds=20), 2.70, 3.50, 2.70, 3.16, 760_000, Timeframe.SEC_10),
-        Bar("MBUR", now - timedelta(seconds=10), 3.17, 4.08, 3.10, 3.9674, 845_000, Timeframe.SEC_10),
+        Bar("MBUR", now - timedelta(seconds=20), 2.70, 3.50, 2.70, 3.16, 760_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", now - timedelta(seconds=10), 3.17, 4.08, 3.10, 3.9674, 845_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
     runner._bar_aggregator = _Bars10(bars)
     pending = {
@@ -1474,9 +1476,9 @@ def test_warrior_squeeze_rejects_high_price_generic_pullaway_starter() -> None:
     runner._warrior_squeeze_rejection_reason["PIII"] = "first explosive 10s spike"
     now = runner._test_now
     bars = [
-        Bar("PIII", now - timedelta(seconds=30), 6.80, 7.20, 6.70, 7.05, 260_000, Timeframe.SEC_10),
-        Bar("PIII", now - timedelta(seconds=20), 7.05, 7.35, 6.95, 7.28, 310_000, Timeframe.SEC_10),
-        Bar("PIII", now - timedelta(seconds=10), 7.30, 7.75, 7.25, 7.62, 380_000, Timeframe.SEC_10),
+        Bar("PIII", now - timedelta(seconds=30), 6.80, 7.20, 6.70, 7.05, 260_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PIII", now - timedelta(seconds=20), 7.05, 7.35, 6.95, 7.28, 310_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PIII", now - timedelta(seconds=10), 7.30, 7.75, 7.25, 7.62, 380_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
     runner._bar_aggregator = _Bars10(bars)
     pending = {
@@ -1500,11 +1502,11 @@ def test_warrior_squeeze_equal_high_pullaway_allows_clwt_style_level_hold() -> N
     runner._warrior_squeeze_rejection_reason["MBUR"] = "high-volume shooting-star rejection"
     now = runner._test_now
     bars = [
-        Bar("MBUR", now - timedelta(seconds=40), 3.42, 3.50, 3.36, 3.47, 180_000, Timeframe.SEC_10),
-        Bar("MBUR", now - timedelta(seconds=30), 3.48, 3.54, 3.42, 3.52, 230_000, Timeframe.SEC_10),
-        Bar("MBUR", now - timedelta(seconds=20), 3.51, 3.58, 3.45, 3.55, 260_000, Timeframe.SEC_10),
-        Bar("MBUR", now - timedelta(seconds=10), 3.54, 3.59, 3.49, 3.57, 280_000, Timeframe.SEC_10),
-        Bar("MBUR", now, 3.56, 3.60, 3.50, 3.59, 310_000, Timeframe.SEC_10),
+        Bar("MBUR", now - timedelta(seconds=40), 3.42, 3.50, 3.36, 3.47, 180_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", now - timedelta(seconds=30), 3.48, 3.54, 3.42, 3.52, 230_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", now - timedelta(seconds=20), 3.51, 3.58, 3.45, 3.55, 260_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", now - timedelta(seconds=10), 3.54, 3.59, 3.49, 3.57, 280_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", now, 3.56, 3.60, 3.50, 3.59, 310_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
     runner._bar_aggregator = _Bars10(bars)
     pending = {
@@ -1535,8 +1537,8 @@ def test_warrior_squeeze_curl_reclaim_rejects_high_price_first_starter() -> None
     runner._warrior_squeeze_min_reclaim_price = 3.50
     now = runner._test_now
     bars = [
-        Bar("PIII", now - timedelta(seconds=20), 7.10, 7.35, 7.05, 7.28, 260_000, Timeframe.SEC_10),
-        Bar("PIII", now - timedelta(seconds=10), 7.32, 7.72, 7.30, 7.65, 360_000, Timeframe.SEC_10),
+        Bar("PIII", now - timedelta(seconds=20), 7.10, 7.35, 7.05, 7.28, 260_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("PIII", now - timedelta(seconds=10), 7.32, 7.72, 7.30, 7.65, 360_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
     runner._bar_aggregator = _Bars10(bars)
     pending = {
@@ -1564,10 +1566,10 @@ def test_warrior_squeeze_equal_high_pullaway_rejects_topping_tail() -> None:
     runner._warrior_squeeze_rejection_reason["MBUR"] = "high-volume shooting-star rejection"
     now = runner._test_now
     bars = [
-        Bar("MBUR", now - timedelta(seconds=30), 3.48, 3.54, 3.42, 3.52, 230_000, Timeframe.SEC_10),
-        Bar("MBUR", now - timedelta(seconds=20), 3.51, 3.58, 3.45, 3.55, 260_000, Timeframe.SEC_10),
-        Bar("MBUR", now - timedelta(seconds=10), 3.54, 3.59, 3.49, 3.57, 280_000, Timeframe.SEC_10),
-        Bar("MBUR", now, 3.58, 3.82, 3.50, 3.60, 410_000, Timeframe.SEC_10),
+        Bar("MBUR", now - timedelta(seconds=30), 3.48, 3.54, 3.42, 3.52, 230_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", now - timedelta(seconds=20), 3.51, 3.58, 3.45, 3.55, 260_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", now - timedelta(seconds=10), 3.54, 3.59, 3.49, 3.57, 280_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", now, 3.58, 3.82, 3.50, 3.60, 410_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ]
     runner._bar_aggregator = _Bars10(bars)
 
@@ -1619,9 +1621,9 @@ def test_warrior_pending_confirm_accepts_trend_pullback_lane() -> None:
         }
     }
     runner._bar_aggregator = _Bars10([
-        Bar("MBUR", now - timedelta(seconds=20), 4.90, 5.00, 4.80, 4.92, 140_000, Timeframe.SEC_10),
-        Bar("MBUR", now - timedelta(seconds=10), 4.78, 4.86, 4.62, 4.70, 85_000, Timeframe.SEC_10),
-        Bar("MBUR", now, 4.72, 4.88, 4.66, 4.84, 155_000, Timeframe.SEC_10),
+        Bar("MBUR", now - timedelta(seconds=20), 4.90, 5.00, 4.80, 4.92, 140_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", now - timedelta(seconds=10), 4.78, 4.86, 4.62, 4.70, 85_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", now, 4.72, 4.88, 4.66, 4.84, 155_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ])
     runner._warrior_trend_pullback_reclaim_context = lambda *args, **kwargs: {
         "entry_trigger": "warrior_trend_pullback_reclaim",
@@ -1717,7 +1719,7 @@ def test_momentum_burst_cycle_skips_unconfirmed_reversal() -> None:
 
     # Next bar reverses (red, closes below the breakout close) — not confirmed.
     runner._bar_aggregator.append(
-        Bar("MBUR", now + timedelta(seconds=10), 2.51, 2.53, 2.30, 2.34, 140_000, Timeframe.SEC_10)
+        Bar("MBUR", now + timedelta(seconds=10), 2.51, 2.53, 2.30, 2.34, 140_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL)
     )
     runner._process_momentum_burst_scalps()
 
@@ -1738,7 +1740,7 @@ def test_momentum_burst_hit_run_requires_continuation_high() -> None:
     assert "MBUR" in runner._momentum_burst_pending
 
     runner._bar_aggregator.append(
-        Bar("MBUR", now + timedelta(seconds=10), 2.53, 2.55, 2.52, 2.54, 130_000, Timeframe.SEC_10)
+        Bar("MBUR", now + timedelta(seconds=10), 2.53, 2.55, 2.52, 2.54, 130_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL)
     )
     runner._process_momentum_burst_scalps()
 
@@ -1765,9 +1767,9 @@ def test_momentum_burst_hit_run_rejects_failed_half_dollar_hold() -> None:
     runner._momentum_burst_hit_run_enabled = True
     now = runner._test_now
     runner._bar_aggregator = _Bars10([
-        Bar("MBUR", now - timedelta(seconds=10), 2.38, 2.40, 2.36, 2.39, 75_000, Timeframe.SEC_10),
+        Bar("MBUR", now - timedelta(seconds=10), 2.38, 2.40, 2.36, 2.39, 75_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
         # Spike crosses $2.50 but closes just below it. This only arms pending.
-        Bar("MBUR", now, 2.39, 2.501, 2.38, 2.49, 125_000, Timeframe.SEC_10),
+        Bar("MBUR", now, 2.39, 2.501, 2.38, 2.49, 125_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ])
 
     runner._process_momentum_burst_scalps()
@@ -1776,7 +1778,7 @@ def test_momentum_burst_hit_run_rejects_failed_half_dollar_hold() -> None:
     # Next 10s bar is technically green and trades through the spike high, but
     # it cannot hold the $2.50 level. Do not buy this failed level break.
     runner._bar_aggregator.append(
-        Bar("MBUR", now + timedelta(seconds=10), 2.48, 2.507, 2.47, 2.496, 130_000, Timeframe.SEC_10)
+        Bar("MBUR", now + timedelta(seconds=10), 2.48, 2.507, 2.47, 2.496, 130_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL)
     )
     runner._process_momentum_burst_scalps()
 
@@ -1791,13 +1793,13 @@ def test_momentum_burst_hit_run_accepts_half_dollar_hold() -> None:
     runner._momentum_burst_hit_run_enabled = True
     now = runner._test_now
     runner._bar_aggregator = _Bars10([
-        Bar("MBUR", now - timedelta(seconds=10), 2.38, 2.40, 2.36, 2.39, 75_000, Timeframe.SEC_10),
-        Bar("MBUR", now, 2.39, 2.501, 2.38, 2.49, 125_000, Timeframe.SEC_10),
+        Bar("MBUR", now - timedelta(seconds=10), 2.38, 2.40, 2.36, 2.39, 75_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar("MBUR", now, 2.39, 2.501, 2.38, 2.49, 125_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL),
     ])
 
     runner._process_momentum_burst_scalps()
     runner._bar_aggregator.append(
-        Bar("MBUR", now + timedelta(seconds=10), 2.49, 2.56, 2.48, 2.55, 130_000, Timeframe.SEC_10)
+        Bar("MBUR", now + timedelta(seconds=10), 2.49, 2.56, 2.48, 2.55, 130_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL)
     )
     runner._process_momentum_burst_scalps()
 
@@ -1823,7 +1825,7 @@ def test_momentum_burst_hit_run_rebases_after_clean_micro_base_pause() -> None:
     # The first confirm bar holds green but does not clear the spike high. This
     # used to delete the setup; now it should rebase to the micro-base instead.
     runner._bar_aggregator.append(
-        Bar("MBUR", now + timedelta(seconds=10), 2.52, 2.55, 2.50, 2.54, 130_000, Timeframe.SEC_10)
+        Bar("MBUR", now + timedelta(seconds=10), 2.52, 2.55, 2.50, 2.54, 130_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL)
     )
     runner._process_momentum_burst_scalps()
 
@@ -1837,7 +1839,7 @@ def test_momentum_burst_hit_run_rebases_after_clean_micro_base_pause() -> None:
 
     # The next 10s bar finally clears that micro-base high with a strong close.
     runner._bar_aggregator.append(
-        Bar("MBUR", now + timedelta(seconds=20), 2.54, 2.60, 2.53, 2.59, 140_000, Timeframe.SEC_10)
+        Bar("MBUR", now + timedelta(seconds=20), 2.54, 2.60, 2.53, 2.59, 140_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL)
     )
     runner._process_momentum_burst_scalps()
 
@@ -1868,7 +1870,7 @@ def test_momentum_burst_hit_run_rebase_keeps_original_timeout_anchor() -> None:
     }
     runner._momentum_burst_window_high["MBUR"] = 2.60
     runner._bar_aggregator.append(
-        Bar("MBUR", now + timedelta(seconds=20), 2.54, 2.55, 2.50, 2.54, 130_000, Timeframe.SEC_10)
+        Bar("MBUR", now + timedelta(seconds=20), 2.54, 2.55, 2.50, 2.54, 130_000, Timeframe.SEC_10, provenance=BarSource.CANONICAL_INTERVAL)
     )
 
     runner._process_momentum_burst_scalps()

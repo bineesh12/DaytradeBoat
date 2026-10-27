@@ -13,6 +13,7 @@ immediately.
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from typing import Callable, Dict, List, Optional
@@ -50,6 +51,22 @@ class WatchlistScanner:
         # Common warrant symbols are usually longer root tickers ending in W.
         # Short real tickers like WNW should stay in the scan universe.
         return len(symbol) >= 4 and symbol.endswith("W")
+
+    @classmethod
+    def asset_rejection(cls, asset) -> Optional[str]:
+        symbol = str(asset.symbol)
+        if cls._is_probable_warrant_symbol(symbol):
+            return "warrant symbol"
+        name = str(getattr(asset, "name", "") or "")
+        # Alpaca reports funds as us_equity too; names provide an explicit,
+        # explainable filter. Unknown names are allowed and labeled as unknown.
+        if symbol in cls._ETF_BLACKLIST or re.search(
+            r"\b(ETF|ETN|exchange[- ]traded|Direxion|ProShares|iShares|YieldMax|GraniteShares|Defiance|Leverage Shares|Daily.*[234]X)\b", name, re.I
+        ):
+            return "fund excluded by stocks-only asset-name policy"
+        if re.search(r"\b(warrant|preferred stock|depositary shares)\b", name, re.I):
+            return "non-common equity"
+        return None
 
     def __init__(
         self,
@@ -128,7 +145,11 @@ class WatchlistScanner:
         return ranked
 
     def scan_candidates(self, *, full_universe: bool = False, readonly: bool = False) -> List[Dict]:
-        """Light rescan of cached movers (or full universe on first run)."""
+        """Refresh snapshots for cached movers or the eligible asset inventory.
+
+        Broad discovery can use full_universe=True with readonly=True to find
+        newly active stocks without replacing the pool worker's candidate list.
+        """
         t0 = time.time()
         if full_universe or not self._candidate_symbols:
             symbols = self._load_all_symbols()
@@ -142,7 +163,8 @@ class WatchlistScanner:
         ranked = self._rank(candidates)
         elapsed = time.time() - t0
         logger.info(
-            "Candidate scan in %.1fs — %d pass filters",
+            "%s candidate scan in %.1fs — %d pass filters",
+            "Broad" if full_universe else "Cached",
             elapsed,
             len(candidates),
         )
@@ -255,15 +277,22 @@ class WatchlistScanner:
             return self._all_symbols
 
         logger.info("Loading US equity list from Alpaca...")
-        req = GetAssetsRequest(status=AssetStatus.ACTIVE)
-        assets = self._trading.get_all_assets(req)
+        # Filter at the API boundary, before the SDK parses the whole list.
+        # An unrelated new exchange code (e.g. TXSE) otherwise makes the SDK's
+        # enum validation reject every asset. Keep the existing allowlist;
+        # never map an unknown exchange to a permitted one or broaden policy.
+        allowed_exchanges = ("NYSE", "NASDAQ", "ARCA", "AMEX")
+        assets = []
+        for exchange in allowed_exchanges:
+            req = GetAssetsRequest(status=AssetStatus.ACTIVE, exchange=exchange)
+            assets.extend(a for a in self._trading.get_all_assets(req)
+                          if a.exchange == exchange)
         self._all_symbols = [
             a.symbol for a in assets
             if a.exchange in ("NYSE", "NASDAQ", "ARCA", "AMEX")
             and a.tradable
             and len(a.symbol) <= 5
-            and not self._is_probable_warrant_symbol(a.symbol)
-            and a.symbol not in self._ETF_BLACKLIST
+            and self.asset_rejection(a) is None
         ]
         self._symbols_loaded_at = now
         logger.info("Cached %d US symbols", len(self._all_symbols))

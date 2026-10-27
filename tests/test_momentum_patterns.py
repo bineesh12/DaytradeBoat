@@ -1,6 +1,7 @@
 """Tests for Bull Flag and Flat Top Breakout scanners + verifier."""
 
 from __future__ import annotations
+from daytrading.models import BarSource
 
 from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock, patch
@@ -42,7 +43,7 @@ def _bar(
         low=low,
         close=close,
         volume=volume,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
 
 
 def _make_bull_flag_bars() -> list[Bar]:

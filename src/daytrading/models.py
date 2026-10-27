@@ -67,9 +67,16 @@ class TradingStyle(str, Enum):
 # Market data types
 # ---------------------------------------------------------------------------
 
+class BarSource(str, Enum):
+    UNKNOWN = "unknown"
+    CANONICAL_INTERVAL = "canonical_interval"
+    ROLLING_SNAPSHOT = "rolling_snapshot"
+    PRICE_MARK = "price_mark"
+
+
 @dataclass(frozen=True)
 class Bar:
-    """Single OHLCV bar for one symbol."""
+    """OHLCV value. Provenance and completion must be checked before history use."""
 
     symbol: str
     ts: datetime
@@ -79,6 +86,26 @@ class Bar:
     close: float
     volume: float
     timeframe: Timeframe = Timeframe.MIN_1
+    provenance: BarSource = BarSource.UNKNOWN
+
+
+@dataclass(frozen=True)
+class CompletedBar:
+    """A bar and the exchange event time at which it actually completed."""
+
+    bar: Bar
+    closed_at: datetime
+
+
+@dataclass(frozen=True)
+class ConfirmationWindow:
+    """Immutable execution context, separate from minute/session quality bars."""
+
+    bars: tuple[CompletedBar, ...]
+    observed_at: datetime
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "bars", tuple(self.bars))
 
 
 @dataclass(frozen=True)
@@ -151,6 +178,7 @@ class ScanResult:
     score: float
     criteria: Dict[str, Any] = field(default_factory=dict)
     bars: List[Bar] = field(default_factory=list)
+    confirmation_window: Optional[ConfirmationWindow] = None
 
 
 @dataclass(frozen=True)
@@ -182,6 +210,12 @@ class Order:
     limit_price: Optional[float] = None
     stop_price: Optional[float] = None
     client_order_id: Optional[str] = None
+    # Optional absolute execution ceiling/floor, preserved through repricing.
+    hard_limit_price: Optional[float] = None
+    # Optional original setup deadline: client cancels outstanding BUY shares.
+    expires_at: Optional[datetime] = None
+    # Live liquidation evidence; repricing/cancellation cannot refresh its age.
+    liquidation_quote_ts: Optional[datetime] = None
 
 
 @dataclass(frozen=True)
@@ -192,6 +226,11 @@ class Fill:
     price: float
     ts: datetime
     commission: float = 0.0
+    order_id: str = ""
+    cumulative_quantity: Optional[float] = None
+    cumulative_notional: Optional[float] = None
+    account_id: str = ""
+    execution_reason: str = ""
 
 
 # ---------------------------------------------------------------------------

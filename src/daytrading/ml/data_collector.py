@@ -12,16 +12,18 @@ import json
 import logging
 import os
 import threading
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 from daytrading.ml.features import FEATURE_NAMES, compute_entry_features
 from daytrading.models import Bar
+from daytrading.ml.artifacts import data_root
 
 logger = logging.getLogger(__name__)
 
-_DATA_DIR = Path(__file__).resolve().parent.parent.parent.parent / "data" / "ml"
+_DATA_DIR = data_root() / "ml"
 _CANDIDATES_FILE = _DATA_DIR / "entry_candidates.jsonl"
 
 _lock = threading.Lock()
@@ -65,6 +67,8 @@ def log_entry_candidate(
         )
 
         record = {
+            "candidate_id": uuid.uuid4().hex,
+            "feed": os.getenv("DAYTRADING_ALPACA_FEED", "iex"),
             "ts": datetime.now(timezone.utc).isoformat(),
             "symbol": symbol,
             "price": round(price, 4),
@@ -97,11 +101,12 @@ def log_trade_outcome(
     exit_price: float,
     entry_time: Optional[datetime] = None,
     exit_time: Optional[datetime] = None,
+    outcome_pct: Optional[float] = None,
 ) -> None:
     """Backfill P&L outcome for the most recent entry candidate of this symbol."""
     if entry_price <= 0:
         return
-    pnl_pct = (exit_price - entry_price) / entry_price * 100
+    pnl_pct = outcome_pct if outcome_pct is not None else (exit_price - entry_price) / entry_price * 100
     duration_s = None
     if entry_time and exit_time:
         duration_s = int((exit_time - entry_time).total_seconds())
@@ -119,6 +124,7 @@ def log_trade_outcome(
             # replace it so training data prefers ground truth over future-price
             # inference.
             updated = False
+            candidate_id = _pending_outcomes.get(symbol)
             for i in range(len(lines) - 1, -1, -1):
                 try:
                     rec = json.loads(lines[i])
@@ -126,6 +132,7 @@ def log_trade_outcome(
                     continue
                 if (
                     rec.get("symbol") == symbol
+                    and (candidate_id is None or rec.get("candidate_id") == candidate_id)
                     and rec.get("passed")
                     and (
                         rec.get("outcome_pnl") is None
@@ -136,6 +143,7 @@ def log_trade_outcome(
                     rec["outcome_pct"] = round(pnl_pct, 4)
                     rec["outcome_duration_s"] = duration_s
                     rec["outcome_source"] = "real_trade"
+                    rec["trade_complete"] = candidate_id is not None
                     rec.pop("shadow_label", None)
                     rec.pop("labeled_at", None)
                     lines[i] = json.dumps(rec)
@@ -144,9 +152,35 @@ def log_trade_outcome(
 
             if updated:
                 _CANDIDATES_FILE.write_text("\n".join(lines) + "\n")
+                _pending_outcomes.pop(symbol, None)
 
     except Exception as exc:
         logger.debug("Outcome backfill error: %s", exc)
+
+
+def bind_candidate_to_trade(symbol: str, entry_time: datetime) -> None:
+    """Attach the actual fill to one candidate; later quality checks cannot relabel it."""
+    if not _CANDIDATES_FILE.exists():
+        return
+    with _lock:
+        lines = _CANDIDATES_FILE.read_text().splitlines()
+        for i in range(len(lines) - 1, -1, -1):
+            try:
+                row = json.loads(lines[i])
+                ts = datetime.fromisoformat(row["ts"].replace("Z", "+00:00"))
+                if row.get("symbol") != symbol or not row.get("passed") or row.get("outcome_pnl") is not None:
+                    continue
+                age = (entry_time - ts).total_seconds()
+                if not 0 <= age <= 600:
+                    continue
+                candidate_id = row.setdefault("candidate_id", uuid.uuid4().hex)
+                _pending_outcomes[symbol] = candidate_id
+                row["trade_entry_ts"] = entry_time.isoformat()
+                lines[i] = json.dumps(row)
+                _CANDIDATES_FILE.write_text("\n".join(lines) + "\n")
+                return
+            except (KeyError, ValueError, TypeError):
+                continue
 
 
 def update_deferred_entry_outcomes(

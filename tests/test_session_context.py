@@ -1,3 +1,4 @@
+from daytrading.models import BarSource
 """Tests for session open / day-change calculation."""
 
 from datetime import datetime
@@ -21,7 +22,7 @@ def _bar_et(h: int, m: int, open_: float, close: float, sym: str = "TOYO") -> Ba
         low=min(open_, close) - 0.1,
         close=close,
         volume=50_000,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
 
 
 def test_resolve_session_open_uses_4am_for_extended() -> None:

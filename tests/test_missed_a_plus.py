@@ -1,4 +1,5 @@
 from __future__ import annotations
+from daytrading.models import BarSource
 
 from datetime import datetime, timedelta, timezone
 
@@ -29,7 +30,7 @@ def _bar(
         low=low if low is not None else min(open_px, close) - 0.04,
         close=close,
         volume=volume,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
 
 
 def _a_plus_bars(base_ts: datetime | None = None) -> list[Bar]:
@@ -513,7 +514,7 @@ def test_report_ranks_biggest_missed_runners_first() -> None:
         hit=_hit(bars),
         now=now,
     )
-    other = [Bar(symbol="RUN", ts=b.ts, open=b.open, high=b.high, low=b.low, close=b.close, volume=b.volume) for b in bars]
+    other = [Bar(symbol="RUN", ts=b.ts, open=b.open, high=b.high, low=b.low, close=b.close, volume=b.volume, provenance=BarSource.CANONICAL_INTERVAL) for b in bars]
     run_hit = ScanResult(
         symbol="RUN",
         scanner_name="vwap_pullback",
@@ -531,7 +532,7 @@ def test_report_ranks_biggest_missed_runners_first() -> None:
     )
     tracker.update_prices({
         "HOT": bars + [_bar(19, close=5.60, high=5.62, base_ts=now, n=20)],
-        "RUN": other + [Bar(symbol="RUN", ts=now, open=5.4, high=6.2, low=5.35, close=6.1, volume=350_000)],
+        "RUN": other + [Bar(symbol="RUN", ts=now, open=5.4, high=6.2, low=5.35, close=6.1, volume=350_000, provenance=BarSource.CANONICAL_INTERVAL)],
     }, now=now + timedelta(seconds=5))
 
     report = tracker.report()

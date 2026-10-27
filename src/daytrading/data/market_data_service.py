@@ -103,6 +103,7 @@ class MarketDataService:
         sleep: Callable[[float], None] = time.sleep,
         poll_interval: float = 0.25,
         max_iterations: Optional[int] = None,
+        run_step: Optional[Callable[[], bool]] = None,
     ) -> None:
         """Run the candidate hydration worker loop.
 
@@ -116,40 +117,48 @@ class MarketDataService:
                 return
             iterations += 1
 
-            paused, pending_entry = pause_state()
-            if paused:
-                if pending_entry and not was_paused_for_entry and publish_status is not None:
-                    publish_status(
-                        paused_for_entry=True,
-                        pending=self.candidate_pending_size(),
-                    )
-                was_paused_for_entry = pending_entry
+            if run_step is not None:
+                processed = run_step()
+            else:
+                was_paused_for_entry, processed = self.candidate_iteration(
+                    was_paused_for_entry, pause_state, process_batch, publish_status)
+            if not processed:
                 sleep(poll_interval)
-                continue
 
-            if was_paused_for_entry and publish_status is not None:
+    def candidate_iteration(self, was_paused_for_entry, pause_state, process_batch, publish_status):
+        paused, pending_entry = pause_state()
+        if paused:
+            if pending_entry and not was_paused_for_entry and publish_status is not None:
                 publish_status(
-                    paused_for_entry=False,
+                    paused_for_entry=True,
                     pending=self.candidate_pending_size(),
                 )
-            was_paused_for_entry = False
+            was_paused_for_entry = pending_entry
+            return was_paused_for_entry, False
 
-            batch = self.pull_candidate_batch()
-            if not batch:
-                sleep(poll_interval)
-                continue
+        if was_paused_for_entry and publish_status is not None:
+            publish_status(
+                paused_for_entry=False,
+                pending=self.candidate_pending_size(),
+            )
+        was_paused_for_entry = False
 
-            loaded_count = process_batch(batch)
-            source = str(batch[0].get("_source", "candidate worker"))
-            if publish_status is not None:
-                publish_status(
-                    batches=1,
-                    hydrated=loaded_count,
-                    pending=self.candidate_pending_size(),
-                    last_batch_size=len(batch),
-                    last_loaded=loaded_count,
-                    last_source=source,
-                )
+        batch = self.pull_candidate_batch()
+        if not batch:
+            return was_paused_for_entry, False
+
+        loaded_count = process_batch(batch)
+        source = str(batch[0].get("_source", "candidate worker"))
+        if publish_status is not None:
+            publish_status(
+                batches=1,
+                hydrated=loaded_count,
+                pending=self.candidate_pending_size(),
+                last_batch_size=len(batch),
+                last_loaded=loaded_count,
+                last_source=source,
+            )
+        return was_paused_for_entry, True
 
     def hot_watch_contains(self, symbol: str) -> bool:
         sym = symbol.upper().strip()

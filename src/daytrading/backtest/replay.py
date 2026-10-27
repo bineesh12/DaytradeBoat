@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence
 
 from daytrading.journal.store import TradingJournal
-from daytrading.models import Bar, ScanResult, SignalAction, Timeframe, TradeSignal
+from daytrading.models import BarSource, Bar, ScanResult, SignalAction, Timeframe, TradeSignal
 from daytrading.strategy.entry_policy import EntryDecision, EntryPolicy
 
 
@@ -61,6 +61,7 @@ def _bars_from_payload(payload: Dict[str, Any], symbol: str) -> List[Bar]:
                     close=float(item.get("close", item.get("c", 0.0)) or 0.0),
                     volume=float(item.get("volume", item.get("v", 0.0)) or 0.0),
                     timeframe=Timeframe(timeframe),
+                    provenance=BarSource(item.get("provenance", "unknown")),
                 )
             )
         except Exception:

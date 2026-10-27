@@ -541,14 +541,31 @@ def run_backtest(
     session_date: str,
     *,
     flags: Optional[Dict[str, Any]] = None,
+    mode: str = "historical_estimate",
+    session_id: Optional[str] = None,
     start_time: Optional[str] = None,
     bars_by_symbol: Optional[Dict[str, List[Bar]]] = None,
     settings: Optional[Settings] = None,
 ) -> Dict[str, Any]:
     sym = normalize_symbol(symbol)
     day = normalize_session_date(session_date)
+    if mode == "paper_validation":
+        if flags or start_time or bars_by_symbol is not None:
+            raise ValueError("Paper validation uses the frozen recording; experiment flags, start overrides and supplied candles are unavailable.")
+        from daytrading.replay.service import start_validation
+        return start_validation(sym, day.isoformat(), session_id)
+    if mode != "historical_estimate":
+        raise ValueError("Unknown backtest mode")
     start_dt = normalize_start_time(start_time, day)
     active_flags = normalize_flags(flags)
+    configured_patterns = (tuple(p.strip() for p in os.environ['DAYTRADING_ENTRY_PATTERNS'].split(',') if p.strip())
+                           if 'DAYTRADING_ENTRY_PATTERNS' in os.environ else None)
+    # Preserve explicit research experiments; the normal webpage estimate uses
+    # the same enabled-pattern policy as PAPER. Micro execution is never faked
+    # with minute candles: it is evaluated in the separate native detector lane.
+    experiment = any(v for k, v in active_flags.items() if k not in ('execution_timer_10s', 'live_like_10s'))
+    minute_patterns = (tuple(p for p in configured_patterns if p != 'micro_pullback_reclaim')
+                       if configured_patterns is not None and not experiment else None)
 
     bars = bars_by_symbol or fetch_alpaca_bars_for_day(sym, day, settings=settings)
     symbol_bars = list(bars.get(sym, []))
@@ -565,6 +582,8 @@ def run_backtest(
         )
         return {
             "ok": True,
+            "mode": "historical_estimate", "label": "Historical estimate — simulated candle fills", "validated": False,
+            "capture_completeness": "historical_candles", "decision_parity": "not_verified", "execution_validation": "not_verified",
             "symbol": sym,
             "date": day.isoformat(),
             "bars": 0,
@@ -600,6 +619,7 @@ def run_backtest(
                 commission_per_share=(settings.commission_per_share if settings else 0.0),
                 broker=broker,
                 portfolio=portfolio,
+                entry_patterns=minute_patterns,
                 fresh_vwap_reclaim_scout_enabled=active_flags["fresh_vwap_reclaim_scout"],
                 vwap_reclaim_scout_enabled=active_flags["vwap_reclaim_scout"],
                 level_breakout_scout_enabled=active_flags["level_breakout_scout"],
@@ -743,8 +763,12 @@ def run_backtest(
         timer_bars=timer_bars,
         symbol_bars=symbol_bars,
     )
+    from daytrading.backtest.diagnostics import strategy_breakdown, micro_diagnostics
+    diagnostics = micro_diagnostics(sym, day.isoformat(), symbol_bars)
     return {
         "ok": True,
+        "mode": "historical_estimate", "label": "Historical estimate — simulated candle fills", "validated": False,
+        "capture_completeness": "historical_candles", "decision_parity": "not_verified", "execution_validation": "not_verified",
         "symbol": sym,
         "date": day.isoformat(),
         "start_time": start_time or "",
@@ -764,6 +788,20 @@ def run_backtest(
         "top_reject_reasons_by_layer": result.rejected_reasons_by_layer,
         "scorecard": scorecard,
         "funnel": scorecard.get("funnel", {}),
+        "strategy_breakdown": strategy_breakdown(result.scan_events, result.rejection_details),
+        "micro_diagnostics": diagnostics,
+        "research_coverage": {
+            "session_context": "complete_current_session_separate_from_detector_window",
+            "minute_lane": "historical_estimate_with_synthetic_quotes",
+            "micro_lane": "native_detector_only_no_execution",
+            "minute_clock": "completed_candle_labelled_by_start_not_original_receipt_time",
+            "discovery": "symbol_supplied_original_discovery_not_recorded",
+            "paper_parity": "not_verified",
+            "configured_paper_patterns": configured_patterns,
+            "minute_entry_patterns": minute_patterns,
+            "entry_policy": ("explicit_research_experiment" if experiment else
+                             "configured_paper_patterns" if configured_patterns is not None else "factory_defaults"),
+        },
         "missed_a_plus": result.missed_a_plus,
         "flags": active_flags,
         "manifest": manifest,

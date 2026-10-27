@@ -14,14 +14,19 @@ from __future__ import annotations
 import json
 import math
 import os
+import logging
+from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import timezone
 from typing import Dict, List, Optional, Sequence
 
 from daytrading.models import Bar
+from daytrading.market_calendar import ET
+from daytrading.ml.artifacts import data_root
 
-_MODEL_PATH = os.path.join(os.path.dirname(__file__), "warrior_ignition_model.json")
-_PREMKT_OPEN_UTC_MIN = 8 * 60  # 04:00 ET
+_BUNDLED_MODEL_PATH = os.path.join(os.path.dirname(__file__), "warrior_ignition_model.json")
+_MODEL_PATH = str(data_root() / "models" / "warrior_ignition_model.json")
+_PREMKT_OPEN_UTC_MIN = 4 * 60  # session minutes in ET, including daylight savings
 
 
 def _f(value: object) -> float:
@@ -42,13 +47,24 @@ class IgnitionModel:
     cutoff: float
 
     @classmethod
-    def load(cls, path: str = _MODEL_PATH) -> "IgnitionModel":
+    def load(cls, path: Optional[str] = None) -> "IgnitionModel":
+        path = path or (_MODEL_PATH if os.path.exists(_MODEL_PATH) else _BUNDLED_MODEL_PATH)
         with open(path) as fh:
             m = json.load(fh)
+        vectors = (m["features"], m["weights"], m["feat_mean"], m["feat_std"])
+        if not vectors[0] or any(len(v) != len(vectors[0]) for v in vectors):
+            raise ValueError("inconsistent ignition model feature dimensions")
+        if any(not math.isfinite(float(v)) for values in vectors[1:] for v in values) or any(float(v) <= 0 for v in m["feat_std"]):
+            raise ValueError("invalid ignition model normalization")
+        if m["features"] != FEATS or not math.isfinite(float(m["bias"])):
+            raise ValueError("incompatible ignition feature schema")
+        cutoff = float(m.get("high_conviction_cutoff", 0.31))
+        if not math.isfinite(cutoff) or not 0 < cutoff <= 1:
+            raise ValueError("invalid ignition conviction cutoff")
         return cls(
             features=m["features"], weights=m["weights"], bias=m["bias"],
             feat_mean=m["feat_mean"], feat_std=m["feat_std"],
-            gates=m["candidate_gates"], cutoff=float(m.get("high_conviction_cutoff", 0.31)),
+            gates=m["candidate_gates"], cutoff=cutoff,
         )
 
 
@@ -110,17 +126,29 @@ def ignition_suppression_reason(
 
 
 _MODEL_CACHE: Optional[IgnitionModel] = None
+_MODEL_SIGNATURE = None
 
 
 def get_model() -> IgnitionModel:
-    global _MODEL_CACHE
-    if _MODEL_CACHE is None:
-        _MODEL_CACHE = IgnitionModel.load()
+    global _MODEL_CACHE, _MODEL_SIGNATURE
+    path = Path(_MODEL_PATH if os.path.exists(_MODEL_PATH) else _BUNDLED_MODEL_PATH)
+    stat = path.stat()
+    signature = (str(path), stat.st_mtime_ns, stat.st_size)
+    if _MODEL_CACHE is None or signature != _MODEL_SIGNATURE:
+        try:
+            candidate = IgnitionModel.load(str(path))
+        except (ValueError, TypeError, KeyError, OSError) as exc:
+            if _MODEL_CACHE is None:
+                raise
+            logging.getLogger(__name__).error("Ignition reload rejected; keeping last valid model: %s", exc)
+            _MODEL_SIGNATURE = signature
+        else:
+            _MODEL_CACHE, _MODEL_SIGNATURE = candidate, signature
     return _MODEL_CACHE
 
 
 def _utc_minutes(ts) -> float:
-    t = ts.astimezone(timezone.utc)
+    t = ts.astimezone(ET)
     return t.hour * 60 + t.minute
 
 

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import time as dt_time
+from datetime import datetime, timezone, time as dt_time
+from daytrading.data.bar_provenance import completed_minutes
 from typing import List, Optional, Sequence
 
 from daytrading.market_calendar import ET
@@ -87,7 +88,9 @@ def today_bars(
     bars: Sequence[Bar],
     *,
     rth_only: bool = False,
+    now: Optional[datetime] = None,
 ) -> List[Bar]:
+    bars = completed_minutes(bars, now=now)
     if not bars:
         return []
     latest = bars[-1]
@@ -116,9 +119,10 @@ def session_context_from_bars(
     *,
     prior_day: Optional[PriorDayStats] = None,
     rth_only: bool = False,
+    now: Optional[datetime] = None,
 ) -> Optional[SessionContext]:
     """Build session high/low/open and total day volume from today's 1m bars."""
-    today = today_bars(bars, rth_only=rth_only)
+    today = today_bars(bars, rth_only=rth_only, now=now)
     if not today:
         return None
     session_open, incomplete = resolve_session_open(today, rth_only=rth_only)

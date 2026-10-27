@@ -18,7 +18,7 @@ from daytrading.exits.manager import (
     TrackedPosition,
     build_exit_tiers,
 )
-from daytrading.models import ExitReason, Side, SignalAction
+from daytrading.models import ExitReason, Side, SignalAction, Fill
 
 TS = datetime(2026, 5, 13, 14, 30, 0, tzinfo=timezone.utc)
 
@@ -48,6 +48,21 @@ def _long_pos(
     )
 
 
+def _filled_exits(manager, prices, now):
+    """These management scenarios assume execution; commit the simulated sale.
+
+    Unfilled and partial execution behavior is tested in the incident suite.
+    """
+    signals = manager.check_exits(prices, now)
+    for signal in signals:
+        manager._test_fill_sequence = getattr(manager, '_test_fill_sequence', 0)+1
+        side = Side.SELL if signal.action is SignalAction.EXIT_LONG else Side.BUY
+        manager.commit_coordinated_exit_fill(Fill(signal.symbol, side, signal.quantity,
+            signal.entry_price, now, order_id='simulated-'+str(manager._test_fill_sequence),
+            cumulative_quantity=signal.quantity, cumulative_notional=signal.quantity*signal.entry_price))
+    return signals
+
+
 class TestBuildExitTiersCompat:
     def test_returns_empty_list(self) -> None:
         assert build_exit_tiers(500, 5.00, Side.BUY) == []
@@ -57,7 +72,7 @@ class TestStopLoss:
     def test_stop_loss_exits_full_position(self) -> None:
         em = ExitManager()
         em.track(_long_pos(stop=4.90))
-        exits = em.check_exits({"ABC": 4.89}, _ts(5))
+        exits = _filled_exits(em, {"ABC": 4.89}, _ts(5))
         assert len(exits) == 1
         assert exits[0].quantity == 100
         assert ExitReason.STOP_LOSS.value in exits[0].reason
@@ -65,13 +80,13 @@ class TestStopLoss:
     def test_no_exit_above_stop(self) -> None:
         em = ExitManager()
         em.track(_long_pos())
-        exits = em.check_exits({"ABC": 5.02}, _ts(5))
+        exits = _filled_exits(em, {"ABC": 5.02}, _ts(5))
         assert len(exits) == 0
 
     def test_dollar_stop_exits_before_wide_broker_stop(self) -> None:
         em = ExitManager(max_unrealized_loss=50.0)
         em.track(_long_pos(entry=5.59, stop=5.28, qty=294))
-        exits = em.check_exits({"ABC": 5.40}, _ts(30))
+        exits = _filled_exits(em, {"ABC": 5.40}, _ts(30))
         assert len(exits) == 1
         assert exits[0].quantity == 294
         assert ExitReason.STOP_LOSS.value in exits[0].reason
@@ -79,7 +94,7 @@ class TestStopLoss:
     def test_dollar_stop_does_not_exit_inside_loss_cap(self) -> None:
         em = ExitManager(max_unrealized_loss=50.0)
         em.track(_long_pos(entry=5.59, stop=5.28, qty=160))
-        exits = em.check_exits({"ABC": 5.40}, _ts(30))
+        exits = _filled_exits(em, {"ABC": 5.40}, _ts(30))
         assert len(exits) == 0
 
 
@@ -88,7 +103,7 @@ class TestHalfSellAt2to1:
         em = ExitManager()
         pos = _long_pos(entry=5.00, stop=4.90)  # risk 0.10, target 5.20
         em.track(pos)
-        exits = em.check_exits({"ABC": 5.21}, _ts(10))
+        exits = _filled_exits(em, {"ABC": 5.21}, _ts(10))
         assert len(exits) == 1
         assert exits[0].quantity == 50
         assert "take_profit" in exits[0].reason.lower()
@@ -104,7 +119,7 @@ class TestHalfSellAt2to1:
         pos.reason = "Momentum Burst CING"
         em.track(pos)
 
-        exits = em.check_exits({"ABC": 5.05}, _ts(10))
+        exits = _filled_exits(em, {"ABC": 5.05}, _ts(10))
 
         assert len(exits) == 1
         assert exits[0].quantity == 50
@@ -123,7 +138,7 @@ class TestHalfSellAt2to1:
         pos.entry_pattern = "vwap_pullback"
         em.track(pos)
 
-        exits = em.check_exits({"ABC": 5.05}, _ts(10))
+        exits = _filled_exits(em, {"ABC": 5.05}, _ts(10))
 
         assert exits == []
         tracked = em.tracked.get("ABC")
@@ -137,7 +152,7 @@ class TestHalfSellAt2to1:
         pos.entry_pattern = "pullback_base"
         em.track(pos)
 
-        exits = em.check_exits({"ABC": 5.05}, _ts(10))
+        exits = _filled_exits(em, {"ABC": 5.05}, _ts(10))
 
         assert len(exits) == 1
         assert exits[0].quantity == 90
@@ -151,7 +166,7 @@ class TestHalfSellAt2to1:
         pos.entry_strategy = "momentum_burst_hit_run"
         em.track(pos)
 
-        exits = em.check_exits({"ABC": 5.21}, _ts(10))
+        exits = _filled_exits(em, {"ABC": 5.21}, _ts(10))
 
         assert len(exits) == 1
         assert exits[0].quantity == 90
@@ -173,7 +188,7 @@ class TestHalfSellAt2to1:
             low_price=9.50,
             volume=180_000,
         )
-        exits = em.check_exits({"ABC": 9.52}, _ts(20))
+        exits = _filled_exits(em, {"ABC": 9.52}, _ts(20))
 
         assert len(exits) == 1
         assert exits[0].quantity == 90
@@ -195,7 +210,7 @@ class TestHalfSellAt2to1:
             low_price=9.50,
             volume=180_000,
         )
-        exits = em.check_exits({"ABC": 9.52}, _ts(20))
+        exits = _filled_exits(em, {"ABC": 9.52}, _ts(20))
 
         assert exits == []
         assert "ABC" in em.tracked
@@ -207,7 +222,7 @@ class TestHalfSellAt2to1:
         pos.entry_strategy = "warrior_squeeze_playbook"
         em.track(pos)
 
-        exits = em.check_exits({"ABC": 5.21}, _ts(10))
+        exits = _filled_exits(em, {"ABC": 5.21}, _ts(10))
 
         assert len(exits) == 1
         assert exits[0].quantity == 45
@@ -227,7 +242,7 @@ class TestHalfSellAt2to1:
         pos.entry_trigger = "warrior_halt_resume_continuation"
         em.track(pos)
 
-        exits = em.check_exits({"ABC": 11.05}, _ts(10))
+        exits = _filled_exits(em, {"ABC": 11.05}, _ts(10))
 
         assert len(exits) == 1
         assert exits[0].quantity == 90
@@ -243,7 +258,7 @@ class TestHalfSellAt2to1:
         pos.entry_trigger = "warrior_stair_step_runner"
         em.track(pos)
 
-        exits = em.check_exits({"ABC": 11.05}, _ts(10))
+        exits = _filled_exits(em, {"ABC": 11.05}, _ts(10))
 
         assert len(exits) == 1
         assert exits[0].quantity == 45
@@ -277,7 +292,7 @@ class TestHalfSellAt2to1:
             volume=229_569,
         )
 
-        exits = em.check_exits({"ABC": 9.59}, _ts(10))
+        exits = _filled_exits(em, {"ABC": 9.59}, _ts(10))
 
         assert len(exits) == 1
         assert exits[0].quantity == 205
@@ -302,7 +317,7 @@ class TestHalfSellAt2to1:
             volume=229_569,
         )
 
-        exits = em.check_exits({"ABC": 9.59}, _ts(10))
+        exits = _filled_exits(em, {"ABC": 9.59}, _ts(10))
 
         assert exits == []
         assert "ABC" in em.tracked
@@ -315,7 +330,7 @@ class TestHalfSellAt2to1:
         pos.trend_strength = 0.9
         em.track(pos)
 
-        exits = em.check_exits({"ABC": 5.10}, _ts(10))
+        exits = _filled_exits(em, {"ABC": 5.10}, _ts(10))
 
         assert len(exits) == 1
         tracked = em.tracked.get("ABC")
@@ -332,7 +347,7 @@ class TestHalfSellAt2to1:
         pos.trend_strength = 0.9
         em.track(pos)
 
-        exits = em.check_exits({"ABC": 5.10}, _ts(10))
+        exits = _filled_exits(em, {"ABC": 5.10}, _ts(10))
 
         assert len(exits) == 1
         assert exits[0].quantity == 30
@@ -348,7 +363,7 @@ class TestHalfSellAt2to1:
         pos.trend_strength = 0.9
         em.track(pos)
 
-        exits = em.check_exits({"ABC": 5.10}, _ts(10))
+        exits = _filled_exits(em, {"ABC": 5.10}, _ts(10))
 
         assert len(exits) == 1
         tracked = em.tracked.get("ABC")
@@ -365,7 +380,7 @@ class TestHalfSellAt2to1:
         pos.trend_strength = 0.9
         em.track(pos)
 
-        exits = em.check_exits({"ABC": 5.10}, _ts(10))
+        exits = _filled_exits(em, {"ABC": 5.10}, _ts(10))
 
         assert len(exits) == 1
         tracked = em.tracked.get("ABC")
@@ -382,7 +397,7 @@ class TestHalfSellAt2to1:
         pos.runner_candidate = False
         em.track(pos)
 
-        exits = em.check_exits({"ABC": 5.10}, _ts(10))
+        exits = _filled_exits(em, {"ABC": 5.10}, _ts(10))
 
         assert len(exits) == 1
         tracked = em.tracked.get("ABC")
@@ -397,7 +412,7 @@ class TestHalfSellAt2to1:
         pos.reason = "Momentum Burst CING"
         em.track(pos)
 
-        exits = em.check_exits({"ABC": 5.10}, _ts(10))
+        exits = _filled_exits(em, {"ABC": 5.10}, _ts(10))
 
         assert len(exits) == 1
         tracked = em.tracked.get("ABC")
@@ -415,7 +430,7 @@ class TestBreakevenAfterHalf:
         pos.stop_loss = 5.00
         pos.breakeven_locked = True
         em.track(pos)
-        exits = em.check_exits({"ABC": 4.99}, _ts(60))
+        exits = _filled_exits(em, {"ABC": 4.99}, _ts(60))
         assert len(exits) == 1
         assert exits[0].quantity == 50
 
@@ -426,7 +441,7 @@ class TestExtensionExit:
         pos = _long_pos(entry=5.00, stop=4.50)
         pos.extension_threshold = 0.15
         em.track(pos)
-        exits = em.check_exits({"ABC": 5.80}, _ts(30))  # 16% gain
+        exits = _filled_exits(em, {"ABC": 5.80}, _ts(30))  # 16% gain
         assert len(exits) == 1
         assert exits[0].quantity == 100
 
@@ -439,7 +454,7 @@ class TestRedCandleExit:
         pos.prev_bar_open = 5.04
         em.track(pos)
         em.update_bar_close("ABC", close_price=5.00, open_price=5.05, volume=50_000)
-        exits = em.check_exits({"ABC": 4.95}, _ts(30))
+        exits = _filled_exits(em, {"ABC": 4.95}, _ts(30))
         assert len(exits) == 0
 
     def test_red_exit_after_hold_with_volume_and_drop(self) -> None:
@@ -452,7 +467,7 @@ class TestRedCandleExit:
         pos.consecutive_red = 3
         em.track(pos)
         # Price below last_bar_close by >0.5% after 120s hold
-        exits = em.check_exits({"ABC": 5.05}, _ts(130))
+        exits = _filled_exits(em, {"ABC": 5.05}, _ts(130))
         assert len(exits) == 1
         assert exits[0].quantity == 100
 
@@ -468,9 +483,9 @@ class TestStaleExit:
             first_target_price=3.30,
             trend_strength=0.3,
         ))
-        exits = em.check_exits({"GHI": 2.98}, _ts(60))
+        exits = _filled_exits(em, {"GHI": 2.98}, _ts(60))
         assert len(exits) == 0
-        exits = em.check_exits({"GHI": 2.98}, _ts(185))
+        exits = _filled_exits(em, {"GHI": 2.98}, _ts(185))
         assert len(exits) >= 1
 
 
@@ -494,7 +509,7 @@ class TestVolumeExhaustionExit:
     def test_exit_on_exhaustion_in_profit(self) -> None:
         """3 declining-vol green bars + in profit + held 120s -> exit."""
         em, pos = self._setup_exhausted_pos()
-        exits = em.check_exits({"ABC": 5.12}, _ts(130))
+        exits = _filled_exits(em, {"ABC": 5.12}, _ts(130))
         assert len(exits) == 1
         assert exits[0].quantity == 100
         assert "take_profit" in exits[0].reason.lower()
@@ -502,17 +517,17 @@ class TestVolumeExhaustionExit:
     def test_no_exit_before_120s(self) -> None:
         """Exhaustion detected but held less than 120s -> no exit."""
         em, pos = self._setup_exhausted_pos()
-        exits = em.check_exits({"ABC": 5.12}, _ts(60))
+        exits = _filled_exits(em, {"ABC": 5.12}, _ts(60))
         assert len(exits) == 0
 
     def test_no_exit_when_at_loss(self) -> None:
         """Exhaustion detected but position is at a loss -> no exhaustion exit."""
         em, pos = self._setup_exhausted_pos()
         # First call expands the range so range-exit doesn't interfere
-        em.check_exits({"ABC": 5.15}, _ts(5))
-        em.check_exits({"ABC": 4.92}, _ts(10))
+        _filled_exits(em, {"ABC": 5.15}, _ts(5))
+        _filled_exits(em, {"ABC": 4.92}, _ts(10))
         # Now call with price below entry but above stop, at 130s
-        exits = em.check_exits({"ABC": 4.98}, _ts(130))
+        exits = _filled_exits(em, {"ABC": 4.98}, _ts(130))
         # Any exit that fires should NOT be from volume exhaustion
         for e in exits:
             assert "volume exhaustion" not in e.reason.lower()
@@ -526,7 +541,7 @@ class TestVolumeExhaustionExit:
         em.update_bar_close("ABC", close_price=5.05, open_price=5.00, volume=80_000)
         em.update_bar_close("ABC", close_price=5.10, open_price=5.05, volume=60_000)
         # Only 2 declining bars
-        exits = em.check_exits({"ABC": 5.12}, _ts(130))
+        exits = _filled_exits(em, {"ABC": 5.12}, _ts(130))
         assert len(exits) == 0
 
     def test_red_bar_resets_streak(self) -> None:
@@ -541,7 +556,7 @@ class TestVolumeExhaustionExit:
         em.update_bar_close("ABC", close_price=5.08, open_price=5.10, volume=40_000)
         em.update_bar_close("ABC", close_price=5.12, open_price=5.08, volume=30_000)
         # Only 1 qualifying bar after reset
-        exits = em.check_exits({"ABC": 5.12}, _ts(130))
+        exits = _filled_exits(em, {"ABC": 5.12}, _ts(130))
         assert len(exits) == 0
 
     def test_volume_increase_resets_streak(self) -> None:
@@ -556,7 +571,7 @@ class TestVolumeExhaustionExit:
         em.update_bar_close("ABC", close_price=5.15, open_price=5.10, volume=90_000)
         em.update_bar_close("ABC", close_price=5.20, open_price=5.15, volume=70_000)
         # Only 1 qualifying bar since reset
-        exits = em.check_exits({"ABC": 5.18}, _ts(130))
+        exits = _filled_exits(em, {"ABC": 5.18}, _ts(130))
         assert len(exits) == 0
 
 
@@ -582,8 +597,8 @@ class TestConfigurableRunnerTrail:
         def run(trail: float) -> int:
             em = ExitManager(runner_trail_pct=trail)
             self._confirmed_runner(em, 5.50)
-            em.check_exits({"ABC": 5.50}, _ts(10))   # set high + trail stop
-            return len(em.check_exits({"ABC": 5.25}, _ts(15)))
+            _filled_exits(em, {"ABC": 5.50}, _ts(10))   # set high + trail stop
+            return len(_filled_exits(em, {"ABC": 5.25}, _ts(15)))
 
         assert run(0.03) == 1   # 5.25 <= 5.335 trail stop → exits
         assert run(0.08) == 0   # 5.25 > 5.06 trail stop → rides
@@ -635,14 +650,14 @@ class TestGiveRunnerRoom:
     def test_breakeven_by_default_after_partial(self) -> None:
         em = ExitManager(runner_give_room_after_partial=False)
         pos = self._runner(em)
-        em.check_exits({"ABC": 5.20}, _ts(30))  # hits 1:1 target -> half sell
+        _filled_exits(em, {"ABC": 5.20}, _ts(30))  # hits 1:1 target -> half sell
         assert pos.sold_half is True
         assert pos.stop_loss == pytest.approx(5.00)  # snapped to breakeven
 
     def test_give_room_keeps_wider_stop_after_partial(self) -> None:
         em = ExitManager(runner_give_room_after_partial=True)
         pos = self._runner(em)
-        em.check_exits({"ABC": 5.20}, _ts(30))
+        _filled_exits(em, {"ABC": 5.20}, _ts(30))
         assert pos.sold_half is True
         assert pos.breakeven_locked is True
         assert pos.stop_loss == pytest.approx(4.90)  # kept the wider original stop
@@ -651,5 +666,5 @@ class TestGiveRunnerRoom:
         em = ExitManager(runner_give_room_after_partial=True)
         pos = _long_pos(entry=5.00, stop=4.90, qty=100)  # runner_candidate stays False
         em._positions[pos.symbol] = pos
-        em.check_exits({"ABC": 5.20}, _ts(30))
+        _filled_exits(em, {"ABC": 5.20}, _ts(30))
         assert pos.stop_loss == pytest.approx(5.00)  # non-runners still go breakeven

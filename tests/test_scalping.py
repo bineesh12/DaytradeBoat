@@ -1,6 +1,7 @@
 """Tests for the scalping pipeline focused on $1–$20 stocks."""
 
 from __future__ import annotations
+from daytrading.models import BarSource
 
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
@@ -49,7 +50,7 @@ def _bar(
         symbol=symbol, ts=TS, open=o,
         high=close + 0.02, low=close - 0.02,
         close=close, volume=volume, timeframe=tf,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
 
 
 # ---------------------------------------------------------------------------

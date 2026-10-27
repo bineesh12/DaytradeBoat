@@ -1,4 +1,5 @@
 from __future__ import annotations
+from daytrading.models import BarSource
 
 from datetime import datetime, timezone
 
@@ -13,7 +14,7 @@ from daytrading.models import Bar
 
 def _bar(symbol: str, close: float) -> Bar:
     ts = datetime(2026, 1, 2, 14, 30, tzinfo=timezone.utc)
-    return Bar(symbol=symbol, ts=ts, open=close, high=close, low=close, close=close, volume=100.0)
+    return Bar(symbol=symbol, ts=ts, open=close, high=close, low=close, close=close, volume=100.0, provenance=BarSource.CANONICAL_INTERVAL)
 
 
 def test_buy_and_hold_backtest() -> None:

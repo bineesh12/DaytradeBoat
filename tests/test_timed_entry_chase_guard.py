@@ -1,4 +1,5 @@
 from __future__ import annotations
+from daytrading.models import BarSource
 
 from datetime import datetime, timezone
 
@@ -24,7 +25,7 @@ def _bar(symbol: str = "DXST", close: float = 5.00) -> Bar:
         close=close,
         volume=1000,
         ts=datetime.now(timezone.utc),
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
 
 
 def _signal(symbol: str = "DXST", price: float = 5.00) -> TradeSignal:
@@ -280,7 +281,7 @@ def test_shared_entry_quality_uses_cached_or_stored_float_without_network(monkey
             close=4.9 + i * 0.01,
             volume=100_000,
             timeframe=Timeframe.MIN_1,
-        )
+         provenance=BarSource.CANONICAL_INTERVAL)
         for i in range(25)
     ]
     bars[-1] = Bar(
@@ -292,7 +293,7 @@ def test_shared_entry_quality_uses_cached_or_stored_float_without_network(monkey
         close=5.02,
         volume=250_000,
         timeframe=Timeframe.MIN_1,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
     runner._quote_buffer = {
         "SPCE": [
             Quote(symbol="SPCE", ts=now, bid=5.01, ask=5.02, bid_size=2000, ask_size=2000)
@@ -354,7 +355,7 @@ def test_timed_entry_chase_guard_uses_opportunity_scaled_spread_policy() -> None
                 close=2.00 + i * 0.0068,
                 volume=90_000,
                 timeframe=Timeframe.MIN_1,
-            )
+             provenance=BarSource.CANONICAL_INTERVAL)
             for i in range(20)
         ]
     }
@@ -432,7 +433,7 @@ def test_timed_entry_chase_guard_rejects_red_10s_release() -> None:
         volume=1000,
         ts=datetime.now(timezone.utc),
         timeframe=Timeframe.SEC_10,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
     runner._bar_aggregator = _Agg([red_10s])
 
     reason = runner._timed_entry_chase_reject(_signal(price=5.00), _bar(close=5.05))
@@ -454,7 +455,7 @@ def test_timed_hod_reclaim_rejects_10s_release_without_expansion() -> None:
         volume=30_000,
         ts=datetime.now(timezone.utc),
         timeframe=Timeframe.SEC_10,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
     flat_10s = Bar(
         symbol="CAST",
         open=4.07,
@@ -464,7 +465,7 @@ def test_timed_hod_reclaim_rejects_10s_release_without_expansion() -> None:
         volume=30_000,
         ts=datetime.now(timezone.utc),
         timeframe=Timeframe.SEC_10,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
     runner._bar_aggregator = _Agg([prev_10s, flat_10s])
 
     reason = runner._timed_entry_chase_reject(signal, _bar(symbol="CAST", close=4.08))
@@ -486,7 +487,7 @@ def test_timed_hod_reclaim_rejects_10s_release_with_weak_volume() -> None:
         volume=28_000,
         ts=datetime.now(timezone.utc),
         timeframe=Timeframe.SEC_10,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
     light_10s = Bar(
         symbol="CAST",
         open=4.07,
@@ -496,7 +497,7 @@ def test_timed_hod_reclaim_rejects_10s_release_with_weak_volume() -> None:
         volume=5_000,
         ts=datetime.now(timezone.utc),
         timeframe=Timeframe.SEC_10,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
     runner._bar_aggregator = _Agg([prev_10s, light_10s])
 
     reason = runner._timed_entry_chase_reject(signal, _bar(symbol="CAST", close=4.09))
@@ -518,7 +519,7 @@ def test_timed_hod_reclaim_allows_clean_10s_expansion() -> None:
         volume=28_000,
         ts=datetime.now(timezone.utc),
         timeframe=Timeframe.SEC_10,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
     clean_10s = Bar(
         symbol="CAST",
         open=4.07,
@@ -528,7 +529,7 @@ def test_timed_hod_reclaim_allows_clean_10s_expansion() -> None:
         volume=25_000,
         ts=datetime.now(timezone.utc),
         timeframe=Timeframe.SEC_10,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
     runner._bar_aggregator = _Agg([prev_10s, clean_10s])
 
     reason = runner._timed_entry_chase_reject(signal, _bar(symbol="CAST", close=4.09))

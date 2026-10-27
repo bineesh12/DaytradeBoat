@@ -1,6 +1,7 @@
 """Tests for multi-timeframe bar aggregation."""
 
 from __future__ import annotations
+from daytrading.models import BarSource
 
 from datetime import datetime, timedelta, timezone
 
@@ -11,7 +12,7 @@ from daytrading.models import Bar, Side, Tick, Timeframe
 
 
 def _1m_bar(symbol: str, ts: datetime, o: float, h: float, l: float, c: float, v: float = 10_000) -> Bar:
-    return Bar(symbol=symbol, ts=ts, open=o, high=h, low=l, close=c, volume=v, timeframe=Timeframe.MIN_1)
+    return Bar(symbol=symbol, ts=ts, open=o, high=h, low=l, close=c, volume=v, timeframe=Timeframe.MIN_1, provenance=BarSource.CANONICAL_INTERVAL)
 
 
 def _tick(symbol: str, ts: datetime, price: float, size: float = 100) -> Tick:

@@ -182,3 +182,35 @@ def test_after_market_training_waits_until_after_hours_close(monkeypatch, tmp_pa
     assert runner._maybe_run_after_market_training(early, "AFTER-HOURS") is False
     assert runner._maybe_run_after_market_training(cutoff, "AFTER-HOURS") is True
     assert runner._nightly_calls == 1
+
+
+def test_premarket_resets_daily_entry_limit_and_loss_lockout_only_at_boundary(monkeypatch):
+    runner = _runner()
+    runner._last_session_reset_day = '2026-06-01'
+    runner._pipeline._symbol_entry_counts = {'OLD': 3}
+    runner._pipeline._circuit_breaker_tripped = True
+    # Existing position protection is independent of resetting daily limits.
+    protection = object()
+    runner._pipeline.exit_manager = SimpleNamespace(tracked={'OPEN': protection})
+    monkeypatch.setattr(AlpacaRunner, '_is_trading_day', classmethod(lambda cls, when=None: True))
+    assert not runner._maybe_daily_session_reset(datetime(2026, 6, 2, 3, 59), 'CLOSED')
+    assert runner._pipeline._symbol_entry_counts == {'OLD': 3}
+    assert runner._pipeline._circuit_breaker_tripped
+    assert runner._maybe_daily_session_reset(datetime(2026, 6, 2, 4, 0), 'PRE-MARKET')
+    assert runner._pipeline._symbol_entry_counts == {}
+    assert not runner._pipeline._circuit_breaker_tripped
+    assert runner._pipeline.exit_manager.tracked == {'OPEN': protection}
+    runner._pipeline._symbol_entry_counts['NEW'] = 1
+    assert not runner._maybe_daily_session_reset(datetime(2026, 6, 2, 4, 1), 'PRE-MARKET')
+    assert runner._pipeline._symbol_entry_counts == {'NEW': 1}
+
+
+
+def test_daily_reset_clears_previous_session_news_admissions(monkeypatch):
+    runner = _runner()
+    runner._news_pinned = {"OLD"}
+    runner._news_pinned_at = {"OLD": datetime(2026, 6, 1, 10)}
+    monkeypatch.setattr(AlpacaRunner, '_is_trading_day', classmethod(lambda cls, when=None: True))
+    assert runner._maybe_daily_session_reset(datetime(2026, 6, 2, 4, 0), 'PRE-MARKET')
+    assert not runner._news_pinned
+    assert not runner._news_pinned_at

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -31,6 +32,7 @@ def test_shadow_train_writes_model_with_enough_samples(tmp_path, monkeypatch):
     for i in range(60):
         label = 1 if i % 2 else 0
         rows.append({
+            "ts": (datetime(2026, 10, 1, tzinfo=timezone.utc) + timedelta(days=i // 6, seconds=i)).isoformat(),
             "features": {"momentum_5bar_pct": float(i), "spread_pct": float(i % 3)},
             "price": 5.0 + i / 100,
             "label": label,
@@ -46,3 +48,6 @@ def test_shadow_train_writes_model_with_enough_samples(tmp_path, monkeypatch):
     meta = json.loads(model_file.with_suffix(".meta.json").read_text())
     assert meta["samples"] == 60
     assert "momentum_5bar_pct" in meta["feature_names"]
+
+    assert meta["advisory_only"]
+    assert meta["trained_through"] < meta["validation_start"] < meta["test_start"]

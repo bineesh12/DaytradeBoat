@@ -13,10 +13,12 @@ import sqlite3
 import shutil
 import threading
 import uuid
+from dataclasses import fields, is_dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence
 
 from daytrading.models import Bar
+from daytrading.reliability_metrics import StageMetrics, measured
 
 SQLITE_BUSY_TIMEOUT_MS = 30000
 logger = logging.getLogger(__name__)
@@ -33,8 +35,12 @@ def _day_key(ts: Optional[datetime] = None) -> str:
 def _json_safe(value: Any) -> Any:
     if isinstance(value, datetime):
         return value.isoformat()
+    if is_dataclass(value) and not isinstance(value, type):
+        # Market evidence remains typed in the engine; copy its fields only
+        # at the reporting boundary so neither prices nor live state change.
+        return {f.name: _json_safe(getattr(value, f.name)) for f in fields(value)}
     if hasattr(value, "value"):
-        return getattr(value, "value")
+        return _json_safe(getattr(value, "value"))
     if isinstance(value, dict):
         return {str(k): _json_safe(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
@@ -81,6 +87,7 @@ class TradingJournal:
         async_prune: Optional[bool] = None,
         skipped_event_types: Optional[Sequence[str]] = None,
     ) -> None:
+        self._stage_metrics = StageMetrics()
         root = base_dir or os.environ.get("DAYTRADING_JOURNAL_DIR", "data/journal")
         use_runtime_env = base_dir is None and db_path is None
         self._base_dir = os.path.abspath(root)
@@ -175,6 +182,10 @@ class TradingJournal:
             self._migrate_specialized_tables(cur)
             cur.executescript(
                 """
+                CREATE TABLE IF NOT EXISTS execution_event_keys (
+                    execution_event_id TEXT PRIMARY KEY,
+                    event_id INTEGER NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     ts TEXT NOT NULL,
@@ -603,8 +614,9 @@ class TradingJournal:
                 ),
             )
 
+    @measured('journal_record')
     def record(self, event_type: str, payload: Dict[str, Any], ts: Optional[datetime] = None) -> None:
-        if event_type in self._skipped_event_types:
+        if event_type in self._skipped_event_types and event_type != 'entry_submission_checks':
             self._maybe_prune_daily()
             return
         t = ts or _utc_now()
@@ -622,14 +634,28 @@ class TradingJournal:
         line = json.dumps(event, separators=(",", ":"), ensure_ascii=True)  # legacy mirror
         path = os.path.join(self._event_dir, "{}.jsonl".format(event["day"]))
         with self._lock:
-            cur = self._conn.cursor()
-            cur.execute(
-                "INSERT INTO events(ts, day, type, payload_json) VALUES (?, ?, ?, ?)",
-                (event["ts"], event["day"], event_type, payload_json),
-            )
-            event_id = int(cur.lastrowid)
-            self._insert_specialized(event_id, event_type, event["ts"], event["payload"])
-            self._conn.commit()
+            execution_key = payload_for_storage.get('execution_event_id') if isinstance(payload_for_storage,dict) else None
+            if execution_key and event_type not in ('trade_exit','trade_fill'):
+                raise ValueError('Execution identity is only valid on fills')
+            previous_sync = self._conn.execute('PRAGMA synchronous').fetchone()[0] if execution_key else None
+            if execution_key:
+                self._conn.execute('PRAGMA synchronous = FULL')
+            try:
+                with self._conn:
+                    cur = self._conn.cursor()
+                    if execution_key and cur.execute('SELECT 1 FROM execution_event_keys WHERE execution_event_id=?', (execution_key,)).fetchone():
+                        return
+                    cur.execute(
+                        "INSERT INTO events(ts, day, type, payload_json) VALUES (?, ?, ?, ?)",
+                        (event["ts"], event["day"], event_type, payload_json),
+                    )
+                    event_id = int(cur.lastrowid)
+                    self._insert_specialized(event_id, event_type, event["ts"], event["payload"])
+                    if execution_key:
+                        cur.execute('INSERT INTO execution_event_keys VALUES (?,?)', (execution_key,event_id))
+            finally:
+                if previous_sync is not None:
+                    self._conn.execute('PRAGMA synchronous = {}'.format(int(previous_sync)))
             # Keep JSONL mirror so old tools/scripts keep working.
             with open(path, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
@@ -647,6 +673,7 @@ class TradingJournal:
                 "close": b.close,
                 "volume": b.volume,
                 "timeframe": getattr(b.timeframe, "value", str(b.timeframe)),
+                "provenance": getattr(b.provenance, "value", b.provenance),
             }
             for b in recent
         ]

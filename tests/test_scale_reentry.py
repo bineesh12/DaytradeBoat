@@ -8,6 +8,7 @@ Covers:
 """
 
 from __future__ import annotations
+from daytrading.models import BarSource
 
 from datetime import datetime, timedelta
 from typing import Dict, List, Sequence
@@ -48,7 +49,7 @@ def _bar(symbol: str, close: float, volume: float = 100_000, offset_s: int = 0) 
         low=close - 0.02,
         close=close,
         volume=volume,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
 
 
 def _ohlcv_bar(
@@ -68,7 +69,7 @@ def _ohlcv_bar(
         low=low,
         close=close,
         volume=volume,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
 
 
 def _clean_runner_readd_bars(symbol: str = "RUN") -> List[Bar]:

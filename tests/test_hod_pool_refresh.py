@@ -1,6 +1,7 @@
 """Tests for HOD bar pool merge, prune, and price band."""
 
 from __future__ import annotations
+from daytrading.models import BarSource
 
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -39,7 +40,7 @@ def _bar(sym: str, close: float) -> Bar:
         low=close - 0.1,
         close=close,
         volume=100_000,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
 
 
 class TestHodPoolPriceBand:

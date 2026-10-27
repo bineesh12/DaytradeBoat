@@ -1,61 +1,27 @@
-"""Day trading & scalping platform: classify, scan, verify, execute."""
+"""Day trading platform. Public exports load only when requested."""
+from importlib import import_module
 
-from daytrading.backtest import BacktestEngine, BacktestResult
-from daytrading.classifier import AdaptiveRouter, MarketRegimeClassifier, StyleConfig
-from daytrading.data import DataFeed, InMemoryBarFeed
-from daytrading.execution import Broker, PaperBroker
-from daytrading.exits import ExitManager, TrackedPosition
-from daytrading.pipeline import PipelineResult, TradingPipeline
-from daytrading.scanner import (
-    CompositeScanner,
-    MomentumBurstScanner,
-    PremarketGapScanner,
-    Scanner,
-    SpreadFilterScanner,
-    TapeReaderScanner,
-    VolumeSpikeScanner,
-    VWAPDeviationScanner,
-)
-from daytrading.strategy import (
-    GapReversalVerifier,
-    MomentumScalpVerifier,
-    Strategy,
-    StrategyVerifier,
-    TapeScalpVerifier,
-    VolumeBreakoutVerifier,
-    VWAPBounceVerifier,
-)
+_EXPORTS = {
+    "BacktestEngine": "backtest", "BacktestResult": "backtest",
+    "AdaptiveRouter": "classifier", "MarketRegimeClassifier": "classifier", "StyleConfig": "classifier",
+    "DataFeed": "data", "InMemoryBarFeed": "data",
+    "Broker": "execution", "PaperBroker": "execution",
+    "ExitManager": "exits", "TrackedPosition": "exits",
+    "PipelineResult": "pipeline", "TradingPipeline": "pipeline",
+    "CompositeScanner": "scanner", "MomentumBurstScanner": "scanner", "PremarketGapScanner": "scanner",
+    "Scanner": "scanner", "SpreadFilterScanner": "scanner", "TapeReaderScanner": "scanner",
+    "VolumeSpikeScanner": "scanner", "VWAPDeviationScanner": "scanner",
+    "GapReversalVerifier": "strategy", "MomentumScalpVerifier": "strategy", "Strategy": "strategy",
+    "StrategyVerifier": "strategy", "TapeScalpVerifier": "strategy", "VolumeBreakoutVerifier": "strategy",
+    "VWAPBounceVerifier": "strategy",
+}
+__all__ = [*_EXPORTS, "__version__"]
+__version__ = "0.1.0"
 
-__all__ = [
-    "AdaptiveRouter",
-    "BacktestEngine",
-    "BacktestResult",
-    "Broker",
-    "CompositeScanner",
-    "DataFeed",
-    "ExitManager",
-    "GapReversalVerifier",
-    "InMemoryBarFeed",
-    "MarketRegimeClassifier",
-    "MomentumBurstScanner",
-    "MomentumScalpVerifier",
-    "PaperBroker",
-    "PipelineResult",
-    "PremarketGapScanner",
-    "Scanner",
-    "SpreadFilterScanner",
-    "Strategy",
-    "StrategyVerifier",
-    "StyleConfig",
-    "TapeReaderScanner",
-    "TapeScalpVerifier",
-    "TrackedPosition",
-    "TradingPipeline",
-    "VolumeBreakoutVerifier",
-    "VolumeSpikeScanner",
-    "VWAPBounceVerifier",
-    "VWAPDeviationScanner",
-    "__version__",
-]
 
-__version__ = "0.4.0"
+def __getattr__(name):
+    if name not in _EXPORTS:
+        raise AttributeError(name)
+    value = getattr(import_module(f"daytrading.{_EXPORTS[name]}"), name)
+    globals()[name] = value
+    return value

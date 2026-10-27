@@ -8,6 +8,8 @@ without changing live trade behavior.
 from __future__ import annotations
 
 import json
+from collections import OrderedDict
+from hashlib import sha256
 import logging
 import threading
 from datetime import datetime, timezone
@@ -148,6 +150,53 @@ def _future_outcome(
     return True
 
 
+_row_headers = OrderedDict()
+_HEADER_PATH_TYPE = type(Path())
+
+
+def _shadow_header_cache(path=None):
+    # Only ordinary immutable paths identify a file partition. Unknown path
+    # adapters and direct one-argument header callers retain shared-cache
+    # behavior without invoking a new user-defined hash/string conversion.
+    key = path if type(path) is _HEADER_PATH_TYPE else None
+    if key in _row_headers:
+        _row_headers.move_to_end(key)
+        return _row_headers[key]
+    headers = OrderedDict()
+    _row_headers[key] = headers
+    while len(_row_headers) > 2:
+        _row_headers.popitem(last=False)
+    return headers
+
+
+def _shadow_row_header(line: str, headers=None):
+    """Cache immutable eligibility fields, never mutable outcome rows.
+
+    Each of at most two file partitions retains at most 32K small headers.
+    Sequential files cannot evict every header from one another. Current line
+    bytes are still hashed; corrections/appends get new digests and pending
+    labels still use current prices/time under the existing file lock.
+    """
+    if headers is None:
+        headers = _shadow_header_cache()
+    key = sha256(line.encode()).digest()
+    if key in headers:
+        headers.move_to_end(key)
+        return headers[key]
+    try:
+        row = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    finalized = row.get("label") is not None
+    header = (True, '', None) if finalized else (False, str(row.get('symbol') or ''), row.get('ts'))
+    # Malformed/unbounded headers remain uncached, with old parsing behavior.
+    if finalized or (len(header[1]) <= 32 and isinstance(header[2], str) and len(header[2]) <= 64):
+        headers[key] = header
+        while len(headers) > 32768:
+            headers.popitem(last=False)
+    return header
+
+
 def _label_pending_file(
     path: Path,
     latest_prices: Dict[str, float],
@@ -157,28 +206,44 @@ def _label_pending_file(
     fail_pct: float,
 ) -> int:
     with _lock:
-        rows = _read_jsonl(path)
+        if not path.exists():
+            return 0
+        # Preserve already-final rows verbatim instead of parsing and sorting
+        # their large feature payloads again on every maintenance pass. The
+        # existing lock still serializes appends and rewrites with real labels.
+        lines = path.read_text().splitlines()
+        output = []
         changed = 0
         now = _utc_now()
-        for row in rows:
-            if row.get("label") is not None:
+        headers = _shadow_header_cache(path)
+        for original in lines:
+            line = original.strip()
+            if not line:
                 continue
-            sym = str(row.get("symbol") or "")
+            header = _shadow_row_header(line, headers)
+            if header is None:
+                continue
+            finalized, sym, stamp = header
+            if finalized:
+                output.append(line)
+                continue
             price = latest_prices.get(sym)
-            if price is None:
-                continue
-            try:
-                ts = datetime.fromisoformat(str(row.get("ts")).replace("Z", "+00:00"))
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
-            except Exception:
-                continue
-            if (now - ts.astimezone(timezone.utc)).total_seconds() < wait_seconds:
-                continue
-            if _future_outcome(row, price, positive_pct=positive_pct, fail_pct=fail_pct):
-                changed += 1
+            if price is not None:
+                try:
+                    ts = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                    mature = (now - ts.astimezone(timezone.utc)).total_seconds() >= wait_seconds
+                except Exception:
+                    mature = False
+                if mature:
+                    row = json.loads(line)
+                    if _future_outcome(row, price, positive_pct=positive_pct, fail_pct=fail_pct):
+                        changed += 1
+                        line = json.dumps(row, sort_keys=True)
+            output.append(line)
         if changed:
-            _write_jsonl(path, rows)
+            path.write_text("\n".join(output) + "\n")
         return changed
 
 

@@ -1,6 +1,7 @@
 """Tests for 10-second execution timing."""
 
 from __future__ import annotations
+from daytrading.models import BarSource
 
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -467,7 +468,7 @@ def _10s_bar(
         close=c,
         volume=volume,
         timeframe=Timeframe.SEC_10,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
 
 
 def _pullback_profile_bars(
@@ -503,7 +504,7 @@ def _pullback_profile_bars(
             low=l,
             close=c,
             volume=v,
-        )
+         provenance=BarSource.CANONICAL_INTERVAL)
         for i, (o, c, h, l, v) in enumerate(rows)
     ]
 

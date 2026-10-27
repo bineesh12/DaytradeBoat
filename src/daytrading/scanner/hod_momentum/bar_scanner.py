@@ -6,6 +6,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Sequence, Set
 
+from daytrading.data.bar_provenance import completed_minutes
 from daytrading.models import Bar
 from daytrading.scanner.hod_momentum.alert_store import HODAlertStore
 from daytrading.scanner.hod_momentum.hod_alert_logic import (
@@ -61,6 +62,7 @@ class HODMomentumScanner:
         sub2_max_float: float = 10_000_000,
         bar_cooldown_keys: Optional[Set[str]] = None,
         debug: bool = False,
+        on_qualification=None,
     ) -> None:
         self._store = store
         self._float_checker = float_checker
@@ -87,6 +89,25 @@ class HODMomentumScanner:
         )
         self._bar_cooldown_keys: Set[str] = bar_cooldown_keys if bar_cooldown_keys is not None else set()
         self._gapper_fired: Set[str] = set()
+        self._on_qualification = on_qualification
+        # One watermark per symbol/label, not an unbounded candle-ID set.
+        self._qualification_watermarks = {}
+
+    def _qualify(self, symbol, label, latest, now, *, notification_suppressed, metrics):
+        if self._on_qualification is None:
+            return
+        if (now.tzinfo is None or latest.ts.tzinfo is None
+                or not 60 <= (now-latest.ts).total_seconds() <= 120):
+            return  # No fresh completed source; timer/poll cannot renew it.
+        key = symbol + '|' + label
+        previous = self._qualification_watermarks.get(key)
+        if previous is not None and latest.ts <= previous:
+            return
+        row = dict(symbol=symbol, alert_name=label, source='canonical_completed_minute',
+                   source_start=latest.ts.isoformat(),
+                   qualified_at=now.isoformat(), notification_suppressed=notification_suppressed, **metrics)
+        self._on_qualification(row)
+        self._qualification_watermarks[key] = latest.ts
 
     def scan(
         self,
@@ -98,8 +119,10 @@ class HODMomentumScanner:
         verified_symbols: Optional[Set[str]] = None,
         rejections: Optional[Dict[str, str]] = None,
         is_premarket: bool = False,
+        now: Optional[datetime] = None,
     ) -> Dict[str, int]:
         """Add bar-sourced rows to the alert store. Returns reject reason counts."""
+        now = now if now is not None else datetime.now(timezone.utc)
         verified_symbols = verified_symbols or set()
         rejections = rejections or {}
         rel_vols = rel_vols or {}
@@ -110,6 +133,7 @@ class HODMomentumScanner:
         new_alerts = 0
 
         for symbol, bars in universe.items():
+            bars = completed_minutes(bars, now=now)
             if len(bars) < 10:
                 reject_stats["too_few_bars"] = reject_stats.get("too_few_bars", 0) + 1
                 continue
@@ -128,14 +152,14 @@ class HODMomentumScanner:
                 reject_stats["price_band"] = reject_stats.get("price_band", 0) + 1
                 continue
 
-            today = today_bars(bars, rth_only=self._rth_only)
+            today = today_bars(bars, rth_only=self._rth_only, now=now)
             if len(today) < MIN_TODAY_BARS:
                 reject_stats["too_few_today"] = reject_stats.get("too_few_today", 0) + 1
                 continue
 
             prior = prior_day_stats.get(symbol)
             ctx = session_context_from_bars(
-                bars, prior_day=prior, rth_only=self._rth_only,
+                bars, prior_day=prior, rth_only=self._rth_only, now=now,
             )
             if ctx is None:
                 reject_stats["no_context"] = reject_stats.get("no_context", 0) + 1
@@ -203,8 +227,7 @@ class HODMomentumScanner:
                     (price - prior_close) / prior_close * 100
                     if prior_close and prior_close > 0 else 0.0
                 )
-                if (symbol not in self._gapper_fired
-                        and early_chg >= 30.0):
+                if early_chg >= 30.0:
                     session_high = ctx.session_high
                     if session_high > 0:
                         distance_from_hod_pct = (session_high - price) / session_high * 100
@@ -293,7 +316,7 @@ class HODMomentumScanner:
             )
 
             # Gapper Continuation: one-time alert for massive gappers still near HOD
-            if not alert_names and symbol not in self._gapper_fired:
+            if not alert_names:
                 if change_from_close is not None and change_from_close >= 30.0:
                     session_high = ctx.session_high
                     if session_high > 0:
@@ -310,6 +333,10 @@ class HODMomentumScanner:
 
             for name in alert_names:
                 key = symbol + "|" + name
+                self._qualify(symbol, name, latest, now,
+                              notification_suppressed=key in self._bar_cooldown_keys and name != "HOD Reclaim",
+                              metrics=dict(price=price,day_volume=day_vol,float_shares=float_shares,
+                                  rel_vol=rel_vol,bar_rvol=bar_rvol,change_session_pct=change_session))
                 if key in self._bar_cooldown_keys and name != "HOD Reclaim":
                     continue
                 self._bar_cooldown_keys.add(key)

@@ -1,6 +1,7 @@
 """Tests for market regime classifier and adaptive router."""
 
 from __future__ import annotations
+from daytrading.models import BarSource
 
 from datetime import datetime, timezone
 
@@ -19,7 +20,7 @@ def _bar(
 ) -> Bar:
     h = high if high is not None else close + 0.02
     lo = low if low is not None else close - 0.02
-    return Bar(symbol=symbol, ts=TS, open=close - 0.01, high=h, low=lo, close=close, volume=volume)
+    return Bar(symbol=symbol, ts=TS, open=close - 0.01, high=h, low=lo, close=close, volume=volume, provenance=BarSource.CANONICAL_INTERVAL)
 
 
 def _quote(symbol: str, bid: float, ask: float) -> Quote:

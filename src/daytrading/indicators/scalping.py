@@ -91,6 +91,23 @@ def order_flow_imbalance(ticks: Sequence[Tick], window: int = 50) -> List[float]
     return out
 
 
+def last_order_flow_imbalance(ticks: Sequence[Tick], window: int = 50) -> float:
+    """Final rolling value without allocating/recomputing the preceding series.
+
+    Keep the same accumulation order and Side interpretation as the reference
+    function, including its zero-volume result. Entry thresholds are unchanged.
+    """
+    buy_vol = 0.0
+    sell_vol = 0.0
+    for tick in ticks[max(0, len(ticks) - window):]:
+        if tick.side is Side.BUY:
+            buy_vol += tick.size
+        else:
+            sell_vol += tick.size
+    total = buy_vol + sell_vol
+    return (buy_vol - sell_vol) / total if total > 0 else 0.0
+
+
 def cumulative_delta(ticks: Sequence[Tick]) -> List[float]:
     """Running sum of (buy_volume - sell_volume).
 

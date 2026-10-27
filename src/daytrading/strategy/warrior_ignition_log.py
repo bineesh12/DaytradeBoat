@@ -51,6 +51,7 @@ class IgnitionLogger:
             row = {
                 "ts": ts_iso,
                 "symbol": sym,
+                "feed": os.getenv("DAYTRADING_ALPACA_FEED", "iex"),
                 "session": session,
                 "conviction": round(float(signal.conviction), 4),
                 "would_enter": bool(would_enter),

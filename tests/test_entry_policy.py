@@ -1,4 +1,5 @@
 from __future__ import annotations
+from daytrading.models import BarSource
 
 from datetime import datetime, timezone
 
@@ -9,9 +10,9 @@ from daytrading.strategy.entry_policy import EntryPolicy
 def _bars(symbol: str = "AAPL", price: float = 5.0) -> list[Bar]:
     ts = datetime.now(timezone.utc)
     return [
-        Bar(symbol=symbol, ts=ts, open=price, high=price + 0.1, low=price - 0.1, close=price, volume=200_000),
-        Bar(symbol=symbol, ts=ts, open=price, high=price + 0.1, low=price - 0.1, close=price, volume=220_000),
-        Bar(symbol=symbol, ts=ts, open=price, high=price + 0.1, low=price - 0.1, close=price, volume=250_000),
+        Bar(symbol=symbol, ts=ts, open=price, high=price + 0.1, low=price - 0.1, close=price, volume=200_000, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar(symbol=symbol, ts=ts, open=price, high=price + 0.1, low=price - 0.1, close=price, volume=220_000, provenance=BarSource.CANONICAL_INTERVAL),
+        Bar(symbol=symbol, ts=ts, open=price, high=price + 0.1, low=price - 0.1, close=price, volume=250_000, provenance=BarSource.CANONICAL_INTERVAL),
     ]
 
 

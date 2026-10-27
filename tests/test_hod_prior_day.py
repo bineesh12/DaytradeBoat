@@ -1,3 +1,4 @@
+from daytrading.models import BarSource
 """Tests for prior-day HOD vs today-only HOD classification."""
 
 from datetime import datetime, timezone
@@ -33,7 +34,7 @@ def _bar(i: int, o: float, h: float, c: float, vol: float = 80_000) -> Bar:
         low=o - 0.1,
         close=c,
         volume=vol,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
 
 
 class _FloatChecker:

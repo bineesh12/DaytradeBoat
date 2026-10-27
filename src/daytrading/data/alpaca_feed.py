@@ -22,6 +22,7 @@ Usage:
 """
 
 from __future__ import annotations
+from daytrading.models import BarSource
 
 import asyncio
 import concurrent.futures
@@ -60,7 +61,7 @@ def configure_alpaca_stream_logging() -> None:
 try:
     from alpaca.data.historical.stock import StockHistoricalDataClient
     from alpaca.data.live.stock import StockDataStream
-    from alpaca.data.requests import StockBarsRequest, StockLatestBarRequest, StockTradesRequest
+    from alpaca.data.requests import StockBarsRequest, StockLatestBarRequest, StockTradesRequest, StockLatestQuoteRequest
     from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
     from alpaca.data.enums import DataFeed
     _HAS_ALPACA = True
@@ -134,73 +135,81 @@ def _chunk_symbols(symbols: Sequence[str], batch_size: int) -> List[List[str]]:
 if _HAS_ALPACA:
 
     class _ResilientDataStream(StockDataStream):
-        """StockDataStream subclass that adds backoff on connection-limit errors.
+        """Reconnect without flooding the provider, including DNS/auth failures."""
 
-        The base SDK catches ValueError internally and retries with zero delay,
-        hammering Alpaca's server.  We override ``_run_forever`` to insert a
-        30-60 s sleep when the server says "connection limit exceeded".
-        """
+        async def _reconnect_pause(self, seconds: float) -> None:
+            # stop_ws sets this event, so shutdown does not wait for backoff.
+            try:
+                await asyncio.wait_for(self._stop_stream_event.wait(), timeout=seconds)
+            except asyncio.TimeoutError:
+                pass
 
         async def _run_forever(self) -> None:
-            import websockets  # noqa: F811 — re-import inside async scope
             self._loop = asyncio.get_running_loop()
-
-            while not any(
-                v
-                for k, v in self._handlers.items()
-                if k not in ("cancelErrors", "corrections")
-            ):
+            while not any(v for k, v in self._handlers.items()
+                          if k not in ("cancelErrors", "corrections")):
                 if not self._stop_stream_queue.empty():
-                    self._stop_stream_queue.get(timeout=1)
+                    self._stop_stream_queue.get_nowait()
                     return
-                await asyncio.sleep(0)
-
-            _log = logging.getLogger("alpaca.data.live.websocket")
-            _log.info("started %s stream", self._name)
+                await asyncio.sleep(0.1)
+            if not self._stop_stream_queue.empty():
+                self._stop_stream_queue.get_nowait()
+                return
+            self._stop_stream_event = asyncio.Event()
             self._should_run = True
             self._running = False
-            _conn_limit_hits = 0
-
-            while True:
+            self._data_received = False
+            retries = 0
+            connection_limits = 0
+            log = logging.getLogger("alpaca.data.live.websocket")
+            while self._should_run:
+                delay = None
                 try:
-                    if not self._should_run:
-                        _log.info("%s stream stopped", self._name)
-                        return
                     if not self._running:
-                        _log.info("starting %s websocket connection", self._name)
+                        self._data_received = False
                         await self._start_ws()
                         await self._send_subscribe_msg()
                         self._running = True
-                        _conn_limit_hits = 0
-                    await self._consume()
-                except websockets.WebSocketException as wse:
+                    stale = await self._consume()
+                    if not self._should_run:
+                        return
+                    if not stale:
+                        continue
+                    # A mute socket is not a successful recovery. Reset retries
+                    # only when actual market data arrived on the old socket.
+                    if self._data_received:
+                        retries = connection_limits = 0
+                    retries += 1
+                    delay = min(2 ** min(retries - 1, 5), 30)
+                    log.warning("stale data socket; reconnecting in %ss", delay)
+                except asyncio.CancelledError:
                     await self.close()
                     self._running = False
-                    _log.warning("data websocket error, restarting connection: %s", wse)
-                except ValueError as ve:
-                    msg = str(ve).lower()
-                    if "insufficient subscription" in msg:
-                        await self.close()
-                        self._running = False
-                        _log.error("fatal: %s", ve)
+                    raise
+                except Exception as exc:
+                    if self._data_received:
+                        retries = connection_limits = 0
+                    msg = str(exc).lower()
+                    if isinstance(exc, ValueError) and "insufficient subscription" in msg:
+                        log.error("fatal market data subscription error: %s", exc)
+                        self._should_run = False
                         return
+                    retries += 1
                     if "connection limit" in msg:
-                        _conn_limit_hits += 1
+                        connection_limits += 1
+                        delay = 30 if connection_limits <= 2 else 60
+                    else:
+                        delay = min(2 ** min(retries - 1, 5), 30)
+                    log.warning("data socket failure (%s); retrying in %ss: %s",
+                                type(exc).__name__, delay, exc)
+                finally:
+                    # Release half-open/auth-failed sockets as well as established
+                    # ones; otherwise the account's connection slot can leak.
+                    if delay is not None or not self._should_run:
                         await self.close()
                         self._running = False
-                        wait = 30 if _conn_limit_hits <= 2 else 60
-                        _log.warning(
-                            "connection limit exceeded (hit #%d) — "
-                            "waiting %ds for Alpaca to release old slot …",
-                            _conn_limit_hits, wait,
-                        )
-                        await asyncio.sleep(wait)
-                        continue
-                    _log.exception("error during websocket communication: %s", ve)
-                except Exception as e:
-                    _log.exception("error during websocket communication: %s", e)
-                finally:
-                    await asyncio.sleep(0)
+                if delay is not None and self._should_run:
+                    await self._reconnect_pause(delay)
 
 
 _TF_MAP = {
@@ -252,10 +261,20 @@ class AlpacaHistoricalFeed:
                 "alpaca-py is required. Install with: pip install 'daytrading[alpaca]'"
             )
         self._client = StockHistoricalDataClient(api_key, secret_key)
+        from daytrading.execution.transport import configure_client_timeouts
+        configure_client_timeouts(self._client)
         self._feed = _parse_feed(feed)
         self._bar_fetch_batch_size = max(1, int(bar_fetch_batch_size))
         self._bar_fetch_batch_delay_sec = max(0.0, float(bar_fetch_batch_delay_sec))
         self.last_fetch_failures: int = 0
+
+    def get_latest_quotes(self, symbols: Sequence[str]) -> Dict[str, Quote]:
+        """Timestamped REST quotes for exits when the stream has gone stale."""
+        rows = self._client.get_stock_latest_quote(
+            StockLatestQuoteRequest(symbol_or_symbols=list(symbols), feed=self._feed))
+        return {symbol: Quote(symbol, row.timestamp, float(row.bid_price),
+                              float(row.ask_price), float(row.bid_size), float(row.ask_size))
+                for symbol, row in rows.items() if symbol in symbols}
 
     def get_bars(
         self,
@@ -270,6 +289,8 @@ class AlpacaHistoricalFeed:
 
         Returns dict mapping symbol -> list of Bar objects, oldest first.
         Uses batched REST requests to reduce connection churn on weak networks.
+        The requested limit is retained per symbol, after paging the bounded
+        time window; Alpaca's request limit would truncate the whole batch.
         """
         start, end = _normalize_bar_window(start, end)
 
@@ -343,13 +364,16 @@ class AlpacaHistoricalFeed:
         for attempt in range(1, _BAR_FETCH_MAX_RETRIES + 1):
             try:
                 request = StockBarsRequest(
+                    adjustment="split",
                     symbol_or_symbols=list(symbols),
                     timeframe=tf,
                     start=start,
                     end=end,
-                    limit=limit,
                     feed=self._feed,
                 )
+                # Alpaca sorts by symbol and its limit counts bars across ALL
+                # symbols. Let the SDK follow every page in this bounded window
+                # so an active earlier symbol cannot starve later symbols.
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                     future = pool.submit(self._client.get_stock_bars, request)
                     raw = future.result(timeout=15)
@@ -407,9 +431,9 @@ class AlpacaHistoricalFeed:
                     close=float(getattr(b, "close", 0)),
                     volume=float(getattr(b, "volume", 0)),
                     timeframe=tf_enum,
-                ))
+                 provenance=BarSource.CANONICAL_INTERVAL))
             if bars:
-                batch_result[symbol] = bars
+                batch_result[symbol] = bars[-limit:]
 
         missing = len(symbols) - len(batch_result)
         return batch_result, missing
@@ -435,7 +459,7 @@ class AlpacaHistoricalFeed:
                 low=float(getattr(b, 'low', 0)),
                 close=float(getattr(b, 'close', 0)),
                 volume=float(getattr(b, 'volume', 0)),
-            )
+             provenance=BarSource.CANONICAL_INTERVAL)
 
         return result
 
@@ -564,14 +588,66 @@ class AlpacaStreamFeed:
         if not syms:
             return
         with self._sub_lock:
+            existing = set(self._subscribed_bar_symbols) | set(self._subscribed_quote_symbols) | set(self._subscribed_trade_symbols) | self._pending_bar_symbols | self._pending_quote_symbols | self._pending_trade_symbols
+            if self._feed_str.lower() == "iex" and len(existing | set(syms)) > 30:
+                raise ValueError("IEX Basic allows 30 streamed symbols; release old symbols before adding more")
             if bars:
                 self._pending_bar_symbols.update(syms)
             if quotes:
                 self._pending_quote_symbols.update(syms)
             if trades:
                 self._pending_trade_symbols.update(syms)
+                self._trade_filter_symbols.update(syms)
         if trades:
             self.flush_pending_subscriptions()
+
+    def unsubscribe(self, symbols: Sequence[str]) -> bool:
+        """Release all channels for removed symbols, retaining state on failure."""
+        syms = {s.upper() for s in symbols}
+        async def release():
+            for channel, current in (("bars", self._subscribed_bar_symbols), ("quotes", self._subscribed_quote_symbols), ("trades", self._subscribed_trade_symbols)):
+                removed = sorted(syms.intersection(current))
+                if removed:
+                    await self._stream._send_unsubscribe_msg(channel, removed)
+                    for symbol in removed:
+                        self._stream._handlers[channel].pop(symbol, None)
+        try:
+            loop = getattr(self._stream, "_loop", None)
+            if self._running and loop and loop.is_running():
+                asyncio.run_coroutine_threadsafe(release(), loop).result(timeout=2)
+            with self._sub_lock:
+                for pending in (self._pending_bar_symbols, self._pending_quote_symbols, self._pending_trade_symbols):
+                    pending.difference_update(syms)
+                for current in (self._subscribed_bar_symbols, self._subscribed_quote_symbols, self._subscribed_trade_symbols):
+                    current[:] = [s for s in current if s not in syms]
+                self._trade_filter_symbols.difference_update(syms)
+            self._subscription_error = False
+            return True
+        except Exception as exc:
+            self._subscription_error = True
+            logger.error("Cannot release stream subscriptions: %s", exc)
+            return False
+
+    def unsubscribe_quotes(self, symbols: Sequence[str]) -> bool:
+        """Release preparation-owned quotes without touching bars/trades."""
+        syms={s.upper() for s in symbols}
+        async def release():
+            removed=sorted(syms.intersection(self._subscribed_quote_symbols))
+            if removed:
+                await self._stream._send_unsubscribe_msg('quotes',removed)
+                for symbol in removed:self._stream._handlers['quotes'].pop(symbol,None)
+        try:
+            loop=getattr(self._stream,'_loop',None)
+            if self._running and loop and loop.is_running():
+                asyncio.run_coroutine_threadsafe(release(),loop).result(timeout=2)
+            with self._sub_lock:
+                self._pending_quote_symbols.difference_update(syms)
+                self._subscribed_quote_symbols[:]=[s for s in self._subscribed_quote_symbols if s not in syms]
+            return True
+        except Exception:
+            self._subscription_error=True
+            logger.exception('Cannot release preparation quote subscription')
+            return False
 
     def flush_pending_subscriptions(self) -> None:
         """Send queued subscriptions on the stream thread (thread-safe)."""
@@ -699,7 +775,7 @@ class AlpacaStreamFeed:
             close=float(data.close),
             volume=float(data.volume),
             timeframe=Timeframe.MIN_1,
-        )
+         provenance=BarSource.CANONICAL_INTERVAL)
         for cb in self._bar_callbacks:
             try:
                 cb(bar)
@@ -871,3 +947,8 @@ class AlpacaStreamFeed:
     @property
     def is_running(self) -> bool:
         return self._running and (self._thread is not None and self._thread.is_alive())
+
+    @property
+    def is_connected(self) -> bool:
+        """Transport state only; exchange timestamps establish data freshness."""
+        return self.is_running and bool(getattr(self._stream, "_running", False))

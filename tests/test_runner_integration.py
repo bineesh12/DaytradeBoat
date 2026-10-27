@@ -1,6 +1,7 @@
 """Integration-style tests for runner wiring (mocked broker, no live Alpaca)."""
 
 from __future__ import annotations
+from daytrading.models import BarSource
 
 from collections import deque
 from datetime import datetime, timezone
@@ -101,7 +102,7 @@ class TestTimedSignalQueue:
             ts=datetime.now(timezone.utc),
             open=5.0, high=5.12, low=4.98, close=5.10,
             volume=1000, timeframe=Timeframe.SEC_10,
-        )
+         provenance=BarSource.CANONICAL_INTERVAL)
         sig = timer.on_10s_bar(bar)
         if sig:
             queue.append(sig)
@@ -122,9 +123,9 @@ class TestTimedSignalQueue:
         )
         runner._bar_buffer = {
             "TST": deque([
-                Bar("TST", datetime.now(timezone.utc), 5.0, 5.05, 4.95, 5.0, 200_000),
-                Bar("TST", datetime.now(timezone.utc), 5.0, 5.05, 4.95, 5.02, 200_000),
-                Bar("TST", datetime.now(timezone.utc), 5.02, 5.05, 4.99, 5.01, 200_000),
+                Bar("TST", datetime.now(timezone.utc), 5.0, 5.05, 4.95, 5.0, 200_000, provenance=BarSource.CANONICAL_INTERVAL),
+                Bar("TST", datetime.now(timezone.utc), 5.0, 5.05, 4.95, 5.02, 200_000, provenance=BarSource.CANONICAL_INTERVAL),
+                Bar("TST", datetime.now(timezone.utc), 5.02, 5.05, 4.99, 5.01, 200_000, provenance=BarSource.CANONICAL_INTERVAL),
             ])
         }
         runner._timed_entry_chase_reject = lambda *a, **k: None
@@ -151,7 +152,7 @@ class TestTimedSignalQueue:
         runner._latest_price = lambda symbol: 5.05
         runner._bar_buffer = {
             "TST": deque([
-                Bar("TST", datetime.now(timezone.utc), 5.0, 5.1, 4.95, 5.05, 250_000),
+                Bar("TST", datetime.now(timezone.utc), 5.0, 5.1, 4.95, 5.05, 250_000, provenance=BarSource.CANONICAL_INTERVAL),
             ])
         }
         runner._shared_entry_quality_reject = lambda *a, **k: "ML model low confidence (22%, need 30%)"
@@ -169,7 +170,7 @@ class TestTimedSignalQueue:
         fill, status = runner._retry_hot_hod_timed_entry(
             sig,
             OrderStatus.REJECTED,
-            Bar("TST", datetime.now(timezone.utc), 5.0, 5.1, 4.95, 5.02, 250_000),
+            Bar("TST", datetime.now(timezone.utc), 5.0, 5.1, 4.95, 5.02, 250_000, provenance=BarSource.CANONICAL_INTERVAL),
         )
 
         assert fill is None
@@ -255,7 +256,7 @@ class TestFastScanDeferral:
             low=4.9,
             close=5.1,
             volume=1000,
-        )
+         provenance=BarSource.CANONICAL_INTERVAL)
         runner._event_queue.put_nowait(BarsLoadedEvent({"XOS": [bar]}, {}))
 
         got_bars = runner._drain_events()
@@ -305,7 +306,7 @@ class TestFastScanDeferral:
         runner = self._runner()
         runner._scanner = SimpleNamespace(
             _is_premarket=False,
-            scan_candidates=lambda readonly=True: [{
+            scan_candidates=lambda readonly=True, full_universe=False: [{
                 "symbol": "FOXX",
                 "price": 4.66,
                 "abs_change_pct": 62.94,
@@ -328,7 +329,7 @@ class TestFastScanDeferral:
                     low=4.4,
                     close=4.66,
                     volume=50_000,
-                )
+                 provenance=BarSource.CANONICAL_INTERVAL)
             ])
         }
         runner._hot_watch = {}
@@ -371,7 +372,7 @@ class TestPriorityRefresh:
                     low=5.0,
                     close=5.0,
                     volume=100,
-                )
+                 provenance=BarSource.CANONICAL_INTERVAL)
             ]),
             "SLOW": deque([
                 Bar(
@@ -382,7 +383,7 @@ class TestPriorityRefresh:
                     low=5.0,
                     close=5.0,
                     volume=100,
-                )
+                 provenance=BarSource.CANONICAL_INTERVAL)
             ]),
         }
         requested_batches = []
@@ -400,7 +401,7 @@ class TestPriorityRefresh:
                             low=6.0,
                             close=6.0,
                             volume=100,
-                        )
+                         provenance=BarSource.CANONICAL_INTERVAL)
                     ]
                     for sym in batch
                 }
@@ -440,7 +441,7 @@ class TestTimedEntryChaseGuard:
             close=4.94,
             volume=10_000,
             timeframe=Timeframe.SEC_10,
-        )
+         provenance=BarSource.CANONICAL_INTERVAL)
         runner._bar_aggregator = SimpleNamespace(
             get_latest_10s=lambda symbol, count=1: [red_bar],
         )
@@ -459,7 +460,7 @@ class TestTimedEntryChaseGuard:
                 low=4.90,
                 close=4.94,
                 volume=1000,
-            ),
+             provenance=BarSource.CANONICAL_INTERVAL),
         )
 
         assert reject == "latest 10s candle turned red during entry wait"
@@ -477,7 +478,7 @@ class TestTimedEntryChaseGuard:
                 low=4.90,
                 close=4.94,
                 volume=1000,
-            ),
+             provenance=BarSource.CANONICAL_INTERVAL),
         )
 
         assert reject is None
@@ -500,7 +501,7 @@ class TestTimedEntryChaseGuard:
                 low=4.90,
                 close=4.94,
                 volume=1000,
-            ),
+             provenance=BarSource.CANONICAL_INTERVAL),
         )
 
         assert reject is None

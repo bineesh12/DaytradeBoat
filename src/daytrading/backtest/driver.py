@@ -457,7 +457,8 @@ class PipelineBacktestDriver:
                 now=now,
             )
             self._refresh_5m_context(universe)
-            cycle = self._pipeline.run_cycle(universe, now=now, quotes=quotes)
+            cycle = self._pipeline.run_cycle(universe, now=now, quotes=quotes,
+                session_universe=self._session_universe(now))
             self._record_cycle(result, ledger, cycle, now=now)
             self._queue_deferred(cycle, result=result, now=now)
             self._record_10s_opportunities(result, ledger, universe=universe, now=now, cycle=cycle)
@@ -513,7 +514,8 @@ class PipelineBacktestDriver:
                             quotes=quotes,
                         )
             self._refresh_5m_context(universe)
-            cycle = self._pipeline.run_cycle(universe, now=t10, quotes=quotes)
+            cycle = self._pipeline.run_cycle(universe, now=t10, quotes=quotes,
+                session_universe=self._session_universe(t10, visible_universe=universe))
             self._record_cycle(result, ledger, cycle, now=t10)
             self._queue_deferred(cycle, result=result, now=t10)
             if self._use_breakout_scalp_replay:
@@ -676,6 +678,31 @@ class PipelineBacktestDriver:
                              "conviction": round(sig.conviction, 3), "size_factor": round(size_factor, 2)},
             })
             return
+
+    def _session_universe(self, now, *, visible_universe=None):
+        """Keep full same-session quality context separate from detector windows.
+
+        The legacy minute lane labels its completed candle by its start. In the
+        intra-minute lane, replace that candle with the exact visible partial;
+        never expose its future final OHLCV to session verification.
+        """
+        from zoneinfo import ZoneInfo
+        ny = ZoneInfo('America/New_York')
+        day = now.astimezone(ny).date()
+        out = {}
+        for symbol, source in self._bars_by_symbol.items():
+            trigger = (visible_universe or {}).get(symbol, [])
+            cutoff = trigger[-1].ts if trigger else now
+            rows = [b for b in source if b.symbol == symbol and
+                    b.timeframe == Timeframe.MIN_1 and b.ts <= cutoff and
+                    b.ts.astimezone(ny).date() == day]
+            if visible_universe is not None:
+                if not trigger:
+                    continue
+                rows = [b for b in rows if b.ts < cutoff] + [trigger[-1]]
+            if rows:
+                out[symbol] = rows
+        return out
 
     def _live_like_universe(
         self,
@@ -1063,7 +1090,9 @@ class PipelineBacktestDriver:
         apply_fill(self._pipeline.portfolio, fill)
         result.fills.append(fill)
         self._pipeline._symbol_entry_counts[symbol] = self._pipeline._symbol_entry_counts.get(symbol, 0) + 1
-        self._pipeline.exit_manager.register_from_signal(signal, bar.ts, fill_price=fill.price)
+        self._pipeline.exit_manager.register_from_signal(
+            signal, bar.ts, fill_price=fill.price, fill_quantity=fill.quantity,
+        )
         ledger.record_entry(fill, strategy="ten_second_breakout_scout")
         result.entry_decisions.append({
             "ts": bar.ts.isoformat(),
@@ -1165,7 +1194,9 @@ class PipelineBacktestDriver:
             apply_fill(self._pipeline.portfolio, fill)
             result.fills.append(fill)
             self._pipeline._symbol_entry_counts[symbol] = self._pipeline._symbol_entry_counts.get(symbol, 0) + 1
-            self._pipeline.exit_manager.register_from_signal(signal, now, fill_price=fill.price)
+            self._pipeline.exit_manager.register_from_signal(
+                signal, now, fill_price=fill.price, fill_quantity=fill.quantity,
+            )
             self._breakout_scalp_last_entry[symbol] = now
             ledger.record_entry(fill, strategy="breakout_scalp_replay")
             result.entry_decisions.append({
@@ -4382,7 +4413,9 @@ class PipelineBacktestDriver:
         self._pipeline._symbol_entry_counts[signal.symbol] = (
             self._pipeline._symbol_entry_counts.get(signal.symbol, 0) + 1
         )
-        self._pipeline.exit_manager.register_from_signal(signal, bar.ts, fill_price=fill.price)
+        self._pipeline.exit_manager.register_from_signal(
+            signal, bar.ts, fill_price=fill.price, fill_quantity=fill.quantity,
+        )
         ledger.record_entry(fill, strategy=_entry_strategy_label(signal))
 
     def _timed_release_chase_reject(

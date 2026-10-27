@@ -1,6 +1,7 @@
 """Safety logic for fast-exit and other non-pipeline exit paths."""
 
 from __future__ import annotations
+from daytrading.models import BarSource
 
 from collections import deque
 from datetime import datetime, timedelta, timezone
@@ -141,7 +142,10 @@ def test_tick_trail_exit_escalates_to_urgent_exit_after_limit_miss() -> None:
         portfolio=PortfolioState(cash=10_000),
     )
     runner._broker = broker
-    runner._record_trade_exit = lambda *args, **kwargs: -12.96
+    def record_executed_fill(fill, *args, **kwargs):
+        exit_manager.commit_coordinated_exit_fill(fill)
+        return -12.96
+    runner._record_trade_exit = record_executed_fill
     runner._hub = SimpleNamespace(add_log=lambda *args, **kwargs: None)
     runner._seed_recent_order_ids = lambda: None
     runner._push_positions_from_alpaca = lambda: None
@@ -243,7 +247,7 @@ def test_partial_exit_record_refreshes_broker_stop_for_remaining_qty() -> None:
         symbol="OLOX",
         side=Side.BUY,
         quantity=100,
-        remaining_qty=50,
+        remaining_qty=100,
         entry_price=10.0,
         stop_loss=10.0,
     )
@@ -296,6 +300,7 @@ def test_flat_portfolio_exit_clears_stale_tracked_stop() -> None:
 
 
 def test_failed_fast_exit_attempts_are_logged_for_shadow_ml(monkeypatch) -> None:
+    from unittest.mock import Mock
     class ExitManagerStub:
         def __init__(self) -> None:
             self._positions = {
@@ -342,7 +347,15 @@ def test_failed_fast_exit_attempts_are_logged_for_shadow_ml(monkeypatch) -> None
     runner._broker = SimpleNamespace(
         submit=lambda *args, **kwargs: (None, OrderStatus.CANCELLED)
     )
-    runner._live_prices = lambda symbols: {"MASK": 6.94}
+    # Isolate reporting at the current exit seams; this test does not supply a
+    # real quote/broker snapshot and must not rely on the old mark-price path.
+    runner._pipeline.portfolio.positions['MASK']=Position('MASK',294,5.59)
+    runner._exit_prices=Mock(return_value={'MASK':6.94})
+    runner._pipeline.exit_manager.latch_timeouts=Mock(return_value=[])
+    runner._submit_fast_exit_order=Mock(return_value=(None,OrderStatus.CANCELLED))
+    runner._broker_has_compatible_exit_position=lambda *a:True
+    runner._refresh_broker_stop=Mock()
+    runner._journal=SimpleNamespace(record=Mock())
 
     runner._check_exits_only()
 
@@ -351,6 +364,10 @@ def test_failed_fast_exit_attempts_are_logged_for_shadow_ml(monkeypatch) -> None
         "fast_exit_guarded_marketable",
     ]
     assert all(row["status"] is OrderStatus.CANCELLED for row in logged)
+    assert runner._submit_fast_exit_order.call_count==2
+    assert runner._pipeline.exit_manager.tracked['MASK'].remaining_qty==294
+    runner._journal.record.assert_called_once()
+    assert runner._journal.record.call_args.args[0]=='exit_execution_failure'
 
 
 def test_confirmed_runner_core_uses_runner_management() -> None:
@@ -393,8 +410,8 @@ def test_confirmed_runner_skips_10s_profit_protection_exit() -> None:
     )
     runner._bar_aggregator = SimpleNamespace(
         get_latest_10s=lambda symbol, count=2: [
-            Bar(symbol=symbol, open=3.86, high=3.88, low=3.82, close=3.85, volume=10_000, ts=datetime.now(timezone.utc)),
-            Bar(symbol=symbol, open=3.85, high=3.86, low=3.78, close=3.79, volume=12_000, ts=datetime.now(timezone.utc)),
+            Bar(symbol=symbol, open=3.86, high=3.88, low=3.82, close=3.85, volume=10_000, ts=datetime.now(timezone.utc), provenance=BarSource.CANONICAL_INTERVAL),
+            Bar(symbol=symbol, open=3.85, high=3.86, low=3.78, close=3.79, volume=12_000, ts=datetime.now(timezone.utc), provenance=BarSource.CANONICAL_INTERVAL),
         ]
     )
     calls = []
@@ -412,7 +429,7 @@ def test_confirmed_runner_skips_10s_profit_protection_exit() -> None:
         close=3.79,
         volume=12_000,
         ts=datetime.now(timezone.utc),
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
     runner._check_10s_candle_exit("CHAI", red_bar)
 
     assert calls == []
@@ -552,7 +569,7 @@ def test_fast_exit_clamps_to_fresh_broker_position_qty() -> None:
     runner._broker = broker
 
     order = Order(symbol="VERU", side=Side.SELL, quantity=147, limit_price=None)
-    bar = Bar(symbol="VERU", open=5.55, high=5.55, low=5.55, close=5.55, volume=0, ts=datetime.now(timezone.utc))
+    bar = Bar(symbol="VERU", open=5.55, high=5.55, low=5.55, close=5.55, volume=0, ts=datetime.now(timezone.utc), provenance=BarSource.CANONICAL_INTERVAL)
 
     fill, status = runner._submit_fast_exit_order(order, bar)
 
@@ -580,7 +597,7 @@ def test_fast_exit_skips_when_broker_is_already_flat() -> None:
 
     runner._broker = BrokerStub()
     order = Order(symbol="VERU", side=Side.SELL, quantity=147, limit_price=None)
-    bar = Bar(symbol="VERU", open=5.55, high=5.55, low=5.55, close=5.55, volume=0, ts=datetime.now(timezone.utc))
+    bar = Bar(symbol="VERU", open=5.55, high=5.55, low=5.55, close=5.55, volume=0, ts=datetime.now(timezone.utc), provenance=BarSource.CANONICAL_INTERVAL)
 
     fill, status = runner._submit_fast_exit_order(order, bar)
 
@@ -614,8 +631,8 @@ def test_breakout_scalp_reject_does_not_reference_missing_status() -> None:
     )
     runner._bar_buffer = {
         "HOT": deque([
-            Bar(symbol="HOT", open=5.0, high=5.1, low=4.9, close=5.0, volume=10_000, ts=datetime.now(timezone.utc)),
-            Bar(symbol="HOT", open=5.0, high=5.2, low=4.95, close=5.1, volume=12_000, ts=datetime.now(timezone.utc)),
+            Bar(symbol="HOT", open=5.0, high=5.1, low=4.9, close=5.0, volume=10_000, ts=datetime.now(timezone.utc), provenance=BarSource.CANONICAL_INTERVAL),
+            Bar(symbol="HOT", open=5.0, high=5.2, low=4.95, close=5.1, volume=12_000, ts=datetime.now(timezone.utc), provenance=BarSource.CANONICAL_INTERVAL),
         ])
     }
     runner._new_entries_blocked = lambda *args, **kwargs: False
@@ -651,9 +668,9 @@ def test_breakout_scalp_honors_spread_size_factor_before_submit() -> None:
     now = datetime.now(timezone.utc)
     runner._bar_buffer = {
         "HOT": deque([
-            Bar(symbol="HOT", open=4.80, high=5.00, low=4.75, close=4.90, volume=300_000, ts=now),
-            Bar(symbol="HOT", open=4.90, high=5.20, low=4.85, close=5.10, volume=350_000, ts=now),
-            Bar(symbol="HOT", open=5.10, high=5.35, low=5.05, close=5.30, volume=400_000, ts=now),
+            Bar(symbol="HOT", open=4.80, high=5.00, low=4.75, close=4.90, volume=300_000, ts=now, provenance=BarSource.CANONICAL_INTERVAL),
+            Bar(symbol="HOT", open=4.90, high=5.20, low=4.85, close=5.10, volume=350_000, ts=now, provenance=BarSource.CANONICAL_INTERVAL),
+            Bar(symbol="HOT", open=5.10, high=5.35, low=5.05, close=5.30, volume=400_000, ts=now, provenance=BarSource.CANONICAL_INTERVAL),
         ])
     }
     submitted = []
@@ -706,9 +723,9 @@ def test_paused_runner_blocks_timed_entries() -> None:
 def test_timed_entry_rechecks_shared_entry_quality_before_submit(monkeypatch) -> None:
     runner = object.__new__(AlpacaRunner)
     bars = deque([
-        Bar(symbol="HOT", open=5.0, high=5.05, low=4.95, close=5.0, volume=10_000, ts=datetime.now(timezone.utc)),
-        Bar(symbol="HOT", open=5.0, high=5.06, low=4.96, close=5.02, volume=10_000, ts=datetime.now(timezone.utc)),
-        Bar(symbol="HOT", open=5.02, high=5.08, low=5.0, close=5.04, volume=10_000, ts=datetime.now(timezone.utc)),
+        Bar(symbol="HOT", open=5.0, high=5.05, low=4.95, close=5.0, volume=10_000, ts=datetime.now(timezone.utc), provenance=BarSource.CANONICAL_INTERVAL),
+        Bar(symbol="HOT", open=5.0, high=5.06, low=4.96, close=5.02, volume=10_000, ts=datetime.now(timezone.utc), provenance=BarSource.CANONICAL_INTERVAL),
+        Bar(symbol="HOT", open=5.02, high=5.08, low=5.0, close=5.04, volume=10_000, ts=datetime.now(timezone.utc), provenance=BarSource.CANONICAL_INTERVAL),
     ])
     runner._hub = SimpleNamespace(
         trading_paused=False,

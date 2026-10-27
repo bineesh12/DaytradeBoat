@@ -1,6 +1,7 @@
 """Tests for multi-source live price resolution."""
 
 from __future__ import annotations
+from daytrading.models import BarSource
 
 from datetime import datetime, timezone
 
@@ -25,7 +26,7 @@ def test_bar_close_fallback() -> None:
     ts = datetime.now(timezone.utc)
     bars = {
         "TST": [
-            Bar(symbol="TST", ts=ts, open=4.0, high=4.5, low=3.9, close=4.25, volume=1000, timeframe=Timeframe.MIN_1),
+            Bar(symbol="TST", ts=ts, open=4.0, high=4.5, low=3.9, close=4.25, volume=1000, timeframe=Timeframe.MIN_1, provenance=BarSource.CANONICAL_INTERVAL),
         ],
     }
     prices = resolve_live_prices(["TST"], bars=bars)

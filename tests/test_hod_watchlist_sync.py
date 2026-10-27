@@ -1,6 +1,7 @@
 """Tests for HOD-alert-driven watchlist sync and trade universe."""
 
 from __future__ import annotations
+from daytrading.models import BarSource
 
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -85,6 +86,7 @@ class _RunnerStub:
         self._hot_watch_setup_refresh_min_recent_volume = 100_000
         self._news_checker = None
         self._news_pinned = set()
+        self._news_pinned_at = {}
         self._skip_counts = defaultdict(int)
         self._bar_buffer = defaultdict(list)
         self._quote_buffer = defaultdict(list)
@@ -223,7 +225,7 @@ class TestHotWatchStreaming:
 
         AlpacaRunner._ensure_streaming_symbols(runner, ["fofo", "STAK"])
 
-        runner._stream.subscribe.assert_called_once_with(["FOFO", "STAK"], bars=True, quotes=True)
+        runner._stream.subscribe.assert_called_once_with(["FOFO", "STAK"], bars=True, quotes=True, trades=True)
         runner._hod_tick_tracker.add_known_symbols.assert_called_once_with(["FOFO", "STAK"])
         runner._stream.add_trade_filter_symbols.assert_called_once_with(["FOFO", "STAK"])
         runner._stream.flush_pending_subscriptions.assert_not_called()
@@ -234,7 +236,7 @@ class TestHotWatchStreaming:
 
         AlpacaRunner._ensure_streaming_symbols(runner, ["FOFO"])
 
-        runner._stream.subscribe.assert_called_once_with(["FOFO"], bars=True, quotes=True)
+        runner._stream.subscribe.assert_called_once_with(["FOFO"], bars=True, quotes=True, trades=True)
         runner._stream.flush_pending_subscriptions.assert_called_once_with()
         runner._stream.add_trade_filter_symbols.assert_not_called()
 
@@ -305,6 +307,7 @@ class TestHodWatchlistSync:
     def test_news_pinned_symbol_stays_active(self) -> None:
         runner = _make_runner(["SPY", "NEWS"])
         runner._news_pinned.add("NEWS")
+        runner._news_pinned_at["NEWS"] = datetime.now(timezone.utc)
         runner._sync_watchlist_to_hod_alerts()
         assert "NEWS" in runner._watchlist_set
         assert "SPY" in runner._watchlist_set
@@ -327,7 +330,7 @@ class TestHodWatchlistSync:
                 4.80,
                 5.00,
                 120_000,
-            )
+             provenance=BarSource.CANONICAL_INTERVAL)
         ]
 
         runner._sync_watchlist_to_hod_alerts()
@@ -489,7 +492,7 @@ class TestTradeUniverse:
             low=4.9,
             close=5.0,
             volume=100_000,
-        )
+         provenance=BarSource.CANONICAL_INTERVAL)
         bar_universe = {
             "SPY": [bar],
             "CISS": [bar],
@@ -515,7 +518,7 @@ class TestTradeUniverse:
             low=6.9,
             close=7.4,
             volume=200_000,
-        )
+         provenance=BarSource.CANONICAL_INTERVAL)
         trade = runner._trade_universe({"SPY": [bar], "CODX": [bar]})
         assert "CODX" in trade
 
@@ -611,7 +614,7 @@ class TestTradeUniverse:
             low=6.9,
             close=7.4,
             volume=200_000,
-        )
+         provenance=BarSource.CANONICAL_INTERVAL)
         trade = runner._trade_universe({"SPY": [bar], "OLD": [bar]})
         assert "OLD" not in trade
         runner._journal.record.assert_called()
@@ -642,7 +645,7 @@ class TestHotWatchTTL:
         closes = [5.20, 5.30, 5.38, 5.42, 5.44, 5.43]
         vols = [80_000, 90_000, 95_000, 45_000, 42_000, 40_000]
         runner._bar_buffer["CONL"] = [
-            Bar("CONL", ts + timedelta(minutes=i), c - 0.02, c + 0.03, c - 0.03, c, vols[i])
+            Bar("CONL", ts + timedelta(minutes=i), c - 0.02, c + 0.03, c - 0.03, c, vols[i], provenance=BarSource.CANONICAL_INTERVAL)
             for i, c in enumerate(closes)
         ]
 
@@ -661,7 +664,7 @@ class TestHotWatchTTL:
         ts = datetime.now(timezone.utc) - timedelta(minutes=8)
         closes = [5.20, 5.35, 5.50, 5.42, 5.30, 5.20]
         runner._bar_buffer["QUIET"] = [
-            Bar("QUIET", ts + timedelta(minutes=i), c - 0.02, c + 0.03, c - 0.03, c, 8_000)
+            Bar("QUIET", ts + timedelta(minutes=i), c - 0.02, c + 0.03, c - 0.03, c, 8_000, provenance=BarSource.CANONICAL_INTERVAL)
             for i, c in enumerate(closes)
         ]
 
@@ -826,9 +829,9 @@ class TestHotWatchTTL:
         }
         ts = datetime(2026, 6, 8, 18, 0, tzinfo=timezone.utc)
         runner._bar_buffer["HUBC"] = [
-            Bar("HUBC", ts, 1.40, 1.55, 1.35, 1.50, 20_000),
-            Bar("HUBC", ts + timedelta(minutes=1), 1.50, 1.70, 1.49, 1.66, 30_000),
-            Bar("HUBC", ts + timedelta(minutes=2), 1.66, 1.77, 1.62, 1.73, 4_125),
+            Bar("HUBC", ts, 1.40, 1.55, 1.35, 1.50, 20_000, provenance=BarSource.CANONICAL_INTERVAL),
+            Bar("HUBC", ts + timedelta(minutes=1), 1.50, 1.70, 1.49, 1.66, 30_000, provenance=BarSource.CANONICAL_INTERVAL),
+            Bar("HUBC", ts + timedelta(minutes=2), 1.66, 1.77, 1.62, 1.73, 4_125, provenance=BarSource.CANONICAL_INTERVAL),
         ]
 
         row = runner._hot_watch_snapshot()[0]
@@ -837,3 +840,79 @@ class TestHotWatchTTL:
         assert row["short_change_pct"] == 15.33
         assert row["session_high"] == 1.77
         assert row["pullback_from_high_pct"] == -2.26
+
+
+class TestNewsWatchExpiry:
+    def test_positive_news_does_not_keep_an_inactive_symbol_all_day(self):
+        runner = _make_runner(["SPY", "NEWS"])
+        runner._news_pinned.add("NEWS")
+        runner._news_pinned_at["NEWS"] = datetime.now(timezone.utc) - timedelta(minutes=6)
+        runner._sync_watchlist_to_hod_alerts()
+        assert "NEWS" not in runner._watchlist_set
+        assert "NEWS" not in runner._news_pinned_at
+        assert "NEWS" not in runner._news_pinned
+        assert "SPY" in runner._watchlist_set
+
+    def test_news_without_a_proven_timestamp_cannot_pin_indefinitely(self):
+        runner = _make_runner(["SPY", "NEWS"])
+        runner._news_pinned.add("NEWS")
+        runner._sync_watchlist_to_hod_alerts()
+        assert "NEWS" not in runner._watchlist_set
+
+    def test_weak_positive_news_uses_existing_ttl_and_sync_does_not_refresh_it(self):
+        runner = _make_runner(["SPY"])
+        runner._news_checker = MagicMock()
+        runner._news_checker.get_sentiment.return_value = (.03, ["Market roundup"])
+        runner._add_symbols_to_watchlist(["NEWS"])
+        pinned_at = runner._news_pinned_at["NEWS"]
+        runner._sync_watchlist_to_hod_alerts()
+        runner._sync_watchlist_to_hod_alerts()
+        assert runner._news_pinned_at["NEWS"] == pinned_at
+        runner._news_checker.get_sentiment.assert_called_once_with("NEWS")
+        runner._news_pinned_at["NEWS"] -= timedelta(minutes=6)
+        runner._sync_watchlist_to_hod_alerts()
+        assert "NEWS" not in runner._watchlist_set
+
+    def test_cleanup_releases_news_pin_instead_of_immediately_readding_symbol(self):
+        runner = _make_runner(["SPY", "NEWS"])
+        runner._news_pinned.add("NEWS")
+        runner._news_pinned_at["NEWS"] = datetime.now(timezone.utc)
+        runner._skip_counts["NEWS"] = 10
+        runner._SKIP_THRESHOLD = 10
+        AlpacaRunner._prune_watchlist(runner)
+        runner._sync_watchlist_to_hod_alerts()
+        assert "NEWS" not in runner._watchlist_set
+        assert "NEWS" not in runner._news_pinned_at
+        runner._enqueue_hod_seed_symbols.assert_not_called()
+
+    def test_expired_news_preserves_open_position_and_protection(self):
+        runner = _make_runner(["SPY", "NEWS"])
+        runner._news_pinned.add("NEWS")
+        runner._news_pinned_at["NEWS"] = datetime.now(timezone.utc) - timedelta(minutes=6)
+        position = MagicMock(is_flat=False)
+        protection = object()
+        runner._pipeline.portfolio.positions = {"NEWS": position}
+        runner._pipeline.exit_manager.tracked = {"NEWS": protection}
+        runner._sync_watchlist_to_hod_alerts()
+        assert "NEWS" in runner._watchlist_set
+        assert runner._pipeline.exit_manager.tracked["NEWS"] is protection
+        runner._stream.unsubscribe.assert_not_called()
+
+    def test_fresh_hod_alert_readmits_symbol_after_news_expires(self):
+        runner = _make_runner(["SPY", "NEWS"])
+        runner._news_pinned.add("NEWS")
+        runner._news_pinned_at["NEWS"] = datetime.now(timezone.utc) - timedelta(minutes=6)
+        runner._sync_watchlist_to_hod_alerts()
+        assert "NEWS" not in runner._watchlist_set
+        runner._on_hod_alerts_changed([dict(symbol="NEWS", time=datetime.now(timezone.utc).isoformat(),
+            price=3., day_volume=1_000_000, rel_vol=2., bar_rvol=2., alert_name="HOD Tick Alert")])
+        assert "NEWS" in runner._watchlist_set
+
+    def test_fresh_hot_watch_remains_independent_of_expired_news(self):
+        runner = _make_runner(["SPY", "NEWS"])
+        runner._news_pinned.add("NEWS")
+        runner._news_pinned_at["NEWS"] = datetime.now(timezone.utc) - timedelta(minutes=6)
+        runner._hot_watch["NEWS"] = {"added_at": datetime.now(timezone.utc), "reason": "fresh mover"}
+        runner._sync_watchlist_to_hod_alerts()
+        assert "NEWS" in runner._watchlist_set
+        assert "NEWS" not in runner._news_pinned

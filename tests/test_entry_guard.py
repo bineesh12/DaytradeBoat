@@ -1,6 +1,7 @@
 """Tests for ``entry_guard.check_entry_quality`` — scoring-based system."""
 
 from __future__ import annotations
+from daytrading.models import BarSource
 
 from datetime import datetime, timedelta, timezone
 
@@ -31,7 +32,7 @@ def _bar(
         close=close,
         volume=volume,
         timeframe=Timeframe.SEC_5,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
 
 
 def _5m_bar(ts: datetime, o: float, c: float, h: float, l: float) -> Bar:
@@ -44,7 +45,7 @@ def _5m_bar(ts: datetime, o: float, c: float, h: float, l: float) -> Bar:
         close=c,
         volume=50_000,
         timeframe=Timeframe.MIN_5,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
 
 
 def _uptrend_bars_passing_default_guard() -> list[Bar]:
@@ -111,7 +112,7 @@ class TestHardRejects:
 
     def test_price_outside_range(self) -> None:
         now = datetime.now(timezone.utc)
-        bars = [_bar(i, close=1.10, open_=1.05, high=1.15, low=1.03, volume=100_000, base_ts=now, n=3) for i in range(3)]
+        bars = [_bar(i, close=0.90, open_=0.85, high=0.95, low=0.83, volume=100_000, base_ts=now, n=3) for i in range(3)]
         r = eg.check_entry_quality(bars, symbol="TST")
         assert r is not None and "price" in r.lower()
 
@@ -405,8 +406,8 @@ class TestHardRejects:
         if r is not None:
             assert "outside range" not in r
 
-    def test_entry_guard_still_rejects_below_dollar_fifty(self) -> None:
-        # Strategy trades from $1.50; sub-$1.50 names are out of range.
+    def test_sub_dollar_fifty_reaches_movement_guard(self) -> None:
+        # $1.49 is in the configured band; movement rules still apply.
         now = datetime.now(timezone.utc)
         n = 5
         bars = [
@@ -425,7 +426,7 @@ class TestHardRejects:
 
         r = eg.check_entry_quality(bars, symbol="LOW")
 
-        assert r == "price $1.49 outside range $1.50-$20.00"
+        assert r is not None and "from session open" in r
 
     def test_large_known_float_rejected_off_thesis(self) -> None:
         # SPCE-like: a large-float name (100M) is outside the low-float thesis

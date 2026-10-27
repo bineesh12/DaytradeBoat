@@ -1,4 +1,5 @@
 from __future__ import annotations
+from daytrading.models import BarSource
 
 import math
 from datetime import datetime, timezone
@@ -12,7 +13,7 @@ TS = datetime(2026, 1, 2, 14, 30, tzinfo=timezone.utc)
 def _bar(close: float, volume: float = 1000, high: float | None = None, low: float | None = None) -> Bar:
     h = high if high is not None else close + 0.5
     lo = low if low is not None else close - 0.5
-    return Bar(symbol="TEST", ts=TS, open=close, high=h, low=lo, close=close, volume=volume)
+    return Bar(symbol="TEST", ts=TS, open=close, high=h, low=lo, close=close, volume=volume, provenance=BarSource.CANONICAL_INTERVAL)
 
 
 def test_sma_basic() -> None:

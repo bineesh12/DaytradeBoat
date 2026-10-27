@@ -161,8 +161,14 @@ class PositionReconciler:
                 pos.avg_price = avg
 
             if sym not in tracked_syms:
-                self._adopt_orphan(sym, qty, avg, now, exit_manager)
-                result.adopted.append(sym)
+                if exit_manager.restore_known_lifecycle(sym, qty):
+                    if sym in getattr(exit_manager, '_residual_confirmation_pending', {}):
+                        result.still_pending.append(sym)
+                    else:
+                        result.confirmed.append(sym)
+                else:
+                    self._adopt_orphan(sym, qty, avg, now, exit_manager)
+                    result.adopted.append(sym)
                 tracked_syms.add(sym)
             else:
                 tracked = exit_manager.tracked[sym]
@@ -212,6 +218,16 @@ class PositionReconciler:
             result.closed.append(sym)
             led.broker_miss_count = 0
             led.pending_broker_since = None
+
+        for sym in list(getattr(exit_manager, '_retired_positions', {})):
+            if sym in broker_syms or sym in tracked_syms:
+                continue
+            led = self.ledger(sym)
+            led.broker_miss_count += 1
+            if led.broker_miss_count >= self._broker_miss_limit:
+                exit_manager._retired_positions.pop(sym, None)
+                getattr(exit_manager, '_residual_confirmation_pending', {}).pop(sym, None)
+                led.broker_miss_count = 0
 
         # --- Portfolio symbols not on broker (no active exit tracking) ---
         for sym, pos in list(portfolio.positions.items()):

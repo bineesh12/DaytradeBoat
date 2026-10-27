@@ -107,6 +107,25 @@ def atr(bars: Sequence[Bar], period: int = 14) -> List[float]:
     return out
 
 
+def relative_volume_last(bars: Sequence[Bar], period: int = 20) -> float:
+    """The exact final element of relative_volume, without unused prefixes.
+
+    Preserve the same summation order, division and NaN behavior. This is not
+    a rolling sum or cached result; mutable/replaced bars are read every call.
+    """
+    i = len(bars) - 1
+    if i < 0 or i < period:
+        return NaN
+    # Keep the legacy error path for unusual numeric adapters/huge integers;
+    # this is a computation fast path, never a new market-data acceptance rule.
+    if any(not (type(b.volume) is float or
+                (type(b.volume) is int and b.volume.bit_length() <= 53)) for b in bars):
+        values = relative_volume(bars, period)
+        return values[-1] if values else NaN
+    avg_v = sum(bars[j].volume for j in range(i - period, i)) / period
+    return bars[i].volume / avg_v if avg_v > 0 else NaN
+
+
 def relative_volume(bars: Sequence[Bar], period: int = 20) -> List[float]:
     """Current bar volume / average volume over `period` prior bars."""
     out: List[float] = []

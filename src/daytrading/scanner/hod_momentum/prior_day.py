@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta
+from daytrading.market_calendar import ET
 from typing import Dict, List, Optional, Sequence
 
 import logging
@@ -11,7 +13,8 @@ logger = logging.getLogger(__name__)
 
 try:
     from alpaca.data.historical.stock import StockHistoricalDataClient
-    from alpaca.data.requests import StockSnapshotRequest
+    from alpaca.data.requests import StockBarsRequest
+    from alpaca.data.timeframe import TimeFrame
     from alpaca.data.enums import DataFeed
     _HAS_ALPACA = True
 except ImportError:
@@ -43,45 +46,36 @@ def fetch_prior_day_stats(
     *,
     feed: object,
 ) -> Dict[str, PriorDayStats]:
-    """Load previous_daily_bar close/high via Alpaca snapshots."""
+    """Load the last completed daily bar on today's split-adjusted basis.
+
+    Snapshots expose raw previous bars; comparing those with post-split prices
+    can turn a corporate action into a fake gap or HOD breakout.
+    """
     if not _HAS_ALPACA or not symbols:
         return {}
-
-    result: Dict[str, PriorDayStats] = {}
-    batch_size = 100
+    result = {}
+    end = datetime.now(ET).replace(hour=0, minute=0, second=0, microsecond=0)
+    start = end - timedelta(days=10)
     sym_list = list(symbols)
-
-    for i in range(0, len(sym_list), batch_size):
-        batch = sym_list[i : i + batch_size]
+    for i in range(0, len(sym_list), 100):
+        batch = sym_list[i:i+100]
         try:
-            req = StockSnapshotRequest(symbol_or_symbols=batch, feed=feed)
-            snaps = client.get_stock_snapshot(req)
+            req = StockBarsRequest(symbol_or_symbols=batch, feed=feed,
+                                   timeframe=TimeFrame.Day, start=start, end=end,
+                                   adjustment="split")
+            raw = client.get_stock_bars(req)
+            rows = getattr(raw, "data", raw)
+            for symbol in batch:
+                completed = [b for b in rows.get(symbol, []) if b.timestamp.astimezone(ET).date() < end.date()]
+                if not completed:
+                    continue
+                previous = max(completed, key=lambda b: b.timestamp)
+                close = float(previous.close)
+                high = float(previous.high)
+                if close > 0:
+                    result[symbol] = PriorDayStats(close, high if high > 0 else close, float(previous.volume))
         except Exception as exc:
-            logger.warning("Prior day snapshot batch failed: %s", exc)
+            logger.warning("Split-adjusted prior-day bar batch unavailable: %s", type(exc).__name__)
+            # Missing verified reference data is preferable to a fabricated gap.
             continue
-
-        if not isinstance(snaps, dict):
-            snaps = {batch[0]: snaps} if len(batch) == 1 else {}
-
-        for sym in batch:
-            snap = snaps.get(sym)
-            if snap is None:
-                continue
-            prev = getattr(snap, "previous_daily_bar", None)
-            if prev is None:
-                continue
-            try:
-                close = float(getattr(prev, "close", 0))
-                high = float(getattr(prev, "high", close))
-                volume = float(getattr(prev, "volume", 0))
-            except (TypeError, ValueError):
-                continue
-            if close <= 0:
-                continue
-            if high <= 0:
-                high = close
-            result[sym] = PriorDayStats(
-                prior_close=close, prior_high=high, prior_volume=volume,
-            )
-
     return result

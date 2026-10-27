@@ -24,7 +24,7 @@ import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence
 
-from daytrading.indicators.core import atr, ema, relative_volume, sma
+from daytrading.indicators.core import atr, ema, relative_volume, relative_volume_last, sma
 from daytrading.models import Bar, MarketRegime, Quote, TradingStyle
 
 NaN = float("nan")
@@ -216,8 +216,7 @@ class MarketRegimeClassifier:
         # --- Relative volume ---
         rvol_period = min(20, len(bars) - 1)
         if rvol_period >= 1:
-            rv = relative_volume(bars, period=rvol_period)
-            last_rv = rv[-1] if rv else 1.0
+            last_rv = relative_volume_last(bars, period=rvol_period)
             m.rvol = last_rv if not math.isnan(last_rv) else 1.0
 
         # --- Trend strength ---

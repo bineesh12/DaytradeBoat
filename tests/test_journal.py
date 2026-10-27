@@ -1,6 +1,7 @@
 """Tests for persistent trading journal and replay helpers."""
 
 from __future__ import annotations
+from daytrading.models import BarSource
 
 import sqlite3
 from datetime import datetime, timezone
@@ -19,7 +20,7 @@ def _bar(symbol: str = "TST", close: float = 5.0) -> Bar:
         close=close,
         volume=10_000,
         timeframe=Timeframe.MIN_1,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
 
 
 class TestTradingJournal:

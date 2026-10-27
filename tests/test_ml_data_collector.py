@@ -1,4 +1,5 @@
 from __future__ import annotations
+from daytrading.models import BarSource
 
 import json
 from datetime import datetime, timedelta, timezone
@@ -26,7 +27,7 @@ def _bar(symbol: str, close: float, ts: datetime) -> Bar:
         low=close,
         close=close,
         volume=100_000,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
 
 
 def test_deferred_entry_outcomes_label_same_day_candidates():

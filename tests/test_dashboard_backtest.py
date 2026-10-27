@@ -27,12 +27,15 @@ def test_dashboard_renders_backtest_page() -> None:
     assert "window.LightweightCharts" not in html
     assert "function hydrateTradingViewBacktestChart" not in html
     assert "onwheel=\"wheelBacktestChart(event)\"" in html
-    assert "Chart times are Eastern Time" in html
-    assert ".replace(' ET', '')" in html
+    # The deployed dashboard follows the explicitly requested Swedish clock.
+    assert 'title="All displayed timestamps use Europe/Stockholm"' in html
+    assert "Swedish clock for the selected US trading day" in html
+    assert "Chart times are Swedish time (Europe/Stockholm)" in html
+    assert ".replace(' SE', '')" in html
     assert "A+ Funnel Detail" in html
     assert "Backtest Gate Breakdown" in html
-    assert "level_reclaim_10s_scout" in html
-    assert "10s_reclaim=" in html
+    assert 'id="bt-experiments"' not in html
+    assert 'id="bt-date" type="date"' in html
 
 
 def test_backtest_endpoint_returns_service_result(monkeypatch) -> None:
@@ -40,7 +43,7 @@ def test_backtest_endpoint_returns_service_result(monkeypatch) -> None:
     seen = {}
 
     def fake_run(symbol, session_date, *, flags=None, start_time=None, settings=None):
-        seen["settings"] = settings
+        seen["isolated"] = True
         seen["start_time"] = start_time
         return {
             "ok": True,
@@ -55,7 +58,7 @@ def test_backtest_endpoint_returns_service_result(monkeypatch) -> None:
             "flags": flags,
         }
 
-    monkeypatch.setattr("daytrading.backtest.service.run_backtest", fake_run)
+    monkeypatch.setattr("daytrading.backtest.historical_worker.run_isolated_historical", fake_run)
 
     resp = app.test_client().post("/api/backtest", json={
         "symbol": "cupr",
@@ -71,7 +74,7 @@ def test_backtest_endpoint_returns_service_result(monkeypatch) -> None:
     assert data["date"] == "2026-06-10"
     assert data["start_time"] == "10:10"
     assert data["flags"]["level_breakout_scout"] is True
-    assert seen["settings"] is not None
+    assert seen["isolated"] is True
     assert seen["start_time"] == "10:10"
 
 
@@ -89,7 +92,7 @@ def test_backtest_sweep_endpoint_returns_service_result(monkeypatch) -> None:
     seen = {}
 
     def fake_sweep(symbols, dates, *, experiments=None, settings=None):
-        seen["settings"] = settings
+        seen["isolated_sweep"] = True
         return {
             "ok": True,
             "symbols": symbols,
@@ -98,7 +101,7 @@ def test_backtest_sweep_endpoint_returns_service_result(monkeypatch) -> None:
             "deltas_vs_baseline": {},
         }
 
-    monkeypatch.setattr("daytrading.backtest.service.run_backtest_sweep", fake_sweep)
+    monkeypatch.setattr("daytrading.backtest.historical_worker.run_isolated_sweep", fake_sweep)
 
     resp = app.test_client().post("/api/backtest/sweep", json={
         "symbols": "cupr, conl",
@@ -110,7 +113,7 @@ def test_backtest_sweep_endpoint_returns_service_result(monkeypatch) -> None:
     assert data["ok"] is True
     assert data["symbols"] == ["cupr", "conl"]
     assert data["dates"] == ["2026-06-10"]
-    assert seen["settings"] is not None
+    assert seen["isolated_sweep"] is True
 
 
 def test_backtest_sweep_endpoint_validates_required_fields() -> None:
@@ -158,5 +161,16 @@ def test_backtest_page_renders_live_paper_scores_panel() -> None:
     assert "function renderLivePaperScores" in html
     assert "Live Paper Entry Scores" in html
     assert "/api/entry_scores?symbol=" in html
-    assert 'id="bt-flag-live-like"' in html
-    assert "live_like_10s=" in html
+    assert 'id="bt-flag-live-like"' not in html
+    assert 'flags: validation ? {} : {execution_timer_10s: true}' in html
+
+
+def test_backtest_profit_summary_distinguishes_missing_and_breakeven():
+    import shutil
+    import subprocess
+    from pathlib import Path
+    import pytest
+    node = shutil.which('node')
+    if not node:
+        pytest.skip('Node is required for the dashboard calculation regression')
+    subprocess.run([node, str(Path(__file__).with_name('dashboard_pnl_summary.cjs'))], check=True)

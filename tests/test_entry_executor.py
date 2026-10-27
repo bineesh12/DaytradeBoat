@@ -1,3 +1,4 @@
+from daytrading.models import BarSource
 from datetime import datetime, timezone
 
 from daytrading.execution.entry_executor import EntryExecutor
@@ -15,7 +16,7 @@ def _bar(symbol="BATL", close=1.66):
         close=close,
         volume=10_000,
         timeframe=Timeframe.MIN_1,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
 
 
 def _signal(symbol="BATL"):

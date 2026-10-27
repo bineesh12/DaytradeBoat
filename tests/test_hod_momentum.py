@@ -1,3 +1,4 @@
+from daytrading.models import BarSource
 """Tests for HOD Momentum bar scanner and alert store."""
 
 from datetime import datetime, timezone
@@ -18,7 +19,7 @@ def _bar(i: int, close: float, vol: float = 100_000) -> Bar:
         low=close - 0.2,
         close=close,
         volume=vol,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
 
 
 class _FloatChecker:
@@ -74,7 +75,7 @@ def _aiio_bar(
         low=l,
         close=c,
         volume=vol,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
 
 
 def test_no_hod_reclaim_below_session_high() -> None:
@@ -174,7 +175,7 @@ def test_sub2_extreme_momentum_can_alert_under_standard_price_band() -> None:
     bars = [
         Bar("MTEK", datetime(2026, 5, 18, 14, i, 0, tzinfo=timezone.utc),
             1.18 + i * 0.07, 1.24 + i * 0.07, 1.16 + i * 0.07,
-            1.22 + i * 0.07, 120_000 + i * 20_000)
+            1.22 + i * 0.07, 120_000 + i * 20_000, provenance=BarSource.CANONICAL_INTERVAL)
         for i in range(10)
     ]
 

@@ -8,7 +8,7 @@ import pytest
 
 from daytrading.execution.position_reconciler import PositionReconciler
 from daytrading.exits.manager import ExitManager, TrackedPosition
-from daytrading.models import PortfolioState, Position, Side
+from daytrading.models import PortfolioState, Position, Side, Fill
 
 
 def _tracked(symbol: str = "AIIO", qty: float = 100) -> TrackedPosition:
@@ -115,6 +115,8 @@ class TestPositionReconciler:
         assert len(signals) == 1
         assert signals[0].symbol == "TENX"
         assert signals[0].quantity == 50
+        assert exit_mgr.tracked["TENX"].sold_half is False
+        exit_mgr.commit_coordinated_exit_fill(Fill('TENX', Side.SELL, 50, 12.55, datetime.now(timezone.utc)))
         assert exit_mgr.tracked["TENX"].sold_half is True
 
     def test_adopt_orphan_trend_strength(self) -> None:

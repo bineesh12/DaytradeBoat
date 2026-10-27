@@ -6,6 +6,11 @@ Uses a simple pub/sub pattern with SSE (Server-Sent Events).
 
 from __future__ import annotations
 
+from daytrading.execution.fill_identity import projected, identity as fill_identity
+
+from daytrading.opportunities import OpportunityTracker, hit_identity, decision_stages
+from daytrading.reporting import report_safely
+
 import json
 import sqlite3
 import time
@@ -74,10 +79,14 @@ class DashboardHub:
         self.starting_cash: float = 0.0
 
         # Counters
+        self._entry_fill_records: dict = {}
         self.total_trades: int = 0
         self.winning_trades: int = 0
         self.losing_trades: int = 0
         self.total_pnl: float = 0.0
+        self.opportunities = OpportunityTracker()
+        self.loaded_symbols = 0
+        self.baseline = {}
         self.total_scan_hits: int = 0
         self._seen_scan_keys: set = set()
         self.total_signals: int = 0
@@ -320,12 +329,12 @@ class DashboardHub:
             "market_phase": phase or self.market_phase,
         })
 
-    def on_classification(self, symbol: str, regime: Any) -> None:
+    def on_classification(self, symbol: str, regime: Any, *, price: float = 0.0) -> None:
         status = SymbolStatus(
             symbol=symbol,
             style=regime.style.value,
             confidence=regime.confidence,
-            price=0.0,
+            price=price,
             volatility_pct=regime.volatility_pct,
             spread_pct=regime.spread_pct,
             relative_volume=regime.relative_volume,
@@ -340,20 +349,107 @@ class DashboardHub:
                 self.rt_movers = [m for m in self.rt_movers if m["symbol"] != symbol]
         self._broadcast("classification", _status_dict(status))
 
+    def on_entry_decision(self, payload: dict) -> None:
+        payload = dict(payload)
+        payload.setdefault('ts', _now_str())
+        self.opportunities.observe(payload, decision_stages(payload))
+        self._broadcast("entry_funnel", self.funnel_snapshot())
+
+    def on_opportunity_fill(self, signal, fill) -> None:
+        oid, stamp = hit_identity(signal.scan_result)
+        payload = {"opportunity_id": oid, "bar_ts": stamp,
+                                  "symbol": fill.symbol, "scanner": signal.scan_result.scanner_name if signal.scan_result else "",
+                                  "stage": "fill", "passed": True, "price": fill.price, "reason": "", "ts": fill.ts.isoformat(),
+                                  "metadata": {"status": "filled"}}
+        self.opportunities.observe(payload, ("qualified", "submitted", "filled"))
+        if self.journal is not None:
+            report_safely(self.journal.record, 'entry_decision', payload, ts=fill.ts)
+        self._broadcast("entry_funnel", self.funnel_snapshot())
+
+    def on_opportunity_exit(self, symbol: str, flat: bool) -> None:
+        payload = self.opportunities.exit(symbol, flat, _now_str())
+        if payload and self.journal is not None:
+            # Compact identity/result only; the full trail remains in its
+            # original journal events rather than recursively copying it.
+            row = {k:payload[k] for k in ('opportunity_id','bar_ts','symbol','scanner','stage','passed','reason','ts') if k in payload}
+            report_safely(self.journal.record, 'entry_decision', row)
+        self._broadcast("entry_funnel", self.funnel_snapshot())
+
+    def funnel_snapshot(self) -> dict:
+        data = self.opportunities.snapshot()
+        data["history_restore"] = dict(getattr(self, "_entry_history_restore", {}))
+        with self._lock:
+            data["inventory"] = {"discovered": len(self.watchlist_scan), "loaded": self.loaded_symbols,
+                                 "watched": len((set(self.trading_watchlist) | {r["symbol"] for r in self.hot_watch}) - {"SPY"})}
+            data["baseline"] = dict(self.baseline)
+            data["actual_entries_today"] = self.total_trades
+        return data
+
+    def restore_entry_history(self, now=None) -> dict:
+        """Rebuild today's observed funnel without rewriting the journal.
+
+        Older rows without stable IDs remain in the journal, counted as
+        unlinked. Never infer a fill/flat position from a nearby pattern.
+        """
+        from zoneinfo import ZoneInfo
+        from types import SimpleNamespace
+        from pathlib import Path
+        now = now or datetime.now(timezone.utc)
+        local = now.astimezone(ZoneInfo('America/New_York'))
+        start = local.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+        db_path = getattr(self.journal, 'db_path', None)
+        if not db_path or not Path(db_path).is_file():
+            return {}
+        tracker = OpportunityTracker()
+        events = unlinked = 0
+        with sqlite3.connect(Path(db_path).resolve().as_uri()+'?mode=ro', uri=True, timeout=5) as conn:
+            for stamp,kind,raw in conn.execute(
+                "SELECT ts,type,payload_json FROM events WHERE ts>=? AND ts<=? "
+                "AND type IN ('scan_hit','entry_decision') ORDER BY id",
+                (start.isoformat(),now.isoformat()),
+            ):
+                payload=json.loads(raw);events+=1
+                if kind=='scan_hit':
+                    oid,bar_ts=payload.get('opportunity_id'),payload.get('bar_ts')
+                    if not oid:
+                        bars=payload.get('candle_snapshot') or []
+                        if not bars or not bars[-1].get('ts'):
+                            unlinked+=1;continue
+                        hit=SimpleNamespace(symbol=payload['symbol'],scanner_name=payload['scanner'],
+                            criteria=payload.get('criteria',{}),bars=[SimpleNamespace(ts=bars[-1]['ts'])])
+                        oid,bar_ts=hit_identity(hit)
+                    payload=dict(opportunity_id=oid,bar_ts=bar_ts,symbol=payload['symbol'],scanner=payload['scanner'],
+                        stage='pattern',reason=payload.get('reject_reason') or 'pattern detected; evaluating',
+                        passed=not bool(payload.get('reject_reason')),ts=stamp)
+                    tracker.observe(payload,('pattern',))
+                else:
+                    if not payload.get('opportunity_id'):
+                        unlinked+=1;continue
+                    payload.setdefault('ts',stamp)
+                    tracker.observe(payload,(['pattern'] if payload.get('scanner') and payload.get('bar_ts') else [])+decision_stages(payload))
+        self.opportunities=tracker
+        self._entry_history_restore=dict(day=local.date().isoformat(),events_read=events,
+            unlinked_legacy_events=unlinked,restored_setups=len(tracker.rows),restored_at=now.isoformat())
+        return dict(self._entry_history_restore)
+
     def on_scan_hit(self, hit: Any, verified: bool = False, reject_reason: Optional[str] = None) -> None:
         price = 0.0
         bars = getattr(hit, "bars", None)
         if bars and len(bars) > 0:
             price = float(bars[-1].close)
 
-        key = (hit.symbol, hit.scanner_name)
+        oid, stamp = hit_identity(hit)
+        self.opportunities.observe({"opportunity_id": oid, "bar_ts": stamp, "symbol": hit.symbol,
+                                  "scanner": hit.scanner_name, "stage": "pattern", "price": price,
+                                  "reason": reject_reason or "pattern detected; evaluating", "passed": not bool(reject_reason), "ts": _now_str()}, ("pattern",))
+        key = oid or (hit.symbol, hit.scanner_name)
         rec = ScannerHit(
             symbol=hit.symbol,
             scanner_name=hit.scanner_name,
             score=hit.score,
             time=_now_str(),
             price=price,
-            criteria={k: _safe_val(v) for k, v in hit.criteria.items()},
+            criteria={k: _safe_val(v) for k, v in hit.criteria.items() if k != "_event_evidence"},
             verified=verified,
             action_taken=reject_reason if reject_reason else ("SIGNAL" if verified else None),
         )
@@ -374,6 +470,7 @@ class DashboardHub:
         with self._lock:
             self.total_signals += 1
 
+    @projected('dashboard_entry')
     def on_fill(self, fill: Any, trade_type: str = "entry", strategy: str = "") -> None:
         rec = TradeRecord(
             symbol=fill.symbol,
@@ -385,11 +482,25 @@ class DashboardHub:
             strategy=strategy,
         )
         with self._lock:
+            # The broker poller and submit path can report the same execution.
+            # Fill currently has no execution ID: retain the exact economic
+            # fingerprint, including its exchange timestamp and partial quantity.
+            stamp = fill.ts
+            if isinstance(stamp, datetime) and stamp.tzinfo is not None:
+                stamp = stamp.astimezone(timezone.utc).isoformat()
+            key = fill_identity(fill) + (trade_type,)
+            prior = self._entry_fill_records.get(key)
+            if prior is not None:
+                if strategy and not prior.strategy:
+                    prior.strategy = strategy
+                return
+            self._entry_fill_records[key] = rec
             self.trades.append(rec)
             if trade_type == "entry":
                 self.total_trades += 1
         self._broadcast("trade", _trade_dict(rec))
 
+    @projected('dashboard_exit')
     def on_exit_fill(self, fill: Any, entry_price: float = 0.0, reason: str = "",
                      skip_pnl_accum: bool = False) -> None:
         pnl: Optional[float] = None
@@ -456,6 +567,7 @@ class DashboardHub:
             visible_cycle = self.cycle_count
         summary = {
             "cycle": visible_cycle,
+            "entry_funnel": self.funnel_snapshot(),
             "scan_hits": len(result.scan_hits),
             "signals": len(result.signals),
             "fills": len(result.fills),
@@ -479,6 +591,7 @@ class DashboardHub:
                 self.log_messages.append(log_entry)
         self._broadcast("cycle", {
             "cycle": visible_cycle,
+            "entry_funnel": self.funnel_snapshot(),
             "scan_hits": 0,
             "signals": 0,
             "fills": 0,
@@ -509,10 +622,12 @@ class DashboardHub:
     def reset_daily_overview(self) -> None:
         """Clear dashboard session counters for a fresh trading day."""
         with self._lock:
+            self._entry_fill_records.clear()
             self.total_trades = 0
             self.winning_trades = 0
             self.losing_trades = 0
             self.total_pnl = 0.0
+            self.opportunities = OpportunityTracker()
             self.total_scan_hits = 0
             self._seen_scan_keys.clear()
             self.total_signals = 0
@@ -573,6 +688,7 @@ class DashboardHub:
     def snapshot(self) -> dict:
         """Full current state for initial page load."""
         # Heavy journal scan first, before taking the hub lock (see method docs).
+        funnel = self.funnel_snapshot()
         rolling_scorecard = self._cached_rolling_scorecard()
         with self._lock:
             win_rate = 0.0
@@ -598,6 +714,7 @@ class DashboardHub:
                     "starting_cash": round(self.starting_cash, 2),
                 },
                 "stats": {
+                    "runtime": dict(getattr(self, "runtime_metrics", {})),
                     "total_trades": self.total_trades,
                     "winning_trades": self.winning_trades,
                     "losing_trades": self.losing_trades,
@@ -608,6 +725,7 @@ class DashboardHub:
                     "total_rejected": self.total_rejected,
                     "cycle_count": self.cycle_count,
                 },
+                "entry_funnel": funnel,
                 "positions": dict(self.positions),
                 "symbols": {
                     sym: _status_dict(s)

@@ -207,13 +207,13 @@ def test_dashboard_hot_watch_shows_session_and_current_move_separately() -> None
 
     assert resp.status_code == 200
     html = resp.get_data(as_text=True)
-    assert "<th>Session</th><th>Now</th>" in html
+    assert "<th>vs Close</th><th>Now</th>" in html
     assert "function hotWatchNowText" in html
     assert "from high" in html
     assert "short-term" in html
 
 
-def test_dashboard_renders_warrior_watch_panel() -> None:
+def test_dashboard_keeps_main_watchlists_without_warrior_watch_panels() -> None:
     hub = DashboardHub()
     app = create_app(hub)
 
@@ -221,9 +221,12 @@ def test_dashboard_renders_warrior_watch_panel() -> None:
 
     assert resp.status_code == 200
     html = resp.get_data(as_text=True)
-    assert "Warrior Watch" in html
-    assert "function renderWarriorWatch" in html
-    assert "case 'warrior_watch'" in html
+    assert '<h3>Trading Watchlist</h3>' in html
+    assert '<h3>Hot Watch</h3>' in html
+    assert '<h3>Warrior Watch</h3>' not in html
+    assert '<h3>Warrior Ignition Watch</h3>' not in html
+    assert 'warrior-watch-wrap' not in html
+    assert 'warrior-ignition-watch-wrap' not in html
 
 
 def test_candidate_hydration_stats_snapshot_and_broadcast() -> None:

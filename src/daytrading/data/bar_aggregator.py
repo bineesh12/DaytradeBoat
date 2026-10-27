@@ -11,13 +11,15 @@ Usage in the trading hierarchy:
 """
 
 from __future__ import annotations
+from daytrading.data.bar_provenance import canonical_minute
+from daytrading.models import BarSource
 
 import logging
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Sequence
 
-from daytrading.models import Bar, Tick, Timeframe
+from daytrading.models import Bar, CompletedBar, Tick, Timeframe
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +32,11 @@ class BarAggregator:
         self._max_10s = max_10s_bars
 
         self._5m_bars: Dict[str, List[Bar]] = defaultdict(list)
+        # Bars are immutable. Reuse only an exact full input sequence, never
+        # just its last timestamp: REST corrections can change an older candle.
+        self._5m_exact_inputs: dict = {}
         self._10s_bars: Dict[str, List[Bar]] = defaultdict(list)
+        self._completed_10s: Dict[str, List[CompletedBar]] = defaultdict(list)
 
         self._10s_accum: Dict[str, _TickAccumulator] = {}
 
@@ -38,14 +44,28 @@ class BarAggregator:
     # 5-minute bars from 1-minute bars
     # ------------------------------------------------------------------
 
-    def build_5m_bars(self, symbol: str, bars_1m: Sequence[Bar]) -> List[Bar]:
+    def build_5m_bars(self, symbol: str, bars_1m: Sequence[Bar], *, now=None) -> List[Bar]:
         """Build 5-minute bars from a sequence of 1-minute bars.
 
         Groups by 5-minute boundary (e.g., 9:30-9:34, 9:35-9:39, etc.)
         and produces one 5-min OHLCV bar per group.
         """
+        now = now if now is not None else datetime.now(timezone.utc)
+        bars_1m = [b for b in bars_1m if canonical_minute(b, now)]
         if len(bars_1m) < 5:
-            return list(self._5m_bars.get(symbol, []))
+            self._5m_bars[symbol] = []
+            self._5m_exact_inputs.pop(symbol, None)
+            return []
+
+        exact_inputs = getattr(self, '_5m_exact_inputs', None)
+        if exact_inputs is None:
+            exact_inputs = self._5m_exact_inputs = {}
+        immutable = all(type(b) is Bar for b in bars_1m)
+        source = tuple(bars_1m) if immutable else None
+        cached = exact_inputs.get(symbol)
+        if immutable and cached is not None and cached[0] == source:
+            self._5m_bars[symbol] = list(cached[1])
+            return self._5m_bars[symbol]
 
         groups: Dict[str, List[Bar]] = {}
         for b in bars_1m:
@@ -68,9 +88,13 @@ class BarAggregator:
                 close=group[-1].close,
                 volume=sum(b.volume for b in group),
                 timeframe=Timeframe.MIN_5,
-            ))
+             provenance=BarSource.CANONICAL_INTERVAL))
 
         self._5m_bars[symbol] = result[-self._max_5m:]
+        if immutable:
+            exact_inputs[symbol] = (source, tuple(self._5m_bars[symbol]))
+        else:
+            exact_inputs.pop(symbol, None)
         return self._5m_bars[symbol]
 
     def get_5m_bars(self, symbol: str) -> List[Bar]:
@@ -93,6 +117,9 @@ class BarAggregator:
         completed = accum.add(tick)
 
         if completed is not None:
+            windows = self._completed_10s[sym]
+            windows.append(CompletedBar(completed, tick.ts))
+            self._completed_10s[sym] = windows[-self._max_10s:]
             buf = self._10s_bars[sym]
             buf.append(completed)
             if len(buf) > self._max_10s:
@@ -108,6 +135,10 @@ class BarAggregator:
         bars = self._10s_bars.get(symbol, [])
         return list(bars[-count:]) if bars else []
 
+    def get_completed_10s(self, symbol: str, count: int = 6) -> List[CompletedBar]:
+        """Return bars with the actual next-trade completion timestamp."""
+        return list(self._completed_10s.get(symbol, [])[-count:])
+
     # ------------------------------------------------------------------
     # Bulk update for all symbols
     # ------------------------------------------------------------------
@@ -119,7 +150,9 @@ class BarAggregator:
 
     def clear_symbol(self, symbol: str) -> None:
         self._5m_bars.pop(symbol, None)
+        getattr(self, '_5m_exact_inputs', {}).pop(symbol, None)
         self._10s_bars.pop(symbol, None)
+        self._completed_10s.pop(symbol, None)
         self._10s_accum.pop(symbol, None)
 
 
@@ -182,4 +215,4 @@ class _TickAccumulator:
             close=self._close,
             volume=self._volume,
             timeframe=Timeframe.SEC_10,
-        )
+         provenance=BarSource.CANONICAL_INTERVAL)

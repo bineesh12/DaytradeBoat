@@ -1,6 +1,7 @@
 """Integration test for the full Scanner → Verify → Execute pipeline."""
 
 from __future__ import annotations
+from daytrading.models import BarSource
 
 from datetime import datetime, timedelta, timezone
 
@@ -143,7 +144,7 @@ def _bar(
     o = open_ if open_ is not None else close
     h = high if high is not None else close + 1.0
     lo = low if low is not None else close - 1.0
-    return Bar(symbol=symbol, ts=TS, open=o, high=h, low=lo, close=close, volume=volume)
+    return Bar(symbol=symbol, ts=TS, open=o, high=h, low=lo, close=close, volume=volume, provenance=BarSource.CANONICAL_INTERVAL)
 
 
 def _vwap_scout_signal(

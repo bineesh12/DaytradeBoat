@@ -10,6 +10,7 @@ def isolate_ml_runtime_files(tmp_path, monkeypatch):
 
     try:
         from daytrading.ml import data_collector
+        monkeypatch.setattr(data_collector, "_pending_outcomes", {})
         monkeypatch.setattr(data_collector, "_DATA_DIR", ml_dir)
         monkeypatch.setattr(
             data_collector,

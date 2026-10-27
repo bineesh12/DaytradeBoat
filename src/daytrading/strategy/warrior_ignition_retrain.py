@@ -1,160 +1,272 @@
-"""Importable retrain for the Warrior ignition model — the offline half of the
-adaptive loop. Runs on demand (CLI) or nightly after market close (runner hook).
+"""Offline ignition candidates with deduplicated forward-date validation.
 
-Dataset = the cached bootstrap days PLUS the live-logged PAPER candidates (their
-outcomes reconstructed from that day's bars). Retrains the logistic model,
-validates out-of-sample, and DEPLOYS ONLY IF it beats the current model — a worse
-or noise-chasing model can never reach trading.
+Promotion requires positive returns under a stated barrier/cost model and fresh
+holdout dates. It does not establish future profitability or simulate the full
+live exit strategy. Automatic nightly promotion is disabled by default.
 """
+
 from __future__ import annotations
 
 import glob
 import json
+import logging
 import os
 import re
-from datetime import date, timezone
-from typing import Dict, List, Tuple
+from datetime import date
+from pathlib import Path
 
 import numpy as np
 
 from daytrading.backtest.data_loader import fetch_alpaca_10s_bars_for_day
+from daytrading.market_calendar import ET
+from daytrading.ml.artifacts import atomic_json, data_root, promote_json
+from daytrading.ml.validation import (
+    TrainingRow,
+    chronological_split,
+    parse_timestamp,
+    promotion_reason,
+    selected_metrics,
+)
 from daytrading.strategy.warrior_ignition import (
-    detect_ignition, get_model, prior_day_high, _MODEL_PATH, FEATS,
+    _MODEL_PATH,
+    FEATS,
+    detect_ignition,
+    get_model,
+    prior_day_high,
 )
 from daytrading.strategy.warrior_ignition_log import _DEFAULT_PATH as _LOG_PATH
 
-SESS = (8 * 60, 13 * 60 + 30)
 HORIZON = 180
 
 
-def _um(ts):
-    t = ts.astimezone(timezone.utc)
-    return t.hour * 60 + t.minute
+def _premarket(bars):
+    return [
+        b
+        for b in bars
+        if b.ts
+        and 4 * 60
+        <= b.ts.astimezone(ET).hour * 60 + b.ts.astimezone(ET).minute
+        < 9 * 60 + 30
+        and b.close > 0
+    ]
+
+
+def _runner_outcome(bars, i, entry, stop):
+    risk = entry - stop
+    if risk <= 0 or i >= len(bars):
+        return None
+    cost_r = (
+        entry * float(os.getenv("DAYTRADING_ML_COST_BUFFER_PCT", "0.3")) / 100 / risk
+    )
+    if cost_r < 0:
+        raise ValueError("negative execution cost buffer")
+    # Entry is the OPEN of bar i. That bar already carries execution risk.
+    for j in range(i, min(i + HORIZON, len(bars))):
+        if float(bars[j].low) <= stop:
+            return 0.0, -1.0 - cost_r
+        if float(bars[j].high) >= entry + 2 * risk:
+            return 1.0, 2.0 - cost_r
+    if len(bars) - i < HORIZON:
+        return None  # incomplete/censored trajectory is not a loss label
+    return 0.0, (float(bars[i + HORIZON - 1].close) - entry) / risk - cost_r
 
 
 def _runner_label(bars, i, entry, stop):
-    risk = entry - stop
-    if risk <= 0:
-        return None
-    for j in range(i + 1, min(i + 1 + HORIZON, len(bars))):
-        if float(bars[j].high) >= entry + 2 * risk:
-            return 1.0
-        if float(bars[j].low) <= stop:
-            return 0.0
-    return 0.0
+    outcome = _runner_outcome(bars, i, entry, stop)
+    return None if outcome is None else outcome[0]
 
 
-def _rows_from_cache(model) -> List[Tuple[int, list, float]]:
-    pairs = []
-    for f in sorted(glob.glob("data/backtest_cache/*_10s_trades.json")):
-        m = re.match(r"(.+)_(\d{4})-(\d{2})-(\d{2})_10s", f.split("/")[-1])
-        if m:
-            pairs.append((m.group(1), date(int(m.group(2)), int(m.group(3)), int(m.group(4)))))
+def _rows_from_cache(model):
     rows = []
-    for k, (sym, day) in enumerate(pairs):
+    pattern = str(data_root() / "backtest_cache" / "*_10s_trades.json")
+    for path in sorted(glob.glob(pattern)):
+        match = re.match(r"(.+)_(\d{4}-\d{2}-\d{2})_10s", Path(path).name)
+        if not match:
+            continue
+        symbol, day = match.group(1), date.fromisoformat(match.group(2))
         try:
-            b = fetch_alpaca_10s_bars_for_day(sym, day).get(sym, [])
-        except Exception:
+            bars = _premarket(
+                fetch_alpaca_10s_bars_for_day(symbol, day).get(symbol, [])
+            )
+            prior_high = prior_day_high(symbol, day)
+        except Exception as exc:  # noqa: BLE001 -- optional cache fetch must not abort the complete dataset
+            logging.getLogger(__name__).warning(
+                "Skipping ignition cache %s: %s", symbol, type(exc).__name__
+            )
             continue
-        bars = [x for x in b if SESS[0] <= _um(x.ts) < SESS[1] and float(x.close) > 0]
-        if len(bars) < 40:
-            continue
-        ph = prior_day_high(sym, day)
         i = 24
         while i < len(bars) - 2:
-            sig = detect_ignition(bars[:i], model, prior_high=ph)
-            if sig.detected:
-                lab = _runner_label(bars, i, float(bars[i].open), sig.stop)
-                if lab is not None:
-                    rows.append((k, [sig.features[n] for n in FEATS], lab))
+            signal = detect_ignition(bars[:i], model, prior_high=prior_high)
+            outcome = (
+                _runner_outcome(bars, i, float(bars[i].open), signal.stop)
+                if signal.detected
+                else None
+            )
+            if outcome is not None:
+                rows.append(
+                    TrainingRow(
+                        symbol,
+                        parse_timestamp(bars[i - 1].ts),
+                        tuple(float(signal.features[name]) for name in FEATS),
+                        *outcome,
+                    )
+                )
                 i += 18
             else:
                 i += 1
     return rows
 
 
-def _rows_from_log(model, day_offset: int) -> List[Tuple[int, list, float]]:
-    """Real paper candidates: use the logged features; reconstruct the outcome
-    from that day's bars (fetched post-hoc, after close)."""
+def _rows_from_log(model, day_offset=0):
+    del model, day_offset  # identities use actual timestamps, never randomized hashes
     if not os.path.exists(_LOG_PATH):
         return []
-    rows = []
-    for line in open(_LOG_PATH):
-        try:
-            r = json.loads(line)
-        except Exception:
-            continue
-        if r.get("kind") != "candidate":
-            continue
-        try:
-            ts = r["ts"]; sym = r["symbol"]
-            d = date.fromisoformat(ts[:10])
-            bars = fetch_alpaca_10s_bars_for_day(sym, d).get(sym, [])
-            bars = [x for x in bars if SESS[0] <= _um(x.ts) < SESS[1] and float(x.close) > 0]
-            idx = next((j for j, x in enumerate(bars) if x.ts.isoformat() == ts), None)
-            if idx is None or idx + 2 >= len(bars):
+    rows, cache = [], {}
+    with open(_LOG_PATH) as file:
+        for line in file:
+            try:
+                record = json.loads(line)
+                if record.get("kind") != "candidate":
+                    continue
+                if record.get("feed") != os.getenv("DAYTRADING_ALPACA_FEED", "iex"):
+                    continue
+                ts = parse_timestamp(record["ts"])
+                symbol = str(record["symbol"]).upper()
+                day = ts.astimezone(ET).date()
+                key = symbol, day
+                if key not in cache:
+                    cache[key] = _premarket(
+                        fetch_alpaca_10s_bars_for_day(symbol, day).get(symbol, [])
+                    )
+                bars = cache[key]
+                idx = next(
+                    (j for j, b in enumerate(bars) if parse_timestamp(b.ts) == ts), None
+                )
+                if idx is None or idx + 1 >= len(bars):
+                    continue
+                outcome = _runner_outcome(
+                    bars, idx + 1, float(bars[idx + 1].open), float(record["stop"])
+                )
+                if outcome is not None:
+                    rows.append(
+                        TrainingRow(
+                            symbol,
+                            ts,
+                            tuple(float(record["features"][name]) for name in FEATS),
+                            *outcome,
+                        )
+                    )
+            except (ValueError, KeyError, TypeError, OSError):
                 continue
-            entry = float(bars[idx + 1].open); stop = float(r["stop"])
-            lab = _runner_label(bars, idx + 1, entry, stop)
-            if lab is None:
-                continue
-            feats = [float(r["features"][n]) for n in FEATS]
-            rows.append((day_offset + hash(d.isoformat()) % 1000, feats, lab))  # distinct day index
-        except Exception:
-            continue
     return rows
 
 
-def _fit(Xt, yt, l2=10.0, lr=0.1, it=6000):
-    n, dd = Xt.shape; w = np.zeros(dd); b = 0.0
+def _fit(X, y, l2=10.0, lr=0.1, it=2000):
+    n, width = X.shape
+    w, b = np.zeros(width), 0.0
     for _ in range(it):
-        p = 1 / (1 + np.exp(-np.clip(Xt @ w + b, -30, 30)))
-        g = p - yt
-        w -= lr * (Xt.T @ g / n + l2 * w / n); b -= lr * g.mean()
+        p = 1 / (1 + np.exp(-np.clip(X @ w + b, -30, 30)))
+        error = p - y
+        w -= lr * (X.T @ error / n + l2 * w / n)
+        b -= lr * error.mean()
     return w, b
 
 
-def retrain(deploy: bool = False) -> Dict[str, object]:
-    """Retrain, validate OOS, and (if --deploy) overwrite the model only if it
-    beats the current one. Returns a result summary."""
-    cur = get_model()
-    rows = _rows_from_cache(cur) + _rows_from_log(cur, day_offset=10_000)
-    if len(rows) < 50:
-        return {"status": "not_enough_data", "rows": len(rows)}
-    X = np.array([r[1] for r in rows]); Y = np.array([r[2] for r in rows]); D = np.array([r[0] for r in rows])
+def _scores(rows, mean, std, weights, bias):
+    X = np.asarray([r.features for r in rows])
+    return 1 / (1 + np.exp(-np.clip((X - mean) / std @ weights + bias, -30, 30)))
 
-    tr = D % 2 == 0
-    if tr.sum() < 20 or (~tr).sum() < 20:
-        return {"status": "not_enough_data", "rows": len(rows)}
-    mu, sd = X[tr].mean(0), X[tr].std(0) + 1e-9
-    w0, b0 = _fit(((X - mu) / sd)[tr], Y[tr])
-    pt = 1 / (1 + np.exp(-np.clip(((X - mu) / sd)[~tr] @ w0 + b0, -30, 30)))
-    new_topq = float(Y[~tr][pt >= np.quantile(pt, 0.75)].mean())
-    if len(cur.weights) == X.shape[1]:
-        # same feature set -> compare against the current model head-to-head
-        pc = 1 / (1 + np.exp(-np.clip(
-            ((X - np.array(cur.feat_mean)) / np.array(cur.feat_std))[~tr] @ np.array(cur.weights) + cur.bias,
-            -30, 30)))
-        cur_topq = float(Y[~tr][pc >= np.quantile(pc, 0.75)].mean())
-    else:
-        # feature set changed (e.g. added prior-day/1-min) -> the old model can't
-        # be scored on the new vectors; gate against the base runner rate instead.
-        cur_topq = float(Y[~tr].mean())
 
-    result = {"status": "ok", "rows": int(len(rows)), "runner_rate": round(float(Y.mean()), 3),
-              "current_oos": round(cur_topq, 3), "retrained_oos": round(new_topq, 3),
-              "improved": bool(new_topq >= cur_topq), "deployed": False}
-    if deploy and new_topq >= cur_topq:
-        MU, SD = X.mean(0), X.std(0) + 1e-9
-        W, B = _fit((X - MU) / SD, Y)
-        scores = 1 / (1 + np.exp(-np.clip(((X - MU) / SD) @ W + B, -30, 30)))
-        json.dump({
-            "model_type": "logistic_regression", "target": "premarket_ignition_runner(MFE>=2R)",
-            "features": FEATS, "weights": [round(float(x), 5) for x in W], "bias": round(float(B), 5),
-            "feat_mean": [round(float(x), 6) for x in MU], "feat_std": [round(float(x), 6) for x in SD],
-            "candidate_gates": cur.gates, "high_conviction_cutoff": round(float(np.quantile(scores, 0.75)), 4),
-            "trained_on": {"candidates": int(len(Y)), "runner_rate": round(float(Y.mean()), 3)},
-            "oos_validation": {"top_quartile_runner_rate": round(new_topq, 3)},
-        }, open(_MODEL_PATH, "w"), indent=2)
+def retrain(deploy=False):
+    current = get_model()
+    rows = _rows_from_cache(current) + _rows_from_log(current)
+    try:
+        train, validation, test = chronological_split(rows)
+    except ValueError as exc:
+        return {
+            "status": "not_enough_data",
+            "rows": len(rows),
+            "reason": str(exc),
+            "deployed": False,
+        }
+    if len({r.label for r in train}) < 2:
+        return {
+            "status": "not_enough_data",
+            "rows": len(rows),
+            "reason": "need both training classes",
+            "deployed": False,
+        }
+    X = np.asarray([r.features for r in train])
+    y = np.asarray([r.label for r in train])
+    mean, std = X.mean(0), X.std(0) + 1e-9
+    weights, bias = _fit((X - mean) / std, y)
+    validation_scores = _scores(validation, mean, std, weights, bias)
+    cutoff = float(np.quantile(validation_scores, 0.75))
+    new_metrics = selected_metrics(
+        test, _scores(test, mean, std, weights, bias), cutoff
+    )
+    current_metrics = selected_metrics(
+        test,
+        _scores(
+            test,
+            np.asarray(current.feat_mean),
+            np.asarray(current.feat_std),
+            np.asarray(current.weights),
+            current.bias,
+        ),
+        current.cutoff,
+    )
+    # Missing incumbent provenance is an explicit promotion blocker.
+    metadata = {}
+    if Path(_MODEL_PATH).exists():
+        metadata = json.loads(Path(_MODEL_PATH).read_text()).get("validation", {})
+    reason = promotion_reason(
+        train, validation, test, new_metrics, metadata, current_metrics
+    )
+    validation_metrics = selected_metrics(validation, validation_scores, cutoff)
+    if (
+        validation_metrics["selected"] < 10
+        or validation_metrics["mean_return_after_cost"] <= 0
+    ):
+        reason = "validation expectancy/count insufficient"
+    provenance = {
+        "trained_through": max(r.session for r in train).isoformat(),
+        "validation_start": min(r.session for r in validation).isoformat(),
+        "test_start": min(r.session for r in test).isoformat(),
+        "evaluated_through": max(r.session for r in test).isoformat(),
+        "final_holdout": new_metrics,
+        "return_model": "2R target / -1R stop, stop-first on ambiguous bars, execution-cost buffer",
+    }
+    artifact = {
+        "model_type": "logistic_regression",
+        "target": "premarket_ignition_runner(MFE>=2R)",
+        "features": FEATS,
+        "weights": weights.tolist(),
+        "bias": float(bias),
+        "feat_mean": mean.tolist(),
+        "feat_std": std.tolist(),
+        "candidate_gates": current.gates,
+        "high_conviction_cutoff": cutoff,
+        "validation": provenance,
+    }
+    candidate_path = data_root() / "models" / "warrior_ignition_candidate.json"
+    atomic_json(candidate_path, artifact)
+    result = {
+        "status": "ok",
+        "rows": len(train) + len(validation) + len(test),
+        "runner_rate": float(np.mean([r.label for r in rows])),
+        "current_oos": current_metrics["positive_rate"],
+        "retrained_oos": new_metrics["positive_rate"],
+        "current_holdout": current_metrics,
+        "retrained_holdout": new_metrics,
+        "improved": reason is None,
+        "promotion_reason": reason,
+        "deployed": False,
+        **provenance,
+    }
+    if deploy and reason is None:
+        promote_json(Path(_MODEL_PATH), artifact)
+        get_model()  # explicit reload of the atomic persisted version
         result["deployed"] = True
+    atomic_json(data_root() / "models" / "ignition_training_report.json", result)
     return result

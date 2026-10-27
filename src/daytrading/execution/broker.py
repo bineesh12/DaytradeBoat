@@ -57,7 +57,7 @@ class PaperBroker:
         return fill, OrderStatus.FILLED
 
 
-def apply_fill(portfolio: PortfolioState, fill: Fill) -> None:
+def _apply_fill(portfolio: PortfolioState, fill: Fill) -> None:
     """Update cash and position from a fill (mutates portfolio)."""
     sign = 1.0 if fill.side is Side.BUY else -1.0
     cost = sign * fill.quantity * fill.price + fill.commission
@@ -85,3 +85,21 @@ def apply_fill(portfolio: PortfolioState, fill: Fill) -> None:
         portfolio.positions.pop(fill.symbol, None)
     else:
         portfolio.positions[fill.symbol] = pos
+
+
+def apply_fill(portfolio: PortfolioState, fill: Fill) -> None:
+    from .fill_identity import project, projection_key
+    with project(portfolio, 'inventory', fill) as incremental:
+        if incremental is not None:
+            _apply_fill(portfolio, incremental)
+            if fill.order_id:
+                portfolio._fill_projections.setdefault('cash', {})[projection_key(fill)] = (fill.cumulative_quantity, fill.cumulative_notional)
+
+
+def apply_cash_observation(portfolio, fill):
+    """Apply unseen cash only when positions come from a fresh broker snapshot."""
+    from .fill_identity import project
+    with project(portfolio, 'cash', fill) as incremental:
+        if incremental is not None:
+            sign = 1.0 if incremental.side is Side.BUY else -1.0
+            portfolio.cash -= sign*incremental.quantity*incremental.price + incremental.commission

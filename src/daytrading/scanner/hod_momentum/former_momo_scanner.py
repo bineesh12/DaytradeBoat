@@ -6,6 +6,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Sequence, Set
 
+from daytrading.data.bar_provenance import completed_minutes
 from daytrading.models import Bar
 from daytrading.scanner.hod_momentum.alert_store import HODAlertStore
 from daytrading.scanner.hod_momentum.models import HODAlertRow
@@ -87,6 +88,7 @@ class FormerMomoScanner:
         rejections = rejections or {}
 
         for symbol, bars in universe.items():
+            bars = completed_minutes(bars)
             if len(bars) < 10:
                 continue
             latest = bars[-1]

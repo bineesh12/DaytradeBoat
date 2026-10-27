@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
-import json
 import logging
+import os
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
 
 from daytrading.ml import shadow_collector as collector
+from daytrading.ml.artifacts import archive_model, atomic_json, data_root
+from daytrading.ml.validation import TrainingRow, chronological_split, parse_timestamp
 
 logger = logging.getLogger(__name__)
 
-MODEL_DIR = Path(__file__).resolve().parent.parent.parent.parent / "data" / "models"
+MODEL_DIR = data_root() / "models"
 
 DATASETS = {
     "missed_opportunity": (
@@ -68,9 +71,9 @@ def _flatten_features(record: dict) -> Dict[str, float]:
     return features
 
 
-def _matrix(records: List[dict]) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+def _matrix(records: List[dict], names=None) -> Tuple[np.ndarray, np.ndarray, List[str]]:
     feature_maps = [_flatten_features(r) for r in records]
-    names = sorted({k for fm in feature_maps for k in fm})
+    names = names or sorted({k for fm in feature_maps for k in fm})
     if not names:
         return np.empty((0, 0)), np.empty((0,)), []
     X = np.array([[fm.get(name, 0.0) for name in names] for fm in feature_maps])
@@ -91,9 +94,26 @@ def train_shadow_model(name: str, *, min_samples: int = 50) -> bool:
         )
         return False
 
-    X, y, feature_names = _matrix(records)
-    if X.size == 0 or len(set(y.tolist())) < 2:
-        logger.info("ML SHADOW %s: skipped — needs both positive and negative labels", name)
+    lookup, dated = {}, []
+    for record in records:
+        try:
+            ts = parse_timestamp(record["ts"])
+            symbol = str(record.get("symbol", name)).upper()
+            lookup[symbol, ts] = record
+            dated.append(TrainingRow(symbol, ts, (0.0,), float(record["label"]), 0.0))
+        except (ValueError, KeyError, TypeError):
+            continue
+    try:
+        training, validation, test = chronological_split(dated, min_partition_rows=10)
+    except ValueError as exc:
+        logger.warning("ML SHADOW %s skipped: %s", name, exc)
+        return False
+    training_records = [lookup[r.symbol, r.ts] for r in training]
+    testing_records = [lookup[r.symbol, r.ts] for r in test]
+    X_train, y_train, feature_names = _matrix(training_records)
+    X_test, y_test, _ = _matrix(testing_records, feature_names)
+    if X_train.size == 0 or len(set(y_train.tolist())) < 2:
+        logger.info("ML SHADOW %s: skipped — needs both training classes", name)
         return False
 
     try:
@@ -101,12 +121,6 @@ def train_shadow_model(name: str, *, min_samples: int = 50) -> bool:
     except ImportError:
         logger.warning("ML SHADOW %s: xgboost unavailable", name)
         return False
-
-    split = max(1, int(len(X) * 0.8))
-    if split >= len(X):
-        split = len(X) - 1
-    X_train, y_train = X[:split], y[:split]
-    X_test, y_test = X[split:], y[split:]
 
     pos = int(sum(y_train))
     neg = len(y_train) - pos
@@ -118,21 +132,34 @@ def train_shadow_model(name: str, *, min_samples: int = 50) -> bool:
         colsample_bytree=0.85,
         scale_pos_weight=(neg / pos if pos > 0 else 1.0),
         eval_metric="logloss",
-        use_label_encoder=False,
+        random_state=42, n_jobs=1,
     )
     model.fit(X_train, y_train, verbose=False)
     acc = float((model.predict(X_test) == y_test).mean()) if len(y_test) else 0.0
 
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    model.save_model(str(model_path))
+    fd, temporary = tempfile.mkstemp(suffix=".json", dir=MODEL_DIR)
+    os.close(fd)
+    try:
+        model.save_model(temporary)
+        if model_path.exists():
+            archive_model(model_path)
+        os.replace(temporary, model_path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
     meta_path = model_path.with_suffix(".meta.json")
-    meta_path.write_text(json.dumps({
+    atomic_json(meta_path, {
         "dataset": name,
+        "advisory_only": True,
+        "trained_through": max(r.session for r in training).isoformat(),
+        "validation_start": min(r.session for r in validation).isoformat(),
+        "test_start": min(r.session for r in test).isoformat(),
+        "evaluated_through": max(r.session for r in test).isoformat(),
         "samples": len(records),
-        "positive_rate": round(float(sum(y)) / len(y), 4),
+        "positive_rate": round(float(sum(r.label for r in dated)) / len(dated), 4),
         "test_accuracy": round(acc, 4),
         "feature_names": feature_names,
-    }, indent=2, sort_keys=True) + "\n")
+    })
     logger.info(
         "ML SHADOW %s: trained %d samples, acc %.1f%% → %s",
         name, len(records), acc * 100.0, model_path,

@@ -10,6 +10,7 @@ Lookup order: in-memory session cache → SQLite (7-day TTL) → Yahoo.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone, timedelta
 import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from typing import Dict, Optional, Tuple, TYPE_CHECKING
@@ -43,6 +44,7 @@ class FloatChecker:
         self._cache_ttl_days = cache_ttl_days
         self._cache: Dict[str, Optional[Tuple[float, float]]] = {}
         self._avg_vol_cache: Dict[str, float] = {}
+        self._provenance: Dict[str, dict] = {}
         self._lock = threading.Lock()
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="float")
 
@@ -71,7 +73,7 @@ class FloatChecker:
                 sym,
                 rec.float_shares,
                 rec.outstanding_shares,
-                rec.avg_volume,
+                rec.avg_volume, source=rec.source, fetched_at=rec.fetched_at,
             )
             from_db += 1
         return from_db, need_yahoo
@@ -82,9 +84,11 @@ class FloatChecker:
         float_shares: Optional[float],
         outstanding: Optional[float],
         avg_vol: Optional[float],
+        *, source: str = "yfinance", fetched_at=None,
     ) -> None:
         sym = symbol.upper().strip()
         with self._lock:
+            self._provenance[sym] = {"source": source, "fetched_at": fetched_at or datetime.now(timezone.utc)}
             if float_shares is not None:
                 self._cache[sym] = (float_shares, outstanding or 0.0)
             else:
@@ -92,9 +96,30 @@ class FloatChecker:
             if avg_vol is not None and avg_vol > 0:
                 self._avg_vol_cache[sym] = avg_vol
 
+    def get_float_metadata(self, symbol: str) -> dict:
+        sym = symbol.upper().strip()
+        with self._lock:
+            meta = dict(self._provenance.get(sym, {}))
+        fetched = meta.get("fetched_at")
+        if not fetched:
+            return {"source": "unknown", "fresh": False, "age_hours": None}
+        age = datetime.now(timezone.utc) - fetched
+        return {"source": meta["source"], "fetched_at": fetched.isoformat(),
+                "age_hours": round(age.total_seconds() / 3600, 1),
+                "fresh": timedelta(0) <= age <= timedelta(days=self._cache_ttl_days)}
+
+    def _expire_memory(self, symbol):
+        with self._lock:
+            meta = self._provenance.get(symbol)
+            if meta and datetime.now(timezone.utc) - meta["fetched_at"] > timedelta(days=self._cache_ttl_days):
+                self._cache.pop(symbol, None)
+                self._avg_vol_cache.pop(symbol, None)
+                self._provenance.pop(symbol, None)
+
     def get_float(self, symbol: str) -> Optional[float]:
         """Return the float (publicly tradeable shares) for *symbol*."""
         sym = symbol.upper().strip()
+        self._expire_memory(sym)
         with self._lock:
             if sym in self._cache:
                 cached = self._cache[sym]
@@ -107,6 +132,7 @@ class FloatChecker:
             if rec is not None and rec.is_fresh(self._cache_ttl_days):
                 self._apply_to_memory(
                     sym, rec.float_shares, rec.outstanding_shares, rec.avg_volume,
+                    source=rec.source, fetched_at=rec.fetched_at,
                 )
                 return rec.float_shares
 
@@ -129,6 +155,7 @@ class FloatChecker:
         Use this in hot paths (scanner loops) to avoid blocking.
         """
         sym = symbol.upper().strip()
+        self._expire_memory(sym)
         with self._lock:
             if sym in self._cache:
                 cached = self._cache[sym]
@@ -141,6 +168,7 @@ class FloatChecker:
             if rec is not None and rec.is_fresh(self._cache_ttl_days):
                 self._apply_to_memory(
                     sym, rec.float_shares, rec.outstanding_shares, rec.avg_volume,
+                    source=rec.source, fetched_at=rec.fetched_at,
                 )
                 return rec.float_shares
         return None
@@ -177,6 +205,7 @@ class FloatChecker:
     def get_avg_volume(self, symbol: str) -> Optional[float]:
         """Return the 10-day average daily volume for *symbol*, or None."""
         sym = symbol.upper().strip()
+        self._expire_memory(sym)
         with self._lock:
             if sym in self._avg_vol_cache:
                 return self._avg_vol_cache[sym]
@@ -187,6 +216,7 @@ class FloatChecker:
     def needs_yahoo_refresh(self, symbol: str) -> bool:
         """True if symbol is not in fresh memory or DB cache."""
         sym = symbol.upper().strip()
+        self._expire_memory(sym)
         with self._lock:
             if sym in self._cache:
                 return False
@@ -205,6 +235,7 @@ class FloatChecker:
         with self._lock:
             self._cache.clear()
             self._avg_vol_cache.clear()
+            self._provenance.clear()
 
     def _fetch_with_timeout(self, symbol: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
         """Wrap _fetch in a timeout so slow Yahoo responses don't block trades."""

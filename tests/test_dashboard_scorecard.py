@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from daytrading.dashboard.hub import DashboardHub, TradeRecord
 from daytrading.dashboard.server import create_app
@@ -416,7 +416,7 @@ def test_dashboard_renders_daily_scorecard_panel() -> None:
 def test_rolling_scorecard_reads_trade_expectancy_from_journal(tmp_path) -> None:
     journal = TradingJournal(base_dir=str(tmp_path / "journal"))
     try:
-        day = "2026-06-10"
+        day = datetime.now(timezone.utc).date().isoformat()
         ts_entry = datetime.fromisoformat(f"{day}T14:30:00+00:00")
         ts_exit = datetime.fromisoformat(f"{day}T14:35:00+00:00")
         journal.record("cycle", {

@@ -16,11 +16,16 @@ from __future__ import annotations
 import logging
 import math
 import os
+import json
+import hashlib
+from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional, Sequence, List
 
-from daytrading.indicators.core import relative_volume, vwap
+from daytrading.indicators.core import vwap
+from daytrading.ml.artifacts import data_root
+
 from daytrading.models import Bar, Quote, Tick
 
 logger = logging.getLogger(__name__)
@@ -70,28 +75,47 @@ try:
 except Exception:
     pass
 
-# XGBoost model — loaded once at import time, None if unavailable
+# Load only validated persistent artifacts. Failed updates retain the last good model.
 _xgb_model = None
 _XGB_THRESHOLD = 0.30
-try:
-    import xgboost as xgb
-    _model_path = os.path.join(
-        os.path.dirname(__file__), "..", "..", "..", "data", "models", "entry_model.json",
-    )
-    _model_path = os.path.normpath(_model_path)
-    if ENTRY_ML_ENABLED and os.path.exists(_model_path):
-        _xgb_model = xgb.Booster()
-        _xgb_model.load_model(_model_path)
-        logger.info("XGBoost entry model loaded from %s", _model_path)
-    elif not ENTRY_ML_ENABLED:
-        logger.info("XGBoost entry model disabled by DAYTRADING_ENABLE_ENTRY_ML=false")
-except Exception:
-    pass
+_model_path = str(data_root() / "models" / "entry_model.json")
+_entry_model_signature = None
 
 
-def get_ml_monitor():
-    """Get the global ML monitor instance."""
-    return _ml_monitor
+def refresh_entry_model() -> None:
+    global _xgb_model, _entry_model_signature, _XGB_THRESHOLD
+    if not ENTRY_ML_ENABLED:
+        return
+    path = Path(_model_path)
+    metadata_path = path.with_suffix(".meta.json")
+    if not path.exists() or not metadata_path.exists():
+        return
+    signature = (path.stat().st_mtime_ns, metadata_path.stat().st_mtime_ns)
+    if signature == _entry_model_signature:
+        return
+    try:
+        metadata = json.loads(metadata_path.read_text())
+        if not metadata.get("promotion_allowed") or metadata.get("model_sha256") != hashlib.sha256(path.read_bytes()).hexdigest():
+            raise ValueError("entry model has no matching approved validation metadata")
+        from daytrading.ml.features import FEATURE_NAMES
+        if metadata.get("feature_names") != FEATURE_NAMES:
+            raise ValueError("entry model feature schema mismatch")
+        threshold = float(metadata["threshold"])
+        if not math.isfinite(threshold) or not 0 <= threshold <= 1:
+            raise ValueError("invalid probability threshold")
+        import xgboost as xgb
+        candidate = xgb.Booster()
+        candidate.load_model(str(path))
+        if candidate.num_features() != len(FEATURE_NAMES):
+            raise ValueError("entry model feature count mismatch")
+    except Exception as exc:
+        logger.error("Entry model reload rejected: %s", exc)
+    else:
+        _xgb_model, _XGB_THRESHOLD = candidate, threshold
+    _entry_model_signature = signature
+
+
+refresh_entry_model()
 
 
 def is_entry_ml_enabled() -> bool:
@@ -159,6 +183,7 @@ def _liquidity_score(
     today_bars: Sequence[Bar],
     quotes: Optional[Sequence[Quote]] = None,
     avg_daily_volume: Optional[float] = None,
+    quote_cost=None,
 ) -> tuple[int, str]:
     """Score executable liquidity from volume, recent tape, spread, and size."""
     day_volume, recent_avg, bar_rvol = _recent_volume_stats(today_bars)
@@ -227,10 +252,18 @@ def _liquidity_score(
         parts.append("rvol=5")
 
     valid_quotes = [q for q in list(quotes or [])[-5:] if q.ask > q.bid > 0]
-    if valid_quotes and price > 0:
+    if quote_cost is not None:
+        # Typed micro evidence was validated by the caller. Keep the same
+        # scoring weights/thresholds, with executable quote-time costs.
+        price = quote_cost.last_quote.ask
+        avg_spread_pct = quote_cost.mean_spread / price * 100
+        avg_size = quote_cost.mean_depth
+    elif valid_quotes and price > 0:
         avg_spread_pct = (
             sum((q.ask - q.bid) / price for q in valid_quotes) / len(valid_quotes)
         ) * 100
+        avg_size = sum(min(q.bid_size, q.ask_size) for q in valid_quotes) / len(valid_quotes)
+    if (quote_cost is not None or valid_quotes) and price > 0:
         if tick_aware_spread_ok(avg_spread_pct / 100.0 * price, price, 0.0015):
             score += 15
             parts.append("spread=15")
@@ -243,7 +276,6 @@ def _liquidity_score(
         else:
             parts.append("spread=0")
 
-        avg_size = sum(min(q.bid_size, q.ask_size) for q in valid_quotes) / len(valid_quotes)
         if avg_size >= 2_000:
             score += 10
             parts.append("size=10")
@@ -308,7 +340,7 @@ class ScannerProfile:
 
 LOW_FLOAT_RUNNER = ScannerProfile(
     name="Low Float Runner",
-    min_price=1.5,
+    min_price=1.0,
     max_price=20.0,
     min_day_change_pct=5.0,
     min_bar_volume=10_000,
@@ -365,7 +397,7 @@ def assess_opportunity_scaled_spread(
     distance_from_hod: float = 1.0,
     float_shares: Optional[float] = None,
     quote_depth: float = 0.0,
-    normal_pct_limit: float = 0.005,
+    normal_pct_limit: Optional[float] = None,
     setup_score: float = 0.0,
 ) -> SpreadAssessment:
     """Allow only elite runners to exceed the normal spread gate with size-down."""
@@ -374,8 +406,11 @@ def assess_opportunity_scaled_spread(
     if price <= 0:
         return SpreadAssessment(ok=False, reason="invalid price for spread check")
 
+    from daytrading.strategy.entry_spread import get_policy
+    policy=get_policy()
+    normal_pct_limit=policy.normal_pct if normal_pct_limit is None else normal_pct_limit
     spread_pct = spread / price
-    if tick_aware_spread_ok(spread, price, normal_pct_limit):
+    if tick_aware_spread_ok(spread, price, normal_pct_limit, min_tick=policy.normal_tick_floor):
         return SpreadAssessment(ok=True, spread=spread, spread_pct=spread_pct)
 
     pattern = str(pattern or "")
@@ -506,8 +541,8 @@ def check_entry_quality(
     bars: Sequence[Bar],
     *,
     symbol: str = "",
-    min_price: float = 1.5,
-    max_price: float = 20.0,
+    min_price: Optional[float] = None,
+    max_price: Optional[float] = None,
     min_rvol: float = 1.5,
     max_bar_age_seconds: int = 300,
     min_momentum_quality: int = 40,
@@ -522,12 +557,18 @@ def check_entry_quality(
     entry_tier: Optional[str] = None,
     setup_score: float = 0.0,
     now: Optional[datetime] = None,
+    vwap_diagnostics: Optional[dict] = None,
+    session_vwap_required: bool = False,
+    micro_flow_evidence=None,
+    micro_qualification=None,
 ) -> Optional[str]:
     """Return a rejection reason string, or ``None`` if the setup is OK.
 
     Uses a scoring system: hard rejects first, then score 7 conditions.
-    Score >= 60/100 passes.
+    Score must reach the configured threshold (default 80/100).
     """
+    min_price = float(os.getenv("DAYTRADING_MIN_PRICE", "1.0")) if min_price is None else min_price
+    max_price = float(os.getenv("DAYTRADING_MAX_PRICE", "20.0")) if max_price is None else max_price
     def _rule_reject(reason: str) -> str:
         record_rule_rejection(symbol=symbol, reason=reason)
         return reason
@@ -537,6 +578,16 @@ def check_entry_quality(
 
     latest = bars[-1]
     price = latest.close
+    micro_profile_ok=False
+    if micro_qualification is not None:
+        from daytrading.strategy.scalping.micro_profile import MicroQualification
+        if (not isinstance(micro_qualification,MicroQualification) or entry_pattern!='micro_pullback_reclaim'
+                or not micro_qualification.valid_for(symbol,now) or micro_flow_evidence is None
+                or micro_flow_evidence.symbol!=symbol or micro_flow_evidence.observed_at!=now):
+            return _rule_reject('micro_profile: mismatched or expired typed qualification')
+        micro_profile_ok=True
+        price=micro_flow_evidence.quote_cost.last_quote.ask
+        if vwap_diagnostics is not None:vwap_diagnostics['micro_profile']=micro_qualification.metadata()
     if price <= 0:
         return _rule_reject("invalid price")
 
@@ -666,22 +717,48 @@ def check_entry_quality(
             )
         )
 
+    # Micro VWAP uses current executable evidence, not the last minute close.
+    micro_vwap = None
+    if pattern_context == "micro_pullback_reclaim":
+        from daytrading.strategy.scalping.micro_vwap import fresh_micro_vwap
+        from daytrading.data.completed_bars import Rejection
+        micro_vwap = fresh_micro_vwap(today_bars, ticks, quotes, symbol=symbol, now=now)
+        if isinstance(micro_vwap, Rejection):
+            return _rule_reject(micro_vwap.code+": "+micro_vwap.reason)
+        if vwap_diagnostics is not None:
+            vwap_diagnostics.update(micro_vwap)
+    pullback_vwap = None
+    if pattern_context == "vwap_pullback" and session_vwap_required:
+        from daytrading.data.session_vwap import session_vwap_context
+        from daytrading.data.completed_bars import Rejection
+        pullback_vwap=session_vwap_context(bars,symbol=symbol or latest.symbol,
+            now=now or datetime.now(timezone.utc))
+        if isinstance(pullback_vwap,Rejection):
+            return _rule_reject(pullback_vwap.code+": "+pullback_vwap.reason)
+        if vwap_diagnostics is not None:vwap_diagnostics.update(pullback_vwap['metadata'])
     # 3. Below VWAP — buying into sellers is usually wrong for momentum.
     # Reduced-size A+ reclaim scouts can use recent VWAP when the full-session
     # VWAP is distorted by a huge earlier runner spike.
     last_vwap = 0.0
     if len(today_bars) >= 3:
         vwap_vals = vwap(today_bars)
-        last_vwap = vwap_vals[-1] if vwap_vals else 0.0
+        last_vwap = (micro_vwap["vwap_reference"] if micro_vwap else
+                     pullback_vwap["metadata"]["vwap_reference"] if pullback_vwap else
+                     (vwap_vals[-1] if vwap_vals else 0.0))
+        vwap_price = (micro_vwap["vwap_comparison_price"] if micro_vwap else
+                      pullback_vwap["bars"][-1].close if pullback_vwap else price)
         if not math.isnan(last_vwap) and last_vwap > 0:
-            if price < last_vwap * 0.995:
+            if micro_flow_evidence is not None:
+                from daytrading.strategy.entry_checks import record
+                record(vwap_diagnostics,'session_vwap_floor',now=now,measured=vwap_price,threshold=last_vwap*.995,units='USD/share',comparison='>=',passed=vwap_price>=last_vwap*.995,window={'source':'completed 1m session VWAP','last_bar':today_bars[-1].ts.isoformat()},quote=micro_flow_evidence.quote_cost.last_quote)
+            if vwap_price < last_vwap * 0.995:
                 elite_recent_vwap_ok = (
                     elite_reclaim_context
                     and recent_reclaim_ok
                     and distance_from_hod_context <= 0.55
                 )
                 if not elite_recent_vwap_ok:
-                    return _rule_reject("below VWAP ({:.2f} < {:.2f})".format(price, last_vwap))
+                    return _rule_reject("below VWAP ({:.4f} < {:.4f}; threshold {:.4f}; {})".format(vwap_price, last_vwap, last_vwap*.995, "fresh trade/bid" if micro_vwap else "minute close"))
                 logger.info(
                     "ENTRY GUARD %s: A+ reclaim using recent VWAP %.2f "
                     "over session VWAP %.2f pattern=%s tier=%s",
@@ -742,12 +819,12 @@ def check_entry_quality(
             )
             if day_change_pct_hard < min_day_change_pct and not hot_low_float_runner:
                 return _rule_reject(
-                    "not enough movement: day change {:.1f}% (need {:.1f}%+)".format(
+                    "not enough movement: from session open {:.1f}% (need {:.1f}%+)".format(
                         day_change_pct_hard, min_day_change_pct)
                 )
             if day_change_pct_hard < min_day_change_pct and hot_low_float_runner:
                 logger.info(
-                    "ENTRY GUARD %s: hot runner movement exception day_change=%.1f%% "
+                    "ENTRY GUARD %s: hot runner movement exception from_session_open=%.1f%% "
                     "vol=%.0f recent=%.0f rvol=%.1fx float=%s",
                     symbol,
                     day_change_pct_hard,
@@ -793,11 +870,29 @@ def check_entry_quality(
             )
         )
 
+    # Opt-in micro evidence: executable quotes determine cost, never a minute
+    # candle's close. Both sustained and instantaneous spreads keep the normal
+    # tick-aware threshold. All broader session/score/liquidity gates remain.
+    if micro_flow_evidence is not None:
+        from daytrading.strategy.scalping.micro_flow import MicroFlowEvidence,EventFlowEvidence
+        if (not isinstance(micro_flow_evidence,(MicroFlowEvidence,EventFlowEvidence)) or pattern_context != "micro_pullback_reclaim"
+                or micro_flow_evidence.symbol != symbol or micro_flow_evidence.observed_at != now):
+            return _rule_reject("micro_flow_evidence: evidence symbol/timeframe/observation mismatch")
+        cost=micro_flow_evidence.quote_cost
+        executable=cost.last_quote.ask
+        if vwap_diagnostics is not None:vwap_diagnostics.update(micro_flow_evidence.metadata())
+        from daytrading.strategy.entry_spread import check
+        if not check(vwap_diagnostics,'micro_current_spread',spread=cost.current_spread,price=executable,now=now,quote=cost.last_quote,window={'source':'current quote'}):
+            return _rule_reject("micro_spread: current spread {:.2f}c / fresh ask ${:.4f} exceeds configured normal spread limit".format(cost.current_spread*100,executable))
+        if not check(vwap_diagnostics,'micro_historical_spread',spread=cost.mean_spread,price=executable,now=now,quote=cost.last_quote,window={'source':'duration-weighted quotes','seconds':cost.window_seconds,'valid_coverage_seconds':cost.coverage_seconds,'end':now.isoformat()}):
+            return _rule_reject("micro_spread: time-weighted spread {:.2f}c over {:.2f}s / fresh ask ${:.4f} exceeds configured normal spread limit".format(cost.mean_spread*100,cost.coverage_seconds,executable))
+
     # 7. Spread filter — wide spread means illiquid stock, bad fills.
     # Elite A+ runner continuation setups may still be executable with a
     # slightly wider spread, but they must continue through score + ML below.
-    if quotes and len(quotes) >= 3:
-        recent_quotes = list(quotes[-5:])
+    if micro_flow_evidence is None and quotes and len(quotes) >= 3:
+        from daytrading.strategy.entry_spread import get_policy
+        recent_quotes = list(quotes[-get_policy().quality_recent_samples:])
         valid_spreads = [q.ask - q.bid for q in recent_quotes if q.ask > q.bid > 0]
         avg_spread = sum(valid_spreads) / len(valid_spreads) if valid_spreads else 0.0
         avg_spread_pct = avg_spread / price if price > 0 else 1.0
@@ -847,6 +942,7 @@ def check_entry_quality(
     # 8. Full liquidity score — avoid weak chop even when simple volume passes
     liquidity_score, liquidity_parts = _liquidity_score(
         price, today_bars, quotes, avg_daily_volume=avg_daily_volume,
+        quote_cost=micro_flow_evidence.quote_cost if micro_flow_evidence is not None else None,
     )
     if price < 5.0 and liquidity_score < 65 and not (
         sub5_has_relative_momentum and liquidity_score >= 55
@@ -865,9 +961,11 @@ def check_entry_quality(
 
     # 9. Tape confirmation — sellers dominating means breakout is failing
     if ticks and len(ticks) >= 20:
-        from daytrading.indicators.scalping import order_flow_imbalance
-        imb_values = order_flow_imbalance(list(ticks), window=min(30, len(ticks)))
-        current_imb = imb_values[-1] if imb_values else 0.0
+        from daytrading.indicators.scalping import last_order_flow_imbalance
+        current_imb = last_order_flow_imbalance(list(ticks), window=min(30, len(ticks)))
+        if micro_flow_evidence is not None:
+            from daytrading.strategy.entry_checks import record
+            record(vwap_diagnostics,'tape_imbalance',now=now,measured=current_imb,threshold=-.3,units='signed volume ratio',comparison='>',passed=current_imb>-.3,window={'source':'latest trades','samples':min(30,len(ticks))},quote=micro_flow_evidence.quote_cost.last_quote)
         if current_imb <= -0.3:
             pattern = str(entry_pattern or "")
             tier = str(setup_tier or "").lower()
@@ -876,7 +974,7 @@ def check_entry_quality(
                 (session_high - price) / session_high if session_high > 0 else 1.0
             )
             elite_sub2_reclaim = (
-                1.5 <= price < 2.0
+                min_price <= price < 2.0
                 and pattern in {
                     "abc_continuation",
                     "vwap_pullback",
@@ -1111,14 +1209,14 @@ def check_entry_quality(
 
     ml_prob_val = None
     # XGBoost ML check (optional — skipped if model not loaded or monitor disabled it)
-    ml_active = _xgb_model is not None and (
+    refresh_entry_model()
+    ml_active = ENTRY_ML_ENABLED and _xgb_model is not None and (
         _ml_monitor is None or _ml_monitor.is_model_enabled
     )
     if ml_active:
         try:
             from daytrading.ml.features import compute_entry_features
             import xgboost as xgb
-            import numpy as np
 
             features = compute_entry_features(
                 price,
@@ -1166,6 +1264,7 @@ def check_entry_quality(
     elite_sub2_score_ok = elite_sub2_reclaim and score >= 50
     if (
         score < ENTRY_SCORE_THRESHOLD
+        and not micro_profile_ok
         and not elite_sub2_score_ok
         and not vwap_reclaim_scout_score_ok
         and not post_blowoff_micro_base_score_ok
@@ -1201,6 +1300,9 @@ def check_entry_quality(
             score,
             ENTRY_SCORE_THRESHOLD,
         )
+
+    if micro_profile_ok and vwap_diagnostics is not None:
+        vwap_diagnostics['micro_profile'].update(legacy_score=score,legacy_threshold=ENTRY_SCORE_THRESHOLD,legacy_breakdown=breakdown)
 
     # PASS — log score for data collection after all live gates clear.
     if _ml_monitor:

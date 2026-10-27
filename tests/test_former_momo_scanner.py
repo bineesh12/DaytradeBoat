@@ -1,3 +1,4 @@
+from daytrading.models import BarSource
 """Tests for Former Momo Stock HOD alerts ($20+)."""
 
 from datetime import datetime, timedelta, timezone
@@ -19,7 +20,7 @@ def _bar(i: int, close: float, vol: float = 200_000) -> Bar:
         low=close - 0.5,
         close=close,
         volume=vol,
-    )
+     provenance=BarSource.CANONICAL_INTERVAL)
 
 
 class _FloatChecker:
